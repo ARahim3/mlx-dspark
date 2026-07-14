@@ -13,7 +13,7 @@ EAGLE-family speculative-decoding drafter:
 This package targets single-user local inference on Apple Silicon.
 """
 
-__version__ = "0.3.1"
+__version__ = "0.3.2"
 
 
 # --- transformers>=5.13 compat shim (must run before mlx_lm/mlx_vlm import below) ---

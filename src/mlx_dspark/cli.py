@@ -452,6 +452,16 @@ def cmd_doctor(argv: list[str]) -> None:
     except Exception:
         pass
 
+    # gemma4 preset compat: mlx-vlm 0.6.4's Gemma4UnifiedProcessor breaks under
+    # transformers>=5.12 (issue #4, upstream Blaizzy/mlx-vlm#1578); load_target shims it.
+    try:
+        from .load import _shim_gemma4_unified_processor
+        if _shim_gemma4_unified_processor():
+            print("  · mlx-vlm 0.6.4 Gemma4UnifiedProcessor is incompatible with this "
+                  "transformers — shimmed at load time (upstream: Blaizzy/mlx-vlm#1578)")
+    except Exception:  # noqa: BLE001
+        pass
+
     total_gb = _total_ram_gb()
     if total_gb:
         check("System RAM", total_gb >= 15,

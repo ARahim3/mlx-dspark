@@ -38,6 +38,14 @@ pip install mlx-dspark          # or:  uv pip install mlx-dspark
 Apple Silicon + Python ≥ 3.10. Model weights download from the Hugging Face cache on first use (none
 bundled). No server framework is pulled in — the API server is built on the standard library.
 
+> **Known upstream incompatibility (worked around since 0.3.2):** mlx-vlm **0.6.4** ×
+> transformers **≥ 5.12** breaks loading the gemma4 target with a misleading
+> `OSError: Can't load video processor …` ([#4](https://github.com/ARahim3/mlx-dspark/issues/4),
+> upstream [Blaizzy/mlx-vlm#1578](https://github.com/Blaizzy/mlx-vlm/issues/1578) — fixed on
+> mlx-vlm main, unreleased). mlx-dspark ≥ 0.3.2 shims it at load time, so any mlx-vlm ≥ 0.6.3
+> works; on older mlx-dspark, pin `mlx-vlm==0.6.3`. `mlx-dspark doctor` reports when the shim
+> is active.
+
 ## Quickstart
 
 You name the **target model** (`--model`, an HF repo or local path, exactly like `mlx-lm`); the matching

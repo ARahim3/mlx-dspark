@@ -4,6 +4,32 @@ All notable changes to `mlx-dspark`. Versions follow [SemVer](https://semver.org
 
 ## [Unreleased]
 
+## [0.3.2] — 2026-07-14 — gemma4 loads on fresh installs (mlx-vlm 0.6.4 compat shim)
+
+### Fixed
+- **gemma4 target loads again on fresh installs (mlx-vlm 0.6.4 × transformers ≥ 5.12) (#3, #4).**
+  mlx-vlm 0.6.4 changed its `Gemma4Processor` to hand `video_processor` through to transformers'
+  `ProcessorMixin`, but left the `Gemma4UnifiedProcessor` subclass taking it via `**kwargs` — and
+  transformers ≥ 5.12 validates processor kwargs against the **literal `__init__` signature**
+  (`ProcessorMixin.get_attributes`), so loading the gemma4 preset raised
+  `TypeError: Unexpected keyword argument video_processor`. mlx-vlm's AutoProcessor patch then
+  swallowed that and fell back to transformers' own (checkpoint-incompatible) processor, which
+  surfaced as an unrelated `OSError: Can't load video processor …` — the confusing traceback users
+  actually saw. Root cause + fix are upstream ([Blaizzy/mlx-vlm#1578](https://github.com/Blaizzy/mlx-vlm/issues/1578),
+  landed on main, unreleased as of 0.6.4); until that ships, `load_target` applies a signature shim
+  that patches **only the broken 0.6.4 shape** (0.6.3 — which never passes the kwarg through — and
+  fixed releases are detected and left untouched). Verified end-to-end in a fresh
+  mlx-vlm 0.6.4 + transformers 5.12.1 venv: `mlx-dspark generate --model gemma4` fails before,
+  generates after, and 0.6.3 behavior is byte-identical (shim no-ops). Thanks @jnyer27 for the
+  upstream root-cause analysis.
+- The `load_target` error message now names this known failure (with the upstream issue and the
+  pin workaround) when the masked `video processor` error is detected, instead of relaying the
+  red-herring `OSError` alone; `mlx-dspark doctor` reports when the shim is active.
+
+### Added
+- `_shim_gemma4_unified_processor` shape tests (broken/0.6.3/fixed/idempotent + installed-version
+  consistency) in `tests/test_import_compat.py`. 141 model-free tests, ruff-clean.
+
 ## [0.3.1] — 2026-07-08 — long-context drafting fix + OpenAI structured-content messages
 
 ### Fixed

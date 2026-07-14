@@ -305,6 +305,50 @@ def _route_target(cfg: dict) -> str:
     return "mlx_vlm"
 
 
+def _shim_gemma4_unified_processor(cls=None) -> bool:
+    """mlx-vlm 0.6.4 compat: make ``Gemma4UnifiedProcessor`` loadable under transformers>=5.12.
+
+    0.6.4 changed the parent ``Gemma4Processor`` to hand ``video_processor`` through to
+    ``ProcessorMixin.__init__``, but the child still takes it via ``**kwargs`` — and
+    transformers>=5.12 derives a processor's valid kwargs from the literal ``__init__``
+    signature (``ProcessorMixin.get_attributes``), so loading the gemma4 preset dies with
+    ``TypeError: Unexpected keyword argument video_processor``. Worse, mlx-vlm's
+    AutoProcessor patch swallows that TypeError and falls back to transformers' own
+    checkpoint-incompatible processor, which surfaces as an unrelated ``OSError: Can't
+    load video processor`` (issue #4; upstream Blaizzy/mlx-vlm#1578). Give the child the
+    explicit signature upstream fixed on main. Only the broken 0.6.4 shape is patched:
+    ``attributes`` names video_processor (so it reaches ProcessorMixin) while the
+    signature omits it — 0.6.3 (neither) and fixed releases (both) pass through
+    untouched; wrapping 0.6.3 would *introduce* an attribute-count mismatch. Returns
+    whether the shim was applied. Drop once the mlx-vlm floor is above 0.6.4."""
+    if cls is None:
+        try:
+            from mlx_vlm.models.gemma4_unified.processing_gemma4_unified import (
+                Gemma4UnifiedProcessor,
+            )
+        except Exception:
+            return False
+        cls = Gemma4UnifiedProcessor
+    import inspect
+    try:
+        params = inspect.signature(cls.__init__).parameters
+    except (TypeError, ValueError):
+        return False
+    if "video_processor" in params or "video_processor" not in getattr(cls, "attributes", ()):
+        return False
+    orig = cls.__init__
+
+    # NOTE: no functools.wraps — inspect.signature() follows __wrapped__, which would
+    # resurface the old signature and defeat the patch.
+    def __init__(self, image_processor=None, tokenizer=None, video_processor=None, **kwargs):
+        if video_processor is not None:
+            kwargs["video_processor"] = video_processor
+        orig(self, image_processor=image_processor, tokenizer=tokenizer, **kwargs)
+
+    cls.__init__ = __init__
+    return True
+
+
 def load_target(repo_or_path: str = DEFAULT_TARGET, *, require_tap: bool = False,
                 kv_bits: int | None = None, kv_group_size: int = 64):
     """Return (Target, tokenizer). Routes text models to mlx-lm and multimodal/unified
@@ -329,14 +373,23 @@ def load_target(repo_or_path: str = DEFAULT_TARGET, *, require_tap: bool = False
     else:
         from mlx_vlm import load as vlm_load
 
+        if str(cfg.get("model_type", "")).startswith("gemma4"):
+            _shim_gemma4_unified_processor()
         try:
             model, processor = vlm_load(path)
         except Exception as e:
+            # mlx-vlm's AutoProcessor fallback masks its own processor failures behind
+            # unrelated errors (issue #4) — name the known one instead of relaying it raw.
+            hint = ""
+            if "video processor" in str(e).lower() or "video_processor" in str(e):
+                hint = (" This looks like the mlx-vlm 0.6.4 × transformers>=5.12 "
+                        "Gemma4UnifiedProcessor incompatibility (Blaizzy/mlx-vlm#1578): "
+                        "upgrade mlx-vlm past 0.6.4, or pin mlx-vlm==0.6.3.")
             raise ValueError(
                 f"{repo_or_path}: target model_type {cfg.get('model_type')!r} is supported by "
                 f"neither this mlx-lm ({e.__class__.__name__} from mlx-vlm fallback: {e}) — "
                 f"try upgrading mlx-lm/mlx-vlm, or open an issue: "
-                f"https://github.com/ARahim3/mlx-dspark/issues"
+                f"https://github.com/ARahim3/mlx-dspark/issues{hint}"
             ) from e
         tokenizer = getattr(processor, "tokenizer", processor)
     target = Target(model, tokenizer, kv_bits=kv_bits, kv_group_size=kv_group_size)
