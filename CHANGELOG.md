@@ -2,6 +2,15 @@
 
 All notable changes to `mlx-dspark`. Versions follow [SemVer](https://semver.org/) (pre-1.0: minor-ish features land as patch bumps).
 
+## [0.4.1] — 2026-07-15 — version-string fix
+
+### Fixed
+- `mlx_dspark.__version__` (shown by `mlx-dspark doctor` and the smoke-install check) still said
+  `0.3.2` in the published 0.4.0 wheel — the module attribute and `pyproject.toml` were bumped
+  separately and drifted. The version is now **single-sourced**: hatchling reads it from
+  `__init__.py` (`dynamic = ["version"]`), so the two can never disagree again. Package metadata,
+  the PyPI listing, and all functionality in 0.4.0 were unaffected — the attribute was cosmetic.
+
 ## [0.4.0] — 2026-07-15 — PrismML Bonsai-27B: speculative decoding for a ternary 27B on a Mac
 
 ### Added
