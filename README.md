@@ -4,8 +4,8 @@
 
 <p align="center">
   <b>DeepSeek's DSpark <i>and</i> z-lab's DFlash speculative decoding — native on Apple Silicon via <a href="https://github.com/ml-explore/mlx">MLX</a>.</b>
-  <br>Lossless drafters (same output, just faster) for the <b>Qwen3 and Gemma-4</b> families — plus any matched
-  <br>DSpark / DFlash checkpoint. Run them at the CLI, from Python, or <b>serve an OpenAI-compatible API</b> to LM Studio / any local tool.
+  <br>Lossless drafters (same output, just faster) for the <b>Qwen3, Gemma-4, and PrismML Bonsai-27B</b> families —
+  <br>plus any matched DSpark / DFlash checkpoint. Run them at the CLI, from Python, or <b>serve an OpenAI-compatible API</b> to LM Studio / any local tool.
 </p>
 
 <p align="center">
@@ -25,9 +25,10 @@ used to accelerate DeepSeek-V4) and z-lab's **DFlash** (block diffusion). Both a
 target verifies every token, so output is identical to normal decoding — and run under one verify loop,
 so you can serve them, script them, or benchmark them head-to-head.
 
-> **What this is *not*:** DeepSeek-V4 inference. The targets are dense models (Gemma-4, Qwen3) that DeepSeek
-> published DSpark drafters for — so this runs their real drafter method on a Mac, but the model producing
-> tokens is Gemma / Qwen, not V4. V4 Flash/Pro (MoE, batched serving) is DSpark's own headline use case.
+> **What this is *not*:** DeepSeek-V4 inference. The targets are consumer-size models (Gemma-4, Qwen3,
+> PrismML's ternary Bonsai-27B) with published DSpark drafters — so this runs the real drafter method on a
+> Mac, but the model producing tokens is Gemma / Qwen / Bonsai, not V4. V4 Flash/Pro (MoE, batched serving)
+> is DSpark's own headline use case.
 
 ## Install
 
@@ -35,8 +36,10 @@ so you can serve them, script them, or benchmark them head-to-head.
 pip install mlx-dspark          # or:  uv pip install mlx-dspark
 ```
 
-Apple Silicon + Python ≥ 3.10. Model weights download from the Hugging Face cache on first use (none
-bundled). No server framework is pulled in — the API server is built on the standard library.
+Apple Silicon + Python ≥ 3.10; installs mlx ≥ 0.32.0 automatically (0.32's quantized-matmul kernels are
+what current speedup numbers are measured on). Model weights download from the Hugging Face cache on
+first use (none bundled). No server framework is pulled in — the API server is built on the standard
+library.
 
 > **Known upstream incompatibility (worked around since 0.3.2):** mlx-vlm **0.6.4** ×
 > transformers **≥ 5.12** breaks loading the gemma4 target with a misleading
@@ -98,7 +101,7 @@ mlx-dspark generate --model mlx-community/Qwen3-4B-8bit --prompt "Explain how ra
 mlx-dspark generate --model mlx-community/Qwen3-4B-8bit --mode baseline --prompt "..." --max-new-tokens 400
 mlx-dspark generate --model mlx-community/Qwen3-4B-8bit --mode dspark   --prompt "..." --max-new-tokens 400
 
-# z-lab DFlash drafter (--max-draft 0 = full 16-block; best on code/math)
+# z-lab DFlash drafter (--max-draft 0 = full 16-block, its native operating point)
 mlx-dspark generate --model mlx-community/gemma-4-12B-it-8bit --mode dflash --max-draft 0 --prompt "Write a binary search."
 
 # sampled (not greedy) — lossless w.r.t. the target at temperature T (dspark and dflash)
@@ -136,6 +139,7 @@ anything else, add `--drafter <repo>`. Run `mlx-dspark models` to print this tab
 | `mlx-community/Qwen3-4B-8bit`        | `deepseek-ai/dspark_qwen3_4b_block7`   | `z-lab/Qwen3-4B-DFlash-b16`  | ~8 GB  |
 | `mlx-community/Qwen3-8B-8bit`        | `deepseek-ai/dspark_qwen3_8b_block7`   | `z-lab/Qwen3-8B-DFlash-b16`  | ~11 GB |
 | `mlx-community/gemma-4-12B-it-8bit`  | `deepseek-ai/dspark_gemma4_12b_block7` | `z-lab/gemma4-12B-it-DFlash` | ~15 GB |
+| `prism-ml/Ternary-Bonsai-27B-mlx-2bit` | `Rahim/Ternary-Bonsai-27B-dspark`    | — | ~12 GB |
 
 *Peak RAM* is measured on an M4 Pro (8-bit target + 4-bit drafter + KV cache); add headroom for macOS.
 A 4-bit target (`--model …-it-4bit`) roughly halves the target's share (fits smaller Macs). **Use the
@@ -160,6 +164,7 @@ a silent mis-load):
 |---|---|---|
 | **DeepSpec-native standalone drafter** (qwen3/gemma4 backbone, any size/quant) | `deepseek-ai/dspark_qwen3_14b_block7` | ✅ runs via `--drafter` (4B/8B/14B/gemma-12B measured on an M4 Pro; larger sizes should run — reports welcome) |
 | **z-lab DFlash adapter** for a qwen3/gemma4-family target | `z-lab/Qwen3-8B-DFlash-b16` | ✅ runs via `--mode dflash --drafter` |
+| **PrismML dspark GGUF** (Bonsai-27B) | `prism-ml/Ternary-Bonsai-27B-gguf` → `*-dspark-bf16.gguf` | ✅ pre-converted repacks auto-resolve (`Rahim/*-dspark`); any future GGUF-only drop runs via `--drafter gguf:<repo>/<file>.gguf` (converted locally, once) |
 | **vLLM "speculators" format** | `RedHatAI/GLM-5.2-speculator.dspark` | ❌ different config schema — not yet ([issue?](https://github.com/ARahim3/mlx-dspark/issues)) |
 | **Full model with embedded drafter** | `deepseek-ai/DeepSeek-V4-Pro-DSpark` (893 GB, MLA+MoE) | ❌ different architecture & packaging — out of scope for consumer Macs |
 | **DFlash+Markov community hybrids** | `Hikari07jp/DSpark-Gemma-4-31B-draft` | ❌ hybrid head — not yet |
@@ -169,6 +174,41 @@ hidden-state tap reproduces the model's own forward and fails loudly if the fami
 support (drafter-free `--mode lookup` / `--mode auto` still work with **any** target). If you run a
 pair we haven't measured, `mlx-dspark benchmark --json` produces a device-stamped result we can fold
 into the table — please share it.
+
+### PrismML Bonsai 27B (ternary / 1-bit Qwen3.6-27B)
+
+[Bonsai 27B](https://huggingface.co/prism-ml/Ternary-Bonsai-27B-mlx-2bit) is PrismML's 1.7-bit
+ternary (and 1-bit) rebuild of Qwen3.6-27B — a full 27B-class reasoning model in ~8 GB. It ships
+with a DSpark drafter that PrismML publishes **GGUF-only** and, per their own docs, accelerates
+their CUDA path but "not Macs yet". mlx-dspark runs it on a Mac:
+
+```bash
+mlx-dspark generate --model prism-ml/Ternary-Bonsai-27B-mlx-2bit \
+  --max-draft auto --prompt "Implement binary search in Python."
+# first run: downloads the target (8.5 GB) + the matched drafter (6.8 GB bf16 safetensors —
+# our 1:1 repack of PrismML's GGUF-only drafter, quantized to 4-bit at load)
+```
+
+Measured on an M4 Pro 48 GB (greedy, warm, interleaved medians): baseline ~25.6 tok/s;
+**1.1–1.2× on code/structured content** (acceptance ~2.8/round at cap 2). Output is lossless —
+byte-identical to plain greedy decoding. Bonsai's backbone is **hybrid linear attention**
+(48 of 64 layers carry recurrent state, which can't be rolled back like a KV cache), so
+mlx-dspark uses a snapshot/replay verify designed for it — as far as we know the first working
+speculative decoding for this model family on Apple Silicon.
+
+Two honest caveats: speculation pays on code/structured output but is a net loss on open-ended
+chat with this target (a 2-bit model's verify-width cost is steep relative to its fast plain
+step), so use **`--max-draft auto`** — it tracks live acceptance and *parks* speculation
+(running plain pipelined steps) whenever it would lose, matching the best fixed cap on code
+while staying within ~10% of baseline on chat. And requires **mlx ≥ 0.32.0** (older mlx lacks
+the multi-row 2-bit matmul path that makes verification affordable). Prefix caching and
+batching remain dense-target-only. Baseline/`--mode lookup` also work for any other `qwen3_5`
+(Qwen3.5/3.6-family) checkpoint.
+
+The **1-bit** `Bonsai-27B-mlx-1bit` pack does *not* run: it is quantized to 1 bit for
+PrismML's own MLX fork, and stock `mx.quantize` has no 1-bit mode (2/3/4/5/6/8 only) —
+`load_target` refuses it with exactly that reason. The ternary 2-bit variant is the
+stock-MLX operating point.
 
 ## How it works
 
@@ -186,37 +226,48 @@ quantization doesn't change acceptance — that's set by the drafter↔target ma
 
 ## Which target & drafter should I use?
 
-The winner is **model-dependent, not just content-dependent** — it comes down to how expensive the target's
-*verify* step is:
+Short answer on current mlx (≥ 0.32): **DSpark, everywhere** (`--mode auto` picks it for you). Measured on
+an M4 Pro, warm (code prompt unless marked chat):
 
-| target (verify cost) | DSpark (`--mode dspark`, cap 2) | DFlash (`--mode dflash --max-draft 0`) | pick |
+| target | DSpark (`--mode dspark`, cap 2) | DFlash (`--mode dflash --max-draft 0`) | pick |
 |---|---|---|---|
-| **Gemma-4 12B** — expensive verify | 1.65× chat, ~1.9× code/math | **~2.1×** code/math, ~1.0× chat | DFlash on code/math, DSpark on chat |
-| **Qwen3-8B** — cheap verify | **~1.6× everywhere** | ~0.9–1.1× (a wash) | **DSpark** |
-| **Qwen3-4B** — cheapest verify | **~1.4×** | modest | **DSpark** |
+| **Gemma-4 12B** | **2.11×** code, 1.77× chat | 1.63× code, ~0.7× chat | **DSpark** |
+| **Qwen3-8B** | **1.90×** | 0.86× full block (1.47× at cap 2) | **DSpark** |
+| **Qwen3-4B** | **1.64×** | modest | **DSpark** |
+| **Ternary-Bonsai-27B** | **1.1–1.2×** code (`--max-draft auto`) | — | **DSpark** (auto) |
 
-Rule of thumb: **bigger / slower-verify target → DFlash's full block pays off on code/math; smaller / fast
-target → DSpark wins outright.** For target *precision*: **8-bit** is the sweet spot (best acceptance +
-quality); **4-bit** gives the highest absolute throughput and fits smaller Macs but a smaller speedup ratio;
-bf16 is *slower* on M-series (verify dominates). The drafter stays 4-bit either way. Full numbers and the
-reasoning are in [Benchmarks & deep dive](#benchmarks--deep-dive).
+This is a *version-dependent* verdict worth knowing about: on mlx 0.31, verify cost rose steeply with the
+number of tokens verified, which made DFlash's full 16-block the winner on Gemma-12B code/math (~2.1× vs
+DSpark's ~1.9× then). mlx 0.32's quantized-matmul kernels made *narrow* multi-row verify disproportionately
+cheaper, and DSpark's short block now wins across the board here. If your mlx/hardware differs,
+`--max-draft auto` re-measures the curves on your machine, and `mlx-dspark benchmark` settles it empirically.
+
+For target *precision*: **8-bit** is the sweet spot (best acceptance + quality); **4-bit** gives the highest
+absolute throughput and fits smaller Macs but a smaller speedup ratio; bf16 is *slower* on M-series (verify
+dominates). The drafter stays 4-bit either way. Full numbers and the reasoning are in
+[Benchmarks & deep dive](#benchmarks--deep-dive).
 
 ## Results at a glance
 
-**DSpark** vs the official MLX tools (`mlx_lm.generate` / `mlx_vlm.generate`) on the same model, at its
-`cap=2` optimum (M4 Pro, warm, 8-bit instruct target, 4-bit drafter):
+**DSpark** vs plain greedy decoding of the same model, at its `cap=2` optimum (M4 Pro 48 GB, warm,
+code prompt, 8-bit instruct target, 4-bit drafter, **mlx 0.32.0** — whose quantized-matmul kernels
+lifted every row well past the mlx-0.31 numbers this README previously carried):
 
-| target | accept len | baseline (official) | mlx-dspark | speedup |
+| target | accept len | baseline | mlx-dspark | speedup |
 |---|---|---|---|---|
-| **Gemma-4 12B** | ~2.5  | 18.4 tok/s | ~30 tok/s | **~1.6×** (≤2× on code/math) |
-| **Qwen3-14B**   | ~2.36 | 15.7 tok/s | ~26 tok/s | **~1.6×** (up to ~1.75× on code) |
-| **Qwen3-8B**    | ~2.44 | 29.4 tok/s | ~47 tok/s | **~1.6×** |
-| **Qwen3-4B**    | ~2.25 | 52.9 tok/s | ~73 tok/s | **~1.4×** |
+| **Gemma-4 12B** | ~2.75 | 17.0 tok/s | 35.9 tok/s | **2.11×** |
+| **Qwen3-14B**   | ~2.50 | 15.5 tok/s | 29.7 tok/s | **1.92×** |
+| **Qwen3-8B**    | ~2.58 | 28.7 tok/s | 54.4 tok/s | **1.90×** |
+| **Qwen3-4B**    | ~2.33 | 51.3 tok/s | 84.1 tok/s | **1.64×** |
+| **Ternary-Bonsai-27B** (2-bit, hybrid) | ~2.80 | 25.6 tok/s | 28.5 tok/s | **1.11×** auto (up to 1.2× fresh) |
 
-All paths produce **identical** output to plain decoding — they're just faster. These land in the DSpark
-paper's own band (60–85% per-user speedup in batched serving = ~1.6–1.85×); the "2–4×" figures elsewhere are
-other papers on datacenter GPUs. Why a Mac can't go much higher, the full DSpark-vs-DFlash head-to-head, and
-the cost model are below.
+Baselines are this harness's pipelined greedy loop, which measures at parity with `mlx_lm.generate`
+(the Qwen3-4B baseline is the same 51–52 tok/s either way). All paths produce **identical** output to
+plain decoding — they're just faster. Chat content accepts less than code everywhere; on the 2-bit
+Bonsai target that flips speculation into a net loss, which is exactly what `--max-draft auto`'s
+parking handles (see the Bonsai section). Why a Mac can't go much higher and the cost model are below.
+The deep-dive's multi-prompt DSpark-vs-DFlash tables are mlx-0.31.2-era and are kept as the last full
+sweep — 0.32 shifted that balance toward DSpark (spot-checked; see that section's note).
 
 ## Concurrent throughput
 
@@ -233,7 +284,9 @@ With `--max-draft auto`, the cap is also calibrated **per batch width**: at B=4 
 curve flattens past the qmm knee (the paper's cheap-verify regime), so longer draft blocks pay again
 (+5% aggregate at B=4 from the auto-picked cap on an M4 Pro).
 
-Qwen3-4B-8bit, M4 Pro, 4 concurrent requests (aggregate tokens/s vs the greedy baseline run serially):
+Qwen3-4B-8bit, M4 Pro, 4 concurrent requests, mlx-0.31.2-era sweep (aggregate tokens/s vs the greedy
+baseline run serially; the batched-vs-serial ratios are the durable part — absolute levels are higher
+on 0.32):
 
 | serving | aggregate tok/s | vs serialized baseline |
 |---|---|---|
@@ -273,18 +326,20 @@ Reproduce the sweep on your own Mac with `mlx-dspark benchmark --model <repo>` (
 
 Speculative decoding amortizes a *memory-bound* single-token decode across the K tokens verified in one
 forward. On a datacenter GPU that arbitrage is huge (parallel verify is nearly free, so speedup ≈ acceptance
-length). On an M-series chip it's much weaker — **verify cost grows with the number of tokens** (measured
-≈ +14 ms/token for Gemma-4 12B, +1.5 ms/token for Qwen3-4B; multi-token verify drops out of MLX's fast
-quantized GEMV path). With the cost model `tok/s ≈ A / (drafter + 0.035 + slope·C)` for accept length `A`
-and draft cap `C`, even a *perfect* drafter accepting the whole 7-token block tops out around **~2.2×** here.
-The binding limiter is acceptance length (set by the drafter↔target match) — **not** drafter quantization
-(4-bit / 8-bit / bf16 give identical acceptance; 4-bit is simply fastest). After a drafter-slice fix and the
-`cap=2` default, verify dominates (~76% of each round).
+length). On an M-series chip it's weaker — **verify cost grows with the number of tokens verified**
+(multi-token verify leaves the quantized matmul's cheap few-rows path). The cost model is
+`tok/s ≈ A / (drafter + overhead + slope·C)` for accept length `A` and draft cap `C`; the *slope* is a
+property of (quantization × mlx version × chip), which is why `--max-draft auto` measures it on your
+machine instead of trusting a constant. On mlx 0.31.2 we measured ≈ +14 ms/token for Gemma-4 12B (a
+~2.2× ceiling even with a perfect drafter); mlx 0.32's kernels flattened the curve enough that Gemma-4
+now measures 2.11× at cap 2 — past what the old curve allowed. The binding limiter remains acceptance
+length (set by the drafter↔target match) — **not** drafter quantization (4-bit / 8-bit / bf16 give
+identical acceptance; 4-bit is simply fastest).
 
 ### Long context
 
 The speculative speedup **holds with context depth** — measured flat at ~1.6× out to 12k+ tokens on
-Qwen3-4B (M4 Pro). (Before v0.3.1 the drafter tiled its GQA/MQA KV cache redundantly every round, which
+Qwen3-4B (M4 Pro, mlx 0.31.2; absolute levels are higher on 0.32 — the flatness is the point). (Before v0.3.1 the drafter tiled its GQA/MQA KV cache redundantly every round, which
 scaled with depth and made speculation go *net-negative* past a few thousand tokens on cheap-verify
 targets; that's fixed — the fix is bit-for-bit identical output.) On expensive-verify targets (Gemma-12B)
 speculation actually *gains* slightly with depth, since the target slows faster than the cheap drafter.
@@ -303,6 +358,14 @@ DFlash's parallel backbone **+ a rank-256 Markov head** that reinjects token-to-
 suffix decay for ~0.6 ms/round. This is the first MLX port of DSpark; it also runs
 [z-lab](https://github.com/z-lab/dflash)'s **original** DFlash (block diffusion, Chen et al.,
 [arXiv:2602.06036](https://arxiv.org/abs/2602.06036), MIT) through the same lossless loop.
+
+> **mlx-version note:** the two multi-prompt tables below are the last full sweep, measured on
+> **mlx 0.31.2**. On mlx 0.32 the balance shifted toward DSpark — narrow multi-row verify got
+> disproportionately cheaper, so on the same code prompt Gemma-12B now measures DSpark cap-2 at 2.11×
+> vs DFlash full-16 at 1.63×, and the 12B "DFlash wins code/math" pick no longer holds on this M4 Pro
+> (the 8B "full block is a net loss" verdict still does: 0.86×). The per-domain *acceptance* numbers
+> below are mlx-independent and remain the useful part; re-run `mlx-dspark benchmark` for current
+> throughput on your setup.
 
 **Gemma-4 12B** (it-8bit, M4 Pro, warm, greedy, 4 prompts/domain — accept / tok·s; greedy ≈ 17.3 tok/s):
 
@@ -340,7 +403,9 @@ numbers because greedy is the strictest possible accept rule (not a bug).
 
 ### Target precision
 
-Since verify dominates, target precision is a speed/quality knob:
+Since verify dominates, target precision is a speed/quality knob (mlx-0.31.2-era sweep — the 8-bit
+column is higher on 0.32, see [Results at a glance](#results-at-a-glance); the qualitative trade-off
+is unchanged):
 
 | target | 8-bit (default) | 4-bit |
 |---|---|---|
@@ -352,18 +417,23 @@ Since verify dominates, target precision is a speed/quality knob:
 
 ### Tuning
 
-- **DSpark** — `--max-draft 2` is the measured optimum for every target (default): verify cost grows per
-  token and the marginal draft token rarely survives. `--confidence-threshold 0.6` truncates the block
-  adaptively via the confidence head instead.
+- **DSpark** — `--max-draft 2` is the measured optimum for the dense presets (default): verify cost grows
+  per token and the marginal draft token rarely survives. `--confidence-threshold 0.6` truncates the block
+  adaptively via the confidence head instead. For **Bonsai-27B** use `--max-draft auto` (see its section).
 - **`--max-draft auto`** — measures this machine + model's verify/drafter cost curves once (a few seconds,
-  cached on disk) and picks the cap per round from the curves + a live acceptance estimate, so it tracks the
-  hardware (M1→M5) instead of the hard-coded `cap=2`. Lossless — the cap only sets how many drafts get verified.
+  cached on disk) and picks the cap per round from the curves + live acceptance **and observed round
+  times**, so it tracks the hardware and the mlx version instead of a hard-coded `cap=2`. It can also
+  **park** speculation entirely (plain pipelined steps + periodic probe rounds) on content where
+  speculation would lose — the safety net that makes it the recommended setting for Bonsai. Lossless —
+  the cap only sets how many drafts get verified.
 - **Hybrid n-gram drafting** (dspark, on by default) — when the current suffix already occurred earlier in the
   context (quoting, code edits, repeats), that free continuation is verified instead of running the drafter
   that round, so copy-heavy spans commit several tokens per round. Composes losslessly; `--no-lookup-drafts`
   turns it off. `--mode lookup` runs the same n-gram speculation with **no drafter at all**, for any target.
-- **DFlash** — use **`--max-draft 0`** (full 16-block, its native point) on **code/math**, where acceptance
-  reaches ~6; use a short cap on **open chat**, where the block doesn't fill and the full block is a net loss.
+- **DFlash** — `--max-draft 0` (full 16-block) is its native point and reaches ~6 accepted tokens on
+  code/math; on current mlx that still measures below DSpark cap-2 on this M4 Pro (see the pick table),
+  so treat DFlash as the head-to-head benchmark option rather than the speed pick. Short caps on open
+  chat; the full block never fills there.
 - **Sampling** — `--temperature > 0` (+ `--top-p` / `--top-k`) is lossless w.r.t. the target at temperature T
   (the paper's §2.1 method). On M-series it's ≈ greedy speed (the extra acceptance lives in a tail a short
   cap never reaches) — it's a *sampled-output* feature, not a speed lever.

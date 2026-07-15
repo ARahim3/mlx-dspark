@@ -52,6 +52,14 @@ class DSparkConfig:
     enable_confidence_head: bool = True
     confidence_head_with_markov: bool = True
 
+    # GIDD log-SNR conditioning (PrismML Bonsai drafters; absent from DeepSpec's).
+    # At inference the per-position pattern is fixed — anchor (block pos 0) at
+    # max_log_snr, every masked position at min_log_snr — so the resulting additive
+    # embedding is a constant per block position (see model.LogSnrEmbed).
+    log_snr_conditioning: bool = False
+    min_log_snr: float = -9.0
+    max_log_snr: float = 9.0
+
     # logits
     final_logit_softcapping: float | None = 30.0
     pad_token_id: int = 0
@@ -132,6 +140,15 @@ class DSparkConfig:
 
         if family == "qwen3":
             rp = c.get("rope_parameters") or {}
+            if c.get("log_snr_conditioning"):
+                lo, hi = c.get("min_log_snr"), c.get("max_log_snr")
+                if lo is None or hi is None or not (float(hi) > float(lo)):
+                    raise ValueError(
+                        f"{path}: log_snr_conditioning is enabled but min/max_log_snr are "
+                        f"missing or not ordered (min={lo!r}, max={hi!r}) — the featurization "
+                        f"divides by (max - min), so a drafter converted without them would "
+                        f"draft from silently-wrong embeddings."
+                    )
             return cls(
                 family="qwen3",
                 hidden_size=c["hidden_size"], vocab_size=c["vocab_size"],
@@ -154,6 +171,9 @@ class DSparkConfig:
                 final_logit_softcapping=c.get("final_logit_softcapping", None),
                 pad_token_id=c.get("pad_token_id") or 0,
                 mlp_activation="silu", norm_style="qwen", use_v_norm=False,
+                log_snr_conditioning=bool(c.get("log_snr_conditioning", False)),
+                min_log_snr=float(c.get("min_log_snr", -9.0)),
+                max_log_snr=float(c.get("max_log_snr", 9.0)),
             )
 
         rope = (c.get("rope_parameters") or {}).get("full_attention", {}) or {}

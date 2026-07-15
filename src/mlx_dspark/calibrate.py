@@ -36,7 +36,7 @@ import mlx.core as mx
 
 CACHE_DIR = os.path.expanduser("~/.cache/mlx_dspark")
 CACHE_FILE = "calibration.json"
-SCHEMA = 1
+SCHEMA = 2   # 2: verify curve includes width 1; adds the measured per-round overhead
 CTX_LEN = 512          # curve shape is nearly ctx-independent (SDPA is flat in width)
 TOKEN_ID = 7           # arbitrary; timings are content-independent
 
@@ -139,6 +139,55 @@ def measure_batch_verify_grid(target, tap: list[int], batch_widths: list[int],
     return grid
 
 
+def measure_dspark_round_overhead(target, drafter, verify_ms: dict[int, float],
+                                  drafter_ms: dict[int, float], cap: int = 2,
+                                  ctx_len: int = CTX_LEN) -> float:
+    """ms of per-round cost the drafter/verify curves do NOT capture — graph build for
+    ~70 layers, the round's device sync, the sequential markov sampling, the ctx-append
+    projections, Python bookkeeping. Measured as (full synthetic round at ``cap``, full-
+    accept bookkeeping — the common case) minus the two curves' parts. This is what makes
+    the controller's absolute tok/s predictions land close enough to reality that the
+    cap-0 "don't speculate" option competes on fair terms."""
+    cfg = drafter.config
+    tap = list(cfg.target_layer_ids)
+    k = int(cfg.block_size)
+    cap = max(1, min(int(cap), k))
+    cache = target.make_cache()
+    if hasattr(target, "reset_spec"):
+        target.reset_spec()
+    mx.eval(target.run(mx.array([[TOKEN_ID] * ctx_len]), cache, tap)[0])
+    ctx = drafter.make_ctx_cache()
+    fused = mx.random.normal(
+        (1, ctx_len, len(tap) * cfg.hidden_size)).astype(mx.bfloat16)
+    drafter.update_context(fused, ctx_offset=0, ctx_caches=ctx)
+    mx.eval([c.k for c in ctx])
+    pos = ctx_len
+
+    def round_fn():
+        nonlocal pos
+        noise = drafter.embed(mx.array([[TOKEN_ID] * k]))
+        hidden = drafter.backbone(noise, pos, ctx)
+        logits = drafter.compute_logits(hidden[:, :cap, :])[0]
+        draft_arr = drafter.sample_block(logits, first_prev_token=TOKEN_ID)
+        verify_ids = mx.concatenate(
+            [mx.array([TOKEN_ID], dtype=draft_arr.dtype), draft_arr]).reshape(1, -1)
+        v_logits, v_fused = target.verify(verify_ids, cache, tap)
+        tt_arr = mx.argmax(v_logits[0], axis=-1)
+        match = (draft_arr == tt_arr[: draft_arr.shape[0]]).astype(mx.int32)
+        n_arr = mx.cumprod(match).sum()
+        mx.eval(n_arr, tt_arr, draft_arr)
+        int(n_arr.item()), draft_arr.tolist(), tt_arr.tolist()   # pay the real syncs
+        target.rollback(cache, 0, [])                            # full-accept bookkeeping
+        drafter.update_context(v_fused[:, : cap + 1, :], ctx_offset=pos, ctx_caches=ctx)
+        pos += cap + 1
+        mx.async_eval([c.k for c in ctx])
+        return n_arr
+
+    round_ms = _bench(round_fn)
+    parts = _interp(drafter_ms, cap) + _interp(verify_ms, cap + 1)
+    return max(0.0, round_ms - parts)
+
+
 def measure_dflash_drafter_cost(drafter, ctx_len: int = CTX_LEN) -> float:
     """ms per DFlash draft round (cap-independent: the drafter always denoises and reads
     logits for the full block)."""
@@ -219,7 +268,9 @@ class CapController:
     def __init__(self, verify_ms: dict[int, float], drafter_ms: dict[int, float] | float,
                  max_cap: int, *, init_cap: int = 2, prior_p: float = 0.65,
                  alpha: float = 0.02, hysteresis: float = 1.03, repick_every: int = 4,
-                 verify_grid: dict[int, dict[int, float]] | None = None):
+                 verify_grid: dict[int, dict[int, float]] | None = None,
+                 allow_zero: bool = False, hybrid_replay: bool = False,
+                 probe_every: int = 8, overhead_ms: float = 0.0):
         self.verify_ms = {int(k): float(v) for k, v in verify_ms.items()}
         self.drafter_ms = drafter_ms
         self.max_cap = max(1, int(max_cap))
@@ -231,6 +282,47 @@ class CapController:
         self.rounds = 0
         self.verify_grid = ({int(B): {int(k): float(v) for k, v in row.items()}
                              for B, row in verify_grid.items()} if verify_grid else None)
+        # cap 0 = "don't speculate this round" (a plain committed step). Only offered when
+        # the driving loop supports it (the dspark loop does); it wins whenever live
+        # acceptance is too low for the verify slope — e.g. open chat on a 2-bit target,
+        # where every extra verify row costs ~40% of a full step and speculation is a net
+        # loss no positive cap can fix. While parked at 0, every ``probe_every``-th round
+        # runs at cap 1 so the acceptance estimate keeps tracking content shifts.
+        self.allow_zero = bool(allow_zero)
+        self.probe_every = max(2, int(probe_every))
+        self._best = self.cap
+        # Bernoulli observations behind the acceptance estimate. Early on the EWMA runs
+        # as a plain running mean (effective alpha 1/n), so p converges in a handful of
+        # rounds instead of dragging the prior for hundreds; and parking (cap 0) is only
+        # offered once enough real observations back the estimate — otherwise a
+        # pessimistic prior parks a perfectly good drafter at round 4 (measured: code
+        # acceptance 0.93 got parked by the 0.65 prior before any data came in).
+        self._obs = 0
+        self.min_obs_to_park = 24
+        # Observed round timings, fed by the loop via update(..., round_ms=, committed=).
+        # The synthetic cost model can't see everything (replay cascades on hybrid
+        # targets, per-round sync/Python, content-dependent effects), so measured
+        # ms-per-committed-token at a cap OVERRIDES the model once that cap has enough
+        # rounds; caps without data use model × a live global correction (observed vs
+        # modeled at whatever cap is running). Cap 0's model (one plain step) is exact,
+        # so the correction applies to speculative caps only. Stale entries expire so a
+        # content shift can't pin an old measurement forever.
+        self._t_obs: dict[int, float] = {}     # cap -> EWMA ms per committed token
+        self._t_cnt: dict[int, int] = {}       # cap -> rounds observed
+        self._t_age: dict[int, int] = {}       # cap -> rounds since last observation
+        self._corr = 1.0
+        self.t_alpha = 0.1
+        self.min_rounds_observed = 4
+        self.obs_max_age = 32
+        # hybrid targets re-commit ("replay") the accepted tokens of a partially-accepted
+        # round inside the next round's forward — a real marginal cost dense targets don't
+        # pay. Priced into rate() so the picked cap doesn't overshoot on hybrids.
+        self.hybrid_replay = bool(hybrid_replay)
+        # measured fixed per-round cost the curves miss (sync/graph-build/markov/ctx —
+        # see measure_dspark_round_overhead). Charged to speculative caps only: cap-0
+        # rounds skip the drafter graph entirely, and biasing the comparison slightly
+        # toward parking is the conservative direction (its downside is bounded).
+        self.overhead_ms = float(overhead_ms)
 
     # -- cost model --
     def _draft_cost(self, cap: int) -> float:
@@ -242,26 +334,81 @@ class CapController:
         """1 bonus/replacement token + geometric accepted prefix."""
         return 1.0 + sum(self.p ** i for i in range(1, cap + 1))
 
+    def _replay_ms(self, cap: int) -> float:
+        """Expected extra next-round cost a hybrid target pays for this round's partial
+        acceptance: [anchor + accepted] rows re-commit at the verify curve's marginal
+        per-row slope. Zero for dense targets (their rollback is a free KV trim)."""
+        if not self.hybrid_replay or cap == 0:
+            return 0.0
+        # E[(1 + n) · 1{partial}] under the geometric acceptance model
+        exp_rows = sum((1 + i) * (self.p ** i) * (1.0 - self.p) for i in range(cap))
+        slope = _interp(self.verify_ms, cap + 2) - _interp(self.verify_ms, cap + 1)
+        return exp_rows * max(slope, 0.0)
+
     def rate(self, cap: int) -> float:
-        """Expected committed tokens per ms of round time at this cap."""
-        t = self._draft_cost(cap) + _interp(self.verify_ms, cap + 1)
+        """Expected committed tokens per ms of round time at this cap. Cap 0 is a plain
+        step: one committed token for one width-1 forward, no drafter."""
+        if cap == 0:
+            return 1.0 / max(_interp(self.verify_ms, 1), 1e-6)
+        t = (self._draft_cost(cap) + _interp(self.verify_ms, cap + 1)
+             + self._replay_ms(cap) + self.overhead_ms)
         return self.expected_committed(cap) / max(t, 1e-6)
 
+    def _rate_eff(self, cap: int) -> float:
+        """Best available estimate of committed tokens/ms at this cap: measured when this
+        cap has enough observed rounds, else the model (correction-scaled for cap >= 1)."""
+        if self._t_cnt.get(cap, 0) >= self.min_rounds_observed:
+            return 1.0 / max(self._t_obs[cap], 1e-6)
+        return self.rate(cap) * (self._corr if cap >= 1 else 1.0)
+
     # -- live updates --
-    def update(self, accepted_n: int, cap_used: int) -> None:
+    def update(self, accepted_n: int, cap_used: int, *, round_ms: float | None = None,
+               committed: int | None = None) -> None:
         """Feed one round's outcome: ``accepted_n`` drafted tokens survived out of
-        ``cap_used``. Full acceptance is censored (no failure observed)."""
+        ``cap_used``. Full acceptance is censored (no failure observed); cap-0 rounds
+        (``cap_used == 0``) carry no acceptance signal but still advance the round
+        counter that schedules probes and repicks. ``round_ms``/``committed`` (optional)
+        feed the observed-timing layer that grounds the cost model in reality."""
         for _ in range(accepted_n):
-            self.p += self.alpha * (1.0 - self.p)
+            self._bump(1.0)
         if accepted_n < cap_used:
-            self.p += self.alpha * (0.0 - self.p)
+            self._bump(0.0)
+        if round_ms is not None and committed and round_ms > 0:
+            tpt = float(round_ms) / committed
+            prev = self._t_obs.get(cap_used)
+            self._t_obs[cap_used] = (tpt if prev is None
+                                     else prev + self.t_alpha * (tpt - prev))
+            self._t_cnt[cap_used] = self._t_cnt.get(cap_used, 0) + 1
+            self._t_age[cap_used] = 0
+            if cap_used >= 1:
+                inst = (1.0 / tpt) / max(self.rate(cap_used), 1e-6)
+                self._corr += 0.05 * (inst - self._corr)
+        for c in list(self._t_age):
+            if c != cap_used:
+                self._t_age[c] += 1
+                if self._t_age[c] > self.obs_max_age:     # stale: let the model take over
+                    self._t_obs.pop(c, None)
+                    self._t_cnt.pop(c, None)
+                    self._t_age.pop(c, None)
         self.rounds += 1
         if self.rounds % self.repick_every == 0:
             self._repick()
+        if self._best == 0:
+            # parked: schedule a cap-1 probe round so acceptance keeps tracking
+            self.cap = 1 if self.rounds % self.probe_every == 0 else 0
+
+    def _bump(self, x: float) -> None:
+        """One Bernoulli observation into the acceptance estimate: running mean while
+        young (alpha 1/n), settling into the standard EWMA."""
+        self._obs += 1
+        a = max(self.alpha, 1.0 / self._obs)
+        self.p += a * (x - self.p)
 
     def _repick(self) -> None:
-        best = max(range(1, self.max_cap + 1), key=self.rate)
-        if best != self.cap and self.rate(best) > self.rate(self.cap) * self.hysteresis:
+        lo = 0 if (self.allow_zero and self._obs >= self.min_obs_to_park) else 1
+        best = max(range(lo, self.max_cap + 1), key=self._rate_eff)
+        if best != self._best and self._rate_eff(best) > self._rate_eff(self._best) * self.hysteresis:
+            self._best = best
             self.cap = best
 
     # -- batched operating point --
@@ -279,16 +426,17 @@ class CapController:
         curve = self.verify_grid[b_key]
 
         def rate_b(c: int) -> float:
-            t = self._draft_cost(c) + _interp(curve, c + 1)
+            t = self._draft_cost(c) + _interp(curve, c + 1) + self.overhead_ms
             return self.expected_committed(c) / max(t, 1e-6)
 
         return max(range(1, self.max_cap + 1), key=rate_b)
 
     def info(self) -> dict:
+        lo = 0 if self.allow_zero else 1
         out = {"cap": self.cap, "p": round(self.p, 3), "rounds": self.rounds,
                "knee_width": knee_width(self.verify_ms),  # qmm knee → dspark-vs-dflash signal
                "predicted_rates": {c: round(self.rate(c) * 1e3, 1)   # tok/s at each cap
-                                   for c in range(1, self.max_cap + 1)}}
+                                   for c in range(lo, self.max_cap + 1)}}
         if self.verify_grid:
             out["batch_caps"] = {b: self.cap_for(b) for b in sorted(self.verify_grid)}
         return out
@@ -345,8 +493,8 @@ def calibrate(target, drafter, *, mode: str, target_repo: str, drafter_repo: str
     cfg = drafter.config
     if mode == "dspark":
         max_cap = int(cfg.block_size)
-        widths = list(range(2, max_cap + 2))                    # verify width = cap + 1
-        caps = list(range(1, max_cap + 1))
+        widths = list(range(1, max_cap + 2))     # verify width = cap + 1; width 1 = the
+        caps = list(range(1, max_cap + 1))       # plain step, needed to price cap 0
     elif mode == "dflash":
         max_cap = int(cfg.block_size) - 1
         widths = sorted({2, 3, 4, 5, 7, 9, 12, max_cap + 1})    # sample + interpolate
@@ -364,11 +512,14 @@ def calibrate(target, drafter, *, mode: str, target_repo: str, drafter_repo: str
         verify = measure_verify_curve(target, tap, widths)
         if mode == "dspark":
             drafter_ms: dict | float = measure_dspark_drafter_curve(drafter, caps)
+            overhead = measure_dspark_round_overhead(target, drafter, verify, drafter_ms)
         else:
             drafter_ms = measure_dflash_drafter_cost(drafter)
+            overhead = 0.0
         entry = {"verify": {str(k): v for k, v in verify.items()},
                  "drafter": ({str(k): v for k, v in drafter_ms.items()}
-                             if isinstance(drafter_ms, dict) else drafter_ms)}
+                             if isinstance(drafter_ms, dict) else drafter_ms),
+                 "overhead": overhead}
         save_cached(key, entry, cache_dir)
         if verbose:
             vs = " ".join(f"{k}:{v:.0f}" for k, v in sorted(verify.items()))
@@ -395,7 +546,12 @@ def calibrate(target, drafter, *, mode: str, target_repo: str, drafter_repo: str
     drafter_ms = (entry["drafter"] if not isinstance(entry["drafter"], dict)
                   else {int(k): float(v) for k, v in entry["drafter"].items()})
     ctrl = CapController(verify, drafter_ms, max_cap, init_cap=2,
-                         verify_grid=entry.get("verify_grid"))
+                         verify_grid=entry.get("verify_grid"),
+                         # the dspark loop supports cap-0 (skip drafting) rounds; price
+                         # hybrid targets' partial-accept replay into the cap choice
+                         allow_zero=(mode == "dspark"),
+                         hybrid_replay=bool(getattr(target, "is_hybrid", False)),
+                         overhead_ms=float(entry.get("overhead", 0.0)))
     if verbose:
         r = ctrl.info()["predicted_rates"]
         best = max(r, key=r.get)

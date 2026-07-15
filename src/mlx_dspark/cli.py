@@ -401,7 +401,10 @@ def cmd_models(argv: list[str]) -> None:
           "DSpark/DFlash drafter is picked automatically (quantization-agnostic):\n")
     rows = [("target (--model)", "DSpark drafter", "DFlash drafter", "RAM")]
     for e in REGISTRY:
-        rows.append((e["target"], e["dspark"], e["dflash"], e["ram"]))
+        dspark = e.get("dspark", "—")
+        if dspark.startswith("gguf:"):     # PrismML GGUF drafter: converted on first use
+            dspark = dspark[len("gguf:"):].rsplit("/", 1)[-1] + " (auto-converted)"
+        rows.append((e["target"], dspark, e.get("dflash", "—"), e["ram"]))
     widths = [max(len(r[i]) for r in rows) for i in range(4)]
     for i, r in enumerate(rows):
         print("  " + "  ".join(c.ljust(widths[j]) for j, c in enumerate(r)))

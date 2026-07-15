@@ -217,6 +217,42 @@ class ConfidenceHead(nn.Module):
         return self.proj(features).squeeze(-1)
 
 
+LOG_SNR_FREQS = 128  # sinusoidal feature count of the GIDD LogSnrEmbed (fixed by training)
+
+
+def log_snr_features(block_size: int, min_log_snr: float, max_log_snr: float) -> mx.array:
+    """``[block_size, 128]`` sinusoidal features for the fixed inference-time log-SNR
+    pattern (PrismML dspark.cpp): the anchor at block position 0 is "clean" (max_log_snr),
+    every masked position is "fully noised" (min_log_snr); each value maps to
+    ``t = (snr - min) / (max - min) * 1000`` and is featurized as
+    ``[sin(t·f_i), cos(t·f_i)]`` with ``f_i = 10000^(-i/64)`` — the sin half first,
+    matching the reference layout exactly."""
+    import math
+
+    half = LOG_SNR_FREQS // 2
+    pos = mx.arange(block_size)
+    log_snr = mx.where(pos == 0, max_log_snr, min_log_snr).astype(mx.float32)
+    t = (log_snr - min_log_snr) / (max_log_snr - min_log_snr) * 1000.0
+    freq = mx.exp(-math.log(10000.0) * mx.arange(half).astype(mx.float32) / half)
+    angle = t[:, None] * freq[None, :]
+    return mx.concatenate([mx.sin(angle), mx.cos(angle)], axis=-1)
+
+
+class LogSnrEmbed(nn.Module):
+    """GIDD log-SNR conditioning MLP (Bonsai drafters): 128 sinusoidal features →
+    fc1 → silu → fc2 → an additive embedding on the draft block. Since the inference
+    pattern is a pure function of the block position, the drafter caches the resulting
+    ``[1, block_size, H]`` addend after the first call."""
+
+    def __init__(self, config: DSparkConfig):
+        super().__init__()
+        self.fc1 = nn.Linear(LOG_SNR_FREQS, config.hidden_size)
+        self.fc2 = nn.Linear(config.hidden_size, config.hidden_size)
+
+    def __call__(self, feat: mx.array) -> mx.array:
+        return self.fc2(nn.silu(self.fc1(feat)))
+
+
 class DSparkDrafter(nn.Module):
     def __init__(self, config: DSparkConfig):
         super().__init__()
@@ -240,9 +276,19 @@ class DSparkDrafter(nn.Module):
         if config.enable_confidence_head:
             in_dim = config.hidden_size + (config.markov_rank if config.confidence_head_with_markov else 0)
             self.confidence_head = ConfidenceHead(in_dim)
+        self.log_snr_embed = LogSnrEmbed(config) if config.log_snr_conditioning else None
+        self._snr_addend = None       # lazily-built [1, block_size, H] constant
 
     def embed(self, ids: mx.array) -> mx.array:
-        return self.embed_tokens(ids) * self.embed_scale
+        e = self.embed_tokens(ids) * self.embed_scale
+        if self.log_snr_embed is not None:
+            if self._snr_addend is None:
+                feat = log_snr_features(
+                    self.block_size, self.config.min_log_snr, self.config.max_log_snr)
+                self._snr_addend = self.log_snr_embed(feat.astype(e.dtype))[None]
+            # ids is the draft block ([1, block_size]); slicing keeps shorter probes valid.
+            e = e + self._snr_addend[:, : e.shape[1], :]
+        return e
 
     def fuse_target(self, target_hidden_cat: mx.array) -> mx.array:
         return self.hidden_norm(self.fc(target_hidden_cat))

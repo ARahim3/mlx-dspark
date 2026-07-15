@@ -1,6 +1,6 @@
 [project]
 name = "mlx-dspark"
-version = "0.3.2"
+version = "0.4.0"
 description = "DSpark + DFlash speculative decoding (semi-autoregressive / block-diffusion drafting) for Apple Silicon via MLX"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -15,7 +15,9 @@ classifiers = [
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
 dependencies = [
-    "mlx>=0.31.2",
+    # >=0.32.0: multi-row quantized-matmul fast paths (esp. 2-bit — before 0.32 every extra
+    # verify row on a 2-bit target cost ~a full weight re-read, making Bonsai spec a wash)
+    "mlx>=0.32.0",
     "mlx-lm>=0.31.3",
     # mlx-vlm gives us Gemma-4 + the existing EAGLE3/DFlash spec-decode reference impl
     "mlx-vlm>=0.6.3",

@@ -517,6 +517,7 @@ def dflash_generate(
     ids = prompt_ids if prompt_ids is not None else encode_prompt(
         tokenizer, prompt, use_chat=apply_chat_template)
     cache = _make_target_cache(target_model)
+    target_model.reset_spec()                          # hybrid targets: clear replay state
     dcache = drafter.make_cache()                      # persistent draft ctx cache
     st = _Streamer(tokenizer, eos_ids, on_text, stop)
     t0 = time.time()
@@ -546,7 +547,7 @@ def dflash_generate(
             drafted = [int(x) for x in draft_arr.tolist()]
 
             verify_ids = mx.array([[pending] + drafted])
-            v_logits, v_fused = _run_target(target_model, verify_ids, cache, tap)
+            v_logits, v_fused = target_model.verify(verify_ids, cache, tap)
             mx.eval(v_logits, v_fused)
 
             n, repl = _spec_sample_accept(v_logits[0], drafted, q_probs, temperature, top_p, top_k)
@@ -557,7 +558,7 @@ def dflash_generate(
             draft_arr = mx.argmax(head, axis=-1)
             verify_ids = mx.concatenate(
                 [mx.array([pending], dtype=draft_arr.dtype), draft_arr]).reshape(1, -1)
-            v_logits, v_fused = _run_target(target_model, verify_ids, cache, tap)
+            v_logits, v_fused = target_model.verify(verify_ids, cache, tap)
             tt_arr = mx.argmax(v_logits[0], axis=-1)
             match = (draft_arr == tt_arr[: draft_arr.shape[0]]).astype(mx.int32)
             n_arr = mx.cumprod(match).sum()
@@ -572,11 +573,7 @@ def dflash_generate(
             cap_controller.update(n, len(drafted))
 
         # ---- update target cache + draft ctx ----
-        trim = len(drafted) - n
-        if trim > 0:
-            for c in cache:
-                if c is not None and hasattr(c, "trim"):
-                    c.trim(trim)
+        target_model.rollback(cache, len(drafted) - n, drafted[:n])
         pending_ctx = v_fused[:, : n + 1, :]             # [anchor, accepted] -> next draft ctx
 
         for tok in committed:
@@ -769,6 +766,7 @@ def speculative_generate(
         cache = _make_target_cache(target_model)
         ctx_caches = drafter.make_ctx_cache()
         reuse_len = 0
+    target_model.reset_spec()                          # hybrid targets: clear replay state
     st = _Streamer(tokenizer, eos_ids, on_text, stop)
     t0 = time.time()
 
@@ -801,12 +799,67 @@ def speculative_generate(
     accept_lengths: list[int] = []
     target_forwards = 1
     lookup_rounds = 0
+    _rt = time.perf_counter()      # round-period clock for the controller's observed timings
 
     st.update(out_ids)
     while len(out_ids) < max_new_tokens and pending not in eos_ids and not st.stopped:
         lk_draft = index.propose() if index is not None else []
         use_conf = confidence_threshold > 0.0 and drafter.confidence_head is not None
-        if lk_draft:
+        if cap_controller is not None and not lk_draft:
+            # cap 0 = the controller parked speculation (live acceptance too low for this
+            # machine's verify slope): run a plain committed step; probe rounds re-enter.
+            cap = max(0, min(cap_controller.cap, cap_ceiling))
+        if not lk_draft and cap == 0 and not (temperature > 0.0 or pen.active
+                                              or lp_list is not None):
+            # ---- parked sprint ----
+            # The controller decided speculation loses on the current content. A one-step
+            # parked round would still pay this loop's per-round sync (~15% over the
+            # pipelined baseline), so run the plain steps exactly like greedy_generate's
+            # fast path — schedule step t+1 before syncing step t — until the controller
+            # schedules a probe (or flips back to a positive cap). The tap rides along so
+            # the drafter context stays current and probe rounds draft correctly.
+            steps = cap_controller.probe_every
+            y = mx.array([[pending]])
+            logits, fused = target_model.verify(y, cache, tap)
+            nxt_arr = mx.argmax(logits[0, -1])
+            drafter.update_context(fused, ctx_offset=n_cached, ctx_caches=ctx_caches)
+            n_cached += 1
+            mx.async_eval(nxt_arr, [c.k for c in ctx_caches])
+            while True:
+                steps -= 1
+                now = time.perf_counter()
+                cap_controller.update(0, 0, round_ms=(now - _rt) * 1e3, committed=1)
+                _rt = now
+                nxt = int(nxt_arr.item())
+                out_ids.append(nxt)
+                accept_lengths.append(1)
+                target_forwards += 1
+                if index is not None:
+                    index.extend([nxt])
+                pending = nxt
+                st.update(out_ids)
+                if (steps <= 0 or len(out_ids) >= max_new_tokens or pending in eos_ids
+                        or st.stopped or cap_controller.cap != 0):
+                    break
+                y = nxt_arr.reshape(1, 1)
+                logits, fused = target_model.verify(y, cache, tap)
+                nxt_next = mx.argmax(logits[0, -1])
+                drafter.update_context(fused, ctx_offset=n_cached, ctx_caches=ctx_caches)
+                n_cached += 1
+                mx.async_eval(nxt_next, [c.k for c in ctx_caches])
+                nxt_arr = nxt_next
+            continue
+        if not lk_draft and cap == 0:
+            # parked, but sampling / penalties / logprobs need per-token materialization:
+            # a single plain committed step through the round's shared bookkeeping below
+            draft, n = [], 0
+            verify_ids = mx.array([[pending]])
+            v_logits, v_fused = target_model.verify(verify_ids, cache, tap)
+            tt0 = mx.argmax(pen.apply(v_logits[0], draft), axis=-1)
+            mx.eval(tt0, v_fused)
+            committed = [int(tt0[0].item())] if temperature == 0.0 else [
+                _pick(pen.apply(v_logits[0], draft)[0], temperature, top_p, top_k)]
+        elif lk_draft:
             # ---- free lookup draft (a copy run was detected): verify the continuation of
             # the earlier occurrence instead of running the drafter this round. The drafter
             # context still updates below (from v_fused), so drafter rounds stay correct.
@@ -814,7 +867,7 @@ def speculative_generate(
             draft = lk_draft
             if temperature > 0.0:
                 verify_ids = mx.array([[pending] + draft])
-                v_logits, v_fused = _run_target(target_model, verify_ids, cache, tap)
+                v_logits, v_fused = target_model.verify(verify_ids, cache, tap)
                 mx.eval(v_logits, v_fused)
                 vocab = v_logits.shape[-1]     # point-mass proposal: q is one-hot per token
                 q_probs = (mx.arange(vocab)[None, :]
@@ -826,7 +879,7 @@ def speculative_generate(
                 draft_arr = mx.array(draft)
                 verify_ids = mx.concatenate(
                     [mx.array([pending], dtype=draft_arr.dtype), draft_arr]).reshape(1, -1)
-                v_logits, v_fused = _run_target(target_model, verify_ids, cache, tap)
+                v_logits, v_fused = target_model.verify(verify_ids, cache, tap)
                 tt_arr = mx.argmax(pen.apply(v_logits[0], draft), axis=-1)
                 match = (draft_arr
                          == tt_arr[: len(draft)].astype(draft_arr.dtype)).astype(mx.int32)
@@ -843,8 +896,6 @@ def speculative_generate(
             # tokens, so run the lm_head and the sequential markov head over just the first
             # `cap` positions instead of all `k` — the rest used to be computed and thrown
             # away every round (the dominant slice of drafter time at small caps).
-            if cap_controller is not None:
-                cap = max(1, min(cap_controller.cap, cap_ceiling))
             block_ids = [pending] + [mask_id] * (k - 1)
             noise = drafter.embed(mx.array([block_ids]))            # [1, k, H]
             block_hidden = drafter.backbone(noise, n_cached, ctx_caches)
@@ -887,7 +938,7 @@ def speculative_generate(
 
                 # ---- 2. verify with the target ----
                 verify_ids = mx.array([[pending] + draft])     # [1, 1+len(draft)]
-                v_logits, v_fused = _run_target(target_model, verify_ids, cache, tap)
+                v_logits, v_fused = target_model.verify(verify_ids, cache, tap)
                 mx.eval(v_logits, v_fused)
 
                 # ---- 3. accept ----
@@ -910,7 +961,7 @@ def speculative_generate(
                 draft_arr = drafter.sample_block(base_logits, first_prev_token=pending)
                 verify_ids = mx.concatenate(
                     [mx.array([pending], dtype=draft_arr.dtype), draft_arr]).reshape(1, -1)
-                v_logits, v_fused = _run_target(target_model, verify_ids, cache, tap)
+                v_logits, v_fused = target_model.verify(verify_ids, cache, tap)
                 tt_arr = mx.argmax(v_logits[0], axis=-1)
                 match = (draft_arr == tt_arr[: draft_arr.shape[0]]).astype(mx.int32)
                 n_arr = mx.cumprod(match).sum()
@@ -921,16 +972,18 @@ def speculative_generate(
                 committed = draft[:n] + [tt[n]]                # accepted prefix + bonus
         target_forwards += 1
         accept_lengths.append(len(committed))
-        if cap_controller is not None and not lk_draft:
-            # only drafter rounds inform the cap (lookup drafts have their own acceptance)
-            cap_controller.update(n, len(draft))
+        if cap_controller is not None:
+            now = time.perf_counter()
+            if not lk_draft:
+                # only drafter/parked rounds inform the cap (lookup drafts have their own
+                # acceptance); the measured round period grounds the controller's cost
+                # model in observed reality (replay cascades, syncs, Python overhead)
+                cap_controller.update(n, len(draft), round_ms=(now - _rt) * 1e3,
+                                      committed=len(committed))
+            _rt = now
 
         # ---- 4. update caches/context ----
-        trim = len(draft) - n
-        if trim > 0:
-            for c in cache:
-                if c is not None and hasattr(c, "trim"):
-                    c.trim(trim)
+        target_model.rollback(cache, len(draft) - n, draft[:n])
         # commit [pending, accepted drafts] (positions n_cached..n_cached+n) as context
         drafter.update_context(
             v_fused[:, : n + 1, :], ctx_offset=n_cached, ctx_caches=ctx_caches

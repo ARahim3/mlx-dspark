@@ -61,6 +61,16 @@ REGISTRY = [
     {"id": "gemma-4-12b", "target": "mlx-community/gemma-4-12B-it-8bit",
      "dspark": "deepseek-ai/dspark_gemma4_12b_block7", "dflash": "z-lab/gemma4-12B-it-DFlash",
      "ram": "~15 GB"},
+    # PrismML Ternary-Bonsai 27B (ternary rebuild of Qwen3.6-27B, hybrid linear attention).
+    # PrismML ships the DSpark drafter GGUF-only (no safetensors export exists); the repo
+    # below is our 1:1 bf16 repack into the DeepSpec layout (converted with gguf_convert.py —
+    # the "gguf:{repo}/{file}.gguf" drafter scheme converts any future drop locally the same
+    # way). The 1-bit variant (prism-ml/Bonsai-27B-mlx-1bit) is NOT registered: its pack is
+    # 1-bit-quantized for PrismML's own MLX fork and stock mx.quantize has no 1-bit mode
+    # (load_target refuses it with the reason). Drafters are variant-specific.
+    {"id": "ternary-bonsai-27b", "target": "prism-ml/Ternary-Bonsai-27B-mlx-2bit",
+     "dspark": "Rahim/Ternary-Bonsai-27B-dspark",
+     "ram": "~12 GB"},
 ]
 
 # legacy `--family` / load_pair("qwen3") values -> a concrete target repo (deprecated).
@@ -147,6 +157,12 @@ def apply_wired_limit() -> None:
 
 
 def _resolve(repo_or_path: str) -> str:
+    if repo_or_path.startswith("gguf:"):
+        # "gguf:{hf_repo}/{filename}.gguf" — a PrismML dspark drafter shipped as GGUF;
+        # download + convert to the DeepSpec layout on first use (cached).
+        from .gguf_convert import ensure_converted
+        repo, filename = repo_or_path[len("gguf:"):].rsplit("/", 1)
+        return ensure_converted(repo, filename)
     if os.path.isdir(repo_or_path):
         return repo_or_path
     return snapshot_download(repo_or_path)
@@ -202,8 +218,12 @@ def load_drafter(
     drafter.load_weights(list(weights.items()), strict=not (missing or unexpected))
 
     if quantize:
-        # Quantize Linear/Embedding weights; norms/scalars stay full precision.
-        nn.quantize(drafter, group_size=group_size, bits=bits)
+        # Quantize Linear/Embedding weights; norms/scalars stay full precision. The GIDD
+        # log-SNR MLP (Bonsai drafters) is excluded to match PrismML's own packaging (it
+        # stays BF16 even in their Q4_1 GGUF) — it runs once per load, so size is moot.
+        nn.quantize(drafter, group_size=group_size, bits=bits,
+                    class_predicate=lambda p, m: (isinstance(m, (nn.Linear, nn.Embedding))
+                                                  and not p.startswith("log_snr_embed")))
 
     mx.eval(drafter.parameters())
     return drafter, config
@@ -290,7 +310,17 @@ def _route_target(cfg: dict) -> str:
     mlx-vlm. Otherwise any model_type mlx-lm ships a module for (qwen3, llama, glm_moe_dsa,
     deepseek_v3, …) goes to mlx-lm — mirroring mlx-lm's own model_type→module lookup incl.
     its remap table — so new text families route correctly without a code change here.
-    Anything else falls back to mlx-vlm (the pre-existing behavior)."""
+    Anything else falls back to mlx-vlm (the pre-existing behavior).
+
+    Exception: families where mlx-lm ships a *text-only* module that digests the full
+    multimodal checkpoint (its sanitize drops the vision tower) route to mlx-lm despite the
+    vision_config — text generation is what this project serves, and only the mlx-lm path
+    has the replicated-loop hidden-state tap the drafters need (qwen3_5 = Qwen3.6/Bonsai)."""
+    _TEXT_CAPABLE_MM = {"qwen3_5", "qwen3_5_moe"}
+    if cfg.get("model_type") in _TEXT_CAPABLE_MM:
+        from importlib.util import find_spec
+        if find_spec(f"mlx_lm.models.{cfg['model_type']}") is not None:
+            return "mlx_lm"
     if "vision_config" in cfg or "audio_config" in cfg:
         return "mlx_vlm"
     model_type = cfg.get("model_type", "")
@@ -365,6 +395,20 @@ def load_target(repo_or_path: str = DEFAULT_TARGET, *, require_tap: bool = False
     if os.path.exists(cfg_path):
         with open(cfg_path) as f:
             cfg = json.load(f)
+
+    # Fail with the real reason before mlx-lm dies deep inside mx.quantize: stock MLX
+    # supports 2/3/4/5/6/8-bit affine quantization only. (Notably prism-ml/Bonsai-27B-mlx-1bit
+    # is a 1-bit pack for PrismML's own MLX fork — the ternary 2-bit variant is the one that
+    # runs on stock mlx.)
+    bits = (cfg.get("quantization") or {}).get("bits")
+    if bits and int(bits) not in (2, 3, 4, 5, 6, 8):
+        hint = (" Use prism-ml/Ternary-Bonsai-27B-mlx-2bit instead."
+                if "bonsai" in str(repo_or_path).lower() else "")
+        raise ValueError(
+            f"{repo_or_path}: this checkpoint is quantized to {bits} bits, which stock MLX "
+            f"cannot load (mx.quantize supports 2/3/4/5/6/8). It likely targets a vendor MLX "
+            f"fork with custom kernels.{hint}"
+        )
 
     if _route_target(cfg) == "mlx_lm":
         from mlx_lm import load as lm_load

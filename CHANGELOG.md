@@ -2,7 +2,85 @@
 
 All notable changes to `mlx-dspark`. Versions follow [SemVer](https://semver.org/) (pre-1.0: minor-ish features land as patch bumps).
 
-## [Unreleased]
+## [0.4.0] — 2026-07-15 — PrismML Bonsai-27B: speculative decoding for a ternary 27B on a Mac
+
+### Added
+- **PrismML Bonsai-27B support — first speculative decoding for a hybrid linear-attention
+  target on Apple Silicon.** `mlx-dspark generate --model prism-ml/Ternary-Bonsai-27B-mlx-2bit`
+  auto-resolves the matching DSpark drafter, which PrismML ships
+  **GGUF-only** (`*-dspark-bf16.gguf` in the `*-gguf` repos, no safetensors export exists):
+  we republished a 1:1 bf16 repack in the DeepSpec layout
+  ([`Rahim/Ternary-Bonsai-27B-dspark`](https://huggingface.co/Rahim/Ternary-Bonsai-27B-dspark),
+  Apache 2.0, converted with the new `gguf_convert.py`); the `gguf:{repo}/{file}.gguf` drafter
+  scheme converts any future GGUF-only drop locally the same way
+  (cached under `~/.cache/mlx_dspark/drafters/`). Lossless (ids byte-identical
+  to greedy, fp ties excepted); measured on M4 Pro 48 GB: **1.1–1.2× on code/structured**
+  (~25 → 28–30 tok/s; interleaved medians 1.11×, best fresh runs 1.2×), acceptance ~2.8/round
+  at cap 2 (~0.93/token — the drafter is strong; the 2-bit verify slope is the limiter). Their
+  own CUDA number is 1.34×; their Metal path says "no speedup on Macs yet" — this is, as far
+  as we know, the first working one.
+- **Hybrid-target verify/rollback** (`Target.verify()` / `Target.rollback()`): Bonsai-27B is
+  Qwen3.6 (`qwen3_5`) — 48 of 64 layers are gated-DeltaNet linear attention whose recurrent
+  state cannot be trimmed like a KV cache. Each spec round runs as ONE forward over
+  `[replay backlog + anchor + drafts]` with the linear caches' state arrays snapshotted **by
+  reference** (MLX arrays are immutable, so the snapshot copies nothing): full accept keeps
+  everything, partial accept restores the refs + trims the KV layers and re-commits the
+  accepted tokens inside the next round's forward. Dense targets keep the prior trim behavior
+  byte-identically. The tap replicates mlx-lm's qwen3_5 hybrid forward (per-layer fa/ssm
+  masks), proven bit-faithful by the existing `verify_tap()` probe at load. Baseline and
+  `--mode lookup` work for **any** qwen3_5 model (e.g. Qwen3.5-0.8B verified).
+- **GIDD log-SNR conditioning** (`model.LogSnrEmbed`): the Bonsai drafters extend DeepSpec's
+  DSpark architecture with a sinusoidal noise-level embedding (anchor=max, masks=min →
+  fc1→silu→fc2, added to the block embeddings). The inference pattern is a pure function of
+  block position, so the addend is computed once and cached. Ported 1:1 from PrismML's
+  `dspark.cpp`; excluded from drafter quantization to match their packaging.
+- **`--max-draft auto` can now park speculation (cap 0)** when live acceptance is too low for
+  the machine's verify slope — on a 2-bit target every extra verify row costs ~40% of a full
+  step, so open chat (per-token acceptance ~0.8) is a structural net loss no positive cap
+  fixes. Parked stretches run as a **pipelined plain-step sprint** (greedy-loop style, tap
+  riding along so the drafter context stays current) with a cap-1 probe round every 8th round
+  to keep the acceptance estimate tracking. The controller now also feeds back **observed
+  round times** (measured ms/token per cap overrides the synthetic cost model once a cap has
+  data; a live correction factor covers the rest) and prices the hybrid replay cost —
+  fixing the cold-start park (min-observations gate + running-mean warmup for the EWMA) and
+  a calibration gap where the verify curve never measured width 1.
+- 20 new model-free tests (GGUF converter round-trip/refusals, log-SNR numerics vs the
+  reference formula, hybrid verify/rollback equivalence against sequential processing on a
+  tiny real qwen3_5, controller parking/probing/observed-override, routing, registry) —
+  **161 total**, ruff-clean.
+
+### Changed
+- **mlx floor raised to 0.32.0** (from 0.31.2): 0.32's quantized-matmul kernels add multi-row
+  fast paths that this feature depends on — on 0.31.2, 2-bit qmm cost ~+100%/row from M=1
+  (no flat region), making Bonsai speculation a wash at any cap; on 0.32 it's ~+27%/row.
+  Free bonus on the existing presets (same outputs, fp ties excepted): Qwen3-4B dspark
+  70–76 → **84 tok/s (1.64×)**, gemma-4-12B **1.73× → 2.11×** on this M4 Pro.
+- `_route_target`: `qwen3_5`/`qwen3_5_moe` checkpoints route to mlx-lm text-only despite
+  their `vision_config` (mlx-lm's module drops the vision tower in `sanitize`); only the
+  mlx-lm path has the replicated-loop tap the drafters need. `Target` now detects mlx-vlm
+  by module origin instead of a `language_model` attribute (mlx-lm's qwen3_5 has one too).
+- README results table refreshed on mlx 0.32.0 (all rows re-measured this session, same
+  M4 Pro, identical outputs): gemma-4-12B 2.11×, Qwen3-14B 1.92×, Qwen3-8B 1.90×,
+  Qwen3-4B 1.64×, Ternary-Bonsai-27B 1.11× (auto).
+- **The DSpark-vs-DFlash pick changed with mlx 0.32** and the README's guidance now says so:
+  0.32's kernels made narrow multi-row verify disproportionately cheaper, so DSpark cap-2 now
+  beats DFlash full-block even on Gemma-12B code (2.11× vs 1.63× spot-checked; on 0.31 DFlash
+  led there ~2.1× vs ~1.9×). The Qwen3-8B "full block is a net loss" verdict still holds
+  (0.86×). The old multi-prompt sweep tables remain in the deep dive, stamped mlx-0.31.2-era;
+  `--max-draft auto` re-measures the curves per machine/mlx so the pick stays current.
+
+### Known limitations
+- Bonsai speculation is content-dependent: 1.1–1.2× on code/structured output, a net loss on
+  open chat at any fixed cap (0.76× at cap 2 — the 2-bit verify slope + a 3.6B drafter leave
+  no margin at ~0.8 acceptance). **`--max-draft auto` is the recommended setting**: interleaved
+  medians show it matching the best fixed cap on code (1.11×) while parking on chat (0.89×,
+  vs 0.76× fixed). Prefix caching and batching stay dense-only (recurrent state is not
+  trimmable/shareable); `--kv-bits` is refused for hybrid targets.
+- **The 1-bit `Bonsai-27B-mlx-1bit` pack does not run on stock MLX** — it is quantized to
+  1 bit for PrismML's own MLX fork, and `mx.quantize` supports 2/3/4/5/6/8 bits only.
+  `load_target` now refuses any unsupported-bits pack with the real reason (instead of an
+  opaque crash deep in mlx-lm), and the 1-bit variant is deliberately not registered. Its
+  drafter converts fine (kept out of the registry until the target is loadable).
 
 ## [0.3.2] — 2026-07-14 — gemma4 loads on fresh installs (mlx-vlm 0.6.4 compat shim)
 
