@@ -4,8 +4,8 @@
 - qwen3  (mlx-lm):  no hook exists, so we replicate the model's forward loop and
   capture the residual stream after the tapped layers.
 - qwen3_5 (mlx-lm, **hybrid** linear+full attention — the Bonsai-27B / Qwen3.6 family):
-  same replicated-loop tap with per-layer fa/ssm masks, plus two-phase spec verify
-  (see :meth:`verify`) because the 48 linear-attention layers carry recurrent state
+  same replicated-loop tap with per-layer fa/ssm masks, plus exact spec rollback
+  (see :meth:`verify`) because the linear-attention layers carry recurrent state
   that cannot be trimmed like a KV cache.
 
 All expose: make_cache(), run(ids, cache, tap)->(logits, fused_hidden),
@@ -14,6 +14,9 @@ plain(ids, cache)->logits (no capture), and the spec-round pair verify()/rollbac
 """
 
 from __future__ import annotations
+
+import sys
+from contextlib import contextmanager
 
 import mlx.core as mx
 
@@ -49,6 +52,14 @@ class Target:
             # mlx-lm convention: tied models simply don't define lm_head (more reliable
             # than args.tie_word_embeddings, which some families omit)
             self._tied = not hasattr(self._inner, "lm_head")
+        # hybrid targets: the linear-attention modules, in layer order. verify() hooks
+        # their recurrence + conv calls to capture per-round inputs so rollback() can
+        # rebuild the state at the accept point exactly (see the section comment below).
+        if self.is_hybrid:
+            self._gdn_modules = [layer.linear_attn for layer in model.layers
+                                 if getattr(layer, "is_linear", False)]
+            for m in self._gdn_modules:
+                m.conv1d._mlx_dspark_capture = True
         # hybrid spec-verify state (see verify()/rollback()); per-generation, reset by
         # reset_spec() at loop start so a served Target never leaks state across requests.
         self.reset_spec()
@@ -132,37 +143,74 @@ class Target:
     # inline behavior, byte-identical).
     #
     # Hybrid targets: linear-attention state advances through *every* token a forward
-    # touches and cannot be trimmed back, so a verify forward that turns out partially
-    # rejected would poison it. Each spec round therefore runs as ONE forward over
-    # ``[replay-backlog] + [anchor] + [drafts]`` with the linear caches' state arrays
-    # snapshotted by *reference* just before it (MLX arrays are immutable — ops replace,
-    # never mutate — so the snapshot copies nothing):
+    # touches and has no trim, so a partially-rejected verify forward would poison it.
+    # verify() therefore records, per linear layer, references to the round's recurrence
+    # inputs (the exact ``gated_delta_update`` args, post-conv) and the conv input — free:
+    # they are intermediates of the round's graph, held one round. On a partial accept,
+    # rollback() rebuilds each linear cache AT the accept point:
     #
-    #   full accept  → keep every cache effect, backlog cleared (the common case at high
-    #                  acceptance: the round costs exactly one dense-verify forward).
-    #   partial      → restore the linear refs, trim the KV layers by the whole forward
-    #                  width, and carry [old backlog + anchor + accepted drafts] as the
-    #                  next round's backlog — they re-commit inside the next forward.
+    #   delta state  → re-run the recurrence over the accepted prefix from the pre-round
+    #                  state. The kernel consumes tokens strictly sequentially, so the
+    #                  state after ``keep`` tokens is independent of the rejected tail —
+    #                  the re-run reproduces the original round's intermediate state
+    #                  bit-for-bit (same inputs, same op order).
+    #   conv window  → a slice of the recorded conv input (rows [keep, keep+k-1)) — the
+    #                  exact values a committed forward of the prefix would have kept.
+    #   KV layers    → trim only the rejected tail (their rows for accepted tokens are
+    #                  already correct).
     #
-    # An earlier two-phase variant (commit forward + speculative forward per round) was
-    # measured 0.66× baseline on Bonsai-27B: two forwards per round = two full weight
-    # reads of a memory-bound model. The single-forward design pays the replay only on
-    # the rounds that actually rejected something. A backlog longer than
-    # ``_REPLAY_COMMIT_MAX`` (repeated 0-accepts) is committed by a dedicated forward
-    # first, so the round width stays bounded.
+    # So rejects cost ~48 tiny recurrence kernels (lazy, folded into the next round's
+    # graph) instead of re-forwarding the accepted tokens through the whole model — the
+    # earlier "replay backlog" design paid one full-model row per accepted token on every
+    # partial accept, which made past-optimum caps and low-acceptance content decay much
+    # faster than dense targets. (A two-phase commit+spec variant measured 0.66× baseline
+    # — two full weight reads per round; still don't resurrect it.)
     #
-    # The returned rows are [anchor, draft...] — the same rows a dense verify returns —
-    # so the generate loops use verify()/rollback() identically for every family.
-
-    _REPLAY_COMMIT_MAX = 8
+    # The capture is two scoped hooks active only while the forward's graph is built:
+    # the defining module's ``gated_delta_update`` and the conv class ``__call__`` (only
+    # modules flagged ``_mlx_dspark_capture`` record). Both call straight through — no
+    # numeric change — and they sit on mlx-lm's own modules, so the capture works for
+    # the tap path (_run_hybrid) and the model's native forward (lookup mode) alike.
 
     def reset_spec(self) -> None:
-        """Clear per-generation spec state (hybrid replay/snapshot). Loops call this at
-        start so a long-lived served Target never carries state across generations."""
-        self._replay = None      # mx.array [1, c] committed-but-uncached token backlog
-        self._snap = None
-        self._verify_ids = None
+        """Clear per-generation spec state (hybrid capture). Loops call this at start so
+        a long-lived served Target never carries state across generations."""
+        self._stash = None       # ([per-layer gated_delta args], [per-layer conv input])
         self._spec_width = 0
+
+    @contextmanager
+    def _capture_linear(self):
+        """Scoped hooks recording each linear layer's recurrence args + conv input for
+        the forward built inside the context. Pure pass-through (records references,
+        calls the originals) — verify_tap()'s bit-exactness probe runs with the hooks
+        active, so a semantic drift in this plumbing fails loudly at load."""
+        gdn = self._gdn_modules[0]
+        mod = sys.modules[type(gdn).__module__]
+        conv_cls = type(gdn.conv1d)
+        orig_gdu = mod.gated_delta_update
+        orig_conv = conv_cls.__call__
+        rec_delta, rec_conv = [], []
+
+        def rec_gdu(q, k, v, a, b, A_log, dt_bias, state=None, mask=None,
+                    use_kernel=True):
+            # use_kernel is recorded so the rollback re-run takes the SAME
+            # implementation path the forward took (bit-exact prefix re-run)
+            rec_delta.append((q, k, v, a, b, A_log, dt_bias, state, mask, use_kernel))
+            return orig_gdu(q, k, v, a, b, A_log, dt_bias, state, mask,
+                            use_kernel=use_kernel)
+
+        def rec_conv_call(conv_self, x, *args, **kwargs):
+            if getattr(conv_self, "_mlx_dspark_capture", False):
+                rec_conv.append(x)
+            return orig_conv(conv_self, x, *args, **kwargs)
+
+        mod.gated_delta_update = rec_gdu
+        conv_cls.__call__ = rec_conv_call
+        try:
+            yield rec_delta, rec_conv
+        finally:
+            mod.gated_delta_update = orig_gdu
+            conv_cls.__call__ = orig_conv
 
     def verify(self, ids: mx.array, cache, tap: list[int] | None):
         """Spec-round verify forward: ``ids`` [1, 1+m] = [anchor] + m draft tokens.
@@ -177,30 +225,21 @@ class Target:
 
         if not self.is_hybrid:
             return fwd(ids)
-        full = ids
-        if self._replay is not None:
-            if self._replay.shape[1] > self._REPLAY_COMMIT_MAX:
-                fwd(self._replay)          # rare: commit an oversized backlog outright
-            else:
-                full = mx.concatenate([self._replay.astype(ids.dtype), ids], axis=1)
-            self._replay = None
-        want = int(ids.shape[1])           # the 1+m rows the caller gets back
+        self._stash = None
+        want = int(ids.shape[1])
         if want == 1:
-            # no drafts (lookup miss / plain step): everything is committed, no snapshot
-            logits, fused = fwd(full)
-            self._snap, self._verify_ids = None, None
-            return logits[:, -1:], (None if fused is None else fused[:, -1:])
-        self._snap = [
-            None if self._is_trimmable(c) else list(c.cache) for c in cache]
-        self._verify_ids = full
-        self._spec_width = int(full.shape[1])
-        logits, fused = fwd(full)
-        return logits[:, -want:], (None if fused is None else fused[:, -want:])
+            # no drafts (lookup miss / plain step): fully committed, nothing to capture
+            return fwd(ids)
+        with self._capture_linear() as (rec_delta, rec_conv):
+            logits, fused = fwd(ids)
+        self._stash = (rec_delta, rec_conv)
+        self._spec_width = want
+        return logits, fused
 
     def rollback(self, cache, n_rejected: int, accepted: list[int]) -> None:
         """Undo the rejected tail of the last verify. ``accepted`` = the accepted draft
-        tokens (unused — kept for call-site symmetry; hybrid replay slices the verify ids
-        lazily so the on-GPU greedy path never adds a device sync)."""
+        tokens (unused — kept for call-site symmetry; the hybrid rebuild slices the
+        recorded arrays lazily, so the on-GPU greedy path never adds a device sync)."""
         if not self.is_hybrid:
             if n_rejected > 0:
                 for c in cache:
@@ -208,20 +247,30 @@ class Target:
                         c.trim(n_rejected)
             return
         if n_rejected > 0:
-            if self._snap is None:
+            if self._stash is None:
                 raise RuntimeError(
-                    "rollback() with rejected tokens but no preceding verify() snapshot "
+                    "rollback() with rejected tokens but no preceding verify() capture "
                     "on a hybrid target")
-            for c, snap in zip(cache, self._snap):
-                if snap is not None:
-                    c.cache = snap
-                elif hasattr(c, "trim"):
-                    c.trim(self._spec_width)
-            # next round re-commits [backlog + anchor + accepted drafts] (all committed);
-            # the rejected tail and the bonus token (the next anchor) are excluded.
-            self._replay = self._verify_ids[:, : self._spec_width - n_rejected]
-        self._snap = None
-        self._verify_ids = None
+            from mlx_lm.models.gated_delta import gated_delta_update
+
+            rec_delta, rec_conv = self._stash
+            keep = self._spec_width - n_rejected     # anchor + accepted drafts, >= 1
+            li = 0
+            for c in cache:
+                if self._is_trimmable(c):
+                    c.trim(n_rejected)
+                    continue
+                q, k, v, a, b, A_log, dt_bias, state, mask, use_kernel = rec_delta[li]
+                conv_input = rec_conv[li]
+                m = mask[:, :keep] if mask is not None else None
+                _, new_state = gated_delta_update(
+                    q[:, :keep], k[:, :keep], v[:, :keep], a[:, :keep], b[:, :keep],
+                    A_log, dt_bias, state, m, use_kernel=use_kernel)
+                n_keep = conv_input.shape[1] - self._spec_width   # conv kernel size - 1
+                c[0] = mx.contiguous(conv_input[:, keep:keep + n_keep, :])
+                c[1] = new_state
+                li += 1
+        self._stash = None
 
     @staticmethod
     def _is_trimmable(c) -> bool:
@@ -260,10 +309,15 @@ class Target:
                 f"https://github.com/ARahim3/mlx-dspark/issues"
             )
         ids = mx.array([[1, 2, 3, 4]])
-        runner = self._run_hybrid if self.is_hybrid else self._run_mlxlm
         try:
             ref = self.plain(ids, self.make_cache())
-            got, _ = runner(ids, self.make_cache(), [0])
+            if self.is_hybrid:
+                # route through verify() so the capture hooks are active during the
+                # probe — proves the recording plumbing is a pure pass-through too
+                got, _ = self.verify(ids, self.make_cache(), [0])
+                self.reset_spec()
+            else:
+                got, _ = self._run_mlxlm(ids, self.make_cache(), [0])
             diff = float(mx.abs(ref - got).max())
         except Exception as e:
             raise ValueError(

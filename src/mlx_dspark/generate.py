@@ -517,7 +517,7 @@ def dflash_generate(
     ids = prompt_ids if prompt_ids is not None else encode_prompt(
         tokenizer, prompt, use_chat=apply_chat_template)
     cache = _make_target_cache(target_model)
-    target_model.reset_spec()                          # hybrid targets: clear replay state
+    target_model.reset_spec()                          # hybrid targets: clear capture state
     dcache = drafter.make_cache()                      # persistent draft ctx cache
     st = _Streamer(tokenizer, eos_ids, on_text, stop)
     t0 = time.time()
@@ -766,7 +766,7 @@ def speculative_generate(
         cache = _make_target_cache(target_model)
         ctx_caches = drafter.make_ctx_cache()
         reuse_len = 0
-    target_model.reset_spec()                          # hybrid targets: clear replay state
+    target_model.reset_spec()                          # hybrid targets: clear capture state
     st = _Streamer(tokenizer, eos_ids, on_text, stop)
     t0 = time.time()
 

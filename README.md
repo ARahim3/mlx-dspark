@@ -189,21 +189,24 @@ mlx-dspark generate --model prism-ml/Ternary-Bonsai-27B-mlx-2bit \
 # our 1:1 repack of PrismML's GGUF-only drafter, quantized to 4-bit at load)
 ```
 
-Measured on an M4 Pro 48 GB (greedy, warm, interleaved medians): baseline ~25.6 tok/s;
-**1.1–1.2× on code/structured content** (acceptance ~2.8/round at cap 2). Output is lossless —
+Measured on an M4 Pro 48 GB (greedy, warm): baseline ~25.5 tok/s; **~1.15× on code/structured
+content** (acceptance ~2.9/round at cap 2), ~break-even on open chat. Output is lossless —
 byte-identical to plain greedy decoding. Bonsai's backbone is **hybrid linear attention**
 (48 of 64 layers carry recurrent state, which can't be rolled back like a KV cache), so
-mlx-dspark uses a snapshot/replay verify designed for it — as far as we know the first working
-speculative decoding for this model family on Apple Silicon.
+mlx-dspark records each verify round's recurrence inputs and, on a partial accept, rebuilds
+the state at the exact accept point (bit-exact, a few ms) — rejected drafts cost about as
+little as a dense KV trim. As far as we know this is the first working speculative decoding
+for this model family on Apple Silicon.
 
-Two honest caveats: speculation pays on code/structured output but is a net loss on open-ended
-chat with this target (a 2-bit model's verify-width cost is steep relative to its fast plain
-step), so use **`--max-draft auto`** — it tracks live acceptance and *parks* speculation
-(running plain pipelined steps) whenever it would lose, matching the best fixed cap on code
-while staying within ~10% of baseline on chat. And requires **mlx ≥ 0.32.0** (older mlx lacks
-the multi-row 2-bit matmul path that makes verification affordable). Prefix caching and
-batching remain dense-target-only. Baseline/`--mode lookup` also work for any other `qwen3_5`
-(Qwen3.5/3.6-family) checkpoint.
+Two honest caveats. The ceiling is the 2-bit quantization itself: extra verify rows on a
+2-bit model are compute-bound (they cost the same as on a 4-bit model, measured), while its
+plain step is very fast — so chat-level acceptance hovers at break-even instead of the
+1.6–2.1× the 8-bit presets reach. **`--max-draft auto`** stays the recommended setting: it
+picks the cap from this machine's measured curves + live acceptance and can still *park*
+speculation (plain pipelined steps + probe rounds) on content where it would lose. And it
+requires **mlx ≥ 0.32.0** (older mlx lacks the multi-row 2-bit matmul path that makes
+verification affordable at all). Prefix caching and batching remain dense-target-only.
+Baseline/`--mode lookup` also work for any other `qwen3_5` (Qwen3.5/3.6-family) checkpoint.
 
 The **1-bit** `Bonsai-27B-mlx-1bit` pack does *not* run: it is quantized to 1 bit for
 PrismML's own MLX fork, and stock `mx.quantize` has no 1-bit mode (2/3/4/5/6/8 only) —
@@ -234,7 +237,7 @@ an M4 Pro, warm (code prompt unless marked chat):
 | **Gemma-4 12B** | **2.11×** code, 1.77× chat | 1.63× code, ~0.7× chat | **DSpark** |
 | **Qwen3-8B** | **1.90×** | 0.86× full block (1.47× at cap 2) | **DSpark** |
 | **Qwen3-4B** | **1.64×** | modest | **DSpark** |
-| **Ternary-Bonsai-27B** | **1.1–1.2×** code (`--max-draft auto`) | — | **DSpark** (auto) |
+| **Ternary-Bonsai-27B** | **1.15×** code (`--max-draft auto`) | — | **DSpark** (auto) |
 
 This is a *version-dependent* verdict worth knowing about: on mlx 0.31, verify cost rose steeply with the
 number of tokens verified, which made DFlash's full 16-block the winner on Gemma-12B code/math (~2.1× vs
@@ -259,13 +262,14 @@ lifted every row well past the mlx-0.31 numbers this README previously carried):
 | **Qwen3-14B**   | ~2.50 | 15.5 tok/s | 29.7 tok/s | **1.92×** |
 | **Qwen3-8B**    | ~2.58 | 28.7 tok/s | 54.4 tok/s | **1.90×** |
 | **Qwen3-4B**    | ~2.33 | 51.3 tok/s | 84.1 tok/s | **1.64×** |
-| **Ternary-Bonsai-27B** (2-bit, hybrid) | ~2.80 | 25.6 tok/s | 28.5 tok/s | **1.11×** auto (up to 1.2× fresh) |
+| **Ternary-Bonsai-27B** (2-bit, hybrid) | ~2.88 | 25.5 tok/s | 29.4 tok/s | **1.15×** (v0.4.2 exact rollback) |
 
 Baselines are this harness's pipelined greedy loop, which measures at parity with `mlx_lm.generate`
 (the Qwen3-4B baseline is the same 51–52 tok/s either way). All paths produce **identical** output to
 plain decoding — they're just faster. Chat content accepts less than code everywhere; on the 2-bit
-Bonsai target that flips speculation into a net loss, which is exactly what `--max-draft auto`'s
-parking handles (see the Bonsai section). Why a Mac can't go much higher and the cost model are below.
+Bonsai target chat lands ~break-even (its verify rows are compute-bound), and `--max-draft auto`
+adapts or parks where speculation would lose (see the Bonsai section). Why a Mac can't go much
+higher and the cost model are below.
 The deep-dive's multi-prompt DSpark-vs-DFlash tables are mlx-0.31.2-era and are kept as the last full
 sweep — 0.32 shifted that balance toward DSpark (spot-checked; see that section's note).
 

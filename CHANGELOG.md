@@ -2,6 +2,27 @@
 
 All notable changes to `mlx-dspark`. Versions follow [SemVer](https://semver.org/) (pre-1.0: minor-ish features land as patch bumps).
 
+## [0.4.2] — 2026-07-16 — exact hybrid rollback: rejected drafts no longer cost a replay
+
+### Changed
+- **Hybrid (qwen3_5/Bonsai) spec rollback is now exact — rejected drafts no longer cost a
+  replay.** `Target.verify()` records references to each linear-attention layer's recurrence
+  inputs (scoped pass-through hooks, zero numeric change); on a partial accept `rollback()`
+  re-runs the gated-delta recurrence over just the accepted prefix from the pre-round state
+  (bit-exact — the kernel consumes tokens sequentially), restores the conv window by slicing,
+  and trims the KV layers by only the rejected tail. Output unchanged (ids byte-identical to
+  greedy, validated on-device); speed on mid/low-acceptance content improves a lot because
+  partial accepts stop re-forwarding accepted tokens through the whole model: on identical
+  prompts (M4 Pro, Bonsai-27B ternary), code at acceptance 2.5/round went 0.87× → **0.99×**
+  and chat at 2.2/round went 0.67× → **0.93×** at fixed cap 2; the sharp decay past cap 2 is
+  gone (cap 3 now ≈ cap 2); high-acceptance code is unchanged (1.15×, within the old band).
+  Applies to drafter and lookup modes alike; dense targets are untouched byte-for-byte.
+- The auto-cap controller no longer prices the (removed) hybrid replay into its cap choice,
+  so it stops over-penalizing higher caps on hybrid targets; observed round timings continue
+  to ground it live. A new regression test guards parked-controller recovery on content
+  shifts (the parked probe cadence is load-bearing — an exponential probe backoff was tried
+  and reverted after it wedged the chat→code→math sweep parked).
+
 ## [0.4.1] — 2026-07-15 — version-string fix
 
 ### Fixed

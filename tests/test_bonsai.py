@@ -305,8 +305,8 @@ def test_hybrid_partial_accept_rollback_matches_sequential():
     # round 1: anchor 6, drafts [7, 8, 9] -> 1 accepted (7), 2 rejected
     v1, f1 = t.verify(mx.array([[6, 7, 8, 9]]), cache, [0])
     assert v1.shape[1] == 4 and f1.shape[1] == 4
-    t.rollback(cache, 2, [7])
-    # round 2 re-commits [6, 7] internally (replay), anchor 10, drafts [11, 12]
+    t.rollback(cache, 2, [7])                        # rebuilds state at [.., 6, 7]
+    # round 2 verifies just [anchor 10, drafts 11, 12] — no replay backlog
     v2, _ = t.verify(mx.array([[10, 11, 12]]), cache, [0])
     assert bool(mx.allclose(v2[0], ref[-3:], atol=1e-4, rtol=1e-4).item())
 
@@ -321,40 +321,74 @@ def test_hybrid_full_accept_keeps_state():
     t.run(mx.array([prompt]), cache, [0])
     v1, _ = t.verify(mx.array([[6, 7, 8]]), cache, [0])
     t.rollback(cache, 0, [7, 8])                     # full accept: keep everything
-    assert t._replay is None
+    assert t._stash is None
     v2, _ = t.verify(mx.array([[10]]), cache, [0])   # width-1 = pure commit step
     assert bool(mx.allclose(v2[0, -1], ref[-1], atol=1e-4, rtol=1e-4).item())
 
 
-def test_hybrid_zero_accept_and_backlog_commit():
+def test_hybrid_repeated_zero_accept_rounds():
     t = Target(_tiny_hybrid(), tokenizer=None)
-    t._REPLAY_COMMIT_MAX = 2                         # force the backlog-commit path
     prompt = [1, 2, 3]
     cache = t.make_cache()
     t.reset_spec()
     t.run(mx.array([prompt]), cache, [0])
-    # two consecutive 0-accept rounds grow the backlog past the max
-    v, _ = t.verify(mx.array([[4, 9, 9]]), cache, [0])
-    t.rollback(cache, 2, [])                         # backlog: [4]
-    v, _ = t.verify(mx.array([[5, 9, 9]]), cache, [0])
-    t.rollback(cache, 2, [])                         # backlog: [4, 5]
-    v, _ = t.verify(mx.array([[6, 9, 9]]), cache, [0])
-    t.rollback(cache, 2, [])                         # backlog: [4, 5, 6] > max next round
+    # three consecutive 0-accept rounds: each keeps only its anchor
+    for anchor in (4, 5, 6):
+        t.verify(mx.array([[anchor, 9, 9]]), cache, [0])
+        t.rollback(cache, 2, [])
     v2, _ = t.verify(mx.array([[7, 11, 12]]), cache, [0])
     ref = _committed_reference(t, prompt + [4, 5, 6, 7, 11, 12])
     assert bool(mx.allclose(v2[0], ref[-3:], atol=1e-4, rtol=1e-4).item())
 
 
-def test_hybrid_reset_spec_clears_backlog():
+def test_hybrid_rollback_trims_kv_by_rejected_only():
+    t = Target(_tiny_hybrid(), tokenizer=None)
+    prompt = [1, 2, 3, 4, 5]
+    cache = t.make_cache()
+    t.reset_spec()
+    t.run(mx.array([prompt]), cache, [0])
+    t.verify(mx.array([[6, 7, 8, 9]]), cache, [0])
+    t.rollback(cache, 2, [7])
+    kv = [c for c in cache if hasattr(c, "offset")]
+    assert kv and all(c.offset == len(prompt) + 2 for c in kv)   # 5 + [6, 7] kept
+
+
+def test_hybrid_rollback_state_matches_committed_forward():
+    # the rebuilt linear state after a partial accept must match a plain committed
+    # forward of the same prefix (the whole point of the capture-and-rerun design)
+    prompt = [1, 2, 3, 4, 5]
+    t = Target(_tiny_hybrid(), tokenizer=None)
+    cache = t.make_cache()
+    t.reset_spec()
+    t.run(mx.array([prompt]), cache, [0])
+    t.verify(mx.array([[6, 7, 8, 9]]), cache, [0])
+    t.rollback(cache, 2, [7])
+
+    t2 = Target(_tiny_hybrid(), tokenizer=None)      # same seed -> same weights
+    cache2 = t2.make_cache()
+    t2.reset_spec()
+    t2.run(mx.array([prompt + [6, 7]]), cache2, [0])
+
+    lin = [c for c in cache if not hasattr(c, "offset")]
+    lin2 = [c for c in cache2 if not hasattr(c, "offset")]
+    assert lin and len(lin) == len(lin2)
+    for c, c2 in zip(lin, lin2):
+        assert bool(mx.allclose(c[0], c2[0], atol=1e-5, rtol=1e-5).item())   # conv window
+        assert bool(mx.allclose(c[1], c2[1], atol=1e-4, rtol=1e-4).item())   # delta state
+
+
+def test_hybrid_reset_spec_clears_capture():
     t = Target(_tiny_hybrid(), tokenizer=None)
     cache = t.make_cache()
     t.reset_spec()
     t.run(mx.array([[1, 2, 3]]), cache, [0])
     t.verify(mx.array([[4, 9]]), cache, [0])
+    assert t._stash is not None                      # capture live until the rollback
     t.rollback(cache, 1, [])
-    assert t._replay is not None
+    assert t._stash is None
+    t.verify(mx.array([[5, 9]]), cache, [0])
     t.reset_spec()
-    assert t._replay is None and t._snap is None
+    assert t._stash is None
 
 
 def test_dense_rollback_still_trims():
@@ -413,6 +447,28 @@ def test_parks_on_low_acceptance_and_probes():
         caps.append(ctrl.cap)
     assert caps.count(1) == 2                        # a probe every probe_every rounds
     assert caps.count(0) == 14
+
+
+def test_parked_controller_recovers_on_content_shift():
+    # REGRESSION GUARD for the reverted probe backoff (2026-07-16, see NOTES): while
+    # parked, probes are the only acceptance signal, so the fixed every-8 cadence is
+    # load-bearing — a parked controller fed good probe outcomes must un-park within
+    # a bounded number of rounds (the backoff variant stayed parked ~forever).
+    ctrl = _bonsai_like_controller()
+    for _ in range(40):                              # low-acceptance content: parks
+        ctrl.update(0, 2, round_ms=110.0, committed=1)
+    assert ctrl._best == 0
+    rounds_to_unpark = None
+    for i in range(400):                             # content shifts: probes all accept
+        if ctrl.cap == 1:                            # probe: 1 draft + bonus in ~69 ms
+            ctrl.update(1, 1, round_ms=69.0, committed=2)
+        else:                                        # parked plain step
+            ctrl.update(0, 0, round_ms=43.0, committed=1)
+        if ctrl._best >= 1:
+            rounds_to_unpark = i + 1
+            break
+    # recovery rides the observed-timing layer: ~4 good probes at the every-8 cadence
+    assert rounds_to_unpark is not None and rounds_to_unpark <= 100
 
 
 def test_observed_timings_override_model():

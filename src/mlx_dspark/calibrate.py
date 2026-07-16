@@ -288,6 +288,12 @@ class CapController:
         # where every extra verify row costs ~40% of a full step and speculation is a net
         # loss no positive cap can fix. While parked at 0, every ``probe_every``-th round
         # runs at cap 1 so the acceptance estimate keeps tracking content shifts.
+        # KEEP THE CADENCE FIXED: probes are the controller's ONLY acceptance/round-time
+        # signal while parked, so they are load-bearing for un-parking, not just overhead.
+        # An exponential probe backoff (8→64 on failed probes) was measured 2026-07-16:
+        # neutral on steady chat (a probe commits ~p·cap extra tokens — near break-even
+        # at p≈0.75) but it starved p/_corr recovery on content shifts and wedged the
+        # canonical chat→code→math sweep parked (23.4 vs 27.4 tok/s). Reverted; see NOTES.
         self.allow_zero = bool(allow_zero)
         self.probe_every = max(2, int(probe_every))
         self._best = self.cap
@@ -314,9 +320,11 @@ class CapController:
         self.t_alpha = 0.1
         self.min_rounds_observed = 4
         self.obs_max_age = 32
-        # hybrid targets re-commit ("replay") the accepted tokens of a partially-accepted
-        # round inside the next round's forward — a real marginal cost dense targets don't
-        # pay. Priced into rate() so the picked cap doesn't overshoot on hybrids.
+        # LEGACY pricing knob, no longer wired by calibrate(): it modeled the old hybrid
+        # design where a partially-accepted round re-committed [anchor + accepted] inside
+        # the next forward (one full-model row each). Target's capture-and-rerun rollback
+        # made hybrid rejects ~free (a few ms of recurrence kernels), so pricing this
+        # would over-penalize high caps. Kept for cost-model experiments/tests.
         self.hybrid_replay = bool(hybrid_replay)
         # measured fixed per-round cost the curves miss (sync/graph-build/markov/ctx —
         # see measure_dspark_round_overhead). Charged to speculative caps only: cap-0
@@ -547,10 +555,13 @@ def calibrate(target, drafter, *, mode: str, target_repo: str, drafter_repo: str
                   else {int(k): float(v) for k, v in entry["drafter"].items()})
     ctrl = CapController(verify, drafter_ms, max_cap, init_cap=2,
                          verify_grid=entry.get("verify_grid"),
-                         # the dspark loop supports cap-0 (skip drafting) rounds; price
-                         # hybrid targets' partial-accept replay into the cap choice
+                         # the dspark loop supports cap-0 (skip drafting) rounds.
+                         # hybrid_replay stays False: since the capture-and-rerun
+                         # rollback (Target.verify/rollback), a hybrid reject costs ~a
+                         # few ms of recurrence kernels, not a full-model row per
+                         # accepted token — pricing the old replay would over-penalize
+                         # high caps (and observed round timings ground the rest).
                          allow_zero=(mode == "dspark"),
-                         hybrid_replay=bool(getattr(target, "is_hybrid", False)),
                          overhead_ms=float(entry.get("overhead", 0.0)))
     if verbose:
         r = ctrl.info()["predicted_rates"]

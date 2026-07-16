@@ -124,7 +124,7 @@ def lookup_generate(
     if cache is None:
         cache = _make_target_cache(target_model)
         reuse_len = 0
-    target_model.reset_spec()                          # hybrid targets: clear replay state
+    target_model.reset_spec()                          # hybrid targets: clear capture state
     st = _Streamer(tokenizer, eos_ids, on_text, stop)
     index = NGramIndex(min_n=ngram_min, max_n=ngram_max, max_draft=max(1, max_draft_tokens))
     index.extend(ids)
@@ -144,8 +144,7 @@ def lookup_generate(
 
         if not draft:
             # no confident match -> plain 1-token step (zero miss cost; verify() with no
-            # draft tokens is exactly a plain committed step, and lets a hybrid target
-            # fold in any replay tokens from the last partial accept)
+            # draft tokens is exactly a plain committed step for every family)
             logits, _ = target_model.verify(mx.array([[pending]]), cache, None)
             committed = [_pick(logits[0, -1], temperature, top_p, top_k)]
             n = 0
