@@ -2,6 +2,28 @@
 
 All notable changes to `mlx-dspark`. Versions follow [SemVer](https://semver.org/) (pre-1.0: minor-ish features land as patch bumps).
 
+## [0.4.3] — 2026-07-17 — fresh installs work again with mlx-vlm 0.6.5
+
+### Fixed
+- **`import mlx_dspark` crashed with mlx-vlm 0.6.5**
+  (`ModuleNotFoundError: No module named 'mlx_vlm.models.gemma4.rope_utils'`): 0.6.5
+  consolidated per-family rope utilities into `mlx_vlm.models.rope_utils`, and `model.py`
+  imported the old path at module scope. Because `mlx-vlm` is floored but not capped, every
+  **fresh** `pip install mlx-dspark` since 0.6.5's release hit this at import time (existing
+  environments with mlx-vlm ≤ 0.6.4 were unaffected). Both module layouts are now supported;
+  the test suite passes against mlx-vlm 0.6.3 and 0.6.5.
+
+### Changed
+- The 1-bit checkpoint refusal in `load_target` now reflects the current landscape: mlx-vlm
+  ≥ 0.6.5 can run 1-bit affine packs standalone via its own Python-hosted kernel (e.g.
+  `prism-ml/Bonsai-27B-mlx-1bit` — measured 34.9 tok/s baseline on an M4 Pro, 1.37× the
+  ternary 2-bit), but speculative decoding measures a net **loss** on that kernel (0.71–0.77×
+  at any cap, healthy acceptance — its verify cost is linear in draft length), so mlx-dspark
+  keeps the pack unintegrated and the error points at the ternary variant instead.
+- README upstream-compat note updated: mlx-vlm 0.6.5 ships the gemma4-processor fix
+  ([Blaizzy/mlx-vlm#1578](https://github.com/Blaizzy/mlx-vlm/issues/1578)), so the 0.3.2-era
+  shim self-retires there (verified — the shim's gate returns False on 0.6.5).
+
 ## [0.4.2] — 2026-07-16 — exact hybrid rollback: rejected drafts no longer cost a replay
 
 ### Changed

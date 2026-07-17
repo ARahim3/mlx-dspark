@@ -12,7 +12,10 @@ from __future__ import annotations
 import mlx.core as mx
 import mlx.nn as nn
 
-from mlx_vlm.models.gemma4.rope_utils import initialize_rope
+try:  # mlx-vlm <= 0.6.4
+    from mlx_vlm.models.gemma4.rope_utils import initialize_rope
+except ImportError:  # mlx-vlm >= 0.6.5 consolidated per-family rope utils
+    from mlx_vlm.models.rope_utils import initialize_rope
 
 from .config import DSparkConfig
 

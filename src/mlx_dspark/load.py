@@ -397,17 +397,24 @@ def load_target(repo_or_path: str = DEFAULT_TARGET, *, require_tap: bool = False
             cfg = json.load(f)
 
     # Fail with the real reason before mlx-lm dies deep inside mx.quantize: stock MLX
-    # supports 2/3/4/5/6/8-bit affine quantization only. (Notably prism-ml/Bonsai-27B-mlx-1bit
-    # is a 1-bit pack for PrismML's own MLX fork — the ternary 2-bit variant is the one that
-    # runs on stock mlx.)
+    # supports 2/3/4/5/6/8-bit affine quantization only. mlx-vlm >= 0.6.5 can run 1-bit
+    # affine packs (e.g. prism-ml/Bonsai-27B-mlx-1bit) via its own Python-hosted kernel,
+    # but that kernel's verify cost is linear in draft length (each verified token re-reads
+    # the full weight stream), so speculative decoding measures net-negative on it
+    # (0.71-0.77x at any cap, M4 Pro) — kept unintegrated on purpose; see NOTES.
     bits = (cfg.get("quantization") or {}).get("bits")
     if bits and int(bits) not in (2, 3, 4, 5, 6, 8):
-        hint = (" Use prism-ml/Ternary-Bonsai-27B-mlx-2bit instead."
-                if "bonsai" in str(repo_or_path).lower() else "")
+        if int(bits) == 1:
+            hint = (" mlx-vlm >= 0.6.5 runs 1-bit affine packs standalone, but speculative "
+                    "decoding measures net-negative on its kernel (verify cost is linear in "
+                    "draft length), so mlx-dspark does not integrate them.")
+        else:
+            hint = " It likely targets a vendor MLX fork with custom kernels."
+        if "bonsai" in str(repo_or_path).lower():
+            hint += " Use prism-ml/Ternary-Bonsai-27B-mlx-2bit instead."
         raise ValueError(
             f"{repo_or_path}: this checkpoint is quantized to {bits} bits, which stock MLX "
-            f"cannot load (mx.quantize supports 2/3/4/5/6/8). It likely targets a vendor MLX "
-            f"fork with custom kernels.{hint}"
+            f"cannot load (mx.quantize supports 2/3/4/5/6/8).{hint}"
         )
 
     if _route_target(cfg) == "mlx_lm":

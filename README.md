@@ -41,13 +41,15 @@ what current speedup numbers are measured on). Model weights download from the H
 first use (none bundled). No server framework is pulled in — the API server is built on the standard
 library.
 
-> **Known upstream incompatibility (worked around since 0.3.2):** mlx-vlm **0.6.4** ×
-> transformers **≥ 5.12** breaks loading the gemma4 target with a misleading
-> `OSError: Can't load video processor …` ([#4](https://github.com/ARahim3/mlx-dspark/issues/4),
-> upstream [Blaizzy/mlx-vlm#1578](https://github.com/Blaizzy/mlx-vlm/issues/1578) — fixed on
-> mlx-vlm main, unreleased). mlx-dspark ≥ 0.3.2 shims it at load time, so any mlx-vlm ≥ 0.6.3
-> works; on older mlx-dspark, pin `mlx-vlm==0.6.3`. `mlx-dspark doctor` reports when the shim
-> is active.
+> **Known upstream incompatibilities (both handled):** mlx-vlm **0.6.5** moved an internal
+> rope-utils module, which crashed `import mlx_dspark` on fresh installs of mlx-dspark ≤ 0.4.2 —
+> fixed in **0.4.3** (both module layouts supported), so upgrade mlx-dspark rather than pinning
+> mlx-vlm. Separately, mlx-vlm **0.6.4** × transformers **≥ 5.12** breaks loading the gemma4
+> target with a misleading `OSError: Can't load video processor …`
+> ([#4](https://github.com/ARahim3/mlx-dspark/issues/4), upstream
+> [Blaizzy/mlx-vlm#1578](https://github.com/Blaizzy/mlx-vlm/issues/1578) — fixed in mlx-vlm
+> 0.6.5). mlx-dspark ≥ 0.3.2 shims that one at load time, so any mlx-vlm ≥ 0.6.3 works; the
+> shim self-retires on fixed releases, and `mlx-dspark doctor` reports when it is active.
 
 ## Quickstart
 
@@ -208,10 +210,14 @@ requires **mlx ≥ 0.32.0** (older mlx lacks the multi-row 2-bit matmul path tha
 verification affordable at all). Prefix caching and batching remain dense-target-only.
 Baseline/`--mode lookup` also work for any other `qwen3_5` (Qwen3.5/3.6-family) checkpoint.
 
-The **1-bit** `Bonsai-27B-mlx-1bit` pack does *not* run: it is quantized to 1 bit for
-PrismML's own MLX fork, and stock `mx.quantize` has no 1-bit mode (2/3/4/5/6/8 only) —
-`load_target` refuses it with exactly that reason. The ternary 2-bit variant is the
-stock-MLX operating point.
+The **1-bit** `Bonsai-27B-mlx-1bit` pack runs on stock MLX as of mlx-vlm **0.6.5** (which
+ships a Python-hosted 1-bit kernel; stock `mx.quantize` still has no 1-bit mode) — but
+speculative decoding measures a net **loss** on it: that kernel re-reads the full weight
+stream once per verified token, so verify cost is linear in draft length, and dspark lands at
+0.71–0.77× baseline at every cap (M4 Pro, healthy acceptance, losslessness intact). mlx-dspark
+therefore keeps the pack unintegrated — plain generation via mlx-vlm ≥ 0.6.5 is the right tool
+for it (~35 tok/s on an M4 Pro vs ~25 for the ternary), and `load_target` refuses it with a
+pointer saying so. The ternary 2-bit variant remains the speculative-decoding operating point.
 
 ## How it works
 
