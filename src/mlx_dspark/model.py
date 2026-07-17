@@ -94,10 +94,13 @@ class DSparkAttention(nn.Module):
         self.n_kv_heads = config.n_kv_heads
         self.scale = config.scaling
         self.use_v_norm = config.use_v_norm
+        self.gated = config.gated_q_proj
 
         h = config.hidden_size
         b = config.attention_bias
-        self.q_proj = nn.Linear(h, self.n_heads * self.head_dim, bias=b)
+        # gated (qwen3_5): q_proj emits [q ‖ gate] interleaved per head (2× out-features),
+        # split per head like mlx-lm's Qwen3NextAttention so the checkpoint loads 1:1.
+        self.q_proj = nn.Linear(h, self.n_heads * self.head_dim * (2 if self.gated else 1), bias=b)
         self.k_proj = nn.Linear(h, self.n_kv_heads * self.head_dim, bias=b)
         if not self.k_eq_v:
             self.v_proj = nn.Linear(h, self.n_kv_heads * self.head_dim, bias=b)
@@ -109,8 +112,8 @@ class DSparkAttention(nn.Module):
             self.v_norm = RMSNormNoScale(eps=config.rms_norm_eps)
 
         self.rope = initialize_rope(
-            dims=self.head_dim, base=config.rope_theta, traditional=False,
-            scaling_config=config.rope_parameters,
+            dims=config.rope_dims or self.head_dim, base=config.rope_theta,
+            traditional=False, scaling_config=config.rope_parameters,
         )
 
     def _kv(self, x: mx.array):
@@ -136,7 +139,11 @@ class DSparkAttention(nn.Module):
         path (block attends the whole context + all block positions) or a ``[B, 1, k, Lctx+k]``
         boolean mask that hides each row's context padding when ``cache.k/v`` are a batched buffer."""
         B, q_len, _ = hidden.shape
-        q = self.q_proj(hidden).reshape(B, q_len, self.n_heads, self.head_dim)
+        q = self.q_proj(hidden).reshape(B, q_len, self.n_heads, -1)
+        gate = None
+        if self.gated:
+            q, gate = mx.split(q, 2, axis=-1)          # per-head [q ‖ gate]
+            gate = gate.reshape(B, q_len, -1)          # gate is NOT q-normed (qwen3_5 semantics)
         q = self.rope(self.q_norm(q).transpose(0, 2, 1, 3), offset=block_offset)
 
         k_blk, v_blk = self._kv(hidden)
@@ -155,6 +162,8 @@ class DSparkAttention(nn.Module):
         # tiling), strictly less work on every target.
         out = mx.fast.scaled_dot_product_attention(q, k, v, scale=self.scale, mask=mask)
         out = out.transpose(0, 2, 1, 3).reshape(B, q_len, -1)
+        if gate is not None:
+            out = out * mx.sigmoid(gate)
         return self.o_proj(out)
 
 

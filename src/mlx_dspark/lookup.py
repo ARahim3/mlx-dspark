@@ -69,9 +69,19 @@ class NGramIndex:
                     prev = self._index.get(ng)
                     self._index[ng] = (prev[1] if prev else None, end)
 
-    def propose(self) -> list[int]:
+    def propose(self, long_draft: int | None = None) -> list[int]:
         """Draft tokens continuing the latest earlier occurrence of the current suffix
-        n-gram (longest n first). Empty list = no confident match, do a plain step."""
+        n-gram (longest n first). Empty list = no confident match, do a plain step.
+
+        ``long_draft`` (> ``max_draft``) enables **match-scaled drafting** (after llama.cpp's
+        ngram-mod, which requires a 24-token matched context before drafting 48-64 tokens):
+        the suffix match is extended *backwards* token-by-token to measure how much context
+        actually matches the earlier occurrence, and a match of ``m >= 8`` tokens earns a
+        ``2*m``-token draft (clipped to ``long_draft``). Deep inside a verbatim copy run the
+        evidence — and so the draft — grows to the ceiling, where the M-series verify-width
+        plateau makes the extra rows near-free (8-bit, M4 Pro: width 16-32 costs ~2.5x one
+        step); a bare 4-5-gram hit stays at ``max_draft``, so insertion-heavy edits and chat
+        behave exactly as before. Purely a length policy: output is unchanged either way."""
         end = len(self.tokens)
         for n in range(self.max_n, self.min_n - 1, -1):
             if end < n:
@@ -83,10 +93,48 @@ class NGramIndex:
             pos = latest if latest != end else prev   # skip the suffix's own occurrence
             if pos is None:
                 continue
-            draft = self.tokens[pos:pos + self.max_draft]
+            cap = self.max_draft
+            if long_draft is not None and long_draft > cap:
+                m = n                            # matched context: the n-gram itself ...
+                i, j = end - n - 1, pos - n - 1  # ... extended backwards while it keeps matching
+                while j >= 0 and m < long_draft and self.tokens[i] == self.tokens[j]:
+                    m += 1
+                    i -= 1
+                    j -= 1
+                if m >= 8:
+                    cap = min(long_draft, 2 * m)
+            draft = self.tokens[pos:pos + max(1, cap)]
             if draft:
                 return draft
         return []
+
+
+class LongDraftGate:
+    """Acceptance guard for match-scaled long drafts (after llama.cpp ngram-mod's
+    low-acceptance-streak reset). Deep backward match is *usually* a real copy run — but at
+    an insertion point (docstring pass, per-line edits) the evidence is deepest exactly
+    where the continuation diverges, and every long draft gets chopped early. Two
+    consecutive long drafts accepted under half their length park the scaling; a single
+    long probe every ``probe_every`` lookup rounds re-enters when the content turns
+    copy-friendly again (same parked-probe pattern as the auto-cap controller). Base-length
+    lookup drafts are never gated. Speed-only: output is unchanged either way."""
+
+    def __init__(self, probe_every: int = 8):
+        self.probe_every = probe_every
+        self.fails = 0
+        self.rounds_since = 0     # base-length lookup rounds since the last long draft
+
+    @property
+    def allowed(self) -> bool:
+        return self.fails < 2 or self.rounds_since >= self.probe_every
+
+    def update(self, drafted: int, accepted: int, base: int) -> None:
+        """Feed every lookup round's (drafted, accepted); ``base`` = the un-scaled length."""
+        if drafted <= base:
+            self.rounds_since += 1
+            return
+        self.fails = self.fails + 1 if 2 * accepted < drafted else 0
+        self.rounds_since = 0
 
 
 def lookup_generate(
@@ -99,6 +147,7 @@ def lookup_generate(
     reuse_len: int = 0,
     max_new_tokens: int = 128,
     max_draft_tokens: int = 6,
+    long_draft_tokens: int = 32,
     ngram_min: int = 3,
     ngram_max: int = 4,
     temperature: float = 0.0,
@@ -115,6 +164,10 @@ def lookup_generate(
     greedy decoding up to fp ties; ``temperature > 0`` is an exact sample from the target
     (one-hot-proposal speculative sampling). ``cache``/``reuse_len`` support prefix caching
     exactly like ``greedy_generate`` (plain KV cache, no drafter state to roll back).
+
+    ``long_draft_tokens``: match-scaled long-draft ceiling — a deep context match (a real
+    copy run) earns drafts up to this length; see :meth:`NGramIndex.propose`. Set equal to
+    ``max_draft_tokens`` to disable.
     """
     if seed is not None:
         mx.random.seed(seed)
@@ -126,8 +179,10 @@ def lookup_generate(
         reuse_len = 0
     target_model.reset_spec()                          # hybrid targets: clear capture state
     st = _Streamer(tokenizer, eos_ids, on_text, stop)
-    index = NGramIndex(min_n=ngram_min, max_n=ngram_max, max_draft=max(1, max_draft_tokens))
+    base_draft = max(1, max_draft_tokens)
+    index = NGramIndex(min_n=ngram_min, max_n=ngram_max, max_draft=base_draft)
     index.extend(ids)
+    gate = LongDraftGate()
 
     t0 = time.time()
     suffix = ids[reuse_len:] if reuse_len else ids
@@ -140,7 +195,10 @@ def lookup_generate(
 
     st.update(out_ids)
     while len(out_ids) < max_new_tokens and pending not in eos_ids and not st.stopped:
-        draft = index.propose()
+        # clamp to the remaining budget: no verify width wasted past max_new_tokens
+        draft = index.propose(
+            long_draft=long_draft_tokens if gate.allowed else None,
+        )[:max_new_tokens - len(out_ids)]
 
         if not draft:
             # no confident match -> plain 1-token step (zero miss cost; verify() with no
@@ -172,6 +230,8 @@ def lookup_generate(
             committed = draft[:n] + [tt[n]]
         target_forwards += 1
         accept_lengths.append(len(committed))
+        if draft:
+            gate.update(len(draft), n, base_draft)
 
         target_model.rollback(cache, len(draft) - n, draft[:n])
 

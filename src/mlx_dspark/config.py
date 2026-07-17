@@ -4,7 +4,10 @@ Supports two drafter families with a shared inference path:
   - gemma4  (gemma4_text): k_eq_v attention, v_norm, partial/proportional rope,
             sandwich norms + layer_scalar, gelu-tanh MLP, logit softcap.
   - qwen3   (qwen3):       standard GQA (separate v_proj, no v_norm), default rope,
-            Llama-style 2-norm layer, silu MLP, no softcap.
+            Llama-style 2-norm layer, silu MLP, no softcap. Also covers qwen3_5-flavored
+            backbones (model_type qwen3_5, e.g. Ornith drafters) via two config-driven
+            knobs: gated_q_proj (q_proj emits [q ‖ gate], attn out × sigmoid(gate)) and
+            rope_dims (partial rotary).
 Only the fields the MLX inference path needs are pulled out.
 """
 
@@ -39,6 +42,20 @@ class DSparkConfig:
     rope_theta: float = 1_000_000.0
     partial_rotary_factor: float = 0.25
     rope_type: str = "proportional"
+    # qwen3_5 drafters rope only the first rope_dims of head_dim (partial rotary);
+    # None = full head_dim (all other families).
+    rope_dims: int | None = None
+
+    # qwen3_5 gated attention: q_proj emits [q ‖ gate] per head (2× out-features),
+    # attention output is multiplied by sigmoid(gate) before o_proj.
+    gated_q_proj: bool = False
+
+    # qwen3_5 stores every RMSNorm weight as an additive offset from one (Gemma-style
+    # (1+w)·x̂ — the reference vLLM patches call this offset_rms_norm). load_drafter adds
+    # 1.0 to all RMSNorm weights at load so plain nn.RMSNorm modules compute the right
+    # thing. Applying them un-offset multiplies the context fusion by ~0 and silently
+    # collapses acceptance to ~1.25 (measured; d0 15% → 90% with the offset).
+    offset_rms_norm: bool = False
 
     # dspark specifics
     block_size: int = 7
@@ -140,6 +157,16 @@ class DSparkConfig:
 
         if family == "qwen3":
             rp = c.get("rope_parameters") or {}
+            head_dim = c.get("head_dim", c["hidden_size"] // c["num_attention_heads"])
+            # qwen3_5-flavored backbones (e.g. Ornith drafters) declare gated q_proj and
+            # partial rotary in the same DeepSpec layout; plain qwen3 configs carry neither,
+            # so both knobs default to the classic behavior. The config's mrope fields are a
+            # text-only no-op (equal position ids collapse mrope to standard rope — mlx-lm's
+            # own qwen3_5 text module does the same).
+            gated_q = bool(c.get("enable_qwen35_gated_q_proj", False))
+            rope_dims = int(head_dim * float(rp.get("partial_rotary_factor", 1.0)))
+            # qwen3_5 house style: norm weights stored offset-from-one (see field docs).
+            offset_norms = mt == "qwen3_5"
             if c.get("log_snr_conditioning"):
                 lo, hi = c.get("min_log_snr"), c.get("max_log_snr")
                 if lo is None or hi is None or not (float(hi) > float(lo)):
@@ -157,10 +184,13 @@ class DSparkConfig:
                 rms_norm_eps=c.get("rms_norm_eps", 1e-6),
                 num_attention_heads=c["num_attention_heads"],
                 num_key_value_heads=c.get("num_key_value_heads", 8),
-                head_dim=c.get("head_dim", c["hidden_size"] // c["num_attention_heads"]),
+                head_dim=head_dim,
                 attention_k_eq_v=False, attention_bias=c.get("attention_bias", False),
                 rope_theta=rp.get("rope_theta", c.get("rope_theta", 1_000_000.0)),
                 rope_type="default",
+                rope_dims=(rope_dims if rope_dims != head_dim else None),
+                gated_q_proj=gated_q,
+                offset_rms_norm=offset_norms,
                 block_size=c["block_size"], mask_token_id=c["mask_token_id"],
                 target_layer_ids=list(c["target_layer_ids"]),
                 num_target_layers=c.get("num_target_layers", 36),

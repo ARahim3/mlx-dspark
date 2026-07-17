@@ -62,6 +62,41 @@ DFLASH_MARKOV_HYBRID = {  # DFlash block-16 backbone + a DSpark Markov head
     "markov_rank": 256, "markov_head_type": "vanilla",
 }
 
+AVESED_QWEN36 = {  # Avesed/Qwen3.6-27B-DSpark shape: DeepSpec DSpark weights (block 7, markov +
+    # confidence, dense-qwen3 backbone) under a vLLM-fork "DFlashDraftModel" class label, with
+    # target-config noise copied in (gated attention / linear-attention fields the drafter's own
+    # weights don't have). Distinguishing quirks: block_size 7 (vs 16 for the DFlash+Markov
+    # hybrid above) and heads*head_dim != hidden_size (32*128=4096 vs 5120 in the real one).
+    "model_type": "qwen3", "architectures": ["DFlashDraftModel"],
+    "hidden_size": 20, "vocab_size": 32, "num_hidden_layers": 1, "intermediate_size": 32,
+    "num_attention_heads": 2, "num_key_value_heads": 1, "head_dim": 8,
+    "block_size": 7, "mask_token_id": 3, "target_layer_ids": [0, 1], "num_target_layers": 2,
+    "markov_rank": 4, "enable_confidence_head": True, "confidence_head_with_markov": True,
+    "rope_parameters": {"rope_theta": 1e7, "rope_type": "default"},
+    # the noise — must be ignored, never mis-parsed into the drafter:
+    "attn_output_gate": True, "output_gate_type": "swish", "full_attention_interval": 4,
+    "linear_num_key_heads": 16, "linear_num_value_heads": 48, "linear_conv_kernel_dim": 4,
+    "num_anchors": 64, "mtp_num_hidden_layers": 1,
+    "dflash_config": {"mask_token_id": 3, "target_layer_ids": [0, 1], "markov_rank": 4},
+}
+
+
+ORNITH_QWEN35 = {  # stanleyphoong/Ornith-1.0-9B-DSpark shape: DeepSpec layout, qwen3_5-flavored
+    # backbone — gated q_proj (2× out-features) + partial rotary 0.25 + target-config noise
+    # (text_config/vision_config/mrope copied in; mrope is a text-only no-op).
+    "model_type": "qwen3_5", "architectures": ["Qwen35DSparkModel"],
+    "hidden_size": 16, "vocab_size": 32, "num_hidden_layers": 1, "intermediate_size": 32,
+    "num_attention_heads": 2, "num_key_value_heads": 1, "head_dim": 8,
+    "enable_qwen35_gated_q_proj": True, "partial_rotary_factor": 0.25,
+    "block_size": 7, "mask_token_id": 3, "target_layer_ids": [0, 1], "num_target_layers": 2,
+    "markov_rank": 4, "enable_confidence_head": True, "confidence_head_with_markov": True,
+    "confidence_temperatures": [1.5, 0.9, 1.5, 1.6, 0.9, 1.4, 1.6],
+    "rope_parameters": {"rope_theta": 1e7, "rope_type": "default",
+                        "partial_rotary_factor": 0.25, "mrope_interleaved": True,
+                        "mrope_section": [11, 11, 10]},
+    "text_config": {"model_type": "qwen3_5_text"}, "vision_config": {"depth": 27},
+}
+
 
 def _cfg_path(tmp_path, cfg: dict) -> str:
     p = tmp_path / "config.json"
@@ -77,6 +112,27 @@ def test_qwen3_config_parses(tmp_path):
 def test_gemma4_config_parses(tmp_path):
     cfg = DSparkConfig.from_json(_cfg_path(tmp_path, GEMMA4_MIN))
     assert cfg.family == "gemma4" and cfg.target_layer_ids == [0, 1]
+
+
+def test_avesed_qwen36_shape_parses_as_qwen3_dspark(tmp_path):
+    cfg = DSparkConfig.from_json(_cfg_path(tmp_path, AVESED_QWEN36))
+    assert cfg.family == "qwen3" and cfg.block_size == 7
+    assert cfg.rope_theta == 1e7                      # from rope_parameters, not a default
+    assert cfg.head_dim == 8 and cfg.hidden_size == 20  # heads*head_dim != hidden preserved
+    assert not cfg.gated_q_proj and cfg.rope_dims is None  # no gate weights in that checkpoint
+
+
+def test_ornith_qwen35_shape_parses_with_gate_and_partial_rope(tmp_path):
+    cfg = DSparkConfig.from_json(_cfg_path(tmp_path, ORNITH_QWEN35))
+    assert cfg.family == "qwen3" and cfg.gated_q_proj
+    assert cfg.rope_dims == 2                         # head_dim 8 × partial_rotary 0.25
+    assert cfg.rope_theta == 1e7
+    assert cfg.offset_rms_norm                        # qwen3_5 house style
+
+
+def test_plain_qwen3_unaffected_by_qwen35_knobs(tmp_path):
+    cfg = DSparkConfig.from_json(_cfg_path(tmp_path, QWEN3_MIN))
+    assert not cfg.gated_q_proj and cfg.rope_dims is None and not cfg.offset_rms_norm
 
 
 def test_speculators_format_refused_with_reason(tmp_path):
@@ -130,19 +186,19 @@ def test_route_unknown_falls_back_to_vlm():
 
 # ---------------------------------------------------------------- strict weight loading
 
-def _write_drafter_ckpt(tmp_path, weights: dict) -> str:
-    (tmp_path / "config.json").write_text(json.dumps(QWEN3_MIN))
+def _write_drafter_ckpt(tmp_path, weights: dict, cfg: dict = QWEN3_MIN) -> str:
+    (tmp_path / "config.json").write_text(json.dumps(cfg))
     mx.save_safetensors(str(tmp_path / "model.safetensors"), weights)
     return str(tmp_path)
 
 
-def _reference_weights() -> dict:
+def _reference_weights(cfg_dict: dict = QWEN3_MIN) -> dict:
     class _P:  # only the fields DSparkConfig needs, via a real parse for fidelity
         pass
     import tempfile
     with tempfile.TemporaryDirectory() as d:
         cfgp = f"{d}/config.json"
-        open(cfgp, "w").write(json.dumps(QWEN3_MIN))
+        open(cfgp, "w").write(json.dumps(cfg_dict))
         cfg = DSparkConfig.from_json(cfgp)
     ref = DSparkDrafter(cfg)
     weights = dict(tree_flatten(ref.parameters()))
@@ -170,6 +226,43 @@ def test_load_drafter_strict_false_force_loads(tmp_path):
     path = _write_drafter_ckpt(tmp_path, weights)
     drafter, _ = load_drafter(path, quantize=False, strict=False)  # warn-and-load
     assert drafter is not None
+
+
+def test_load_drafter_avesed_qwen36_shape_roundtrips(tmp_path):
+    # heads*head_dim != hidden_size (the Avesed/Qwen3.6 drafter quirk): construction and the
+    # 1:1 key match must both come out of the config, with the fork-label/noise fields inert.
+    path = _write_drafter_ckpt(tmp_path, _reference_weights(AVESED_QWEN36), cfg=AVESED_QWEN36)
+    drafter, cfg = load_drafter(path, quantize=False)
+    assert cfg.family == "qwen3" and drafter.block_size == 7
+
+
+def test_load_drafter_ornith_qwen35_shape_roundtrips(tmp_path):
+    # gated q_proj means 2× out-features on q_proj — construction and the 1:1 key match
+    # must both track the flag (a plain-qwen3 build would fail with a q_proj shape mismatch).
+    path = _write_drafter_ckpt(tmp_path, _reference_weights(ORNITH_QWEN35), cfg=ORNITH_QWEN35)
+    drafter, cfg = load_drafter(path, quantize=False)
+    assert cfg.gated_q_proj and drafter.block_size == 7
+    q = drafter.layers[0].self_attn.q_proj.weight
+    assert q.shape[0] == 2 * 2 * 8                    # heads × head_dim × 2 (q ‖ gate)
+
+
+def test_load_drafter_qwen35_offset_norms_materialized(tmp_path):
+    # qwen3_5 checkpoints store norm weights as offsets from one — load_drafter must add 1
+    # (fresh-init reference norms are all-ones, so loaded values must come back as 2.0).
+    # Un-offset qwen3 loads stay untouched (all-ones stay 1.0).
+    import mlx.core as mx
+
+    path = _write_drafter_ckpt(tmp_path, _reference_weights(ORNITH_QWEN35), cfg=ORNITH_QWEN35)
+    drafter, _ = load_drafter(path, quantize=False)
+    assert mx.allclose(drafter.hidden_norm.weight, mx.full_like(drafter.hidden_norm.weight, 2.0)).item()
+    assert mx.allclose(drafter.layers[0].self_attn.q_norm.weight,
+                       mx.full_like(drafter.layers[0].self_attn.q_norm.weight, 2.0)).item()
+
+    plain_dir = tmp_path / "plain"
+    plain_dir.mkdir()
+    path = _write_drafter_ckpt(plain_dir, _reference_weights(QWEN3_MIN), cfg=QWEN3_MIN)
+    drafter, _ = load_drafter(path, quantize=False)
+    assert mx.allclose(drafter.hidden_norm.weight, mx.full_like(drafter.hidden_norm.weight, 1.0)).item()
 
 
 def test_load_dflash_markov_hybrid_refused_with_reason(tmp_path):

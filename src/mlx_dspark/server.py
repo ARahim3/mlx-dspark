@@ -101,6 +101,7 @@ class Engine:
         max_tokens_cap: int = 32768,
         prefix_cache_slots: int = 2,
         lookup_drafts: bool = True,
+        lookup_long_draft: int = 32,
         executor: ThreadPoolExecutor | None = None,
     ):
         self.target = target
@@ -118,6 +119,7 @@ class Engine:
         self.max_tokens_cap = max_tokens_cap
         self.prefix_cache_slots = max(1, prefix_cache_slots)
         self.lookup_drafts = lookup_drafts                 # hybrid n-gram drafts in dspark mode
+        self.lookup_long_draft = lookup_long_draft         # match-scaled long-draft ceiling
         apply_wired_limit()                                # keep the weights resident
         # chat-template kwargs applied to every request unless the request overrides them
         # (e.g. {"enable_thinking": False} to silence Qwen3's <think> blocks by default).
@@ -181,6 +183,7 @@ class Engine:
         default_top_k: int | None = None,
         prefix_cache_slots: int = 2,
         lookup_drafts: bool = True,
+        lookup_long_draft: int = 32,
         batch_widths: list[int] | None = None,   # e.g. [2, max_batch]: calibrate (B,cap) grid
         kv_bits: int | None = None,              # quantize the target KV cache (4/8)
     ) -> "Engine":
@@ -246,6 +249,7 @@ class Engine:
                    sampling_defaults=sampling_defaults,
                    default_max_tokens=default_max_tokens, max_tokens_cap=max_tokens_cap,
                    prefix_cache_slots=prefix_cache_slots, lookup_drafts=lookup_drafts,
+                   lookup_long_draft=lookup_long_draft,
                    executor=executor)
 
     # --- generation ---
@@ -285,6 +289,7 @@ class Engine:
                     cache=cache, ctx_caches=ctx, reuse_len=reuse_len,
                     max_new_tokens=max_tokens, max_draft_tokens=self.max_draft_tokens,
                     cap_controller=self.cap_controller, lookup_drafts=self.lookup_drafts,
+                    lookup_long_draft=self.lookup_long_draft,
                     confidence_threshold=self.confidence_threshold,
                     temperature=temperature, top_p=top_p, top_k=top_k,
                     presence_penalty=presence_penalty, frequency_penalty=frequency_penalty,
@@ -303,6 +308,7 @@ class Engine:
                     self.target, self.tokenizer, prompt_ids=prompt_ids,
                     cache=cache, reuse_len=reuse_len,
                     max_new_tokens=max_tokens, max_draft_tokens=self.max_draft_tokens or 6,
+                    long_draft_tokens=max(self.max_draft_tokens or 6, self.lookup_long_draft),
                     temperature=temperature, top_p=top_p, top_k=top_k,
                     seed=seed, stop=stop, on_text=on_text,
                 )

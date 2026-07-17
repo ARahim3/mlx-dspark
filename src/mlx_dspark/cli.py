@@ -80,6 +80,12 @@ def cmd_generate(argv: list[str]) -> None:
     ap.add_argument("--no-lookup-drafts", action="store_true",
                     help="disable hybrid n-gram drafting inside dspark mode (on by default; "
                          "free extra speedup on copy-heavy spans, lossless either way)")
+    ap.add_argument("--lookup-long-draft", type=int, default=32,
+                    help="match-scaled long-draft ceiling for lookup drafts (dspark hybrid "
+                         "+ lookup mode): a deep context match (real copy run) earns drafts "
+                         "up to this length (default 32 = the measured M-series verify-width "
+                         "plateau); set to the base (6) to disable. Speed-only, output "
+                         "unchanged")
     ap.add_argument("--no-chat-template", action="store_true")
     ap.add_argument("--no-stream", action="store_true")
     args = ap.parse_args(argv)
@@ -131,6 +137,7 @@ def cmd_generate(argv: list[str]) -> None:
             target, tok, drafter, args.prompt,
             max_new_tokens=args.max_new_tokens, max_draft_tokens=cap,
             cap_controller=cap_controller, lookup_drafts=not args.no_lookup_drafts,
+            lookup_long_draft=args.lookup_long_draft,
             confidence_threshold=args.confidence_threshold,
             temperature=args.temperature, top_p=args.top_p, top_k=args.top_k, seed=args.seed,
             apply_chat_template=not args.no_chat_template, on_text=on_text,
@@ -154,6 +161,7 @@ def cmd_generate(argv: list[str]) -> None:
         res = lookup_generate(
             target, tok, args.prompt,
             max_new_tokens=args.max_new_tokens, max_draft_tokens=cap,
+            long_draft_tokens=max(cap, args.lookup_long_draft),
             temperature=args.temperature, top_p=args.top_p, top_k=args.top_k, seed=args.seed,
             apply_chat_template=not args.no_chat_template, on_text=on_text,
         )
@@ -239,6 +247,9 @@ def cmd_serve(argv: list[str]) -> None:
                          "so an agent and a chat don't evict each other every turn)")
     ap.add_argument("--no-lookup-drafts", action="store_true",
                     help="disable hybrid n-gram drafting inside dspark mode")
+    ap.add_argument("--lookup-long-draft", type=int, default=32,
+                    help="match-scaled long-draft ceiling for lookup drafts (default 32; "
+                         "set to 6 to disable — see `mlx-dspark generate -h`)")
     ap.add_argument("--prefix-cache-dir", default=None,
                     help="directory for the L2 SSD spill tier (enables spilling the cache to disk)")
     ap.add_argument("--prefix-cache-max-ram-mb", type=int, default=0,
@@ -272,6 +283,7 @@ def cmd_serve(argv: list[str]) -> None:
             default_top_k=args.default_top_k,
             prefix_cache_slots=args.prefix_cache_slots,
             lookup_drafts=not args.no_lookup_drafts,
+            lookup_long_draft=args.lookup_long_draft,
             batch_widths=(sorted({2, args.max_batch}) if args.max_batch > 1 else None),
             kv_bits=args.kv_bits or None,
         )

@@ -701,6 +701,7 @@ def speculative_generate(
     cap_controller=None,
     lookup_drafts: bool = True,
     lookup_max_draft: int = 6,
+    lookup_long_draft: int = 32,
     temperature: float = 0.0,
     top_p: float = 1.0,
     top_k: int = 0,
@@ -743,6 +744,15 @@ def speculative_generate(
     running the drafter this round; otherwise the DSpark block drafts as usual. Verification
     is unchanged either way, so this composes losslessly — it just lets copy-heavy spans
     commit ~6 tokens/round where the drafter block would cap out at ~2-3.
+
+    ``lookup_long_draft``: match-scaled long-draft ceiling. When the suffix match extends
+    backwards ≥8 tokens (real copy run, not a bare 4-5-gram hit), the lookup draft grows to
+    ~2x the matched length, up to this ceiling — the M-series verify-width plateau (width
+    16-32 ≈ 2.5x one step) makes the extra rows near-free, so verbatim spans commit ~30
+    tokens per verify instead of ~6. A :class:`~mlx_dspark.lookup.LongDraftGate` parks the
+    scaling when long drafts keep getting chopped early (insertion-heavy edits) and probes
+    back in. Set equal to ``lookup_max_draft`` to disable. Speed-only; output unchanged
+    (see :meth:`NGramIndex.propose`).
     """
     if seed is not None:
         mx.random.seed(seed)
@@ -785,8 +795,9 @@ def speculative_generate(
         lp_list.extend(_logprobs_for_block(logits[0, -1][None, :], [pending], logprobs))
 
     index = None
+    lk_gate = None
     if lookup_drafts:
-        from .lookup import NGramIndex     # deferred: lookup.py imports this module
+        from .lookup import LongDraftGate, NGramIndex   # deferred: lookup.py imports this module
 
         # Hybrid uses a stricter 4-gram minimum than pure lookup mode: here a spurious hit
         # doesn't just cost a wider verify — it forgoes a productive drafter round (~2.3
@@ -794,6 +805,7 @@ def speculative_generate(
         # almost never fire spuriously, while genuine copying has them in abundance.
         index = NGramIndex(min_n=4, max_n=5, max_draft=max(1, lookup_max_draft))
         index.extend(ids + [pending])
+        lk_gate = LongDraftGate()
 
     out_ids: list[int] = [pending]
     accept_lengths: list[int] = []
@@ -803,7 +815,12 @@ def speculative_generate(
 
     st.update(out_ids)
     while len(out_ids) < max_new_tokens and pending not in eos_ids and not st.stopped:
-        lk_draft = index.propose() if index is not None else []
+        lk_draft = []
+        if index is not None:
+            # clamp to the remaining budget: no verify width wasted past max_new_tokens
+            lk_draft = index.propose(
+                long_draft=lookup_long_draft if lk_gate.allowed else None,
+            )[:max_new_tokens - len(out_ids)]
         use_conf = confidence_threshold > 0.0 and drafter.confidence_head is not None
         if cap_controller is not None and not lk_draft:
             # cap 0 = the controller parked speculation (live acceptance too low for this
@@ -972,6 +989,8 @@ def speculative_generate(
                 committed = draft[:n] + [tt[n]]                # accepted prefix + bonus
         target_forwards += 1
         accept_lengths.append(len(committed))
+        if lk_draft:
+            lk_gate.update(len(draft), n, max(1, lookup_max_draft))
         if cap_controller is not None:
             now = time.perf_counter()
             if not lk_draft:

@@ -4,7 +4,7 @@
 
 <p align="center">
   <b>DeepSeek's DSpark <i>and</i> z-lab's DFlash speculative decoding — native on Apple Silicon via <a href="https://github.com/ml-explore/mlx">MLX</a>.</b>
-  <br>Lossless drafters (same output, just faster) for the <b>Qwen3, Gemma-4, and PrismML Bonsai-27B</b> families —
+  <br>Lossless drafters (same output, just faster) for <b>Gemma-4, Qwen3, Ornith-1.0, Qwen3.6-27B, and Bonsai-27B</b> targets —
   <br>plus any matched DSpark / DFlash checkpoint. Run them at the CLI, from Python, or <b>serve an OpenAI-compatible API</b> to LM Studio / any local tool.
 </p>
 
@@ -16,7 +16,7 @@
 </p>
 
 <p align="center">
-  <img src="https://raw.githubusercontent.com/ARahim3/mlx-dspark/main/docs/demo.gif" alt="Baseline vs DSpark — same output, ~1.8x faster on Gemma-4 12B" width="840">
+  <img src="https://raw.githubusercontent.com/ARahim3/mlx-dspark/main/docs/demo.gif" alt="Baseline vs DSpark — same output, ~2.1x faster on Gemma-4 12B" width="840">
 </p>
 
 mlx-dspark runs two EAGLE-family speculative-decoding drafters natively on Apple Silicon: DeepSeek's
@@ -29,6 +29,36 @@ so you can serve them, script them, or benchmark them head-to-head.
 > PrismML's ternary Bonsai-27B) with published DSpark drafters — so this runs the real drafter method on a
 > Mac, but the model producing tokens is Gemma / Qwen / Bonsai, not V4. V4 Flash/Pro (MoE, batched serving)
 > is DSpark's own headline use case.
+
+## Supported models
+
+Every row auto-resolves its drafter from `--model` (any quant of the target matches). Measured warm on
+an M4 Pro; full tables, baselines, and method in [Results at a glance](#results-at-a-glance):
+
+| target | best measured speedup | speed |
+|---|---|---|
+| **Ornith-1.0-9B** (8-bit) | **2.44×** math · **2.17×** code · **2.11×** chat | ~61 tok/s |
+| **Gemma-4 12B** (8-bit) | **2.11×** code · 1.77× chat | ~36 tok/s |
+| **Qwen3-14B** (8-bit) | **1.92×** code | ~30 tok/s |
+| **Qwen3-8B** (8-bit) | **1.90×** code | ~54 tok/s |
+| **Qwen3-4B** (8-bit) | **1.64×** code | ~84 tok/s |
+| **Qwen3.6-27B** (4-bit)\*\* | **1.78×** math · **1.42×** code | ~22 tok/s |
+| **Ternary-Bonsai-27B** (2-bit) | **1.15×** code (`--max-draft auto`) | ~29 tok/s |
+
+<sub>\*\* Qwen3.6-27B works and is lossless, but it's not a speed pick yet: the only drafter
+published for it so far is a community checkpoint with modest acceptance — a better-qualified
+drafter would lift this row. See [Results at a glance](#results-at-a-glance) for the caveats.</sub>
+
+<sub>Target precision: the quants shown are each model's measured best — ratios are
+*non-monotone* in bits and peak at **8-bit** on current MLX (full Ornith sweep: 4-bit 1.38× ·
+8-bit 2.17× · bf16 1.54× on code; bf16 loses in both ratio *and* absolute speed because MLX's
+unquantized matmul pays a ~2× cost cliff at verify width 2). Details in
+[Results at a glance](#results-at-a-glance).</sub>
+
+**Copy-heavy code editing goes further:** when the model re-emits or refactors code already in its
+context (the daily agent/assistant workload), match-scaled lookup drafts reach **4.5× on Gemma-12B**
+(75 tok/s) and **3.6× on Ornith-9B** (93 tok/s). Any model *not* listed still gets drafter-free
+lookup speculation via `--mode auto`.
 
 ## Install
 
@@ -142,8 +172,19 @@ anything else, add `--drafter <repo>`. Run `mlx-dspark models` to print this tab
 | `mlx-community/Qwen3-8B-8bit`        | `deepseek-ai/dspark_qwen3_8b_block7`   | `z-lab/Qwen3-8B-DFlash-b16`  | ~11 GB |
 | `mlx-community/gemma-4-12B-it-8bit`  | `deepseek-ai/dspark_gemma4_12b_block7` | `z-lab/gemma4-12B-it-DFlash` | ~15 GB |
 | `prism-ml/Ternary-Bonsai-27B-mlx-2bit` | `Rahim/Ternary-Bonsai-27B-dspark`    | — | ~12 GB |
+| `mlx-community/Qwen3.6-27B-4bit`     | `Avesed/Qwen3.6-27B-DSpark` (community) | — | ~20 GB |
+| `mlx-community/Ornith-1.0-9B-8bit`   | `stanleyphoong/Ornith-1.0-9B-DSpark` (community) | — | ~13 GB |
 
 *Peak RAM* is measured on an M4 Pro (8-bit target + 4-bit drafter + KV cache); add headroom for macOS.
+Rows marked *(community)* use drafters published by the community, not by DeepSeek — quality varies more
+than with the official checkpoints, and it shows up directly as acceptance length (= your speedup).
+The **Ornith** drafter is the strong case: rigorously qualified by its author (17/17 gates, 95% of the
+DSpark paper's reference acceptance) and it produces the best chat speedups in this table. The
+**Qwen3.6-27B** drafter is solid but accepts below DeepSeek's official drafters (~2.1 vs ~2.6–2.8 at
+cap 2 on code — hence the smaller speedup), is English-centric (Chinese accepts poorly, per its own
+card), and was trained against a W4A16 quant — so pair it with the **4-bit** target: that's its
+*matched* precision, and we measured the 8-bit target *lowering* its acceptance (any `Qwen3.6-27B-*`
+quant still resolves the drafter if you want to try; see the results footnote).
 A 4-bit target (`--model …-it-4bit`) roughly halves the target's share (fits smaller Macs). **Use the
 matched *instruct* target** the drafter was trained against — a base model drops acceptance sharply. The
 legacy `--family qwen3|gemma4` flags still work but are deprecated in favor of `--model`.
@@ -244,6 +285,8 @@ an M4 Pro, warm (code prompt unless marked chat):
 | **Qwen3-8B** | **1.90×** | 0.86× full block (1.47× at cap 2) | **DSpark** |
 | **Qwen3-4B** | **1.64×** | modest | **DSpark** |
 | **Ternary-Bonsai-27B** | **1.15×** code (`--max-draft auto`) | — | **DSpark** (auto) |
+| **Qwen3.6-27B** (4-bit, hybrid) | **1.42×** code · **1.78×** math · 1.27× chat | — | **DSpark** (auto) |
+| **Ornith-1.0-9B** (8-bit, hybrid) | **2.17×** code · **2.44×** math · **2.11×** chat (cap 3) | — | **DSpark** (auto) |
 
 This is a *version-dependent* verdict worth knowing about: on mlx 0.31, verify cost rose steeply with the
 number of tokens verified, which made DFlash's full 16-block the winner on Gemma-12B code/math (~2.1× vs
@@ -269,6 +312,26 @@ lifted every row well past the mlx-0.31 numbers this README previously carried):
 | **Qwen3-8B**    | ~2.58 | 28.7 tok/s | 54.4 tok/s | **1.90×** |
 | **Qwen3-4B**    | ~2.33 | 51.3 tok/s | 84.1 tok/s | **1.64×** |
 | **Ternary-Bonsai-27B** (2-bit, hybrid) | ~2.88 | 25.5 tok/s | 29.4 tok/s | **1.15×** (v0.4.2 exact rollback) |
+| **Qwen3.6-27B** (4-bit, hybrid)² | ~2.12 | 15.2 tok/s | 21.6 tok/s | **1.42×** (1.78× math at cap 3) |
+| **Ornith-1.0-9B** (8-bit, hybrid)² | ~3.19 | 27.9 tok/s | 60.9 tok/s | **2.17×** code (2.44× math, 2.11× chat, cap 3) |
+
+² Community-drafter rows. Qwen3.6-27B runs a **4-bit** target (its drafter's matched
+precision — trained against a W4A16 quant); code at cap 2 shown, `--max-draft auto` settles at
+cap 3; unlike 2-bit Bonsai, chat stays positive (1.27×). An 8-bit target was measured and is
+NOT recommended here: acceptance *drops* (the drafter is 4-bit-native), and while `--max-draft
+auto` still reaches ~2.1× against the slower 8-bit baseline, the 4-bit target is faster in
+absolute tok/s everywhere. Rule of thumb: **match the target's precision to what the drafter
+was trained against** — Ornith's drafter (bf16-qualified) wants 8-bit, Avesed's (W4A16) wants 4-bit. Ornith-1.0-9B (an agentic-coding
+qwen3_5 hybrid, drafter qualified against the bf16 verifier) runs the **8-bit** house
+sweet spot — the first target here with chat above 2× — and its acceptance is so high on code
+(p≈0.96/position) that auto-cap drives the cap to the full block of 7. The **4-bit** Ornith
+target trades the ratio for absolute speed: ~1.4–1.55× but 60–76 tok/s (baseline 49.3) —
+pick 4-bit for peak tok/s, 8-bit for quality and the headline ratio; the same drafter
+auto-resolves for both. And don't bother with a **bf16** target for speculation: we swept it
+(Ornith bf16: 1.54× code at cap 3, 22.9 tok/s) — the ratio is *non-monotone* in bits and
+peaks at 8-bit, because MLX's unquantized matmul pays a ~2× cost cliff at verify width 2
+where the quantized kernels stay flat. bf16 is slower than 8-bit in both ratio *and*
+absolute speed here.
 
 Baselines are this harness's pipelined greedy loop, which measures at parity with `mlx_lm.generate`
 (the Qwen3-4B baseline is the same 51–52 tok/s either way). All paths produce **identical** output to
@@ -276,6 +339,13 @@ plain decoding — they're just faster. Chat content accepts less than code ever
 Bonsai target chat lands ~break-even (its verify rows are compute-bound), and `--max-draft auto`
 adapts or parks where speculation would lose (see the Bonsai section). Why a Mac can't go much
 higher and the cost model are below.
+
+The table is *fresh-generation* content. On **copy-heavy editing** — the model re-emitting or
+refactoring code already in its context — match-scaled lookup drafts (0.5.0, on by default) go well
+past it: Gemma-12B file re-emission 3.03× → **4.51×** (75 tok/s), rename-refactor 4.33×; Ornith-9B
+rename-refactor 2.79× → **3.57×** (93 tok/s), re-emission 2.45× — outputs still bit-identical, chat
+and fresh code unchanged. See the hybrid-drafting bullet in
+[Flags that matter](#benchmarks--deep-dive) for how it works.
 The deep-dive's multi-prompt DSpark-vs-DFlash tables are mlx-0.31.2-era and are kept as the last full
 sweep — 0.32 shifted that balance toward DSpark (spot-checked; see that section's note).
 
@@ -440,6 +510,12 @@ is unchanged):
   context (quoting, code edits, repeats), that free continuation is verified instead of running the drafter
   that round, so copy-heavy spans commit several tokens per round. Composes losslessly; `--no-lookup-drafts`
   turns it off. `--mode lookup` runs the same n-gram speculation with **no drafter at all**, for any target.
+  **Match-scaled long drafts** (`--lookup-long-draft`, default 32): a copy run whose context matches ≥8
+  tokens deep earns drafts up to ~2× the matched length — verify width 16–32 is a measured plateau on
+  M-series (~2.5× the cost of one step), so verbatim spans commit ~20–30 tokens per forward. Measured
+  (8-bit, M4 Pro, outputs bit-identical): gemma-12B file re-emission **3.0×→4.5×** (75 tok/s), Ornith-9B
+  rename-edit **2.8×→3.6×** (93 tok/s); chat unchanged. An acceptance gate parks the scaling on
+  insertion-heavy edits (measured neutral there).
 - **DFlash** — `--max-draft 0` (full 16-block) is its native point and reaches ~6 accepted tokens on
   code/math; on current mlx that still measures below DSpark cap-2 on this M4 Pro (see the pick table),
   so treat DFlash as the head-to-head benchmark option rather than the speed pick. Short caps on open

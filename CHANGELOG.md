@@ -2,6 +2,54 @@
 
 All notable changes to `mlx-dspark`. Versions follow [SemVer](https://semver.org/) (pre-1.0: minor-ish features land as patch bumps).
 
+## [0.5.0] — 2026-07-18 — community DSpark drafters: Ornith-1.0-9B (chat finally >2×) + Qwen3.6-27B + match-scaled long lookup drafts
+
+### Added
+- **Match-scaled long lookup drafts** (`--lookup-long-draft`, default 32; dspark hybrid +
+  lookup mode): when the current context matches an earlier occurrence ≥8 tokens deep (a
+  real copy run — re-emitting a file, mechanical edits, quoting), the free n-gram draft
+  grows to ~2× the matched length instead of the flat 6, up to the ceiling. Verify width
+  16–32 is a measured *plateau* on M-series (≈2.5× the cost of a single step, 8-bit,
+  M4 Pro), so verbatim spans commit ~20–30 tokens per target forward. Measured (M4 Pro,
+  8-bit targets, bit-identical outputs): gemma-4-12B file re-emission **3.03×→4.51×**
+  (75 tok/s), rename-edit 3.03×→4.33×; Ornith-1.0-9B rename-edit **2.79×→3.57×**
+  (93 tok/s), re-emission 2.18×→2.45×; chat unchanged (the scaling needs deep-match
+  evidence a bare 4–5-gram hit doesn't provide). An acceptance gate parks the scaling
+  when long drafts keep getting chopped early (insertion-heavy edits measured neutral)
+  and probes back in every 8 lookup rounds. Inspired by llama.cpp's `ngram-mod` drafter
+  (24-token match context → 48–64-token drafts) after a study of its DFlash n-gram stack.
+- **DeepReinforce Ornith-1.0-9B** (qwen3_5 hybrid, agentic coding):
+  `--model mlx-community/Ornith-1.0-9B-8bit` auto-resolves the community drafter
+  `stanleyphoong/Ornith-1.0-9B-DSpark` (rigorously qualified by its author: 17/17 gates,
+  95% of the DSpark paper's reference acceptance). Measured on an M4 Pro at cap 3:
+  **2.17× code / 2.44× math / 2.11× chat** (59–69 tok/s vs a 27.9 tok/s baseline) — the
+  first target here with chat above 2×; `--max-draft auto` drives the cap to the full
+  block of 7 on code. The 4-bit target trades ratio for absolute speed (1.38–1.55× at
+  60–76 tok/s); the same drafter resolves for any quant.
+- **Qwen3.6-27B**: `--model mlx-community/Qwen3.6-27B-4bit` auto-resolves the community
+  drafter `Avesed/Qwen3.6-27B-DSpark` — 1.42× code / 1.78× math / 1.27× chat (M4 Pro,
+  cap 2/3). Community-drafter caveats apply: acceptance runs below DeepSeek's official
+  drafters, training data is English-centric (Chinese accepts poorly), and the drafter is
+  W4A16-native so the **4-bit** target is its matched precision — an 8-bit target was
+  measured and *lowers* acceptance (auto-cap still reaches ~2.1× against the slower 8-bit
+  baseline, but 4-bit is faster in absolute tok/s everywhere).
+- **qwen3_5-flavored drafter backbones** (what Ornith needed), config-driven on the
+  existing qwen3 family: gated q_proj (per-head [q ‖ gate], attention output ×
+  sigmoid(gate)), partial rotary (`rope_dims`), and **offset RMSNorm weights** — qwen3_5
+  checkpoints store every norm weight as an offset from one ((1+w)·x̂); `load_drafter`
+  materializes the +1 at load. Loading them as plain scales silently collapses acceptance
+  to ~1.25 with no error anywhere, which is exactly how it was found.
+
+### Changed
+- Drafter-precision guidance, confirmed from both directions this release: **run the
+  target at the precision the drafter was trained against** (Ornith bf16-qualified →
+  8-bit target; Avesed W4A16 → 4-bit target). The README pick tables reflect it.
+
+### Fixed
+- Drafter auto-resolve no longer re-downloads a model that already exists in the plain-dir
+  cache (`~/.cache/mlx_dspark/models/<repo basename>`) — previously `--model` with a local
+  target path still pulled the registry drafter from the Hub (6.1 GB for Ornith).
+
 ## [0.4.3] — 2026-07-17 — fresh installs work again with mlx-vlm 0.6.5
 
 ### Fixed

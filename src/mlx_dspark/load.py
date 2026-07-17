@@ -71,6 +71,27 @@ REGISTRY = [
     {"id": "ternary-bonsai-27b", "target": "prism-ml/Ternary-Bonsai-27B-mlx-2bit",
      "dspark": "Rahim/Ternary-Bonsai-27B-dspark",
      "ram": "~12 GB"},
+    # Qwen3.6-27B (qwen3_5 hybrid — the full-precision sibling of Ternary-Bonsai above; same
+    # 64-layer/5120-hidden shape, same tap layers). Community drafter by Avesed: its config says
+    # architectures=["DFlashDraftModel"] (their vLLM-fork class label) and carries target-config
+    # noise (attn_output_gate etc.), but the weights are a standard DeepSpec-standalone DSpark
+    # checkpoint with a plain dense-qwen3 backbone — config.py parses it as family "qwen3" and
+    # ignores the noise (tests/test_formats.py locks this in). Trained on-policy against a
+    # W4A16 (4-bit) quant of Qwen/Qwen3.6-27B, so a 4-bit mlx target is the matched precision;
+    # English-centric (accepts ~4.1-4.7 code/math, ~2.6 chat-EN, ~1.7 chat-ZH per its card).
+    {"id": "qwen3.6-27b", "target": "mlx-community/Qwen3.6-27B-4bit",
+     "dspark": "Avesed/Qwen3.6-27B-DSpark",
+     "ram": "~20 GB"},
+    # DeepReinforce Ornith-1.0-9B (qwen3_5 hybrid, agentic coding). Community drafter by
+    # stanleyphoong — DeepSpec-standalone layout with a qwen3_5-flavored backbone (gated
+    # q_proj + partial rotary; handled by the qwen3 config branch's gated_q_proj/rope_dims
+    # knobs). Ships calibrated confidence_temperatures (unused by fixed/auto cap modes).
+    # 8-bit default (house sweet spot, and this drafter was qualified against the bf16
+    # verifier): measured 2.17×/2.44×/2.11× code/math/chat at cap 3 vs 1.38×/1.47×/1.23×
+    # on the 4-bit target — 4-bit trades those ratios for ~10-15% more absolute tok/s.
+    {"id": "ornith-1.0-9b", "target": "mlx-community/Ornith-1.0-9B-8bit",
+     "dspark": "stanleyphoong/Ornith-1.0-9B-DSpark",
+     "ram": "~13 GB"},
 ]
 
 # legacy `--family` / load_pair("qwen3") values -> a concrete target repo (deprecated).
@@ -165,6 +186,14 @@ def _resolve(repo_or_path: str) -> str:
         return ensure_converted(repo, filename)
     if os.path.isdir(repo_or_path):
         return repo_or_path
+    # Prefer the plain-dir model cache (~/.cache/mlx_dspark/models/<repo basename>) over a
+    # hub download: models fetched by hand (e.g. around a wedged huggingface_hub) live there,
+    # and auto-resolved drafters must not re-download 6 GB the user already has on disk.
+    local = os.path.join(
+        os.path.expanduser("~/.cache/mlx_dspark/models"),
+        os.path.basename(repo_or_path.rstrip("/")))
+    if os.path.isdir(local):
+        return local
     return snapshot_download(repo_or_path)
 
 
@@ -216,6 +245,15 @@ def load_drafter(
         print(f"[load_drafter] WARNING key mismatch:{detail}")
 
     drafter.load_weights(list(weights.items()), strict=not (missing or unexpected))
+
+    if config.offset_rms_norm:
+        # qwen3_5-style checkpoints store RMSNorm weights as offsets from one ((1+w)·x̂).
+        # Materialize the +1 so plain nn.RMSNorm computes the reference semantics (matches
+        # the reference's `weight + 1.0` fused path bit-for-bit in bf16). Skipping this
+        # leaves the context-fusion norm multiplying by ~0 → acceptance collapses to ~1.25.
+        for _, m in drafter.named_modules():
+            if isinstance(m, nn.RMSNorm):
+                m.weight = m.weight + 1.0
 
     if quantize:
         # Quantize Linear/Embedding weights; norms/scalars stay full precision. The GIDD

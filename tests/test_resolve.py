@@ -31,6 +31,33 @@ def test_no_cross_match_between_sizes():
         "deepseek-ai/dspark_qwen3_8b_block7"
 
 
+def test_qwen36_27b_resolves_avesed_drafter_quant_agnostic():
+    for repo in ("mlx-community/Qwen3.6-27B-4bit", "mlx-community/Qwen3.6-27B-8bit",
+                 "mlx-community/Qwen3.6-27B-OptiQ-4bit", "Qwen/Qwen3.6-27B",
+                 "some-org/Qwen3.6-27B-bf16"):
+        assert resolve(repo, mode="dspark")[1] == "Avesed/Qwen3.6-27B-DSpark", repo
+
+
+def test_qwen36_27b_no_cross_match_with_bonsai_or_dense_qwen3():
+    # Ternary-Bonsai is the same architecture but its drafter is variant-specific
+    assert resolve("prism-ml/Ternary-Bonsai-27B-mlx-2bit", mode="dspark")[1] == \
+        "Rahim/Ternary-Bonsai-27B-dspark"
+    # and the dense qwen3-4b/8b ids must not swallow the 3.6 naming (or vice versa)
+    assert resolve("mlx-community/Qwen3-4B-8bit", mode="dspark")[1] == \
+        "deepseek-ai/dspark_qwen3_4b_block7"
+
+
+def test_qwen36_27b_has_no_dflash_drafter():
+    with pytest.raises(ValueError, match="no built-in"):
+        resolve("mlx-community/Qwen3.6-27B-4bit", mode="dflash")
+
+
+def test_ornith_9b_resolves_community_drafter_quant_agnostic():
+    for repo in ("mlx-community/Ornith-1.0-9B-4bit", "mlx-community/Ornith-1.0-9B-8bit",
+                 "deepreinforce-ai/Ornith-1.0-9B"):
+        assert resolve(repo, mode="dspark")[1] == "stanleyphoong/Ornith-1.0-9B-DSpark", repo
+
+
 def test_legacy_family_alias():
     assert resolve("qwen3", mode="dspark")[0] == "mlx-community/Qwen3-4B-8bit"
     assert resolve(None, mode="dspark", family="gemma4")[0] == "mlx-community/gemma-4-12B-it-8bit"
