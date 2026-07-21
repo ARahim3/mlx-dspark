@@ -179,3 +179,38 @@ def test_ids_from_template_result_shapes():
 
     be = BatchEncoding(input_ids=[[7, 8, 9]])
     assert g._ids_from_template_result(be) == [7, 8, 9]
+
+
+# --------------------------------------------------------------------------- stop tokens
+
+
+class _MarkerTok:
+    """Tokenizer stub with a fixed vocab of special markers (ids mirror Gemma-4's)."""
+
+    def __init__(self, vocab):
+        self.vocab = vocab
+        self.unk_token_id = 3
+        self.eos_token_id = 1
+
+    def convert_tokens_to_ids(self, t):
+        return self.vocab.get(t, self.unk_token_id)
+
+
+def test_eos_includes_gemma4_tool_response_marker():
+    """After a tool call Gemma-4 emits <|tool_response> instead of <turn|>, handing back to
+    the harness. Its own response grammar terminates on either; if we don't stop there the
+    model hallucinates the tool result and keeps going until max_tokens — which a tool-calling
+    agent hits on every turn."""
+    from mlx_dspark.generate import eos_token_ids
+
+    ids = eos_token_ids(_MarkerTok({"<turn|>": 106, "<|tool_response>": 50, "<|turn>": 105}))
+    assert 106 in ids and 50 in ids
+    assert 105 not in ids            # turn *opener* must not stop generation
+
+
+def test_eos_filters_unknown_markers_to_unk():
+    from mlx_dspark.generate import eos_token_ids
+
+    ids = eos_token_ids(_MarkerTok({"<|im_end|>": 151645}))
+    assert 151645 in ids
+    assert 3 not in ids              # everything else resolves to unk and is dropped

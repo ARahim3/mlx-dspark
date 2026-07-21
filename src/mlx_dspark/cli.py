@@ -1,7 +1,11 @@
 """mlx-dspark command line.
 
 Subcommands:
-  serve      Start an OpenAI-compatible API server (LM Studio / openai SDK / curl).
+  serve      Start the API server: OpenAI (/v1/chat/completions) **and** Anthropic
+             (/v1/messages) on the same port, so LM Studio clients, the openai SDK, curl,
+             and Claude Code all talk to it.
+  claude     Launch Claude Code against a running ``serve``, configured for this process
+             only — your normal ``claude`` sessions are untouched.
   generate   One-shot local generation (DSpark / DFlash / lookup / baseline). This is also
              the default when no subcommand is given, so the historical flat invocation
              ``python -m mlx_dspark --prompt ...`` keeps working unchanged.
@@ -15,11 +19,16 @@ Run ``mlx-dspark <cmd> -h`` for a command's flags.
 from __future__ import annotations
 
 import argparse
+import json
+import os
+import shutil
 import sys
+import urllib.error
+import urllib.request
 
 from .load import REGISTRY
 
-_SUBCOMMANDS = ("serve", "generate", "benchmark", "models", "doctor")
+_SUBCOMMANDS = ("serve", "claude", "generate", "benchmark", "models", "doctor")
 
 
 def _emit(s: str) -> None:
@@ -231,6 +240,11 @@ def cmd_serve(argv: list[str]) -> None:
                     help="micro-batch up to N concurrently-queued requests through one batched "
                          "target forward (dense mlx-lm target + dspark/baseline; ~1.5-2.5x "
                          "aggregate throughput at 2-4 concurrent). 1 = serialized (default)")
+    ap.add_argument("--context-window", type=int, default=None,
+                    help="cap the prompt length (default: the target's own trained limit). "
+                         "An over-long request is refused with the message Claude Code "
+                         "recognises as a context limit, so it compacts and retries instead "
+                         "of failing; lower it to keep the KV cache inside your RAM budget.")
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=8080)
     ap.add_argument("--api-key", default=None,
@@ -286,11 +300,136 @@ def cmd_serve(argv: list[str]) -> None:
             lookup_long_draft=args.lookup_long_draft,
             batch_widths=(sorted({2, args.max_batch}) if args.max_batch > 1 else None),
             kv_bits=args.kv_bits or None,
+            context_window=args.context_window,
         )
     except ValueError as e:
         ap.error(str(e))
     engine = maybe_batch_engine(engine, args.max_batch)
     run_server(engine, host=args.host, port=args.port, api_key=args.api_key)
+
+
+# --------------------------------------------------------------------------- claude code
+
+
+def _probe_health(base: str, api_key: str | None, timeout: float = 3.0) -> dict:
+    """``GET {base}/health`` -> the server's self-description (model id, context window)."""
+    req = urllib.request.Request(base.rstrip("/") + "/health")
+    if api_key:
+        req.add_header("Authorization", f"Bearer {api_key}")
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return json.loads(r.read().decode("utf-8"))
+
+
+def claude_env(base: str, health: dict, api_key: str | None) -> dict:
+    """The environment that points one Claude Code process at this server.
+
+    Every name here is Claude Code's documented configuration surface, and all of it lives in
+    the *child process* — see :func:`cmd_claude` for why that matters.
+
+    * ``ANTHROPIC_BASE_URL`` sends requests here. On its own it is **not** enough: without a
+      credential variable Claude Code keeps using your saved claude.ai login for auth, which
+      means the session still counts against your subscription. ``ANTHROPIC_AUTH_TOKEN`` is
+      what actually takes over (and takes effect immediately — ``ANTHROPIC_API_KEY`` would
+      instead prompt for one-time approval), so we always set it, placeholder or not.
+    * ``ANTHROPIC_MODEL`` plus the per-alias ``ANTHROPIC_DEFAULT_*_MODEL`` variables point the
+      session model *and* every alias — including the ``haiku`` slot Claude Code uses for
+      background work like conversation titles — at the one model that's loaded. Without the
+      haiku mapping those background calls ask for a model this server has never heard of.
+    * ``CLAUDE_CODE_MAX_OUTPUT_TOKENS`` keeps requested output under the server's own cap.
+    * ``CLAUDE_CODE_AUTO_COMPACT_WINDOW`` triggers compaction below the model's real window —
+      but Claude Code clamps it to at least 100k, so setting it under that does nothing and we
+      skip it. Smaller windows are handled by the server's ``prompt is too long`` reply, which
+      Claude Code recognises and recovers from by compacting.
+    """
+    model = health.get("model") or "local"
+    label = f"{model} (mlx-dspark)"
+    desc = f"Local {health.get('mode', 'dspark')} on Apple Silicon via mlx-dspark"
+    env = dict(os.environ)
+    # A stale key/provider selection in the ambient environment would otherwise override or
+    # bypass the base URL we just set. Drop them for this child only.
+    for stale in ("ANTHROPIC_API_KEY", "CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX",
+                  "CLAUDE_CODE_USE_FOUNDRY", "CLAUDE_CODE_USE_MANTLE",
+                  "CLAUDE_CODE_USE_ANTHROPIC_AWS"):
+        env.pop(stale, None)
+    env["ANTHROPIC_BASE_URL"] = base.rstrip("/")
+    env["ANTHROPIC_AUTH_TOKEN"] = api_key or "mlx-dspark"
+    env["ANTHROPIC_MODEL"] = model
+    for alias in ("OPUS", "SONNET", "HAIKU", "FABLE"):
+        env[f"ANTHROPIC_DEFAULT_{alias}_MODEL"] = model
+        env[f"ANTHROPIC_DEFAULT_{alias}_MODEL_NAME"] = label
+        env[f"ANTHROPIC_DEFAULT_{alias}_MODEL_DESCRIPTION"] = desc
+    env["ANTHROPIC_SMALL_FAST_MODEL"] = model      # pre-2.x alias for DEFAULT_HAIKU_MODEL
+    out_cap = health.get("max_output_tokens")
+    if isinstance(out_cap, int) and out_cap > 0:
+        env["CLAUDE_CODE_MAX_OUTPUT_TOKENS"] = str(out_cap)
+    window = health.get("context_window")
+    if isinstance(window, int) and window >= 100_000:
+        env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] = str(int(window * 0.8))
+    return env
+
+
+def cmd_claude(argv: list[str]) -> None:
+    """Run Claude Code against a local mlx-dspark server, scoped to this process.
+
+    The whole design goal is that using it costs you nothing afterwards. Configuration is
+    passed as the launched process's environment and nothing else: no shell profile is edited,
+    no ``settings.json`` is written, no login is replaced. Your other Claude Code sessions —
+    running now or started later — keep their normal account, model, and endpoint, and this
+    one reverts the moment it exits. ``--print-env`` dumps the same variables if you'd rather
+    wire them in yourself.
+    """
+    ap = argparse.ArgumentParser(
+        prog="mlx-dspark claude",
+        description="Launch Claude Code against a running `mlx-dspark serve`. Configures the "
+                    "launched process only — other Claude Code sessions are unaffected.",
+        epilog="Anything after `--` is passed straight to claude, e.g. "
+               "`mlx-dspark claude -- --continue`.")
+    ap.add_argument("--url", default="http://127.0.0.1:8080",
+                    help="base URL of the running server (default http://127.0.0.1:8080)")
+    ap.add_argument("--api-key", default=None,
+                    help="the server's --api-key, if it was started with one")
+    ap.add_argument("--print-env", action="store_true",
+                    help="print the environment as shell exports instead of launching")
+    ap.add_argument("--print-settings", action="store_true",
+                    help="print a .claude/settings.local.json 'env' block instead of "
+                         "launching (project-scoped: applies to that project only)")
+    args, passthrough = ap.parse_known_args(argv)
+    if passthrough and passthrough[0] == "--":
+        passthrough = passthrough[1:]
+
+    try:
+        health = _probe_health(args.url, args.api_key)
+    except urllib.error.HTTPError as e:
+        if e.code == 401:
+            ap.error(f"{args.url} rejected the credential — pass the server's --api-key value "
+                     f"with --api-key")
+        ap.error(f"{args.url}/health returned HTTP {e.code}")
+    except (urllib.error.URLError, OSError, ValueError):
+        ap.error(f"no mlx-dspark server at {args.url}.\n"
+                 f"  Start one in another terminal, e.g.:\n"
+                 f"    mlx-dspark serve --model mlx-community/Qwen3-8B-8bit\n"
+                 f"  then re-run `mlx-dspark claude`.")
+
+    env = claude_env(args.url, health, args.api_key)
+    added = {k: v for k, v in env.items() if os.environ.get(k) != v}
+
+    if args.print_settings:
+        print(json.dumps({"env": {k: v for k, v in added.items()
+                                  if k.startswith(("ANTHROPIC_", "CLAUDE_CODE_"))}}, indent=2))
+        return
+    if args.print_env:
+        for k, v in sorted(added.items()):
+            print(f"export {k}={v!r}")
+        return
+
+    exe = shutil.which("claude")
+    if exe is None:
+        ap.error("`claude` not found on PATH. Install Claude Code "
+                 "(https://claude.com/claude-code), or use --print-env / --print-settings.")
+    print(f"claude code -> {args.url}  ·  model {health.get('model')} "
+          f"({health.get('mode')})  ·  this session only", flush=True)
+    # exec (not spawn): Claude Code owns the TTY, signals, and the exit code directly.
+    os.execve(exe, [exe, *passthrough], env)
 
 
 # --------------------------------------------------------------------------- benchmark
@@ -524,6 +663,8 @@ def main(argv: list[str] | None = None) -> None:
         return
     if sub == "serve":
         return cmd_serve(argv[1:])
+    if sub == "claude":
+        return cmd_claude(argv[1:])
     if sub == "models":
         return cmd_models(argv[1:])
     if sub == "doctor":

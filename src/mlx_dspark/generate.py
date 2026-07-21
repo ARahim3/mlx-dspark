@@ -109,8 +109,17 @@ def encode_prompt(tokenizer, prompt: str, use_chat: bool = True) -> list[int]:
 
 
 def eos_token_ids(tokenizer) -> set[int]:
-    """Collect stop-token ids: eos + Gemma turn-end markers (Gemma-4 uses <turn|>=106;
-    note <end_of_turn> is the UNK id in Gemma-4, so it must be filtered out)."""
+    """Collect stop-token ids: eos + turn-end markers (Gemma-4 uses <turn|>=106; note
+    <end_of_turn> is the UNK id in Gemma-4, so it must be filtered out).
+
+    ``<|tool_response>`` is a turn-end marker too, and a load-bearing one: after a tool call
+    Gemma-4 does *not* emit ``<turn|>`` — it emits ``<|tool_response>`` to hand back to the
+    harness for the tool result. Its own response grammar
+    (``tokenizer_config.json`` -> ``response_schema.x-regex``) terminates on either. Without it
+    the model runs straight past its turn and hallucinates the tool result and the following
+    conversation, burning the whole ``max_tokens`` budget on fiction — which is exactly what a
+    tool-calling agent hits on every single turn.
+    """
     ids: set[int] = set()
     e = getattr(tokenizer, "eos_token_ids", None)
     if isinstance(e, int):
@@ -121,8 +130,9 @@ def eos_token_ids(tokenizer) -> set[int]:
     if isinstance(e1, int):
         ids.add(e1)
     unk = getattr(tokenizer, "unk_token_id", None)
-    # Gemma-4 (<turn|>), Gemma-3 (<end_of_turn>), Qwen (<|im_end|>), raw eos
-    for t in ("<turn|>", "<end_of_turn>", "<|im_end|>", "<|endoftext|>", "<eos>"):
+    # Gemma-4 (<turn|>, <|tool_response>), Gemma-3 (<end_of_turn>), Qwen (<|im_end|>), raw eos
+    for t in ("<turn|>", "<|tool_response>", "<end_of_turn>", "<|im_end|>",
+              "<|endoftext|>", "<eos>"):
         try:
             i = tokenizer.convert_tokens_to_ids(t)
         except Exception:

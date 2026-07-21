@@ -31,7 +31,9 @@ import traceback
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import urlsplit
 
+from . import anthropic_api as A
 from .generate import (
     GenResult,
     StopStreaming,
@@ -43,9 +45,31 @@ from .generate import (
 from .load import apply_wired_limit, load_dflash, load_drafter, load_target, resolve_mode
 from .lookup import lookup_generate
 from .prefix_cache import PrefixCache, target_cache_reusable
-from .tools import normalize_tool_messages, parse_tool_calls
+from .tools import normalize_tool_messages, parse_tool_calls, schema_types
 
 MODES = ("dspark", "dflash", "lookup", "baseline")
+
+
+def _context_window(target_repo: str) -> int | None:
+    """The target's trained context length, from its ``config.json``.
+
+    Used to reject an over-long prompt with the message Claude Code recognises as a context
+    limit (see :func:`~mlx_dspark.anthropic_api.context_overflow_error`) instead of letting it
+    run off the end of the model's positions. Multimodal repos nest the text config, so check
+    both. ``None`` when it can't be determined — the check is then skipped.
+    """
+    try:
+        from .load import _resolve
+
+        with open(os.path.join(_resolve(target_repo), "config.json")) as f:
+            cfg = json.load(f)
+    except Exception:  # noqa: BLE001 — no file / no net / bad json -> no limit enforced
+        return None
+    for c in (cfg, cfg.get("text_config") or {}):
+        n = c.get("max_position_embeddings")
+        if isinstance(n, int) and n > 0:
+            return n
+    return None
 
 
 def _generation_defaults(target_repo: str) -> dict:
@@ -103,6 +127,7 @@ class Engine:
         prefix_cache_slots: int = 2,
         lookup_drafts: bool = True,
         lookup_long_draft: int = 32,
+        context_window: int | None = None,
         executor: ThreadPoolExecutor | None = None,
     ):
         self.target = target
@@ -121,6 +146,7 @@ class Engine:
         self.prefix_cache_slots = max(1, prefix_cache_slots)
         self.lookup_drafts = lookup_drafts                 # hybrid n-gram drafts in dspark mode
         self.lookup_long_draft = lookup_long_draft         # match-scaled long-draft ceiling
+        self.context_window = context_window               # target's trained positions, if known
         apply_wired_limit()                                # keep the weights resident
         # chat-template kwargs applied to every request unless the request overrides them
         # (e.g. {"enable_thinking": False} to silence Qwen3's <think> blocks by default).
@@ -187,6 +213,7 @@ class Engine:
         lookup_long_draft: int = 32,
         batch_widths: list[int] | None = None,   # e.g. [2, max_batch]: calibrate (B,cap) grid
         kv_bits: int | None = None,              # quantize the target KV cache (4/8)
+        context_window: int | None = None,       # override the target's own limit
     ) -> "Engine":
         if mode != "auto" and mode not in MODES:
             raise ValueError(f"mode must be one of {MODES} or 'auto', got {mode!r}")
@@ -251,6 +278,7 @@ class Engine:
                    default_max_tokens=default_max_tokens, max_tokens_cap=max_tokens_cap,
                    prefix_cache_slots=prefix_cache_slots, lookup_drafts=lookup_drafts,
                    lookup_long_draft=lookup_long_draft,
+                   context_window=context_window or _context_window(target_repo),
                    executor=executor)
 
     # --- generation ---
@@ -673,6 +701,19 @@ def _logprobs_completions(res: GenResult, tokenizer) -> dict:
     return {"tokens": toks, "token_logprobs": tlp, "top_logprobs": tops, "text_offset": []}
 
 
+def _sampling(req: dict, defaults: dict) -> tuple[float, float, int]:
+    """(temperature, top_p, top_k) for a request: explicit request value > the model's
+    ``generation_config`` recommendation > library default. Shared by the OpenAI and
+    Anthropic routes — it matters most on the latter, where Claude Code sends
+    ``temperature`` but never ``top_p``/``top_k``, so the model's own nucleus settings are
+    what keep a temperature-1 agent request sane."""
+    def pick(key, fallback):
+        v = req.get(key)
+        return defaults.get(key, fallback) if v is None else v
+
+    return float(pick("temperature", 0.0)), float(pick("top_p", 1.0)), int(pick("top_k", 0))
+
+
 def _clamp_tokens(v, default: int = 2048, cap: int = 32768) -> int:
     """Requested max_tokens, clamped to [1, cap]; ``default`` when absent/invalid. The cap
     is configurable (``--max-tokens-cap``) — thinking models routinely exceed the old 8192."""
@@ -694,7 +735,18 @@ def make_handler(engine: Engine, api_key: str | None):
         protocol_version = "HTTP/1.1"
         server_version = "mlx-dspark"
 
+        def setup(self):
+            super().setup()
+            # SSE frames are written from the request thread and, during long prefills, from
+            # the keep-alive heartbeat timer — one lock keeps frames from interleaving.
+            self._wlock = threading.Lock()
+
         # -- low-level replies --
+        def _route(self) -> str:
+            """Path with the query string and trailing slash removed. Claude Code posts to
+            ``/v1/messages?beta=true``, so routing on ``self.path`` verbatim would 404."""
+            return urlsplit(self.path).path.rstrip("/") or "/"
+
         def _cors(self):
             self.send_header("Access-Control-Allow-Origin", "*")
             self.send_header("Access-Control-Allow-Headers", "Authorization, Content-Type")
@@ -722,16 +774,23 @@ def make_handler(engine: Engine, api_key: str | None):
             self._cors()
             self.end_headers()
 
-        def _sse(self, obj: dict):
-            self.wfile.write(f"data: {json.dumps(obj)}\n\n".encode("utf-8"))
-            self.wfile.flush()
+        def _sse(self, obj: dict, event: str | None = None):
+            """One SSE frame. Anthropic's stream is a *named*-event stream (``event: <type>``
+            before the data line); OpenAI's is unnamed, so ``event`` is optional."""
+            head = f"event: {event}\n" if event else ""
+            with self._wlock:
+                self.wfile.write(f"{head}data: {json.dumps(obj)}\n\n".encode("utf-8"))
+                self.wfile.flush()
 
         # -- auth --
         def _authed(self) -> bool:
             if not api_key:
                 return True
-            auth = self.headers.get("Authorization", "")
-            return auth == f"Bearer {api_key}"
+            # Which header carries the credential depends on how the client was configured:
+            # ANTHROPIC_AUTH_TOKEN -> Authorization: Bearer, ANTHROPIC_API_KEY / an
+            # apiKeyHelper -> x-api-key (a helper sends both). Accept either.
+            return (self.headers.get("Authorization", "") == f"Bearer {api_key}"
+                    or self.headers.get("x-api-key", "") == api_key)
 
         def log_message(self, fmt, *args):  # quieter default logging
             return
@@ -744,35 +803,62 @@ def make_handler(engine: Engine, api_key: str | None):
             self._cors()
             self.end_headers()
 
+        def do_HEAD(self):
+            # Claude Code opens with a best-effort `HEAD /` connectivity probe.
+            self.send_response(200)
+            self.send_header("Content-Length", "0")
+            self.send_header("Connection", "close")
+            self._cors()
+            self.end_headers()
+
         def do_GET(self):
-            if self.path.rstrip("/") == "/health":
-                return self._send_json(200, {"status": "ok", "model": engine.model_id,
-                                             "mode": engine.mode})
-            if self.path.rstrip("/") in ("/v1/models", "/models"):
+            route = self._route()
+            if route == "/health":
+                return self._send_json(200, {
+                    "status": "ok", "model": engine.model_id, "mode": engine.mode,
+                    "target": engine.target_repo, "drafter": engine.drafter_repo,
+                    "context_window": getattr(engine, "context_window", None),
+                    "max_output_tokens": engine.max_tokens_cap,
+                })
+            if route in ("/v1/models", "/models"):
                 return self._send_json(200, self._models_payload())
-            if self.path.rstrip("/") == "/metrics":
+            if route == "/metrics":
                 return self._send_json(200, engine.metrics())
             return self._send_error(404, f"unknown route {self.path}", "not_found")
 
         def do_POST(self):
+            route = self._route()
+            anthropic = route.endswith("/messages") or route.endswith("/messages/count_tokens")
             if not self._authed():
+                if anthropic:
+                    return self._send_json(401, A.error_body("invalid api key",
+                                                             "authentication_error"))
                 return self._send_error(401, "invalid api key", "authentication_error")
             length = int(self.headers.get("Content-Length", 0) or 0)
             raw = self.rfile.read(length) if length else b""
             try:
                 req = json.loads(raw or b"{}")
             except json.JSONDecodeError as e:
+                if anthropic:
+                    return self._send_json(400, A.error_body(f"invalid JSON body: {e}"))
                 return self._send_error(400, f"invalid JSON body: {e}")
 
-            route = self.path.rstrip("/")
             try:
                 if route in ("/v1/chat/completions", "/chat/completions"):
                     return self._chat(req)
                 if route in ("/v1/completions", "/completions"):
                     return self._completions(req)
+                if route in ("/v1/messages", "/messages"):
+                    return self._messages(req)
+                if route in ("/v1/messages/count_tokens", "/messages/count_tokens"):
+                    return self._count_tokens(req)
             except (BrokenPipeError, ConnectionResetError):
                 return  # client hung up mid-stream; nothing more to do
             except Exception as e:  # keep the server alive on a bad request
+                if anthropic:
+                    traceback.print_exc()
+                    return self._send_json(500, A.error_body(
+                        f"generation failed: {type(e).__name__}: {e}", "api_error"))
                 # Log the full traceback: a per-request 500 is often an intermittent,
                 # state-dependent edge (issue #5) that the client-side message alone can't
                 # localize — without this the only record of WHERE it failed is discarded.
@@ -790,6 +876,9 @@ def make_handler(engine: Engine, api_key: str | None):
                     "object": "model",
                     "created": engine.created,
                     "owned_by": "mlx-dspark",
+                    # `display_name` is what Anthropic-format clients (Claude Code's gateway
+                    # model discovery) label the entry with; harmless for OpenAI clients.
+                    "display_name": f"{engine.model_id} (mlx-dspark {engine.mode})",
                     "x_mlx_dspark": {"mode": engine.mode, "target": engine.target_repo,
                                      "drafter": engine.drafter_repo},
                 }],
@@ -822,21 +911,131 @@ def make_handler(engine: Engine, api_key: str | None):
             prompt_ids = list(engine.tokenizer.encode(prompt))
             self._run(req, prompt_ids, chat=False)
 
+        # -- Anthropic Messages API (the dialect Claude Code speaks) --
+        def _encode_anthropic(self, req: dict) -> list[int]:
+            """Prompt ids for an Anthropic request. Raises ValueError for a bad body."""
+            messages = req.get("messages")
+            if not isinstance(messages, list) or not messages:
+                raise ValueError("'messages': must be a non-empty array")
+            tkw = dict(engine.template_defaults)
+            tools = A.convert_tools(req.get("tools"))
+            if tools:
+                tkw["tools"] = tools
+            th = req.get("thinking")
+            if isinstance(th, dict) and th.get("type") == "disabled":
+                # Map the request onto the model's own switch rather than only hiding the
+                # output: a reasoning model that isn't asked to think is also much faster,
+                # which is what a client disabling thinking is actually after.
+                tkw["enable_thinking"] = False
+            conv = normalize_tool_messages(A.convert_messages(messages, req.get("system")))
+            return encode_messages(engine.tokenizer, conv, **tkw)
+
+        def _anthropic_prompt(self, req: dict):
+            """(prompt_ids, None) or (None, error_response_already_sent)."""
+            try:
+                return self._encode_anthropic(req), None
+            except ValueError as e:
+                return None, self._send_json(400, A.error_body(str(e)))
+            except Exception as e:  # noqa: BLE001 — template failures are the client's problem
+                return None, self._send_json(
+                    400, A.error_body(f"could not apply chat template: {e}"))
+
+        def _messages(self, req: dict):
+            prompt_ids, err = self._anthropic_prompt(req)
+            if prompt_ids is None:
+                return err
+            window = getattr(engine, "context_window", None)
+            if window and len(prompt_ids) >= window:
+                # Phrased so Claude Code's automatic compact-and-retry recognises it.
+                return self._send_json(400, A.context_overflow_error(len(prompt_ids), window))
+            temperature, top_p, top_k = _sampling(req, engine.sampling_defaults)
+            params = dict(
+                max_tokens=_clamp_tokens(req.get("max_tokens"), engine.default_max_tokens,
+                                         engine.max_tokens_cap),
+                temperature=temperature, top_p=top_p, top_k=top_k,
+                stop=A.norm_stop_sequences(req), seed=None,
+            )
+            model = req.get("model") or engine.model_id
+            # A reasoning model emits <think>…</think> whatever the request says; `thinking`
+            # only decides whether that becomes a thinking block or is dropped. Absent means
+            # emit it — silently discarding model output is the worse failure.
+            th = req.get("thinking")
+            want_thinking = not (isinstance(th, dict) and th.get("type") == "disabled")
+            # tool schemas type the XML tool-call form, whose values are raw text
+            schemas = schema_types(req.get("tools"))
+            if req.get("stream"):
+                return self._messages_stream(prompt_ids, params, model, want_thinking, schemas)
+            res = engine.generate(prompt_ids, on_text=None, **params)
+            body = A.build_message(res.text, model=model, input_tokens=len(prompt_ids),
+                                   output_tokens=res.num_tokens,
+                                   finish_reason=res.finish_reason, thinking=want_thinking,
+                                   schemas=schemas)
+            body["x_mlx_dspark"] = engine.spec_info(res)   # non-standard; clients ignore it
+            self._send_json(200, body)
+
+        def _prompt_opens_thinking(self, prompt_ids) -> bool:
+            """Whether the chat template left a ``<think>`` open at the end of the prompt, so
+            the stream starts *inside* a thinking block (see anthropic_api). Decoding the last
+            few ids is enough and costs nothing."""
+            try:
+                return A.prompt_opens_thinking(engine.tokenizer.decode(prompt_ids[-8:]))
+            except Exception:  # noqa: BLE001 — a tokenizer that can't decode just opts out
+                return False
+
+        def _messages_stream(self, prompt_ids, params, model, want_thinking=True, schemas=None):
+            stream = A.MessageStream(model=model, input_tokens=len(prompt_ids),
+                                     thinking=want_thinking, schemas=schemas,
+                                     in_thinking=self._prompt_opens_thinking(prompt_ids))
+            self._sse_start()
+            for name, payload in stream.start():
+                self._sse(payload, name)
+
+            # Prefill on a long agent prompt runs for seconds with nothing on the wire. A
+            # periodic ping (a real Anthropic event type) keeps the client's socket and any
+            # intermediary from timing out the request before the first token lands.
+            done = threading.Event()
+
+            def _heartbeat():
+                while not done.wait(15.0):
+                    try:
+                        self._sse({"type": "ping"}, "ping")
+                    except Exception:  # noqa: BLE001 — socket gone; the request thread reports it
+                        return
+
+            threading.Thread(target=_heartbeat, daemon=True).start()
+
+            def on_text(piece: str):
+                try:
+                    for name, payload in stream.delta(piece):
+                        self._sse(payload, name)
+                except (BrokenPipeError, ConnectionResetError) as e:
+                    raise StopStreaming() from e   # end cleanly, keep the prefix cache
+
+            try:
+                res = engine.generate(prompt_ids, on_text=on_text, **params)
+            finally:
+                done.set()
+            for name, payload in stream.finish(finish_reason=res.finish_reason,
+                                               output_tokens=res.num_tokens):
+                self._sse(payload, name)
+
+        def _count_tokens(self, req: dict):
+            """``POST /v1/messages/count_tokens``. Optional in the protocol — without it the
+            client estimates context usage locally — but exact here, since we tokenize with
+            the very model that will answer."""
+            prompt_ids, err = self._anthropic_prompt(req)
+            if prompt_ids is None:
+                return err
+            self._send_json(200, {"input_tokens": len(prompt_ids)})
+
         def _run(self, req: dict, prompt_ids: list[int], *, chat: bool):
             # request value > model's generation_config recommendation > library default —
             # explicit client settings always win; the model defaults only fill absences.
-            sd = engine.sampling_defaults
-
-            def _or_default(key: str, fallback):
-                v = req.get(key)
-                return sd.get(key, fallback) if v is None else v
-
+            temperature, top_p, top_k = _sampling(req, engine.sampling_defaults)
             params = dict(
                 max_tokens=_clamp_tokens(req.get("max_tokens") or req.get("max_completion_tokens"),
                                          engine.default_max_tokens, engine.max_tokens_cap),
-                temperature=float(_or_default("temperature", 0.0)),
-                top_p=float(_or_default("top_p", 1.0)),
-                top_k=int(_or_default("top_k", 0)),
+                temperature=temperature, top_p=top_p, top_k=top_k,
                 presence_penalty=float(req.get("presence_penalty") or 0.0),
                 frequency_penalty=float(req.get("frequency_penalty") or 0.0),
                 stop=_norm_stop(req.get("stop")),
@@ -991,6 +1190,7 @@ def run_server(engine: Engine, *, host: str = "127.0.0.1", port: int = 8080,
         print(f"  sampling defaults (model generation_config; requests override): "
               f"{engine.sampling_defaults}")
     print(f"  listening on {base}   (OpenAI base_url: {base}/v1)")
+    print(f"  claude code : ANTHROPIC_BASE_URL={base}   (or run `mlx-dspark claude`)")
     if api_key:
         print("  auth   : Bearer <api-key> required")
     print("=" * 64)

@@ -5,7 +5,8 @@
 <p align="center">
   <b>DeepSeek's DSpark <i>and</i> z-lab's DFlash speculative decoding — native on Apple Silicon via <a href="https://github.com/ml-explore/mlx">MLX</a>.</b>
   <br>Lossless drafters (same output, just faster) for <b>Gemma-4, Qwen3, Ornith-1.0, Qwen3.6-27B, and Bonsai-27B</b> targets —
-  <br>plus any matched DSpark / DFlash checkpoint. Run them at the CLI, from Python, or <b>serve an OpenAI-compatible API</b> to LM Studio / any local tool.
+  <br>plus any matched DSpark / DFlash checkpoint. Run them at the CLI, from Python, serve an <b>OpenAI-compatible API</b> to LM Studio / any local tool,
+  <br>or drive <b>Claude Code</b> with a model on your own Mac.
 </p>
 
 <p align="center">
@@ -86,7 +87,7 @@ library.
 You name the **target model** (`--model`, an HF repo or local path, exactly like `mlx-lm`); the matching
 drafter is resolved automatically for known targets (see [Models](#models)), or pass `--drafter`.
 
-### Serve an OpenAI-compatible API
+### Serve an API (OpenAI **and** Anthropic on one port)
 
 ```bash
 mlx-dspark serve --model mlx-community/Qwen3-8B-8bit        # → http://127.0.0.1:8080/v1
@@ -122,6 +123,81 @@ spec-decode gain is visible. **Continuous batching** (`--max-batch N`) serves co
 batched forward for ~2.5× aggregate throughput (see [Concurrent throughput](#concurrent-throughput));
 **prefix caching** (on by default) reuses the conversation prefix so multi-turn chat doesn't re-prefill
 each turn (~13× faster follow-up turns on a long shared context — see [Prefix caching](#prefix-caching)).
+
+### Use it from Claude Code
+
+The same server also speaks Anthropic's **Messages API**, which is the dialect
+[Claude Code](https://claude.com/claude-code) talks — so Claude Code can run entirely on a model
+on your Mac. Start the server, then in another terminal:
+
+```bash
+mlx-dspark serve --model mlx-community/Qwen3-8B-8bit --no-thinking   # terminal 1
+mlx-dspark claude                                                    # terminal 2
+```
+
+That's it — `mlx-dspark claude` finds the running server, points Claude Code at it, and hands over
+the terminal. Anything after `--` goes to `claude` (`mlx-dspark claude -- --continue`).
+
+**It changes nothing outside that one process.** The configuration is passed as the launched
+process's environment and nowhere else: no shell profile edited, no `settings.json` written, no login
+replaced. Your other Claude Code sessions — open now or started later — keep their normal account,
+model, and endpoint, and this one reverts the moment it exits. Your claude.ai login stays saved and
+untouched; Claude Code notes at startup that a credential variable takes precedence over it, which is
+just that notice. To wire it up yourself instead, `mlx-dspark claude --print-env` prints the shell
+exports and `--print-settings` prints a project-scoped `.claude/settings.local.json` block.
+
+Endpoints: `POST /v1/messages` (streaming and non-streaming), `POST /v1/messages/count_tokens`.
+Tool calling, multi-turn `tool_use`/`tool_result` history, `stop_sequences`, and system prompts are
+translated to whatever the loaded model's own chat template expects — including each family's tool
+syntax (Hermes JSON, Gemma-4, and the XML `<function=>` form) — and a reasoning model's `<think>` or
+`<|channel>thought` output is lifted into proper Anthropic `thinking` blocks rather than leaking as
+prose.
+
+**Measured** — each of these ran a real Claude Code session that read a buggy file and fixed it with
+the `Edit` tool (M4 Pro, `--no-thinking`, identical task):
+
+| target | accept length | prefix cache | wall clock |
+|---|---|---|---|
+| `mlx-community/Qwen3-8B-8bit` | 3.01 | on — 2 of 3 requests, ~26k tokens reused | **~2:20** |
+| `mlx-community/Ornith-1.0-9B-8bit` | **5.07** | off — hybrid target, recurrent state can't be reused | ~4:10 |
+| `mlx-community/gemma-4-12B-it-8bit` | 3.68 | on, but its sliding window wraps at this prompt size | ~4:10 |
+
+The ranking is the point: **Claude Code sends ~18–26k tokens of system prompt and tool schemas on
+every request**, so prefill dominates wall clock and the target that *reuses* it wins — Qwen3-8B is
+nearly 2× faster here despite the lowest accept length of the three. Ornith's 5.07 is the highest
+acceptance this project has measured anywhere (tool-call JSON is very predictable), but it spends
+the win on re-prefilling. Choose for prefix-cache compatibility first, drafter quality second.
+
+### Other agent clients
+
+The Anthropic endpoint isn't Claude Code–specific. [**pi**](https://github.com/earendil-works/pi-mono)
+works out of the box against either API — add a custom provider to `~/.pi/agent/models.json`:
+
+```json
+{ "providers": { "mlx-dspark": {
+    "baseUrl": "http://127.0.0.1:8080", "api": "anthropic-messages", "apiKey": "mlx-dspark",
+    "models": [{ "id": "Qwen3-8B-8bit", "contextWindow": 40960, "maxTokens": 8192 }] } } }
+```
+
+then `pi --provider mlx-dspark --model Qwen3-8B-8bit`. (Swap `"api"` for `"openai-completions"`
+and `"baseUrl"` for `http://127.0.0.1:8080/v1` to use the OpenAI endpoint instead — both work.)
+
+**pi is markedly better suited to a local model than Claude Code**, for one reason: its system
+prompt is **~1.5k tokens against Claude Code's ~18–26k**. Since prefill dominates, that lands
+directly on the clock — the same one-bug fix takes **~6 s** instead of ~2:20, and a four-tool
+task (read, two edits, read, write) finishes in **8.5 s at 24 tok/s** on Qwen3-8B. Ornith-1.0-9B
+runs the same task in 18.8 s. Gemma-4-12B doesn't converge on pi's tool protocol (on either
+endpoint, so it's the model, not the server) — use it with Claude Code instead.
+
+Practical notes for a local model:
+
+| | |
+|---|---|
+| **Use a tool-calling model** | These are tool-use agents first. Qwen3-8B and up handle it; smaller models flail. |
+| **Agent choice moves the clock more than model choice** | The client's prompt size is the dominant cost on a local model — a lean agent like pi is an order of magnitude faster on the same hardware and the same task. |
+| **`--no-thinking` is a speed knob, not a requirement** | Leaving it off works fine — reasoning is streamed as proper `thinking` blocks either way. It just costs: on Qwen3-8B the same Claude Code task ran 3:17 and 2762 output tokens with thinking vs ~2:20 and 169 without, since the model thinks before *every* tool call. A client sending `thinking: {"type": "disabled"}` gets the same effect per-request. Note it's a no-op on Gemma-4, whose template doesn't think by default. |
+| **Leave prefix caching on** | It is doing most of the work (see the table). Expect the first request of a session to be the slow one regardless. |
+| **Context** | An over-long request is refused with the wording Claude Code recognises as a context limit, so it compacts and retries instead of dying. `--context-window N` lowers the bar deliberately (e.g. to keep the KV cache inside your RAM budget). |
 
 ### One-shot generation (CLI)
 

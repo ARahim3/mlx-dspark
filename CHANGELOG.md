@@ -2,6 +2,102 @@
 
 All notable changes to `mlx-dspark`. Versions follow [SemVer](https://semver.org/) (pre-1.0: minor-ish features land as patch bumps).
 
+## [0.6.0] — 2026-07-21 — Claude Code support (Anthropic Messages API)
+
+### Added
+- **`POST /v1/messages` + `POST /v1/messages/count_tokens`** — the same server now speaks
+  Anthropic's Messages API alongside the OpenAI one, on the same port. This is what
+  **Claude Code** talks, so a model on your Mac can drive it. New module
+  `anthropic_api.py` holds the whole translation (request blocks ↔ chat-template messages,
+  generated text → content blocks / SSE events) and is pure and model-free, so it's covered
+  by unit tests rather than only end-to-end. Streaming is the real path: Claude Code consumes
+  SSE as it arrives and stalls on a server that buffers.
+- **`mlx-dspark claude`** — launches Claude Code against a running `serve`, configured for
+  **that process only**. No shell profile edited, no `settings.json` written, no login
+  replaced: other Claude Code sessions (running or future) are unaffected and this one
+  reverts on exit. `--print-env` / `--print-settings` emit the same configuration for manual
+  or project-scoped wiring. Sets the per-alias `ANTHROPIC_DEFAULT_*_MODEL` variables —
+  including the `haiku` slot Claude Code uses for background work — so nothing asks for a
+  model the server has never heard of, and drops a stale `ANTHROPIC_API_KEY` /
+  `CLAUDE_CODE_USE_*` from the child so ambient config can't override the base URL.
+- **`--context-window N`** — cap the prompt length below the target's own limit (RAM budget).
+  An over-long request is refused with Anthropic's `prompt is too long` wording, which is
+  what Claude Code's automatic compact-and-retry matches on — verified live: it recognised
+  the limit and reported it as a context problem instead of a failed request.
+- **Reasoning models get real `thinking` blocks.** Qwen3-class targets emit
+  `<think>…</think>` inside the generated text; Anthropic carries that as a separate content
+  block. It is now split out (streaming included, via a small state machine that defers
+  opening block 0 until its type is known) instead of rendering as assistant prose, and
+  `thinking: {"type": "disabled"}` maps onto the model's own `enable_thinking` switch so
+  disabling it actually makes the model faster rather than just hiding the output.
+
+### Fixed
+These were found only by running more than one model and more than one client — each is a case
+where one combination tolerated something another doesn't.
+- **Gemma-4 no longer runs past its own turn after a tool call** (affects *every* path,
+  including the OpenAI server and plain `generate` — not just the new endpoint). After emitting
+  a tool call Gemma-4 does not send `<turn|>`; it sends **`<|tool_response>`** to hand back to
+  the harness for the tool result, and its own response grammar terminates on either. That
+  token was missing from `eos_token_ids`, so generation continued and the model **hallucinated
+  the tool result and the rest of the conversation**, burning the whole `max_tokens` budget on
+  fiction. A tool-calling agent hits this on every single turn: one measured request produced
+  **8192 tokens instead of 14**. Adding the marker fixes it everywhere; other families resolve
+  it to unk and are unaffected.
+- **Mid-conversation `system` messages no longer fail the request.** Recent Claude Code sends
+  operator instructions as `{"role": "system"}` entries *inside* `messages` (an Opus-4.8 API
+  feature it also applies to model names it doesn't recognise, i.e. every local server). Most
+  chat templates accept a system message only in first position: Qwen3 happened to tolerate it,
+  Ornith-1.0-9B raised `System message must be at the beginning` and killed the session. They
+  are now folded into the adjacent user turn as a `<system-reminder>` block — the documented
+  fallback for models without the feature — and leading ones merge into the system prompt.
+- **The XML tool-call format is parsed** (`<tool_call><function=NAME><parameter=K>v</parameter>`
+  `</function></tool_call>`), used by Ornith-1.0 and several other models. Previously it fell
+  through every parser and the raw markup was returned as assistant text, so no tool ever ran.
+  Values are raw text with no type information, so `tools.schema_types()` feeds the request's
+  own tool schemas in and each value is coerced to its declared type; without a schema only
+  short single-line scalars are touched, since a multi-line value is essentially always a
+  string (file contents, code) and coercing one would corrupt it. A call truncated at
+  `max_tokens` is now recovered rather than dropped for a missing suffix.
+- **Gemma-4's `<|channel>thought … <channel|>` reasoning no longer leaks into the response.**
+  Its template prefills an empty thought channel *except* after a tool response, so the markers
+  only appear mid-agent-loop — invisible in plain chat, visible in every Claude Code session.
+  The pair is now split out into a `thinking` block like Qwen3's `<think>`; the marker grammar
+  is taken from the model's own `response_schema.x-regex`, not guessed.
+- **Routing ignored the query string**, so Claude Code's `POST /v1/messages?beta=true` would
+  have 404'd. Routes now match on the path.
+- **Auth accepts `x-api-key`** as well as `Authorization: Bearer` — which header carries the
+  credential depends on whether the client was configured with `ANTHROPIC_AUTH_TOKEN`,
+  `ANTHROPIC_API_KEY`, or an `apiKeyHelper` (a helper sends both).
+- `HEAD /` (Claude Code's startup connectivity probe) returns 200 instead of 501.
+
+### Notes
+- Unknown request fields are **ignored, never rejected** (`thinking`, `context_management`,
+  `output_config`, beta tool-schema fields, `metadata`, …). Claude Code's field set grows every
+  release and it sends the newest fields to any endpoint whose model name it doesn't
+  recognise — which is every local server — so a strict parser here would break on a Claude
+  Code release that doesn't exist yet.
+- **79 new model-free tests** (264 total, ruff-clean). Verified end-to-end on an M4 Pro across
+  **three model families** — each ran a real Claude Code session that read a file and fixed a
+  bug in it with the `Edit` tool, with zero server errors:
+
+  | target | tool syntax | accept | prefix cache |
+  |---|---|---|---|
+  | `Qwen3-8B-8bit` | Hermes JSON | 3.01 | on (2/3 requests, ~26k tokens reused) |
+  | `Ornith-1.0-9B-8bit` | XML `<function=>` | **5.07** | off — hybrid target, state can't be reused |
+  | `gemma-4-12B-it-8bit` | Gemma `<\|tool_call>` | 3.68 | on, but the sliding window wraps at this prompt size |
+
+  Prefill is the wall-clock cost on all three (Claude Code's prompt is ~18–26k tokens per
+  request), so the target that *reuses* it finishes fastest even with a lower accept length —
+  Qwen3-8B ~2:20 vs ~4:10 for the other two on the identical task.
+- **Also verified with [pi](https://github.com/earendil-works/pi-mono)** (`pi-coding-agent`
+  0.80.10), a second, independent agent client, against *both* the Anthropic and OpenAI
+  endpoints via its `models.json` custom-provider config. pi's system prompt is ~1.5k tokens
+  against Claude Code's ~18–26k, and on a local model that difference is everything: the same
+  bug-fix task runs in **~6 s instead of ~2:20**, and a 4-tool task (read, two edits, read,
+  write) completes in **8.5 s** at 24 tok/s on Qwen3-8B. Ornith runs it in 18.8 s. Gemma-4-12B
+  does not converge on pi's tool protocol — on *both* endpoints, so it's a model/agent-protocol
+  mismatch rather than a server issue; it works fine with Claude Code.
+
 ## [0.5.1] — 2026-07-21 — diagnosable server errors + dependency refresh
 
 ### Fixed

@@ -15,6 +15,22 @@ loaded — it also covers any model that borrows one of these conventions):
     bare. Flat arguments are parsed fully; deeply nested structures fall back to string values
     (rare for tool calls, and documented).
 
+  * **XML / "function"** (Ornith-1.0, and the several other models that copy this convention)::
+
+        <tool_call>
+        <function=example_function_name>
+        <parameter=example_parameter_1>
+        value_1
+        </parameter>
+        </function>
+        </tool_call>
+
+    Values are *raw text* and may span multiple lines, so their JSON type isn't recoverable
+    from the syntax. Pass the request's tool schemas (:func:`schema_types`) and each value is
+    coerced to its declared type; without them we fall back to conservative heuristics that
+    only touch short single-line scalars, since a multi-line value is essentially always a
+    string (file contents, code) and mis-coercing one would corrupt it.
+
 :func:`parse_tool_calls` returns OpenAI ``tool_calls`` (``function.arguments`` serialized to a
 JSON string, per the OpenAI schema) plus the assistant text with the call blocks removed.
 :func:`normalize_tool_messages` goes the other way for inbound history: it turns an OpenAI
@@ -32,6 +48,12 @@ _HERMES = re.compile(r"<tool_call>\s*(\{.*?\})\s*</tool_call>", re.DOTALL)
 _GEMMA = re.compile(r"<\|tool_call>\s*call:\s*([^\{]+?)\s*\{(.*?)\}\s*<tool_call\|>", re.DOTALL)
 _GEMMA_STR = '<|"|>'
 _GEMMA_FIELD = re.compile(r'([A-Za-z_]\w*)\s*:\s*(<\|"\|>.*?<\|"\|>|[^,]*)', re.DOTALL)
+# XML form: <tool_call><function=NAME><parameter=KEY>value</parameter>…</function></tool_call>.
+# The closing </tool_call> is optional — models truncated at max_tokens routinely omit it, and
+# a call we can parse is better than one dropped for a missing suffix.
+_XML = re.compile(r"<tool_call>\s*<function=\s*([^>\s]+?)\s*>(.*?)</function>\s*(?:</tool_call>)?",
+                  re.DOTALL)
+_XML_PARAM = re.compile(r"<parameter=\s*([^>\s]+?)\s*>\n?(.*?)\n?</parameter>", re.DOTALL)
 
 
 def _coerce(raw: str):
@@ -64,6 +86,55 @@ def _parse_gemma_args(body: str) -> dict:
     return args
 
 
+def schema_types(tools) -> dict[str, dict[str, str]]:
+    """``{tool_name: {param: json_type}}`` from a tool list in either the OpenAI shape
+    (``{"type": "function", "function": {"name", "parameters"}}``) or the Anthropic one
+    (``{"name", "input_schema"}``). Used to coerce raw XML parameter text to its real type."""
+    out: dict[str, dict[str, str]] = {}
+    for t in tools or []:
+        if not isinstance(t, dict):
+            continue
+        fn = t.get("function") if isinstance(t.get("function"), dict) else t
+        name = fn.get("name")
+        if not name:
+            continue
+        schema = fn.get("parameters") or fn.get("input_schema") or {}
+        props = schema.get("properties") if isinstance(schema, dict) else None
+        if not isinstance(props, dict):
+            continue
+        out[name] = {k: v.get("type") for k, v in props.items() if isinstance(v, dict)}
+    return out
+
+
+def _coerce_typed(raw: str, jtype: str | None):
+    """A raw XML parameter value -> its declared JSON type. Unparseable values stay strings
+    rather than raising: a wrong-typed argument is recoverable by the client, a 500 isn't."""
+    if jtype == "string":
+        return raw
+    if jtype == "boolean":
+        return raw.strip().lower() == "true"
+    if jtype in ("integer", "number"):
+        try:
+            return int(raw.strip()) if jtype == "integer" else float(raw.strip())
+        except ValueError:
+            return raw
+    if jtype in ("object", "array"):
+        try:
+            return json.loads(raw)
+        except (json.JSONDecodeError, TypeError):
+            return raw
+    # No schema for this parameter: only touch short single-line scalars. A multi-line value
+    # is essentially always a string (file contents, code) and coercing it would corrupt it.
+    if "\n" not in raw and len(raw) <= 32:
+        return _coerce(raw)
+    return raw
+
+
+def _parse_xml_args(body: str, types: dict[str, str] | None) -> dict:
+    return {m.group(1): _coerce_typed(m.group(2), (types or {}).get(m.group(1)))
+            for m in _XML_PARAM.finditer(body)}
+
+
 def _as_openai(name: str, args) -> dict:
     if not isinstance(args, str):
         args = json.dumps(args, ensure_ascii=False)
@@ -71,12 +142,24 @@ def _as_openai(name: str, args) -> dict:
             "function": {"name": name, "arguments": args}}
 
 
-def parse_tool_calls(text: str) -> tuple[list[dict], str]:
-    """(tool_calls, cleaned_text). ``tool_calls`` is OpenAI-shaped; empty if none found."""
+def parse_tool_calls(text: str, schemas: dict[str, dict[str, str]] | None = None
+                     ) -> tuple[list[dict], str]:
+    """(tool_calls, cleaned_text). ``tool_calls`` is OpenAI-shaped; empty if none found.
+
+    ``schemas`` (from :func:`schema_types`) is optional and only affects the XML form, whose
+    values carry no type information of their own.
+    """
     calls: list[tuple[str, object]] = []
     cleaned = text
-    if "<tool_call>" in text:
-        for m in _HERMES.finditer(text):
+    # XML first: its body can contain '{', and Hermes requires a '{' immediately after the
+    # opening tag, so the two can't be confused — but parse the stricter shape first anyway.
+    if "<function=" in text:
+        for m in _XML.finditer(text):
+            name = m.group(1)
+            calls.append((name, _parse_xml_args(m.group(2), (schemas or {}).get(name))))
+        cleaned = _XML.sub("", cleaned)
+    if "<tool_call>" in cleaned:
+        for m in _HERMES.finditer(cleaned):
             try:
                 obj = json.loads(m.group(1))
             except json.JSONDecodeError:
@@ -88,6 +171,11 @@ def parse_tool_calls(text: str) -> tuple[list[dict], str]:
         for m in _GEMMA.finditer(text):
             calls.append((m.group(1).strip(), _parse_gemma_args(m.group(2))))
         cleaned = _GEMMA.sub("", cleaned)
+    # A generation cut off at max_tokens mid-call leaves an unclosed opener; everything from
+    # it onward is an aborted call, not prose, so drop it rather than render raw markup.
+    dangling = cleaned.find("<tool_call>")
+    if dangling != -1:
+        cleaned = cleaned[:dangling]
     return [_as_openai(name, args) for name, args in calls], cleaned.strip()
 
 
