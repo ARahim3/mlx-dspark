@@ -13,6 +13,9 @@ struct MlxDsparkApp: App {
                 .onAppear { delegate.model = model }
         }
         .windowResizability(.contentMinSize)
+        // Charts need room; the OS default opens at the minimum size, which makes the Lab
+        // look cramped on first launch.
+        .defaultSize(width: 1120, height: 760)
         .commands {
             CommandGroup(replacing: .newItem) { }      // single-window app
         }

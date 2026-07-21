@@ -5,37 +5,100 @@ struct RootView: View {
     @EnvironmentObject private var model: AppModel
 
     var body: some View {
-        VStack(spacing: 0) {
-            content
-            Divider()
-            StatusBar()
-            if model.showLogs {
-                Divider()
-                LogPane()
+        Group {
+            switch model.phase {
+            case .launching, .settingUp, .startingServer:
+                SetupView()
+            case .ready:
+                MainWindow()
+            case .failed:
+                FailureView()
             }
         }
-        .frame(minWidth: 720, minHeight: 520)
+        .frame(minWidth: 900, minHeight: 600)
         .task { await model.boot() }
     }
+}
 
-    @ViewBuilder
-    private var content: some View {
-        switch model.phase {
-        case .launching, .settingUp, .startingServer:
-            SetupView()
-        case .ready:
-            ChatView()
-        case .failed:
-            FailureView()
+// MARK: - Main window
+
+struct MainWindow: View {
+    @EnvironmentObject private var model: AppModel
+
+    var body: some View {
+        NavigationSplitView {
+            List(selection: $model.screen) {
+                ForEach(visibleScreens) { screen in
+                    Label(screen.title, systemImage: screen.symbol).tag(screen)
+                }
+            }
+            .navigationSplitViewColumnWidth(min: 170, ideal: 190, max: 240)
+            .safeAreaInset(edge: .bottom) { SidebarFooter() }
+        } detail: {
+            VStack(spacing: 0) {
+                switch model.screen {
+                case .chat:     ChatScreen()
+                case .lab:      LabScreen()
+                case .models:   ModelsScreen()
+                case .settings: SettingsScreen()
+                }
+                Divider()
+                StatusBar()
+                if model.showLogs {
+                    Divider()
+                    LogPane()
+                }
+            }
         }
+    }
+
+    private var visibleScreens: [Screen] {
+        Screen.allCases.filter { $0 != .lab || model.detail.showsLab }
+    }
+}
+
+/// Ambient telemetry, always visible.
+///
+/// Straight from MTPLX, and cheap for how much it's liked: seeing tok/s move makes the speedup
+/// feel real instead of being a number in a benchmark table you have to go looking for.
+struct SidebarFooter: View {
+    @EnvironmentObject private var model: AppModel
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Divider()
+            HStack(spacing: 6) {
+                Circle()
+                    .fill(model.isServerReady ? Color.green : Color.orange)
+                    .frame(width: 6, height: 6)
+                Text(model.health?.model ?? "starting…")
+                    .font(.caption).lineLimit(1).truncationMode(.middle)
+            }
+            if model.liveTokensPerSec > 0 {
+                Text("\(model.liveTokensPerSec, specifier: "%.0f") tok/s")
+                    .font(.system(.title3, design: .rounded).monospacedDigit())
+                    .fontWeight(.medium)
+                    .contentTransition(.numericText())
+                    .animation(.easeOut(duration: 0.2), value: model.liveTokensPerSec)
+            }
+            if let stats = model.stats, stats.rounds > 0 {
+                Text("accept \(stats.meanAcceptLen, specifier: "%.2f")")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+        }
+        .padding(.horizontal, 12)
+        .padding(.bottom, 10)
+        .frame(maxWidth: .infinity, alignment: .leading)
     }
 }
 
 // MARK: - Setup
 
-/// The onboarding checklist. Note the wording: the user is told an *engine* is being set up,
-/// never that a Python environment is being built. That is the whole point of the vendored-uv
-/// runtime — the implementation detail stays invisible.
+/// The onboarding checklist.
+///
+/// Note the wording: the user is told an *engine* is being set up, never that a Python
+/// environment is being built. That invisibility is the entire point of the vendored-uv
+/// runtime — the implementation detail must not leak into the product.
 struct SetupView: View {
     @EnvironmentObject private var model: AppModel
 
@@ -45,8 +108,7 @@ struct SetupView: View {
                 Text("Setting up \(AppIdentity.displayName)")
                     .font(.system(size: 22, weight: .semibold))
                 Text("This happens once. The first run downloads the engine, which takes a few minutes.")
-                    .foregroundStyle(.secondary)
-                    .font(.callout)
+                    .foregroundStyle(.secondary).font(.callout)
             }
 
             VStack(spacing: 0) {
@@ -82,26 +144,16 @@ struct SetupRow: View {
                 if !detailText.isEmpty {
                     Text(detailText)
                         .font(.caption)
-                        .foregroundStyle(state == .failedish ? .red : .secondary)
-                        .lineLimit(1)
-                        .truncationMode(.middle)
+                        .foregroundStyle(isFailed ? AnyShapeStyle(.red) : AnyShapeStyle(.secondary))
+                        .lineLimit(1).truncationMode(.middle)
                 }
             }
             Spacer()
         }
-        .padding(.horizontal, 12)
-        .padding(.vertical, 9)
+        .padding(.horizontal, 12).padding(.vertical, 9)
     }
 
-    private enum Kind { case pending, running, done, failedish }
-    private var state: Kind {
-        switch step.state {
-        case .pending: return .pending
-        case .running: return .running
-        case .done:    return .done
-        case .failed:  return .failedish
-        }
-    }
+    private var isFailed: Bool { if case .failed = step.state { return true }; return false }
 
     private var detailText: String {
         if case .failed(let message) = step.state { return message }
@@ -110,96 +162,11 @@ struct SetupRow: View {
 
     @ViewBuilder
     private var icon: some View {
-        switch state {
-        case .pending:
-            Image(systemName: "circle").foregroundStyle(.tertiary)
-        case .running:
-            ProgressView().controlSize(.small)
-        case .done:
-            Image(systemName: "checkmark.circle.fill").foregroundStyle(.green)
-        case .failedish:
-            Image(systemName: "xmark.circle.fill").foregroundStyle(.red)
-        }
-    }
-}
-
-// MARK: - Chat
-
-struct ChatView: View {
-    @EnvironmentObject private var model: AppModel
-
-    var body: some View {
-        VStack(spacing: 0) {
-            if let pairing = model.pairingLine {
-                HStack(spacing: 6) {
-                    Image(systemName: "arrow.triangle.merge").imageScale(.small)
-                    Text(pairing).font(.caption.monospaced())
-                    Spacer()
-                }
-                .foregroundStyle(.secondary)
-                .padding(.horizontal, 20).padding(.vertical, 8)
-                .background(.quaternary.opacity(0.25))
-                Divider()
-            }
-            ScrollView {
-                Text(model.output.isEmpty ? "Ask something to see the engine run." : model.output)
-                    .font(.system(.body, design: .default))
-                    .textSelection(.enabled)
-                    .foregroundStyle(model.output.isEmpty ? .secondary : .primary)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .padding(20)
-            }
-
-            if let stats = model.lastStats {
-                StatsStrip(stats: stats).padding(.horizontal, 20).padding(.bottom, 10)
-            }
-
-            Divider()
-            HStack(spacing: 10) {
-                TextField("Message", text: $model.prompt, axis: .vertical)
-                    .textFieldStyle(.plain)
-                    .lineLimit(1...4)
-                    .onSubmit { model.send() }
-                if model.isGenerating {
-                    Button("Stop") { model.cancelGeneration() }
-                } else {
-                    Button("Send") { model.send() }
-                        .keyboardShortcut(.return, modifiers: [])
-                        .disabled(!model.isServerReady)
-                }
-            }
-            .padding(14)
-        }
-    }
-}
-
-/// The per-turn speculative-decoding numbers. In the real app this becomes the live accept
-/// ribbon; here it proves the `x_mlx_dspark` block survives the round trip.
-struct StatsStrip: View {
-    let stats: SpecInfo
-
-    var body: some View {
-        HStack(spacing: 16) {
-            metric(String(format: "%.1f", stats.tokensPerSec), "tok/s")
-            metric(String(format: "%.2f", stats.acceptLen), "accept")
-            if let cap = stats.cap { metric("\(cap)", "cap") }
-            metric("\(stats.targetForwards)", "verifies")
-            if let lookup = stats.lookupRounds, lookup > 0 {
-                metric("\(lookup)", "lookup")
-            }
-            Spacer()
-            Text(stats.mode.uppercased())
-                .font(.caption2.weight(.semibold))
-                .padding(.horizontal, 7).padding(.vertical, 3)
-                .background(.tint.opacity(0.15), in: Capsule())
-        }
-        .font(.callout)
-    }
-
-    private func metric(_ value: String, _ label: String) -> some View {
-        HStack(spacing: 4) {
-            Text(value).monospacedDigit().fontWeight(.medium)
-            Text(label).foregroundStyle(.secondary).font(.caption)
+        switch step.state {
+        case .pending: Image(systemName: "circle").foregroundStyle(.tertiary)
+        case .running: ProgressView().controlSize(.small)
+        case .done:    Image(systemName: "checkmark.circle.fill").foregroundStyle(.green)
+        case .failed:  Image(systemName: "xmark.circle.fill").foregroundStyle(.red)
         }
     }
 }
@@ -211,24 +178,23 @@ struct StatusBar: View {
 
     var body: some View {
         HStack(spacing: 10) {
-            Circle()
-                .fill(model.isServerReady ? Color.green : Color.orange)
-                .frame(width: 7, height: 7)
-            Text(model.statusLine).font(.caption).foregroundStyle(.secondary)
+            if let pairing = model.pairingLine {
+                Image(systemName: "arrow.triangle.merge").imageScale(.small)
+                Text(pairing).font(.caption.monospaced())
+            } else {
+                Text(model.statusLine).font(.caption)
+            }
             Spacer()
-            if model.liveTokensPerSec > 0 {
-                Text("\(model.liveTokensPerSec, specifier: "%.1f") tok/s")
-                    .font(.caption.monospacedDigit())
-                    .foregroundStyle(.secondary)
+            if let stats = model.stats, stats.rounds > 0 {
+                Text("\(stats.rounds) rounds").font(.caption)
             }
-            Button(model.showLogs ? "Hide Log" : "Log") {
-                model.showLogs.toggle()
+            if model.detail.showsRawLogs {
+                Button(model.showLogs ? "Hide Log" : "Log") { model.showLogs.toggle() }
+                    .buttonStyle(.link).font(.caption)
             }
-            .buttonStyle(.link)
-            .font(.caption)
         }
-        .padding(.horizontal, 14)
-        .padding(.vertical, 7)
+        .foregroundStyle(.secondary)
+        .padding(.horizontal, 14).padding(.vertical, 7)
     }
 }
 
@@ -250,7 +216,7 @@ struct LogPane: View {
                 }
                 .padding(8)
             }
-            .frame(height: 170)
+            .frame(height: 160)
             .background(.quaternary.opacity(0.3))
             .onChange(of: model.logLines.count) { _, count in
                 proxy.scrollTo(count - 1, anchor: .bottom)
@@ -277,5 +243,46 @@ struct FailureView: View {
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .padding(28)
+    }
+}
+
+// MARK: - Shared bits
+
+/// A labelled number. Used everywhere; keeps figures on one baseline and stops digits from
+/// jittering as values change.
+struct Metric: View {
+    let value: String
+    let label: String
+    var tint: Color?
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 1) {
+            Text(value)
+                .font(.system(.title3, design: .rounded).monospacedDigit())
+                .fontWeight(.medium)
+                .foregroundStyle(tint ?? .primary)
+            Text(label).font(.caption2).foregroundStyle(.secondary)
+        }
+    }
+}
+
+struct Card<Content: View>: View {
+    let title: String
+    var subtitle: String?
+    @ViewBuilder var content: Content
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            VStack(alignment: .leading, spacing: 2) {
+                Text(title).font(.headline)
+                if let subtitle {
+                    Text(subtitle).font(.caption).foregroundStyle(.secondary)
+                }
+            }
+            content
+        }
+        .padding(16)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(.quaternary.opacity(0.25), in: RoundedRectangle(cornerRadius: 10))
     }
 }
