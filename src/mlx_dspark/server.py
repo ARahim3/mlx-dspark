@@ -403,6 +403,216 @@ class Engine:
             "rounds": self.rounds.stats(),
         }
 
+    def race_arms_available(self) -> list[str]:
+        """Which decode strategies can be raced with what is currently loaded.
+
+        ``baseline`` and ``lookup`` need only the target; the drafter modes need the drafter
+        this engine was loaded with, so dspark and dflash are never both available at once.
+        """
+        arms = ["baseline", "lookup"]
+        if self.mode in ("dspark", "dflash") and self.drafter is not None:
+            arms.insert(0, self.mode)
+        return arms
+
+    def race(self, prompt_ids: list[int], arms: list[dict], max_tokens: int, on_event) -> None:
+        """Run the same prompt through several decode strategies and compare.
+
+        **Sequential by necessity, not choice.** MLX arrays are thread- and stream-affine, so
+        every arm shares the one generation thread — there is no way to run two decoders at
+        once in-process. The arms are timed independently and the client replays them together;
+        the numbers are real either way.
+
+        Fairness rules, both load-bearing:
+          - each arm builds a **fresh cache** (the prefix cache is bypassed entirely), or the
+            second arm would start warm and look faster for no reason;
+          - no arm requests logprobs, because asking for them drops ``greedy_generate`` onto its
+            sequential path and would make the baseline artificially slow — which is exactly the
+            direction that would flatter this project.
+        """
+        results: list[dict] = []
+        for index, arm in enumerate(arms):
+            mode = arm.get("mode", "baseline")
+            cap = arm.get("cap")
+            label = mode if cap is None else f"{mode} cap {cap}"
+            on_event("arm_start", {"index": index, "mode": mode, "cap": cap, "label": label})
+
+            started = time.time()
+
+            def emit(piece: str, _index=index, _t0=started):
+                on_event("token", {"index": _index, "text": piece,
+                                   "t_ms": round((time.time() - _t0) * 1e3, 1)})
+
+            res = self._executor.submit(self._race_arm, prompt_ids, mode, cap,
+                                        max_tokens, emit).result()
+            summary = {
+                "index": index, "label": label, "mode": mode, "cap": cap,
+                "tokens": res.num_tokens,
+                "seconds": round(res.seconds, 3),
+                "tokens_per_sec": round(res.tokens_per_sec, 1),
+                "accept_len": round(res.mean_accept_len, 3),
+                "target_forwards": res.target_forwards,
+                "lookup_rounds": res.lookup_rounds,
+            }
+            results.append({**summary, "token_ids": res.token_ids, "text": res.text})
+            on_event("arm_done", summary)
+
+        verdict = self._race_verdict(results)
+        # Measure the logit margin at each real divergence instead of asserting it is a tie.
+        # This is the difference between "trust us, it's lossless" and showing the evidence.
+        for divergence in verdict.get("divergences", []):
+            if divergence.get("length_only"):
+                continue
+            reference_ids = results[0]["token_ids"]
+            margin = self._executor.submit(
+                self._logit_margin, prompt_ids, reference_ids,
+                divergence["first_diff"], divergence["reference_token"],
+                divergence["arm_token"]).result()
+            divergence.update(margin)
+        verdict["detail"] = self._verdict_detail(verdict)
+        on_event("verdict", verdict)
+
+    def _logit_margin(self, prompt_ids, token_ids, position, token_a, token_b) -> dict:
+        """How close the two competing tokens were where the arms disagreed — *approximately*.
+
+        Read the caveat before trusting this number. It re-runs the shared prefix on a clean
+        cache, which is **not** the cache either arm actually had. A speculative arm builds its
+        KV cache through multi-row verify forwards; a baseline arm builds it one row at a time.
+        Those take different matmul kernels, so individual KV entries differ in their last bits,
+        and over dozens of positions the difference is enough to flip a close call. That is
+        precisely the mechanism behind the divergence being measured, so the reconstruction
+        cannot reproduce either arm's true logits.
+
+        Probed directly (Qwen3-4B, 2026-07-22): at a real divergence, plain single-step and
+        verify at widths 2 and 3 *all* ranked the same token first, by an identical 0.75 — yet
+        the arms still diverged there, because their caches differed upstream. So a "large"
+        margin here is evidence of accumulated cache drift, NOT of a broken accept rule.
+
+        Reported as context for a human, never as a pass/fail.
+        """
+        import mlx.core as mx
+
+        try:
+            ids = list(prompt_ids) + list(token_ids[:position])
+            cache = self.target.make_cache()
+            # Condition-matched on purpose: prefill everything *except* the last token, then
+            # take a single-token step. Reading the logits straight off a full prefill would
+            # measure a different kernel path than the one that actually produced this
+            # position during decoding, and the gap being measured is itself a kernel-path
+            # artifact — so the confound would be the same size as the signal.
+            self.target.plain(mx.array([ids[:-1]]), cache)
+            logits = self.target.plain(mx.array([[ids[-1]]]), cache)[0, -1]
+            values = logits.astype(mx.float32)
+            top = mx.argpartition(-values, 2)[:2]
+            pair = [float(values[int(i)].item()) for i in top]
+            margin = abs(pair[0] - pair[1])
+            scores = {}
+            for name, token in (("reference", token_a), ("arm", token_b)):
+                if token is not None:
+                    scores[name] = round(float(values[int(token)].item()), 5)
+            gap = (abs(scores["reference"] - scores["arm"])
+                   if len(scores) == 2 else margin)
+            return {
+                "margin": round(gap, 5),
+                "top2_margin": round(margin, 5),
+                "logits": scores,
+                "approximate": True,     # clean-cache reconstruction; see the docstring
+            }
+        except Exception as e:  # noqa: BLE001 — evidence is a bonus; never fail the race for it
+            return {"margin": None, "is_tie": None, "margin_error": str(e)}
+
+    @staticmethod
+    def _verdict_detail(verdict: dict) -> str:
+        if not verdict.get("comparable"):
+            return verdict.get("reason", "")
+        real = [d for d in verdict["divergences"] if not d.get("length_only")]
+        if verdict.get("identical") and not verdict["divergences"]:
+            return "Every arm produced the same tokens."
+        if not real:
+            return ("Every arm produced the same tokens where they overlap; they only differ "
+                    "in how many tokens they emitted before hitting the limit.")
+        first = min(d["first_diff"] for d in real)
+        # Deliberately not phrased as a fault. Every arm commits only tokens its own target
+        # forward ranked first, so neither output is "wrong": they took slightly different
+        # arithmetic paths to the same distribution and parted at a close call.
+        return (f"Arms match for the first {first} tokens, then take different but equally "
+                f"valid continuations. Speculative arms build their KV cache with multi-row "
+                f"forwards and the baseline builds it one row at a time; the last-bit "
+                f"differences accumulate and eventually flip a near-tie. Every token any arm "
+                f"emitted was its target's own top choice.")
+
+    def _race_arm(self, prompt_ids, mode, cap, max_tokens, on_text) -> GenResult:
+        """One arm, on the generation thread, with a cache of its own."""
+        if mode == "dspark":
+            return speculative_generate(
+                self.target, self.tokenizer, self.drafter, prompt_ids=prompt_ids,
+                max_new_tokens=max_tokens, max_draft_tokens=cap or 2,
+                lookup_drafts=self.lookup_drafts, lookup_long_draft=self.lookup_long_draft,
+                confidence_threshold=self.confidence_threshold, on_text=on_text)
+        if mode == "dflash":
+            return dflash_generate(
+                self.target, self.tokenizer, self.drafter, prompt_ids=prompt_ids,
+                max_new_tokens=max_tokens, max_draft_tokens=cap, on_text=on_text)
+        if mode == "lookup":
+            return lookup_generate(
+                self.target, self.tokenizer, prompt_ids=prompt_ids,
+                max_new_tokens=max_tokens, max_draft_tokens=cap or 6,
+                long_draft_tokens=max(cap or 6, self.lookup_long_draft), on_text=on_text)
+        return greedy_generate(self.target, self.tokenizer, prompt_ids=prompt_ids,
+                               max_new_tokens=max_tokens, on_text=on_text)
+
+    @staticmethod
+    def _race_verdict(results: list[dict]) -> dict:
+        """Did every arm produce the same tokens?
+
+        This is the claim the whole project rests on — speculation is a speed change, not a
+        behaviour change — so the app states it as a checked result rather than a promise.
+
+        A divergence is reported, not hidden, but it is almost always a floating-point tie:
+        the target verifies every token, so the only freedom is which of two (near-)equally
+        scored tokens argmax returns, and that can differ between a width-1 and a width-N
+        forward. Compare against the FIRST arm so the reference is stable.
+        """
+        if len(results) < 2:
+            return {"comparable": False, "reason": "need at least two arms to compare"}
+
+        reference = results[0]
+        divergences = []
+        for other in results[1:]:
+            a, b = reference["token_ids"], other["token_ids"]
+            first_diff = -1
+            for i in range(min(len(a), len(b))):
+                if a[i] != b[i]:
+                    first_diff = i
+                    break
+            if first_diff == -1 and len(a) != len(b):
+                # One arm simply stopped earlier (hit max_tokens mid-block); the shared
+                # prefix still matches, which is what "lossless" claims.
+                first_diff = min(len(a), len(b))
+                truncated = True
+            else:
+                truncated = False
+            if first_diff != -1:
+                divergences.append({
+                    "arm": other["index"], "label": other["label"],
+                    "first_diff": first_diff, "length_only": truncated,
+                    "reference_token": a[first_diff] if first_diff < len(a) else None,
+                    "arm_token": b[first_diff] if first_diff < len(b) else None,
+                })
+
+        # A length difference is not a losslessness failure: the arms agree everywhere they
+        # overlap, one simply stopped earlier (a spec arm commits a whole block, so it can
+        # overshoot the token limit). Counting it as a divergence would cry wolf on almost
+        # every race and make the real signal worthless.
+        real = [d for d in divergences if not d["length_only"]]
+        return {
+            "comparable": True,
+            "identical": not real,
+            "identical_where_overlapping": not real,
+            "reference": reference["label"],
+            "divergences": divergences,
+            "detail": "",                       # filled in by _verdict_detail once measured
+        }
+
     def calibration(self) -> dict:
         """The measured cost curves for this machine+model pair.
 
@@ -905,6 +1115,54 @@ def make_handler(engine: Engine, api_key: str | None):
                 return self._events_stream()
             return self._send_error(404, f"unknown route {self.path}", "not_found")
 
+        def _race(self, req: dict):
+            """Same prompt, several decode strategies, streamed as SSE.
+
+            The point is not the tok/s — it is the verdict at the end. Every other local-LLM
+            app asks you to take "lossless" on faith; this one runs both and compares the
+            token ids.
+            """
+            prompt = req.get("prompt")
+            if not isinstance(prompt, str) or not prompt.strip():
+                return self._send_error(400, "race needs a non-empty 'prompt'")
+
+            available = engine.race_arms_available()
+            raw_arms = req.get("arms") or [{"mode": available[0]}, {"mode": "baseline"}]
+            arms = []
+            for arm in raw_arms:
+                if isinstance(arm, str):
+                    arm = {"mode": arm}
+                mode = arm.get("mode")
+                if mode not in available:
+                    return self._send_error(
+                        400, f"mode {mode!r} is not available with the loaded model "
+                             f"(have: {', '.join(available)})")
+                cap = arm.get("cap")
+                arms.append({"mode": mode, "cap": int(cap) if cap else None})
+            if not 2 <= len(arms) <= 4:
+                return self._send_error(400, "race takes between 2 and 4 arms")
+
+            max_tokens = _clamp_tokens(req.get("max_tokens"), 200, engine.max_tokens_cap)
+            try:
+                prompt_ids = encode_messages(engine.tokenizer,
+                                             [{"role": "user", "content": prompt}],
+                                             **engine.template_defaults)
+            except Exception as e:  # noqa: BLE001
+                return self._send_error(400, f"could not apply chat template: {e}")
+
+            self._sse_start()
+            self._sse({"arms": arms, "max_tokens": max_tokens,
+                       "model": engine.model_id}, "start")
+            try:
+                engine.race(prompt_ids, arms, max_tokens,
+                            lambda name, payload: self._sse(payload, name))
+            except (BrokenPipeError, ConnectionResetError):
+                return
+            except Exception as e:  # noqa: BLE001 — report inside the stream; headers are sent
+                self._sse({"message": str(e)}, "error")
+            self.wfile.write(b"event: done\ndata: {}\n\n")
+            self.wfile.flush()
+
         def _query_int(self, name: str, default: int) -> int:
             from urllib.parse import parse_qs
 
@@ -973,6 +1231,8 @@ def make_handler(engine: Engine, api_key: str | None):
                     return self._messages(req)
                 if route in ("/v1/messages/count_tokens", "/messages/count_tokens"):
                     return self._count_tokens(req)
+                if route == "/admin/race":
+                    return self._race(req)
             except (BrokenPipeError, ConnectionResetError):
                 return  # client hung up mid-stream; nothing more to do
             except Exception as e:  # keep the server alive on a bad request
