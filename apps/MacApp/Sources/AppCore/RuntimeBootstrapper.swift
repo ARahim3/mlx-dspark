@@ -1,0 +1,263 @@
+import Foundation
+
+// MARK: - Setup checklist model
+//
+// The onboarding "Setting up the engine" step renders these rows. The bootstrapper publishes
+// full snapshots rather than deltas so the view is a pure function of the last snapshot and
+// tests can assert on one value.
+
+public enum SetupStepID: String, CaseIterable, Sendable {
+    case uv, python, engine, verify
+
+    /// User-facing wording. Note what these deliberately do *not* say: "Python". A user
+    /// installing a Mac app should never have to know the engine is a Python package.
+    public var title: String {
+        switch self {
+        case .uv:     return "Preparing installer"
+        case .python: return "Engine runtime"
+        case .engine: return "Inference engine"
+        case .verify: return "Finishing up"
+        }
+    }
+}
+
+public enum SetupState: Equatable, Sendable {
+    case pending
+    case running
+    case done
+    case failed(String)
+}
+
+public struct SetupStep: Identifiable, Equatable, Sendable {
+    public let id: SetupStepID
+    public var state: SetupState
+    public var detail: String
+
+    public init(id: SetupStepID, state: SetupState = .pending, detail: String = "") {
+        self.id = id
+        self.state = state
+        self.detail = detail
+    }
+
+    public var title: String { id.title }
+}
+
+/// What produced the current runtime. Compared on every launch.
+struct RuntimeFingerprint: Codable, Equatable {
+    var engineVersion: String
+    var pythonVersion: String
+    /// Set when the engine was installed from a local source tree (development builds), so a
+    /// dev runtime is never mistaken for a released one.
+    var source: String
+}
+
+public enum BootstrapError: LocalizedError {
+    case uvMissing
+    case verifyFailed(String)
+
+    public var errorDescription: String? {
+        switch self {
+        case .uvMissing:
+            return "The bundled installer is missing from the app. Reinstall \(AppIdentity.displayName)."
+        case .verifyFailed(let detail):
+            return "The engine installed but did not start correctly: \(detail)"
+        }
+    }
+}
+
+// MARK: - RuntimeBootstrapper
+
+/// Builds and maintains the app-owned Python runtime.
+///
+/// The whole point of this type is that the user never learns any of this happened. It vendors
+/// `uv`, lets uv fetch its own CPython (so **Homebrew is never required** — the failure mode
+/// that MTPLX ships as a visible error string), and installs the engine into a venv under
+/// Application Support, outside the .app bundle.
+public actor RuntimeBootstrapper {
+
+    public typealias ProgressHandler = @Sendable ([SetupStep]) -> Void
+
+    private var steps: [SetupStep] = SetupStepID.allCases.map { SetupStep(id: $0) }
+    private let bundle: Bundle
+    private let logStore: LogStore?
+
+    public init(bundle: Bundle = .main, logStore: LogStore? = nil) {
+        self.bundle = bundle
+        self.logStore = logStore
+    }
+
+    /// Where the engine is installed from.
+    ///
+    /// A local source tree wins when present, which is what makes development bearable — a
+    /// release build has no such override and always installs the pinned version.
+    public enum EngineSource: Equatable, Sendable {
+        case pypi(version: String)
+        case localSourceTree(URL)
+
+        var fingerprint: String {
+            switch self {
+            case .pypi(let v): return "pypi:\(v)"
+            case .localSourceTree(let url): return "local:\(url.path)"
+            }
+        }
+
+        /// `MLXDSPARK_ENGINE_SOURCE=/path/to/repo` points the app at a working tree.
+        public static func fromEnvironment(
+            _ env: [String: String] = ProcessInfo.processInfo.environment
+        ) -> EngineSource {
+            if let path = env["MLXDSPARK_ENGINE_SOURCE"], !path.isEmpty {
+                return .localSourceTree(URL(fileURLWithPath: path))
+            }
+            return .pypi(version: AppIdentity.engineVersion)
+        }
+    }
+
+    /// Ensure a working runtime exists, reinstalling if the fingerprint doesn't match.
+    /// - Returns: the engine executable to drive.
+    @discardableResult
+    public func ensureRuntime(
+        source: EngineSource = .fromEnvironment(),
+        onProgress: ProgressHandler? = nil
+    ) async throws -> URL {
+        try Paths.ensureDirectories()
+
+        let want = RuntimeFingerprint(engineVersion: AppIdentity.engineVersion,
+                                      pythonVersion: AppIdentity.pythonVersion,
+                                      source: source.fingerprint)
+        if currentFingerprint() == want,
+           FileManager.default.isExecutableFile(atPath: Paths.engineExecutable.path) {
+            // Already correct — mark every row done so onboarding can skip past instantly.
+            steps = SetupStepID.allCases.map { SetupStep(id: $0, state: .done, detail: "Ready") }
+            onProgress?(steps)
+            return Paths.engineExecutable
+        }
+
+        // --- uv ------------------------------------------------------------------
+        set(.uv, .running, "Locating installer")
+        onProgress?(steps)
+        guard let uv = Paths.uvExecutable(bundle: bundle) else {
+            set(.uv, .failed("not found"), "")
+            onProgress?(steps)
+            throw BootstrapError.uvMissing
+        }
+        let uvVersion = await Shell.capture(uv, ["--version"]).output
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        set(.uv, .done, uvVersion)
+        onProgress?(steps)
+
+        let env = childEnvironment()
+
+        // --- venv (uv fetches a managed CPython if the machine has none) ----------
+        set(.python, .running, "Preparing Python \(AppIdentity.pythonVersion)")
+        onProgress?(steps)
+        do {
+            // --clear: reaching here means the fingerprint did not match, so whatever is on
+            // disk is stale (wrong engine version, or a dev runtime where a released one is
+            // wanted). Replacing it is the point; without this uv refuses with "a virtual
+            // environment already exists" and the app can never self-heal.
+            try await Shell.check(uv, ["venv", Paths.venvDir.path,
+                                       "--python", AppIdentity.pythonVersion, "--clear"],
+                                  environment: env) { [logStore] line in
+                logStore?.append(line)
+            }
+        } catch {
+            set(.python, .failed(error.localizedDescription), "")
+            onProgress?(steps)
+            throw error
+        }
+        set(.python, .done, "Python \(AppIdentity.pythonVersion)")
+        onProgress?(steps)
+
+        // --- engine --------------------------------------------------------------
+        set(.engine, .running, "Downloading (this can take a few minutes)")
+        onProgress?(steps)
+        var installArgs = ["pip", "install", "--python", venvPython().path]
+        switch source {
+        case .pypi(let version):
+            installArgs.append("\(AppIdentity.enginePackage)==\(version)")
+        case .localSourceTree(let url):
+            installArgs.append(contentsOf: ["--editable", url.path])
+        }
+        do {
+            try await Shell.check(uv, installArgs, environment: env) { [weak self, logStore] line in
+                logStore?.append(line)
+                // uv's progress lines are noisy; surface only the package being resolved so
+                // the row reads like progress rather than a build log.
+                if line.text.contains("Downloading") || line.text.contains("Installed") {
+                    Task { await self?.updateDetail(.engine, line.text.trimmed()) }
+                }
+            }
+        } catch {
+            set(.engine, .failed(error.localizedDescription), "")
+            onProgress?(steps)
+            throw error
+        }
+        set(.engine, .done, "\(AppIdentity.enginePackage) \(AppIdentity.engineVersion)")
+        onProgress?(steps)
+
+        // --- verify --------------------------------------------------------------
+        set(.verify, .running, "Checking the engine")
+        onProgress?(steps)
+        let probe = await Shell.capture(
+            venvPython(),
+            ["-c", "import mlx_dspark; print(mlx_dspark.__version__)"],
+            environment: env)
+        let installed = probe.output.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard probe.code == 0, !installed.isEmpty else {
+            set(.verify, .failed(installed), "")
+            onProgress?(steps)
+            throw BootstrapError.verifyFailed(installed.isEmpty ? "no version reported" : installed)
+        }
+        try writeFingerprint(want)
+        set(.verify, .done, "Engine \(installed)")
+        onProgress?(steps)
+
+        return Paths.engineExecutable
+    }
+
+    // MARK: - internals
+
+    private func venvPython() -> URL {
+        Paths.venvDir.appendingPathComponent("bin/python")
+    }
+
+    /// A deliberately minimal environment.
+    ///
+    /// An app launched from Finder inherits almost nothing, and that is the environment we want
+    /// to test against — inheriting the developer's shell would hide breakage that every real
+    /// user hits. `VIRTUAL_ENV` is cleared so uv never resolves against a venv the user happens
+    /// to have active.
+    private func childEnvironment() -> [String: String] {
+        var env = ProcessInfo.processInfo.environment
+        env["PATH"] = "/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin:/usr/local/bin"
+        env["HOME"] = NSHomeDirectory()
+        env.removeValue(forKey: "VIRTUAL_ENV")
+        env.removeValue(forKey: "PYTHONHOME")
+        env.removeValue(forKey: "PYTHONPATH")
+        return env
+    }
+
+    private func set(_ id: SetupStepID, _ state: SetupState, _ detail: String) {
+        guard let idx = steps.firstIndex(where: { $0.id == id }) else { return }
+        steps[idx].state = state
+        if !detail.isEmpty { steps[idx].detail = detail }
+    }
+
+    private func updateDetail(_ id: SetupStepID, _ detail: String) {
+        guard let idx = steps.firstIndex(where: { $0.id == id }) else { return }
+        steps[idx].detail = detail
+    }
+
+    private func currentFingerprint() -> RuntimeFingerprint? {
+        guard let data = try? Data(contentsOf: Paths.runtimeFingerprint) else { return nil }
+        return try? JSONDecoder().decode(RuntimeFingerprint.self, from: data)
+    }
+
+    private func writeFingerprint(_ fp: RuntimeFingerprint) throws {
+        try JSONEncoder().encode(fp).write(to: Paths.runtimeFingerprint)
+    }
+}
+
+extension String {
+    func trimmed() -> String { trimmingCharacters(in: .whitespacesAndNewlines) }
+}

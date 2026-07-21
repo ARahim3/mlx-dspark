@@ -19,3 +19,7 @@ drafts/
 .claude/
 CLAUDE.md
 NOTES.md
+
+# Mac app build artifacts
+apps/MacApp/.build/
+apps/MacApp/build/

@@ -1,0 +1,192 @@
+import Foundation
+
+// MARK: - Wire types
+//
+// Only the fields the app actually reads are decoded. The engine adds an `x_mlx_dspark` block
+// to every response — that non-standard block is where the whole point of this project lives
+// (accept length, cap, lookup rounds), so it is a first-class type here, not an afterthought.
+
+public struct HealthInfo: Decodable, Sendable, Equatable {
+    public let status: String
+    /// Short display id, e.g. `Qwen3-4B-8bit`. Also the id `/v1/models` lists.
+    public let model: String
+    /// Resolved mode — `auto` is decided server-side, so this may differ from what was asked.
+    public let mode: String
+    /// The full target repo and the drafter that auto-resolved for it. Showing the *pair* is
+    /// this app's domain language; no other local-LLM app has a second model to name.
+    public let target: String?
+    public let drafter: String?
+    public let contextWindow: Int?
+    public let maxOutputTokens: Int?
+
+    enum CodingKeys: String, CodingKey {
+        case status, model, mode, target, drafter
+        case contextWindow = "context_window"
+        case maxOutputTokens = "max_output_tokens"
+    }
+}
+
+public struct SpecInfo: Decodable, Sendable, Equatable {
+    public let mode: String
+    public let acceptLen: Double
+    public let tokensPerSec: Double
+    public let targetForwards: Int
+    public let cap: Int?
+    public let lookupRounds: Int?
+
+    enum CodingKeys: String, CodingKey {
+        case mode
+        case acceptLen = "accept_len"
+        case tokensPerSec = "tokens_per_sec"
+        case targetForwards = "target_forwards"
+        case cap
+        case lookupRounds = "lookup_rounds"
+    }
+}
+
+public struct ModelEntry: Decodable, Sendable, Identifiable {
+    public let id: String
+}
+
+struct ModelList: Decodable { let data: [ModelEntry] }
+
+/// One event from a streaming completion.
+public enum ChatEvent: Sendable {
+    case delta(String)
+    /// Arrives on the last chunk, carrying the speculative-decoding stats for the turn.
+    case finished(SpecInfo?)
+}
+
+public enum APIError: LocalizedError {
+    case badStatus(Int, String)
+    case notReady
+
+    public var errorDescription: String? {
+        switch self {
+        case .badStatus(let code, let body):
+            return "Server returned \(code): \(body)"
+        case .notReady:
+            return "The engine is not running."
+        }
+    }
+}
+
+// MARK: - APIClient
+
+/// Talks to the local engine over its OpenAI-compatible API.
+public struct APIClient: Sendable {
+    public let baseURL: URL
+    public let apiKey: String?
+    private let session: URLSession
+
+    public init(baseURL: URL, apiKey: String? = nil) {
+        self.baseURL = baseURL
+        self.apiKey = apiKey
+        let config = URLSessionConfiguration.ephemeral
+        // Generation can legitimately go quiet for a while on a big prompt; the default 60 s
+        // resource timeout would kill a long agent-style request mid-stream.
+        config.timeoutIntervalForRequest = 60
+        config.timeoutIntervalForResource = 3600
+        self.session = URLSession(configuration: config)
+    }
+
+    private func request(_ path: String, method: String = "GET", body: Data? = nil) -> URLRequest {
+        var req = URLRequest(url: baseURL.appendingPathComponent(path))
+        req.httpMethod = method
+        if let apiKey, !apiKey.isEmpty {
+            req.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
+        }
+        if let body {
+            req.httpBody = body
+            req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        }
+        return req
+    }
+
+    public func health() async throws -> HealthInfo {
+        var req = request("health")
+        req.timeoutInterval = 2                      // used as a readiness poll; fail fast
+        let (data, response) = try await session.data(for: req)
+        try Self.check(response, data)
+        return try JSONDecoder().decode(HealthInfo.self, from: data)
+    }
+
+    public func models() async throws -> [ModelEntry] {
+        let (data, response) = try await session.data(for: request("v1/models"))
+        try Self.check(response, data)
+        return try JSONDecoder().decode(ModelList.self, from: data).data
+    }
+
+    /// Raw `/metrics` JSON. Left untyped for now — the shape grows with the engine, and the
+    /// Lab screens will decode the parts they need.
+    public func metrics() async throws -> [String: Any] {
+        let (data, response) = try await session.data(for: request("metrics"))
+        try Self.check(response, data)
+        return (try JSONSerialization.jsonObject(with: data) as? [String: Any]) ?? [:]
+    }
+
+    /// Stream a chat completion, yielding text deltas and finally the spec-decode stats.
+    public func streamChat(
+        model: String,
+        messages: [[String: String]],
+        temperature: Double? = nil,
+        maxTokens: Int? = nil
+    ) -> AsyncThrowingStream<ChatEvent, Error> {
+        var payload: [String: Any] = [
+            "model": model,
+            "messages": messages,
+            "stream": true,
+        ]
+        if let temperature { payload["temperature"] = temperature }
+        if let maxTokens { payload["max_tokens"] = maxTokens }
+
+        return AsyncThrowingStream { continuation in
+            let task = Task {
+                do {
+                    let body = try JSONSerialization.data(withJSONObject: payload)
+                    let req = request("v1/chat/completions", method: "POST", body: body)
+                    let (bytes, response) = try await session.bytes(for: req)
+                    if let http = response as? HTTPURLResponse, http.statusCode != 200 {
+                        var detail = ""
+                        for try await line in bytes.lines { detail += line }
+                        throw APIError.badStatus(http.statusCode, detail)
+                    }
+                    for try await line in bytes.lines {
+                        guard line.hasPrefix("data: ") else { continue }
+                        let payload = String(line.dropFirst(6))
+                        if payload == "[DONE]" { break }
+                        guard let data = payload.data(using: .utf8),
+                              let obj = try? JSONSerialization.jsonObject(with: data)
+                                  as? [String: Any] else { continue }
+
+                        if let choices = obj["choices"] as? [[String: Any]],
+                           let delta = choices.first?["delta"] as? [String: Any],
+                           let text = delta["content"] as? String, !text.isEmpty {
+                            continuation.yield(.delta(text))
+                        }
+                        // The engine attaches its stats to the final chunk only.
+                        if let specDict = obj["x_mlx_dspark"] {
+                            let specData = try? JSONSerialization.data(withJSONObject: specDict)
+                            let info = specData.flatMap {
+                                try? JSONDecoder().decode(SpecInfo.self, from: $0)
+                            }
+                            continuation.yield(.finished(info))
+                        }
+                    }
+                    continuation.finish()
+                } catch {
+                    continuation.finish(throwing: error)
+                }
+            }
+            continuation.onTermination = { _ in task.cancel() }
+        }
+    }
+
+    private static func check(_ response: URLResponse, _ data: Data) throws {
+        guard let http = response as? HTTPURLResponse else { return }
+        guard http.statusCode == 200 else {
+            throw APIError.badStatus(http.statusCode,
+                                     String(data: data, encoding: .utf8) ?? "")
+        }
+    }
+}
