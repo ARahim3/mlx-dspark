@@ -569,86 +569,79 @@ def cmd_models(argv: list[str]) -> None:
 
 
 def cmd_doctor(argv: list[str]) -> None:
+    """Environment + model-inventory check.
+
+    Rendering only — every fact comes from :mod:`diagnostics`, which is also what the server
+    serves at ``GET /doctor``. One source of truth, so the app and the CLI can never disagree
+    about whether this machine is set up correctly.
+    """
     ap = argparse.ArgumentParser(prog="mlx-dspark doctor")
-    ap.parse_args(argv)
-    ok = True
+    ap.add_argument("--json", action="store_true",
+                    help="emit the full report as JSON (same payload as the server's /doctor)")
+    ap.add_argument("--models", action="store_true",
+                    help="also list which registry models fit this Mac and are already downloaded")
+    args = ap.parse_args(argv)
+
+    from .diagnostics import doctor
+
+    report = doctor()
+    if args.json:
+        import json as _json
+
+        print(_json.dumps(report, indent=1))
+        sys.exit(0 if report["ok"] else 1)
+
+    env = report["environment"]
 
     def check(label: str, good: bool, detail: str = ""):
-        nonlocal ok
-        ok = ok and good
-        mark = "\033[32m✓\033[0m" if good else "\033[31m✗\033[0m"
-        print(f"  {mark} {label}" + (f"  — {detail}" if detail else ""))
-
-    import platform
+        mark = "\033[32m\u2713\033[0m" if good else "\033[31m\u2717\033[0m"
+        print(f"  {mark} {label}" + (f"  \u2014 {detail}" if detail else ""))
 
     print("mlx-dspark doctor\n")
-    is_mac = sys.platform == "darwin"
-    is_arm = platform.machine() == "arm64"
-    check("Apple Silicon (arm64 macOS)", is_mac and is_arm,
-          f"{platform.system()} {platform.machine()}")
-
-    # mlx exposes its version on mlx.core, not the top-level package
-    for pkg, ver_attr in (("mlx", "mlx.core"), ("mlx_lm", "mlx_lm"), ("mlx_vlm", "mlx_vlm")):
-        try:
-            __import__(pkg)
-            ver = getattr(__import__(ver_attr, fromlist=["__version__"]), "__version__", "?")
-            check(f"{pkg} importable", True, ver)
-        except Exception as e:  # noqa: BLE001
-            check(f"{pkg} importable", False, str(e))
-
-    try:
-        import mlx.core as mx  # noqa: F401
-        try:
-            mx.zeros((2, 2))  # exercise the Metal path
-            check("MLX Metal device works", True)
-        except Exception as e:  # noqa: BLE001
-            check("MLX Metal device works", False, str(e))
-    except Exception:
-        pass
+    check("Apple Silicon (arm64 macOS)", env["apple_silicon"],
+          f"{env['platform']} {env['machine']}")
+    for pkg in ("mlx", "mlx_lm", "mlx_vlm"):
+        version = env["packages"].get(pkg)
+        check(f"{pkg} importable", version is not None, version or "not installed")
+    check("MLX Metal device works", env["metal_ok"], env["device"] or env["metal_error"] or "")
+    if env["ram_gb"]:
+        check("System RAM", env["ram_gb"] >= 15,
+              f"{env['ram_gb']:.0f} GB (gemma4 preset ~15 GB, qwen3 ~8 GB)")
 
     # gemma4 preset compat: mlx-vlm 0.6.4's Gemma4UnifiedProcessor breaks under
     # transformers>=5.12 (issue #4, upstream Blaizzy/mlx-vlm#1578); load_target shims it.
     try:
         from .load import _shim_gemma4_unified_processor
+
         if _shim_gemma4_unified_processor():
-            print("  · mlx-vlm 0.6.4 Gemma4UnifiedProcessor is incompatible with this "
-                  "transformers — shimmed at load time (upstream: Blaizzy/mlx-vlm#1578)")
+            print("  \u00b7 mlx-vlm 0.6.4 Gemma4UnifiedProcessor is incompatible with this "
+                  "transformers \u2014 shimmed at load time (upstream: Blaizzy/mlx-vlm#1578)")
     except Exception:  # noqa: BLE001
         pass
 
-    total_gb = _total_ram_gb()
-    if total_gb:
-        check("System RAM", total_gb >= 15,
-              f"{total_gb:.0f} GB (gemma4 preset ~15 GB, qwen3 ~8 GB)")
+    if env["iogpu_wired_limit_mb"]:
+        print(f"  \u00b7 iogpu.wired_limit_mb = {env['iogpu_wired_limit_mb']}")
+    elif env["wired_limit_hint"]:
+        print(f"  \u00b7 tip: for large models, raise the GPU wired limit, e.g. "
+              f"`{env['wired_limit_hint']}` "
+              f"(mlx-dspark also wires the recommended working set at start)")
 
-    # wired-limit hint: with big models, letting macOS page the weights mid-generation is
-    # the classic silent slowdown; a raised iogpu limit keeps them resident
-    try:
-        import subprocess
-        wired = int(subprocess.run(["sysctl", "-n", "iogpu.wired_limit_mb"],
-                                   capture_output=True, text=True).stdout.strip() or 0)
-        if wired:
-            print(f"  · iogpu.wired_limit_mb = {wired}")
-        elif total_gb and total_gb >= 16:
-            print(f"  · tip: for large models, raise the GPU wired limit, e.g. "
-                  f"`sudo sysctl iogpu.wired_limit_mb={int(total_gb * 0.75 * 1024)}` "
-                  f"(mlx-dspark also wires the recommended working set at start)")
-    except Exception:  # noqa: BLE001
-        pass
+    if args.models:
+        print("\n  models (fits this Mac / already downloaded):")
+        for row in report["models"]:
+            fits = "\u2713" if row["fits"] else ("?" if row["fits"] is None else "\u2717")
+            state = "ready" if row["ready"] else (
+                "drafter missing" if row["target_installed"] else "not downloaded")
+            print(f"    {fits} {row['id']:<20} {row['ram'] or '':<8} {state}")
 
-    from . import __version__
-    print(f"\nmlx-dspark {__version__} — {'ready' if ok else 'issues above'}.")
-    if not ok:
+    for problem in report["problems"]:
+        print(f"\n  \u2717 {problem}")
+
+    print(f"\n\u2014 mlx-dspark {env['version']} "
+          f"{'ready' if report['ok'] else 'issues above'}.")
+    if not report["ok"]:
         sys.exit(1)
 
-
-def _total_ram_gb() -> float | None:
-    try:
-        import subprocess
-        out = subprocess.run(["sysctl", "-n", "hw.memsize"], capture_output=True, text=True)
-        return int(out.stdout.strip()) / (1024 ** 3)
-    except Exception:  # noqa: BLE001
-        return None
 
 
 # --------------------------------------------------------------------------- dispatch

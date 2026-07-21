@@ -95,6 +95,30 @@ def test_knee_width_linear_no_knee():
     assert knee_width({1: 5, 2: 10, 3: 15, 4: 20, 5: 25}) == 5   # no jump -> top width
 
 
+def test_knee_width_flat_step_does_not_fake_a_knee():
+    """Regression: a flat step used to collapse the running baseline to ~0, after which any
+    +1 ms read as a jump. Measured Qwen3-4B 8-bit (mlx 0.32) reported a knee at 4 while the
+    curve is still flat there; the real jump is 24 -> 30 at width 6."""
+    from mlx_dspark.calibrate import knee_width
+    measured = {1: 21.0, 2: 22.0, 3: 22.0, 4: 23.0, 5: 24.0, 6: 30.0, 7: 34.0, 8: 36.0}
+    assert knee_width(measured) == 6
+
+
+def test_knee_width_detects_a_cliff_at_the_first_step():
+    """Regression: the first delta was the baseline and so could never be reported as the
+    knee — but that is exactly the bf16 shape, where an unquantized matmul reads the weight
+    stream twice from width 2 and then stays flat (measured Ornith-9B ctx512)."""
+    from mlx_dspark.calibrate import knee_width
+    assert knee_width({1: 67.8, 2: 134.4, 4: 136.0, 8: 139.0}) == 2
+
+
+def test_knee_width_noise_does_not_trigger_on_a_flat_cheap_region():
+    """+-1 ms of measurement noise on a nearly-flat region must not read as leaving it."""
+    from mlx_dspark.calibrate import knee_width
+    measured = {1: 36.7, 2: 37.5, 3: 38.4, 4: 39.5, 5: 40.6, 6: 52.0, 7: 58.0}
+    assert knee_width(measured) == 6
+
+
 def test_drafter_recommendation_small_knee_is_dspark():
     from mlx_dspark.calibrate import drafter_recommendation
     rec = drafter_recommendation({1: 5, 2: 10, 3: 15, 4: 34, 5: 53}, dflash_block=16)

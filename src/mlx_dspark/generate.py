@@ -399,6 +399,7 @@ def greedy_generate(
     apply_chat_template: bool = True,
     stop: list[str] | None = None,
     on_text=None,
+    on_round=None,
 ) -> GenResult:
     """Plain decoding of the target (no drafter, no hidden-state capture) — the fair
     'run the model normally' baseline. ``temperature`` 0 = greedy, > 0 = sampling (matches
@@ -435,6 +436,8 @@ def greedy_generate(
             nxt = int(_sample_arr(logits_row - pen0, temperature, top_p, top_k).item())
             out_ids.append(nxt)
             pen.add([nxt])
+            if on_round is not None:
+                on_round(drafted=0, accepted=0, committed=1, cap=0, source="plain")
             if lp_list is not None:
                 lp_list.extend(_logprobs_for_block(logits_row[None, :], [nxt], logprobs))
             st.update(out_ids)
@@ -454,6 +457,11 @@ def greedy_generate(
             mx.async_eval(y_next)
             nxt = int(y.item())
             out_ids.append(nxt)
+            # Baseline has no speculation, but reporting each step keeps the live view's
+            # event shape identical across modes — which is what makes a side-by-side race
+            # between baseline and dspark a single rendering path.
+            if on_round is not None:
+                on_round(drafted=0, accepted=0, committed=1, cap=0, source="plain")
             st.update(out_ids)
             if len(out_ids) >= max_new_tokens or nxt in eos_ids or st.stopped:
                 break
@@ -492,6 +500,7 @@ def dflash_generate(
     seed: int | None = None,
     stop: list[str] | None = None,
     on_text=None,
+    on_round=None,
 ) -> GenResult:
     """Speculative decoding with a **z-lab DFlash** (block-diffusion) drafter.
 
@@ -581,6 +590,9 @@ def dflash_generate(
         accept_lengths.append(len(committed))
         if cap_controller is not None:
             cap_controller.update(n, len(drafted))
+        if on_round is not None:
+            on_round(drafted=len(drafted), accepted=n, committed=len(committed),
+                     cap=cap, source="drafter")
 
         # ---- update target cache + draft ctx ----
         target_model.rollback(cache, len(drafted) - n, drafted[:n])
@@ -722,6 +734,7 @@ def speculative_generate(
     apply_chat_template: bool = True,
     stop: list[str] | None = None,
     on_text=None,
+    on_round=None,
     verbose: bool = False,
 ) -> GenResult:
     """Speculative decoding (batch=1).
@@ -861,6 +874,11 @@ def speculative_generate(
                 out_ids.append(nxt)
                 accept_lengths.append(1)
                 target_forwards += 1
+                if on_round is not None:
+                    # Parked: the controller judged speculation a loss on this content, so
+                    # these are plain committed steps. Reporting them keeps the live view
+                    # honest about *why* throughput dropped instead of just going quiet.
+                    on_round(drafted=0, accepted=0, committed=1, cap=0, source="plain")
                 if index is not None:
                     index.extend([nxt])
                 pending = nxt
@@ -1010,6 +1028,13 @@ def speculative_generate(
                 cap_controller.update(n, len(draft), round_ms=(now - _rt) * 1e3,
                                       committed=len(committed))
             _rt = now
+        if on_round is not None:
+            # A round is milliseconds, so this dict + queue put is noise; guard it anyway so
+            # the default path (no listener) costs exactly one `is not None` test.
+            on_round(drafted=len(draft), accepted=n, committed=len(committed),
+                     cap=cap,
+                     source=("lookup" if lk_draft else
+                             "plain" if not draft else "drafter"))
 
         # ---- 4. update caches/context ----
         target_model.rollback(cache, len(draft) - n, draft[:n])

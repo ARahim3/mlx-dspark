@@ -210,16 +210,44 @@ def knee_width(verify_ms: dict[int, float]) -> int:
     machine-dependent quantity that decides dspark-vs-DFlash: a *small* knee means wide verify is
     expensive → dspark's short blocks win (what ``--mode auto`` already picks); a knee that has
     moved out to the DFlash block width (M5-class hardware) means DFlash full-block verify stays
-    cheap and re-enters play. Returns the top measured width if no clear knee is found."""
+    cheap and re-enters play. Returns the top measured width if no clear knee is found.
+
+    A jump has to clear **two** bars, because either alone misfires on a real curve:
+
+    - *relative*: above 1.8x the mean marginal cost of the cheap region so far. The mean, not
+      the running minimum — a minimum collapses to ~0 the moment one step is flat, after which
+      every later step trivially "jumps". (Measured Qwen3-4B 8-bit, mlx 0.32, ms by width
+      1..8 = 21 22 22 23 24 30 34 36: the flat 22->22 step drove the old baseline to 0 and the
+      knee was reported at 4, where the curve is still flat. The real jump is at 6.)
+    - *absolute*: at least 15% of the single-row cost. On a nearly-flat cheap region the
+      deltas are +-1 ms of measurement noise, and a ratio test on noise is meaningless.
+
+    Reporting only — cap selection reads the curves directly (see :meth:`CapController.rate`),
+    so this never changes what gets drafted, only what is shown and recommended.
+    """
     ks = sorted(verify_ms)
     if len(ks) < 3:
         return ks[-1] if ks else 0
     deltas = [(ks[i], verify_ms[ks[i]] - verify_ms[ks[i - 1]]) for i in range(1, len(ks))]
-    base = deltas[0][1]
+    floor = 0.15 * verify_ms[ks[0]]          # noise gate, scaled to the model's own cost
+
+    # The very first step can itself be the knee — that is exactly the bf16 case, where an
+    # unquantized matmul reads the full weight stream twice from width 2 and then stays flat
+    # (Ornith-9B: 67.8 -> 134.4 -> ~139 ms). It has no cheap region *below* it to compare
+    # against, so judge it against the rest of the curve instead. Without this the detector
+    # structurally cannot see a cliff at width 2, and reports the top width instead.
+    if len(deltas) >= 2:
+        rest = [d for _, d in deltas[1:]]
+        tail_mean = sum(rest) / len(rest)
+        if deltas[0][1] > max(1.8 * tail_mean, floor):
+            return deltas[0][0]
+
+    seen = [deltas[0][1]]
     for w, d in deltas[1:]:
-        if d > 1.8 * max(base, 1e-6):        # marginal cost jumped clearly above the cheap region
+        base = sum(seen) / len(seen)
+        if d > max(1.8 * base, floor):       # marginal cost left the cheap region
             return w
-        base = min(base, d)
+        seen.append(d)
     return ks[-1]
 
 

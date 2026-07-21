@@ -43,6 +43,7 @@ from .generate import (
     speculative_generate,
 )
 from .load import apply_wired_limit, load_dflash, load_drafter, load_target, resolve_mode
+from .telemetry import RoundLog, RoundRecorder
 from .lookup import lookup_generate
 from .prefix_cache import PrefixCache, target_cache_reusable
 from .tools import normalize_tool_messages, parse_tool_calls, schema_types
@@ -161,6 +162,10 @@ class Engine:
         self._executor = executor or ThreadPoolExecutor(max_workers=1,
                                                         thread_name_prefix="mlx-gen")
         self.created = int(time.time())
+        # Per-round telemetry: fed by the decode loops, read by /events and /metrics. Kept
+        # even with no subscribers so /metrics can report position acceptance (d_0, d_1, ...)
+        # for whatever has already run.
+        self.rounds = RoundLog()
         self.stats = {
             "requests": 0,
             "prompt_tokens": 0,
@@ -305,6 +310,7 @@ class Engine:
     def _generate_impl(self, prompt_ids, max_tokens, temperature, top_p, top_k, stop, seed,
                        on_text, presence_penalty=0.0, frequency_penalty=0.0,
                        logprobs=None) -> GenResult:
+        on_round = RoundRecorder(self.rounds, uuid.uuid4().hex[:8], self.mode)
         # prefix caching: reuse the shared conversation prefix's KV (dspark/baseline on a
         # dense target); `cache is None` means this mode/target doesn't reuse.
         cache = ctx = None
@@ -323,6 +329,7 @@ class Engine:
                     temperature=temperature, top_p=top_p, top_k=top_k,
                     presence_penalty=presence_penalty, frequency_penalty=frequency_penalty,
                     logprobs=logprobs, seed=seed, stop=stop, on_text=on_text,
+                    on_round=on_round,
                 )
             elif self.mode == "dflash":
                 res = dflash_generate(
@@ -330,7 +337,7 @@ class Engine:
                     max_new_tokens=max_tokens, max_draft_tokens=self.max_draft_tokens,
                     cap_controller=self.cap_controller,
                     temperature=temperature, top_p=top_p, top_k=top_k,
-                    seed=seed, stop=stop, on_text=on_text,
+                    seed=seed, stop=stop, on_text=on_text, on_round=on_round,
                 )
             elif self.mode == "lookup":
                 res = lookup_generate(
@@ -339,7 +346,7 @@ class Engine:
                     max_new_tokens=max_tokens, max_draft_tokens=self.max_draft_tokens or 6,
                     long_draft_tokens=max(self.max_draft_tokens or 6, self.lookup_long_draft),
                     temperature=temperature, top_p=top_p, top_k=top_k,
-                    seed=seed, stop=stop, on_text=on_text,
+                    seed=seed, stop=stop, on_text=on_text, on_round=on_round,
                 )
             else:
                 res = greedy_generate(
@@ -348,7 +355,7 @@ class Engine:
                     max_new_tokens=max_tokens, temperature=temperature, top_p=top_p,
                     top_k=top_k, presence_penalty=presence_penalty,
                     frequency_penalty=frequency_penalty, logprobs=logprobs, seed=seed,
-                    stop=stop, on_text=on_text,
+                    stop=stop, on_text=on_text, on_round=on_round,
                 )
         except BaseException:                     # never leave a desynced cache behind
             if self.prefix is not None:
@@ -391,7 +398,53 @@ class Engine:
             if s["generation_seconds"] else 0.0,
             "prefix_cache": self.prefix.info() if self.prefix is not None else {"enabled": False},
             "auto_cap": self.cap_controller.info() if self.cap_controller is not None else None,
+            # per-round aggregates, incl. position acceptance (d_0, d_1, …) — the drafter
+            # quality curve the speedup rests on
+            "rounds": self.rounds.stats(),
         }
+
+    def calibration(self) -> dict:
+        """The measured cost curves for this machine+model pair.
+
+        These are already computed and cached on disk by ``--max-draft auto``; until now they
+        only ever appeared as one line of terminal output. Nothing here measures anything —
+        it reads the cache and reports what is there, so it is safe to call at any time.
+        """
+        from .calibrate import _cache_key, drafter_recommendation, load_cached
+
+        if self.mode not in ("dspark", "dflash"):
+            return {"available": False,
+                    "reason": f"calibration applies to dspark/dflash, not {self.mode!r}"}
+        key = _cache_key(self.mode, self.target_repo, self.drafter_repo,
+                         kv_bits=getattr(self.target, "kv_bits", None))
+        entry = load_cached(key)
+        if entry is None:
+            return {"available": False, "key": key,
+                    "reason": "not calibrated yet on this machine — run with --max-draft auto"}
+
+        verify = {int(k): float(v) for k, v in entry["verify"].items()}
+        drafter_ms = entry["drafter"]
+        out = {
+            "available": True,
+            "key": key,
+            "mode": self.mode,
+            "target": self.target_repo,
+            "drafter": self.drafter_repo,
+            # ms per verify forward at each width — the convex curve whose knee explains
+            # why cap 2 wins on M-series, and whose 16–32 plateau is why long lookup
+            # drafts pay off.
+            "verify_ms": {str(k): round(v, 3) for k, v in sorted(verify.items())},
+            "drafter_ms": ({str(k): round(float(v), 3) for k, v in sorted(
+                ((int(k2), v2) for k2, v2 in drafter_ms.items()))}
+                if isinstance(drafter_ms, dict) else round(float(drafter_ms), 3)),
+            "round_overhead_ms": round(float(entry.get("overhead", 0.0)), 3),
+            "recommendation": drafter_recommendation(verify),
+        }
+        if entry.get("verify_grid"):
+            out["verify_grid"] = entry["verify_grid"]
+        if self.cap_controller is not None:
+            out["controller"] = self.cap_controller.info()
+        return out
 
 
 # --------------------------------------------------------------------------- batching engine
@@ -782,6 +835,13 @@ def make_handler(engine: Engine, api_key: str | None):
                 self.wfile.write(f"{head}data: {json.dumps(obj)}\n\n".encode("utf-8"))
                 self.wfile.flush()
 
+        def _sse_comment(self, text: str):
+            """A comment frame — ignored by every SSE client, but it keeps the socket alive
+            through an idle stretch (no rounds running) without inventing a fake event."""
+            with self._wlock:
+                self.wfile.write(f": {text}\n\n".encode("utf-8"))
+                self.wfile.flush()
+
         # -- auth --
         def _authed(self) -> bool:
             if not api_key:
@@ -824,7 +884,68 @@ def make_handler(engine: Engine, api_key: str | None):
                 return self._send_json(200, self._models_payload())
             if route == "/metrics":
                 return self._send_json(200, engine.metrics())
+            if route == "/calibration":
+                return self._send_json(200, engine.calibration())
+            if route == "/doctor":
+                from .diagnostics import doctor
+
+                return self._send_json(200, doctor())
+            if route == "/admin/models":
+                from .diagnostics import model_inventory
+
+                return self._send_json(200, {"models": model_inventory(),
+                                             "loaded": engine.target_repo})
+            if route == "/rounds":
+                # Recent rounds as one JSON blob — the pull-based sibling of /events, for
+                # clients that would rather poll than hold a stream open.
+                limit = self._query_int("limit", 128)
+                return self._send_json(200, {"rounds": engine.rounds.snapshot(limit),
+                                             "stats": engine.rounds.stats()})
+            if route == "/events":
+                return self._events_stream()
             return self._send_error(404, f"unknown route {self.path}", "not_found")
+
+        def _query_int(self, name: str, default: int) -> int:
+            from urllib.parse import parse_qs
+
+            try:
+                return int(parse_qs(urlsplit(self.path).query).get(name, [default])[0])
+            except (TypeError, ValueError):
+                return default
+
+        def _events_stream(self):
+            """SSE stream of per-round telemetry.
+
+            Deliberately independent of any one request: a client opens this once and watches
+            every round the engine runs, whoever asked for it. That is what lets a UI show a
+            live accept ribbon while a *different* client (an agent, say) is the one generating.
+            """
+            q = engine.rounds.subscribe()
+            try:
+                self._sse_start()
+                # Replay a little history so a client that connects mid-generation has
+                # something to draw immediately instead of an empty chart.
+                for event in engine.rounds.snapshot(32):
+                    self._sse(event, "round")
+                self._sse(engine.rounds.stats(), "stats")
+                idle = 0.0
+                while True:
+                    try:
+                        event = q.get(timeout=1.0)
+                    except _queue.Empty:
+                        idle += 1.0
+                        # Without traffic a proxy or the client can time the socket out; a
+                        # comment frame is the cheapest legal keep-alive.
+                        self._sse_comment("keepalive")
+                        if idle >= 15.0:
+                            self._sse(engine.rounds.stats(), "stats")
+                            idle = 0.0
+                        continue
+                    self._sse(event, "round")
+            except (BrokenPipeError, ConnectionResetError):
+                pass                     # client went away; nothing to report
+            finally:
+                engine.rounds.unsubscribe(q)
 
         def do_POST(self):
             route = self._route()

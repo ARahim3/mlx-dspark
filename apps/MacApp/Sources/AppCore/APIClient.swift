@@ -125,6 +125,81 @@ public struct APIClient: Sendable {
         return (try JSONSerialization.jsonObject(with: data) as? [String: Any]) ?? [:]
     }
 
+    /// This machine's measured verify/drafter cost curves (Lab → Curves).
+    public func calibration() async throws -> Calibration {
+        let (data, response) = try await session.data(for: request("calibration"))
+        try Self.check(response, data)
+        return try JSONDecoder().decode(Calibration.self, from: data)
+    }
+
+    /// Environment + model inventory (onboarding, Models screen).
+    public func doctor() async throws -> DoctorReport {
+        let (data, response) = try await session.data(for: request("doctor"))
+        try Self.check(response, data)
+        return try JSONDecoder().decode(DoctorReport.self, from: data)
+    }
+
+    public func modelInventory() async throws -> [ModelRow] {
+        let (data, response) = try await session.data(for: request("admin/models"))
+        try Self.check(response, data)
+        return try JSONDecoder().decode(ModelInventory.self, from: data).models
+    }
+
+    /// Recent rounds plus aggregates, without holding a stream open.
+    public func rounds(limit: Int = 128) async throws -> (rounds: [RoundEvent], stats: RoundStats) {
+        var req = request("rounds")
+        req.url = URL(string: "\(baseURL.absoluteString)/rounds?limit=\(limit)")
+        let (data, response) = try await session.data(for: req)
+        try Self.check(response, data)
+        struct Payload: Decodable { let rounds: [RoundEvent]; let stats: RoundStats }
+        let payload = try JSONDecoder().decode(Payload.self, from: data)
+        return (payload.rounds, payload.stats)
+    }
+
+    /// Live per-round telemetry.
+    ///
+    /// Not scoped to a request: this reports every round the engine runs, whoever asked for
+    /// it. That is what lets the app show a live accept ribbon while a *different* client —
+    /// Claude Code, say — is the one generating.
+    public func streamRounds() -> AsyncThrowingStream<TelemetryEvent, Error> {
+        AsyncThrowingStream { continuation in
+            let task = Task {
+                do {
+                    let (bytes, response) = try await session.bytes(for: request("events"))
+                    if let http = response as? HTTPURLResponse, http.statusCode != 200 {
+                        throw APIError.badStatus(http.statusCode, "")
+                    }
+                    let decoder = JSONDecoder()
+                    var eventName = "round"
+                    for try await line in bytes.lines {
+                        if line.hasPrefix(":") { continue }            // keep-alive comment
+                        if line.hasPrefix("event: ") {
+                            eventName = String(line.dropFirst(7))
+                            continue
+                        }
+                        guard line.hasPrefix("data: "),
+                              let data = String(line.dropFirst(6)).data(using: .utf8)
+                        else { continue }
+                        switch eventName {
+                        case "stats":
+                            if let stats = try? decoder.decode(RoundStats.self, from: data) {
+                                continuation.yield(.stats(stats))
+                            }
+                        default:
+                            if let round = try? decoder.decode(RoundEvent.self, from: data) {
+                                continuation.yield(.round(round))
+                            }
+                        }
+                    }
+                    continuation.finish()
+                } catch {
+                    continuation.finish(throwing: error)
+                }
+            }
+            continuation.onTermination = { _ in task.cancel() }
+        }
+    }
+
     /// Stream a chat completion, yielding text deltas and finally the spec-decode stats.
     public func streamChat(
         model: String,

@@ -157,6 +157,7 @@ def lookup_generate(
     apply_chat_template: bool = True,
     stop: list[str] | None = None,
     on_text=None,
+    on_round=None,
 ) -> GenResult:
     """Prompt-lookup speculative decoding (batch=1) — no drafter model.
 
@@ -232,6 +233,11 @@ def lookup_generate(
         accept_lengths.append(len(committed))
         if draft:
             gate.update(len(draft), n, base_draft)
+        if on_round is not None:
+            # A miss drafts nothing and costs a plain step; reporting it as such is what makes
+            # the lookup hit-rate visible rather than an unexplained throughput swing.
+            on_round(drafted=len(draft), accepted=n, committed=len(committed),
+                     cap=len(draft), source="lookup" if draft else "plain")
 
         target_model.rollback(cache, len(draft) - n, draft[:n])
 
