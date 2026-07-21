@@ -2,6 +2,29 @@
 
 All notable changes to `mlx-dspark`. Versions follow [SemVer](https://semver.org/) (pre-1.0: minor-ish features land as patch bumps).
 
+## [0.5.1] — 2026-07-21 — diagnosable server errors + dependency refresh
+
+### Fixed
+- **Server 500s are diagnosable again** (issue #5). A failed generation returned
+  `generation failed: <str(e)>` and *discarded the traceback*, so an intermittent
+  per-request error (the reporter saw one `list index out of range` in 461 requests)
+  left no record of where it came from. The handler now logs the full traceback to
+  stderr and names the exception type in the response body.
+- **Prefix cache: stored slots hold exactly their token record.** A speculative round
+  commits a whole block, so a generation ending on an eos that lands *mid-block* left
+  the target KV cache (and drafter ctx) holding rows for tokens dropped from
+  `token_ids`. Reuse trims by absolute offset, so this was harmless in practice, but it
+  wasted KV and made the class's central invariant only accidentally true.
+  `PrefixCache.store()` now normalizes both caches down to the record. Baseline mode
+  can't reach this case (it commits one token per step).
+
+### Changed
+- **Dependencies: mlx-vlm 0.6.3→0.6.6, transformers 5.12.1→5.14.1** (dev `.venv` now
+  matches latest-resolve). Both target routes verified **bit-identical** before/after —
+  mlx-lm/Qwen3-4B and mlx-vlm/gemma-4-12B, greedy ids, speculative ids and accept
+  lengths unchanged. The mlx-vlm 0.6.4 `Gemma4UnifiedProcessor` shim self-retires on
+  0.6.6 and is kept only because the floor still admits 0.6.4.
+
 ## [0.5.0] — 2026-07-18 — community DSpark drafters: Ornith-1.0-9B (chat finally >2×) + Qwen3.6-27B + match-scaled long lookup drafts
 
 ### Added

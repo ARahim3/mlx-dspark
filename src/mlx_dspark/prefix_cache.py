@@ -153,7 +153,21 @@ class PrefixCache:
         # the pending token, not yet fed through the target) — see the generate loops.
         if not _storable(cache):              # e.g. a RotatingKVCache wrapped mid-generation
             return
-        slot = _Slot(list(prompt_ids) + list(token_ids[:-1]), cache, ctx, self._next_sid)
+        tokens = list(prompt_ids) + list(token_ids[:-1])
+        # ...except that a speculative round commits a whole block at once, and the loops stop
+        # at an eos landing MID-block: the tokens after it are dropped from token_ids, but the
+        # verify forward already wrote their KV rows (and their drafter ctx). So normalize the
+        # caches down to the token record before storing, or the slot would claim a prefix
+        # shorter than the KV it actually holds. Reuse trims by absolute offset, so the excess
+        # was harmless in practice — but it wasted KV and left this class's central invariant
+        # (caches hold exactly `slot.tokens`) only accidentally true, which is not something a
+        # future reader should have to re-derive. Baseline can't reach this: it commits one
+        # token per step, so eos is always the last token appended.
+        _trim_target(cache, len(tokens))
+        if ctx is not None:
+            for c in ctx:
+                c.trim_to(len(tokens))
+        slot = _Slot(tokens, cache, ctx, self._next_sid)
         self._next_sid += 1
         self._slots.insert(0, slot)
         while len(self._slots) > self.max_slots:

@@ -27,6 +27,7 @@ import os
 import queue as _queue
 import threading
 import time
+import traceback
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -772,7 +773,12 @@ def make_handler(engine: Engine, api_key: str | None):
             except (BrokenPipeError, ConnectionResetError):
                 return  # client hung up mid-stream; nothing more to do
             except Exception as e:  # keep the server alive on a bad request
-                return self._send_error(500, f"generation failed: {e}", "server_error")
+                # Log the full traceback: a per-request 500 is often an intermittent,
+                # state-dependent edge (issue #5) that the client-side message alone can't
+                # localize — without this the only record of WHERE it failed is discarded.
+                traceback.print_exc()
+                return self._send_error(500, f"generation failed: {type(e).__name__}: {e}",
+                                        "server_error")
             return self._send_error(404, f"unknown route {self.path}", "not_found")
 
         # -- payloads --

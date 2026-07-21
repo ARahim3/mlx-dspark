@@ -187,3 +187,36 @@ def test_reset_invalidates():
     assert pc.info()["cached_tokens"] == 0
     _, _, reuse_len = pc.acquire([1, 2, 3])
     assert reuse_len == 0
+
+
+def test_store_normalizes_caches_to_the_token_record():
+    """A speculative round commits a block at once, so an eos landing mid-block leaves the
+    KV cache (and drafter ctx) holding rows for tokens that never made it into token_ids.
+    store() must trim back to the record, so the slot holds exactly `slot.tokens`."""
+    pc = PrefixCache(_mk_cache, _mk_ctx, min_reuse=1)
+    cache, ctx = _mk_cache(), _mk_ctx()
+    prompt = [1, 2, 3, 4]
+    generated = [5, 6, 7]                 # eos at 7 -> record is prompt + [5, 6]
+    # verify wrote 2 extra rows past the record (the block's post-eos tokens)
+    for c in cache:
+        c.offset = len(prompt) + len(generated) - 1 + 2
+    pc.store(cache, ctx, prompt, generated)
+
+    slot = pc._slots[0]
+    assert slot.tokens == [1, 2, 3, 4, 5, 6]
+    for c in cache:
+        assert c.offset == len(slot.tokens)        # was 8, the record claims 6
+    for c in ctx:
+        assert c.trimmed_to == len(slot.tokens)
+
+
+def test_store_leaves_an_exact_cache_untouched():
+    """The normal case (no eos truncation) is already exact — store must not trim it."""
+    pc = PrefixCache(_mk_cache, _mk_ctx, min_reuse=1)
+    cache, ctx = _mk_cache(), _mk_ctx()
+    prompt, generated = [1, 2, 3], [4, 5]
+    for c in cache:
+        c.offset = len(prompt) + len(generated) - 1  # == len(record)
+    pc.store(cache, ctx, prompt, generated)
+    for c in cache:
+        assert c.offset == 4

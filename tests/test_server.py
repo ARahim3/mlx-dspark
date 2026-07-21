@@ -315,3 +315,26 @@ def test_n_with_stream_is_rejected(server):
         _post(base, "/v1/chat/completions",
               {"messages": [{"role": "user", "content": "hi"}], "n": 2, "stream": True})
     assert e.value.code == 400
+
+
+def test_generation_error_reports_type_and_logs_traceback(server, capfd):
+    """A mid-generation failure must return a 500 that NAMES the exception type and must
+    leave the traceback in the server log. Issue #5 reported an intermittent
+    'generation failed: list index out of range' with no way to localize it: the handler
+    caught the exception, formatted str(e) only, and dropped the traceback on the floor,
+    so neither the user nor a maintainer could tell which list, in which module, blew up.
+    """
+    eng, base = server
+
+    def boom(*a, **k):
+        raise IndexError("list index out of range")
+
+    eng.generate = boom
+    with pytest.raises(urllib.error.HTTPError) as e:
+        _post(base, "/v1/chat/completions", {"messages": [{"role": "user", "content": "hi"}]})
+    assert e.value.code == 500
+    err = json.loads(e.value.read())["error"]
+    assert err["type"] == "server_error"
+    assert "IndexError" in err["message"]           # bare str(e) hid which exception it was
+    assert "list index out of range" in err["message"]
+    assert "Traceback" in capfd.readouterr().err    # the part that makes it diagnosable
