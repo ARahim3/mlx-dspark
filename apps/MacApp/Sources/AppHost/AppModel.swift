@@ -104,7 +104,9 @@ final class AppModel: ObservableObject {
     let logStore = LogStore()
     private var bootstrapper: RuntimeBootstrapper?
     private var supervisor: ServerSupervisor?
-    private var client: APIClient?
+    /// Exposed so feature models (the Race) can drive the engine without re-deriving the port.
+    private(set) var apiClient: APIClient?
+    private var client: APIClient? { apiClient }
     private var generationTask: Task<Void, Never>?
     private var telemetryTask: Task<Void, Never>?
 
@@ -148,7 +150,7 @@ final class AppModel: ObservableObject {
             let port = try await supervisor.start(
                 config: ServerConfig(model: model, mode: "auto", maxDraft: "auto"))
             let client = APIClient(baseURL: URL(string: "http://127.0.0.1:\(port)")!)
-            self.client = client
+            self.apiClient = client
             phase = .ready
             startTelemetry()
             await refreshDiagnostics()
@@ -276,6 +278,15 @@ final class AppModel: ObservableObject {
     }
 
     var isServerReady: Bool { health != nil }
+
+    /// Which strategies can be raced with the currently loaded pair. `baseline` and `lookup`
+    /// need only the target; a drafter mode needs the drafter this engine was loaded with, so
+    /// dspark and dflash are never both on offer.
+    var availableRaceArms: [String] {
+        guard let mode = health?.mode else { return ["baseline", "lookup"] }
+        return mode == "dspark" || mode == "dflash"
+            ? [mode, "baseline", "lookup"] : ["baseline", "lookup"]
+    }
 
     var statusLine: String {
         switch serverState {

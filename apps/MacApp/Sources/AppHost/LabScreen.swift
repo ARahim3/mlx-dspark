@@ -12,7 +12,7 @@ struct LabScreen: View {
     @State private var tab: Tab = Tab(rawValue: Defaults.labTab) ?? .live
 
     enum Tab: String, CaseIterable, Identifiable {
-        case live = "Live", curves = "Curves"
+        case race = "Race", live = "Live", curves = "Curves"
         var id: String { rawValue }
     }
 
@@ -23,7 +23,7 @@ struct LabScreen: View {
             }
             .pickerStyle(.segmented)
             .labelsHidden()
-            .frame(width: 220)
+            .frame(width: 280)
             .padding(12)
 
             Divider()
@@ -31,6 +31,7 @@ struct LabScreen: View {
             ScrollView {
                 VStack(alignment: .leading, spacing: 16) {
                     switch tab {
+                    case .race:   RaceTab()
                     case .live:   LiveTab()
                     case .curves: CurvesTab()
                     }
