@@ -43,6 +43,25 @@ build-backend = "hatchling.build"
 [tool.hatch.build.targets.wheel]
 packages = ["src/mlx_dspark"]
 
+# Explicit allow-list for the source distribution. Without this, hatchling's default sdist
+# swept in the entire working tree — including the untracked `apps/MacApp/.build/` Swift
+# artifacts (~300 MB) when built from the mac-app branch, producing a 112 MB tarball. List
+# only what belongs in a source build; everything else (apps/, drafts/, *.mp4, images, .venv)
+# is excluded by omission. README images are referenced by absolute GitHub URLs, so the PyPI
+# page renders without shipping them.
+[tool.hatch.build.targets.sdist]
+include = [
+    "src/mlx_dspark",
+    "tests",
+    "scripts",
+    "benchmark.py",
+    "pyproject.toml",
+    "README.md",
+    "CHANGELOG.md",
+    "LICENSE",
+    "NOTICE",
+]
+
 [tool.ruff]
 line-length = 100
 
