@@ -218,7 +218,7 @@ def cmd_generate(argv: list[str]) -> None:
 
 
 def cmd_serve(argv: list[str]) -> None:
-    from .server import Engine, maybe_batch_engine, run_server
+    from .server import Engine, EngineHolder, maybe_batch_engine, run_server
 
     ap = argparse.ArgumentParser(prog="mlx-dspark serve",
                                  description="OpenAI-compatible API server.")
@@ -312,33 +312,37 @@ def cmd_serve(argv: list[str]) -> None:
         max_draft = max(1, md)
 
     print(f"loading {args.mode} engine — first run downloads weights…")
+    # Captured so a `/admin/load` model swap re-loads with the same server flags, changing only
+    # the model — an in-place swap that keeps the port instead of a full restart.
+    load_kwargs = dict(
+        mode=args.mode, model=args.model, drafter=args.drafter,
+        family=args.family, target=args.target,
+        drafter_bits=args.drafter_bits, max_draft_tokens=max_draft,
+        confidence_threshold=args.confidence_threshold,
+        enable_thinking=False if args.no_thinking else None,
+        prefix_cache=not args.no_prefix_cache,
+        prefix_cache_dir=args.prefix_cache_dir,
+        prefix_cache_max_ram_mb=args.prefix_cache_max_ram_mb,
+        default_max_tokens=args.default_max_tokens,
+        max_tokens_cap=args.max_tokens_cap,
+        default_temperature=args.default_temperature,
+        default_top_p=args.default_top_p,
+        default_top_k=args.default_top_k,
+        prefix_cache_slots=args.prefix_cache_slots,
+        lookup_drafts=not args.no_lookup_drafts,
+        lookup_long_draft=args.lookup_long_draft,
+        wired_limit=args.wired_limit,
+        batch_widths=(sorted({2, args.max_batch}) if args.max_batch > 1 else None),
+        kv_bits=args.kv_bits or None,
+        context_window=args.context_window,
+    )
     try:
-        engine = Engine.load(
-            mode=args.mode, model=args.model, drafter=args.drafter,
-            family=args.family, target=args.target,
-            drafter_bits=args.drafter_bits, max_draft_tokens=max_draft,
-            confidence_threshold=args.confidence_threshold,
-            enable_thinking=False if args.no_thinking else None,
-            prefix_cache=not args.no_prefix_cache,
-            prefix_cache_dir=args.prefix_cache_dir,
-            prefix_cache_max_ram_mb=args.prefix_cache_max_ram_mb,
-            default_max_tokens=args.default_max_tokens,
-            max_tokens_cap=args.max_tokens_cap,
-            default_temperature=args.default_temperature,
-            default_top_p=args.default_top_p,
-            default_top_k=args.default_top_k,
-            prefix_cache_slots=args.prefix_cache_slots,
-            lookup_drafts=not args.no_lookup_drafts,
-            lookup_long_draft=args.lookup_long_draft,
-            wired_limit=args.wired_limit,
-            batch_widths=(sorted({2, args.max_batch}) if args.max_batch > 1 else None),
-            kv_bits=args.kv_bits or None,
-            context_window=args.context_window,
-        )
+        engine = Engine.load(**load_kwargs)
     except ValueError as e:
         ap.error(str(e))
-    engine = maybe_batch_engine(engine, args.max_batch)
-    run_server(engine, host=args.host, port=args.port, api_key=args.api_key)
+    holder = EngineHolder(maybe_batch_engine(engine, args.max_batch),
+                          load_kwargs, max_batch=args.max_batch)
+    run_server(holder, host=args.host, port=args.port, api_key=args.api_key)
 
 
 # --------------------------------------------------------------------------- claude code

@@ -50,6 +50,14 @@ public struct ModelEntry: Decodable, Sendable, Identifiable {
 
 struct ModelList: Decodable { let data: [ModelEntry] }
 
+/// Result of a hot model swap (`/admin/load`, `/admin/status`).
+public struct LoadStatus: Decodable, Sendable {
+    public let ready: Bool
+    public let loading: Bool
+    public let model: String?
+    public let error: String?
+}
+
 /// One event from a streaming completion.
 public enum ChatEvent: Sendable {
     case delta(String)
@@ -123,6 +131,24 @@ public struct APIClient: Sendable {
         let (data, response) = try await session.data(for: request("metrics"))
         try Self.check(response, data)
         return (try JSONSerialization.jsonObject(with: data) as? [String: Any]) ?? [:]
+    }
+
+    /// Hot-swap the loaded model, keeping the server and its port. Returns once the new model
+    /// is loaded (or throws with the reason). Far preferable to a process restart: the port
+    /// survives, so nothing pointed at the server has to be reconfigured.
+    public func loadModel(_ target: String) async throws -> LoadStatus {
+        let body = try JSONSerialization.data(withJSONObject: ["model": target])
+        var req = request("admin/load", method: "POST", body: body)
+        req.timeoutInterval = 1800        // a first-time load downloads weights
+        let (data, response) = try await session.data(for: req)
+        try Self.check(response, data)
+        return try JSONDecoder().decode(LoadStatus.self, from: data)
+    }
+
+    public func loadStatus() async throws -> LoadStatus {
+        let (data, response) = try await session.data(for: request("admin/status"))
+        try Self.check(response, data)
+        return try JSONDecoder().decode(LoadStatus.self, from: data)
     }
 
     /// This machine's measured verify/drafter cost curves (Lab → Curves).

@@ -87,6 +87,11 @@ final class AppModel: ObservableObject {
     @Published var stats: RoundStats?
     @Published var calibration: Calibration?
 
+    /// The loaded model's self-description. Fetched from `/health` on start and after every hot
+    /// swap, so it stays correct across a model change — the supervisor's own cached health
+    /// only reflects the model the process *started* with, not one swapped in later.
+    @Published var currentHealth: HealthInfo?
+
     // MARK: Models
     @Published var models: [ModelRow] = []
     @Published var doctorReport: DoctorReport?
@@ -190,6 +195,7 @@ final class AppModel: ObservableObject {
                 config: ServerConfig(model: model, mode: "auto", maxDraft: "auto"))
             let client = APIClient(baseURL: URL(string: "http://127.0.0.1:\(port)")!)
             self.apiClient = client
+            currentHealth = try? await client.health()
             phase = .ready
             startTelemetry()
             await refreshDiagnostics()
@@ -198,22 +204,33 @@ final class AppModel: ObservableObject {
         }
     }
 
-    /// Switch to a different target. Restart-based, not a hot swap: MLX holds one device
-    /// context and the weights are gigabytes, so the honest way to change models is to stop the
-    /// server and start a fresh one. The UI shows the loading screen again meanwhile.
+    /// Switch to a different target — an in-place hot swap via `/admin/load`, not a restart.
     ///
-    /// (A true in-place `/admin/load` — swap weights without dropping the process — is the
-    /// eventual control-plane work; this restart is correct and simple until then.)
+    /// The server and its port survive, so anything else pointed at it (a Claude Code session)
+    /// keeps working across the change. The engine frees the old model before loading the new
+    /// one (release-then-load), so peak memory stays at one model. The loading screen shows
+    /// meanwhile; telemetry resets because the new model's numbers are its own.
     func switchModel(to target: String) async {
-        guard target != model || !isServerReady else { return }
+        guard target != model, let client = apiClient else { return }
         generationTask?.cancel()
-        telemetryTask?.cancel()
-        await supervisor?.stop()
-        apiClient = nil
+        self.model = target
+        Defaults.selectedModel = target
         rounds = []
         stats = nil
         calibration = nil
-        await startServer(model: target)
+        phase = .startingServer
+        logStore.note("switching model → \(target)")
+        do {
+            _ = try await client.loadModel(target)
+            // Re-point health at the new model and restart the telemetry stream (the old one
+            // ended when the engine it was streaming from was torn down).
+            currentHealth = try? await client.health()
+            phase = .ready
+            startTelemetry()
+            await refreshDiagnostics()
+        } catch {
+            fail(error)
+        }
     }
 
     private func fail(_ error: Error) {
@@ -330,6 +347,9 @@ final class AppModel: ObservableObject {
     // MARK: - Derived
 
     var health: HealthInfo? {
+        // Prefer the freshly-fetched health (correct after a hot swap); fall back to the
+        // supervisor's start-time snapshot before the first fetch lands.
+        if let currentHealth { return currentHealth }
         if case .ready(_, let health) = serverState { return health }
         return nil
     }

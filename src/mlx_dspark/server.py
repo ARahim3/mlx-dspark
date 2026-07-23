@@ -416,6 +416,28 @@ class Engine:
             "rounds": self.rounds.stats(),
         }
 
+    def close(self) -> None:
+        """Release the models and stop the generation thread. Used by hot model-swapping
+        (``/admin/load``) to free GPU memory before the replacement loads.
+
+        Shuts the executor down *waiting* for any in-flight generation to finish — a swap must
+        never yank the model out from under a running request — then drops references and asks
+        MLX to release the freed Metal buffers so the next model has room. Idempotent.
+        """
+        import mlx.core as mx
+
+        self._executor.shutdown(wait=True)
+        if self.prefix is not None:
+            self.prefix.reset()
+            self.prefix = None
+        self.target = None
+        self.drafter = None
+        self.cap_controller = None
+        try:
+            mx.clear_cache()                 # return the just-freed buffers to the OS
+        except Exception:  # noqa: BLE001 — best-effort; a failed cache clear is not fatal
+            pass
+
     def race_arms_available(self) -> list[str]:
         """Which decode strategies can be raced with what is currently loaded.
 
@@ -930,6 +952,94 @@ def maybe_batch_engine(engine: Engine, max_batch: int):
     return BatchEngine(engine, max_batch=max_batch)
 
 
+class EngineHolder:
+    """A swappable reference to the live engine, so a model can be changed **without dropping
+    the server** (``POST /admin/load``).
+
+    Everything the request handler does — ``holder.generate(...)``, ``holder.metrics()``,
+    ``holder.model_id`` — is delegated to the current engine via ``__getattr__``, so the 57
+    places the handler touches the engine need no changes: they just follow the swap.
+
+    Swap policy is **release-then-load**, deliberately. Freeing the old model before loading the
+    new one means peak memory is one model, not two — the difference between switching two 12 GB
+    models comfortably on a 16 GB Mac and OOM-ing it. The cost is a window with no model loaded;
+    the handler answers requests during that window with 503 (see ``ready``). A load that fails
+    leaves no model, reported clearly and recovered by loading a valid one.
+
+    It preserves the port, which a full process restart cannot — an external client (Claude
+    Code, say) pointed at the server keeps working across a model change.
+    """
+
+    def __init__(self, engine, load_kwargs: dict, max_batch: int = 1):
+        self._engine = engine
+        self._load_kwargs = dict(load_kwargs)     # the flags this server was started with
+        self._max_batch = max_batch
+        self._swap_lock = threading.Lock()
+        self._loading = False
+        self._load_error: str | None = None
+
+    def __getattr__(self, name):
+        # Only reached for names not found on the holder itself. During a swap `_engine` is
+        # None; the request dispatcher gates on `ready` before getting here, so a stray access
+        # surfaces as a clear error rather than a confusing AttributeError on None.
+        engine = self.__dict__.get("_engine")
+        if engine is None:
+            raise RuntimeError("no model is loaded (a model swap is in progress or failed)")
+        return getattr(engine, name)
+
+    @property
+    def ready(self) -> bool:
+        return self._engine is not None and not self._loading
+
+    @property
+    def current(self):
+        return self._engine
+
+    def status(self) -> dict:
+        return {"ready": self.ready, "loading": self._loading,
+                "model": self._engine.model_id if self._engine is not None else None,
+                "error": self._load_error}
+
+    def swap(self, *, model: str, mode: str | None = None,
+             max_draft: int | str | None = None) -> dict:
+        """Release the current model and load ``model`` in its place. Returns the new status.
+
+        Serialized by ``_swap_lock`` so two concurrent loads can't race. Raises ``ValueError``
+        with the reason if the new model can't be loaded — the caller turns that into a 4xx/5xx.
+        """
+        with self._swap_lock:
+            self._loading = True
+            self._load_error = None
+            old = self._engine
+            self._engine = None                   # `ready` is False from here until success
+            try:
+                if old is not None:
+                    old.close()                   # frees GPU memory before the new load
+                    # A BatchEngine's close() only stops its scheduler; the models live on the
+                    # Engine it wraps, so close that too or the old weights never leave memory.
+                    inner = getattr(old, "engine", None)
+                    if inner is not None and inner is not old and hasattr(inner, "close"):
+                        inner.close()
+
+                kwargs = dict(self._load_kwargs)
+                kwargs["model"] = model
+                if mode is not None:
+                    kwargs["mode"] = mode
+                if max_draft is not None:
+                    kwargs["max_draft_tokens"] = max_draft
+                engine = Engine.load(**kwargs)
+                engine = maybe_batch_engine(engine, self._max_batch)
+                self._engine = engine
+            except Exception as e:  # noqa: BLE001 — report the reason to the client
+                self._load_error = str(e)
+                raise
+            finally:
+                self._loading = False
+            # After the finally, so the returned status reflects the settled state (ready=True),
+            # not the mid-load snapshot.
+            return self.status()
+
+
 # --------------------------------------------------------------------------- request parsing
 
 
@@ -1094,15 +1204,36 @@ def make_handler(engine: Engine, api_key: str | None):
             self._cors()
             self.end_headers()
 
+        def _require_ready(self) -> bool:
+            """503 while a model swap is in flight. Everything but /health and the admin status
+            routes needs a loaded model, so they gate on this."""
+            if isinstance(engine, EngineHolder) and not engine.ready:
+                self._send_error(503, "a model is loading — try again in a moment",
+                                 "service_unavailable")
+                return False
+            return True
+
         def do_GET(self):
             route = self._route()
             if route == "/health":
+                # Answers even mid-swap so a client can poll the status through a model change.
+                if isinstance(engine, EngineHolder) and not engine.ready:
+                    status = engine.status()
+                    return self._send_json(200, {"status": "loading", "model": status["model"],
+                                                 "loading": True, "error": status["error"]})
                 return self._send_json(200, {
                     "status": "ok", "model": engine.model_id, "mode": engine.mode,
                     "target": engine.target_repo, "drafter": engine.drafter_repo,
                     "context_window": getattr(engine, "context_window", None),
                     "max_output_tokens": engine.max_tokens_cap,
                 })
+            if route == "/admin/status":
+                if isinstance(engine, EngineHolder):
+                    return self._send_json(200, engine.status())
+                return self._send_json(200, {"ready": True, "loading": False,
+                                             "model": engine.model_id, "error": None})
+            if not self._require_ready():
+                return
             if route in ("/v1/models", "/models"):
                 return self._send_json(200, self._models_payload())
             if route == "/metrics":
@@ -1141,6 +1272,30 @@ def make_handler(engine: Engine, api_key: str | None):
             if route == "/events":
                 return self._events_stream()
             return self._send_error(404, f"unknown route {self.path}", "not_found")
+
+        def _load(self, req: dict):
+            """Swap the loaded model in place, keeping the server and its port.
+
+            The port surviving is the point: an external client (Claude Code, a script) pointed
+            at this server keeps working across a model change — a full restart would move the
+            kernel-assigned port out from under it.
+            """
+            if not isinstance(engine, EngineHolder):
+                return self._send_error(501, "this server was not started with hot-swap support")
+            model = req.get("model")
+            if not isinstance(model, str) or not model.strip():
+                return self._send_error(400, "load needs a 'model' (repo or path)")
+            mode = req.get("mode")
+            max_draft = req.get("max_draft")
+            try:
+                status = engine.swap(model=model, mode=mode, max_draft=max_draft)
+            except ValueError as e:                 # unknown model / unresolvable drafter
+                return self._send_error(400, str(e))
+            except Exception as e:  # noqa: BLE001 — load failed; report, server stays up
+                traceback.print_exc()
+                return self._send_error(500, f"could not load {model!r}: "
+                                             f"{type(e).__name__}: {e}", "api_error")
+            return self._send_json(200, status)
 
         def _race(self, req: dict):
             """Same prompt, several decode strategies, streamed as SSE.
@@ -1250,6 +1405,11 @@ def make_handler(engine: Engine, api_key: str | None):
                 return self._send_error(400, f"invalid JSON body: {e}")
 
             try:
+                # /admin/load runs the swap itself, so it must NOT be gated on readiness.
+                if route == "/admin/load":
+                    return self._load(req)
+                if not self._require_ready():
+                    return
                 if route in ("/v1/chat/completions", "/chat/completions"):
                     return self._chat(req)
                 if route in ("/v1/completions", "/completions"):
@@ -1573,8 +1733,10 @@ def make_handler(engine: Engine, api_key: str | None):
 # --------------------------------------------------------------------------- entrypoint
 
 
-def run_server(engine: Engine, *, host: str = "127.0.0.1", port: int = 8080,
+def run_server(engine, *, host: str = "127.0.0.1", port: int = 8080,
                api_key: str | None = None) -> None:
+    # ``engine`` may be an Engine, a BatchEngine, or an EngineHolder (hot-swap). All three
+    # delegate the attributes the banner and handler read, so this is uniform.
     handler = make_handler(engine, api_key)
     httpd = ThreadingHTTPServer((host, port), handler)
     httpd.daemon_threads = True
