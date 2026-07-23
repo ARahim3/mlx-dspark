@@ -7,7 +7,7 @@ struct MlxDsparkApp: App {
     @StateObject private var model = AppModel()
 
     var body: some Scene {
-        WindowGroup {
+        WindowGroup(id: "main") {
             RootView()
                 .environmentObject(model)
                 .onAppear { delegate.model = model }
@@ -19,6 +19,19 @@ struct MlxDsparkApp: App {
         .commands {
             CommandGroup(replacing: .newItem) { }      // single-window app
         }
+
+        // Ambient telemetry in the system menu bar — MTPLX's most-liked, cheapest idea: the
+        // live rate stays visible without the window open, and it doubles as the way back to
+        // the window when it's been closed. `.menuBarExtraStyle(.window)` gives a small popover
+        // rather than a plain menu, so it can show a real gauge.
+        MenuBarExtra {
+            MenuBarPanel()
+                .environmentObject(model)
+        } label: {
+            MenuBarLabel()
+                .environmentObject(model)
+        }
+        .menuBarExtraStyle(.window)
     }
 }
 
