@@ -19,7 +19,8 @@ public enum AppIdentity {
     /// Minimum engine version this app's UI expects. The bootstrapper installs exactly this;
     /// a runtime built from a different version is torn down and reinstalled (see
     /// `RuntimeBootstrapper`) — same-version rebuilds are the trap that MTPLX documents.
-    public static let engineVersion = "0.6.0"
+    /// 0.6.1: the measured default cap (`static_cap`) — the app's Curves/Race lean on it.
+    public static let engineVersion = "0.6.1"
 
     /// CPython the runtime venv is built against. uv fetches a managed build if the machine
     /// has none, which is what lets onboarding avoid ever mentioning Homebrew.
