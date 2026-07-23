@@ -34,21 +34,29 @@ so you can serve them, script them, or benchmark them head-to-head.
 ## Supported models
 
 Every row auto-resolves its drafter from `--model` (any quant of the target matches). Measured warm on
-an M4 Pro; full tables, baselines, and method in [Results at a glance](#results-at-a-glance):
+an M4 Pro with `mlx-dspark benchmark --trials 3` (median of 3, three prompts — chat/code/math); full
+tables, baselines, and method in [Results at a glance](#results-at-a-glance):
 
 | target | best measured speedup | speed |
 |---|---|---|
-| **Ornith-1.0-9B** (8-bit) | **2.44×** math · **2.17×** code · **2.11×** chat | ~61 tok/s |
-| **Gemma-4 12B** (8-bit) | **2.11×** code · 1.77× chat | ~36 tok/s |
-| **Qwen3-14B** (8-bit) | **1.92×** code | ~30 tok/s |
-| **Qwen3-8B** (8-bit) | **1.90×** code | ~54 tok/s |
-| **Qwen3-4B** (8-bit) | **1.64×** code | ~84 tok/s |
+| **Gemma-4 12B** (8-bit) | **3.09×** math · **2.63×** chat · **2.61×** code | ~49 tok/s |
+| **Ornith-1.0-9B** (8-bit) | **2.53×** code · **2.48×** math · **2.21×** chat | ~64 tok/s |
+| **Qwen3-14B** (8-bit) | **2.36×** math · **2.11×** code · 1.62× chat | ~31 tok/s |
+| **Qwen3-8B** (8-bit) | **2.29×** math · **2.06×** code · 1.81× chat | ~58 tok/s |
+| **Qwen3-4B** (8-bit) | **1.98×** math · 1.77× chat · 1.70× code | ~92 tok/s |
 | **Qwen3.6-27B** (4-bit)\*\* | **1.78×** math · **1.42×** code | ~22 tok/s |
-| **Ternary-Bonsai-27B** (2-bit) | **1.15×** code (`--max-draft auto`) | ~29 tok/s |
+| **Ternary-Bonsai-27B** (2-bit) | **1.13×** code | ~27 tok/s |
 
 <sub>\*\* Qwen3.6-27B works and is lossless, but it's not a speed pick yet: the only drafter
 published for it so far is a community checkpoint with modest acceptance — a better-qualified
-drafter would lift this row. See [Results at a glance](#results-at-a-glance) for the caveats.</sub>
+drafter would lift this row. Its numbers are the one row **not** re-measured in the 2026-07-22
+sweep (cap-2 era, so likely understated — see [Results at a glance](#results-at-a-glance)).</sub>
+
+<sub>This table is the set of pairs we have **measured and vouch for**, which is also exactly the
+auto-resolve registry — that is the only thing the registry is for. It is *not* the set of models
+that work: any DeepSpec-native drafter runs against any compatible target via `--drafter`, and any
+target at all gets drafter-free speculation via `--mode auto`. See
+[Bring your own drafter](#bring-your-own-drafter--what-runs-and-what-doesnt).</sub>
 
 <sub>Target precision: the quants shown are each model's measured best — ratios are
 *non-monotone* in bits and peak at **8-bit** on current MLX (full Ornith sweep: 4-bit 1.38× ·
@@ -265,12 +273,16 @@ A 4-bit target (`--model …-it-4bit`) roughly halves the target's share (fits s
 matched *instruct* target** the drafter was trained against — a base model drops acceptance sharply. The
 legacy `--family qwen3|gemma4` flags still work but are deprecated in favor of `--model`.
 
-`--drafter` lets you run **any** other matched z-lab / DeepSpec checkpoint with no code change — e.g.
-**Qwen3-14B** (DSpark-only; z-lab published no 14B DFlash; ~18 GB peak; benchmarked below):
+`--drafter` lets you run **any** other matched z-lab / DeepSpec checkpoint with no code change and no
+registry entry — the registry only saves you from having to name the drafter:
 
 ```bash
-mlx-dspark generate --model mlx-community/Qwen3-14B-8bit \
-  --drafter deepseek-ai/dspark_qwen3_14b_block7 --prompt "Explain how rainbows form."
+# a pair we have measured -> the drafter auto-resolves
+mlx-dspark generate --model mlx-community/Qwen3-14B-8bit --prompt "Explain how rainbows form."
+
+# anything else -> name the drafter yourself; identical machinery from here on
+mlx-dspark generate --model mlx-community/Qwen3-32B-8bit \
+  --drafter deepseek-ai/dspark_qwen3_32b_block7 --prompt "Explain how rainbows form."
 ```
 
 ### Bring your own drafter — what runs and what doesn't
@@ -281,7 +293,7 @@ a silent mis-load):
 
 | checkpoint style | example | status |
 |---|---|---|
-| **DeepSpec-native standalone drafter** (qwen3/gemma4 backbone, any size/quant) | `deepseek-ai/dspark_qwen3_14b_block7` | ✅ runs via `--drafter` (4B/8B/14B/gemma-12B measured on an M4 Pro; larger sizes should run — reports welcome) |
+| **DeepSpec-native standalone drafter** (qwen3/gemma4 backbone, any size/quant) | `deepseek-ai/dspark_qwen3_32b_block7` | ✅ runs via `--drafter` — no registry entry needed (4B/8B/14B/gemma-12B are measured *and* registered, so they need no flag; larger sizes should run — reports welcome) |
 | **z-lab DFlash adapter** for a qwen3/gemma4-family target | `z-lab/Qwen3-8B-DFlash-b16` | ✅ runs via `--mode dflash --drafter` |
 | **PrismML dspark GGUF** (Bonsai-27B) | `prism-ml/Ternary-Bonsai-27B-gguf` → `*-dspark-bf16.gguf` | ✅ pre-converted repacks auto-resolve (`Rahim/*-dspark`); any future GGUF-only drop runs via `--drafter gguf:<repo>/<file>.gguf` (converted locally, once) |
 | **vLLM "speculators" format** | `RedHatAI/GLM-5.2-speculator.dspark` | ❌ different config schema — not yet ([issue?](https://github.com/ARahim3/mlx-dspark/issues)) |
@@ -355,14 +367,18 @@ quantization doesn't change acceptance — that's set by the drafter↔target ma
 Short answer on current mlx (≥ 0.32): **DSpark, everywhere** (`--mode auto` picks it for you). Measured on
 an M4 Pro, warm (code prompt unless marked chat):
 
-| target | DSpark (`--mode dspark`, cap 2) | DFlash (`--mode dflash --max-draft 0`) | pick |
+| target | DSpark (`--mode dspark`, measured cap) | DFlash (`--mode dflash --max-draft 0`) | pick |
 |---|---|---|---|
-| **Gemma-4 12B** | **2.11×** code, 1.77× chat | 1.63× code, ~0.7× chat | **DSpark** |
-| **Qwen3-8B** | **1.90×** | 0.86× full block (1.47× at cap 2) | **DSpark** |
-| **Qwen3-4B** | **1.64×** | modest | **DSpark** |
-| **Ternary-Bonsai-27B** | **1.15×** code (`--max-draft auto`) | — | **DSpark** (auto) |
+| **Gemma-4 12B** | **2.61×** code, 2.63× chat *(cap 4)* | 1.63× code, ~0.7× chat | **DSpark** |
+| **Qwen3-8B** | **2.06×** code *(cap 4)* | 0.86× full block (1.47× at cap 2) | **DSpark** |
+| **Qwen3-4B** | **1.70×** code *(cap 4)* | modest | **DSpark** |
+| **Ternary-Bonsai-27B** | **1.13×** code *(cap 2)* | — | **DSpark** |
 | **Qwen3.6-27B** (4-bit, hybrid) | **1.42×** code · **1.78×** math · 1.27× chat | — | **DSpark** (auto) |
-| **Ornith-1.0-9B** (8-bit, hybrid) | **2.17×** code · **2.44×** math · **2.11×** chat (cap 3) | — | **DSpark** (auto) |
+| **Ornith-1.0-9B** (8-bit, hybrid) | **2.53×** code · **2.48×** math · **2.21×** chat *(cap 4)* | — | **DSpark** |
+
+<sub>DSpark column regenerated 2026-07-22 at each model's measured cap; the DFlash column is the
+older cap-2-era sweep and was **not** re-measured, so the real DSpark margin is now wider than
+the rows suggest — the verdict does not change.</sub>
 
 This is a *version-dependent* verdict worth knowing about: on mlx 0.31, verify cost rose steeply with the
 number of tokens verified, which made DFlash's full 16-block the winner on Gemma-12B code/math (~2.1× vs
@@ -377,19 +393,36 @@ dominates). The drafter stays 4-bit either way. Full numbers and the reasoning a
 
 ## Results at a glance
 
-**DSpark** vs plain greedy decoding of the same model, at its `cap=2` optimum (M4 Pro 48 GB, warm,
-code prompt, 8-bit instruct target, 4-bit drafter, **mlx 0.32.0** — whose quantized-matmul kernels
-lifted every row well past the mlx-0.31 numbers this README previously carried):
+**DSpark** vs plain greedy decoding of the same model, each at **its own measured cap** (M4 Pro 48 GB,
+warm, 8-bit instruct target, 4-bit drafter, **mlx 0.32.0**). Regenerated 2026-07-22 with
+`mlx-dspark benchmark --trials 3`: every number is a median of 3 runs over the harness's three
+prompts, and the tok/s columns are the mean across them. Reproduce any row with that command.
 
-| target | accept len | baseline | mlx-dspark | speedup |
-|---|---|---|---|---|
-| **Gemma-4 12B** | ~2.75 | 17.0 tok/s | 35.9 tok/s | **2.11×** |
-| **Qwen3-14B**   | ~2.50 | 15.5 tok/s | 29.7 tok/s | **1.92×** |
-| **Qwen3-8B**    | ~2.58 | 28.7 tok/s | 54.4 tok/s | **1.90×** |
-| **Qwen3-4B**    | ~2.33 | 51.3 tok/s | 84.1 tok/s | **1.64×** |
-| **Ternary-Bonsai-27B** (2-bit, hybrid) | ~2.88 | 25.5 tok/s | 29.4 tok/s | **1.15×** (v0.4.2 exact rollback) |
-| **Qwen3.6-27B** (4-bit, hybrid)² | ~2.12 | 15.2 tok/s | 21.6 tok/s | **1.42×** (1.78× math at cap 3) |
-| **Ornith-1.0-9B** (8-bit, hybrid)² | ~3.19 | 27.9 tok/s | 60.9 tok/s | **2.17×** code (2.44× math, 2.11× chat, cap 3) |
+The cap column is the headline change. mlx 0.32's quantized-matmul kernels widened the cheap
+verify region to width 5 for 8-bit weights, moving the knee from 4 to 6 — so the old hard-coded
+`cap=2` was leaving **10–35%** on the table for every 8-bit target. The cap is now derived from
+each machine+model+quant's measured cost curves rather than hard-coded (see [Tuning](#tuning)),
+which is why Bonsai still sits at 2 while the 8-bit rows moved to 4.
+
+| target | cap | accept len | baseline | mlx-dspark | speedup | chat / code / math |
+|---|---|---|---|---|---|---|
+| **Gemma-4 12B** | 4 | 3.95 | 17.8 tok/s | 49.4 tok/s | **2.78×** | 2.63× / 2.61× / 3.09× |
+| **Ornith-1.0-9B** (hybrid)² | 4 | 3.64 | 26.7 tok/s | 64.2 tok/s | **2.40×** | 2.21× / 2.53× / 2.48× |
+| **Qwen3-8B** | 4 | 2.94 | 28.1 tok/s | 57.7 tok/s | **2.05×** | 1.81× / 2.06× / 2.29× |
+| **Qwen3-14B**³ | 4 | 2.87 | 15.3 tok/s | 31.0 tok/s | **2.03×** | 1.62× / 2.11× / 2.36× |
+| **Qwen3-4B** | 4 | 2.79 | 50.9 tok/s | 92.4 tok/s | **1.82×** | 1.77× / 1.70× / 1.98× |
+| **Qwen3.6-27B** (4-bit, hybrid)²⁴ | 2 | ~2.12 | 15.2 tok/s | 21.6 tok/s | **1.42×** | — / 1.42× / 1.78× (cap 3) |
+| **Ternary-Bonsai-27B** (2-bit, hybrid) | 2 | 2.60 | 25.4 tok/s | 27.2 tok/s | **1.07×** | 1.01× / 1.13× / 1.07× |
+
+<sub>³ Qwen3-14B is not in the auto-resolve registry — pass
+`--drafter deepseek-ai/dspark_qwen3_14b_block7`. ⁴ Qwen3.6-27B is the one row not re-measured in
+this sweep (the 4-bit target was not on the machine); its numbers are cap-2 era and likely
+understated.</sub>
+
+Every 8-bit row peaks at **cap 4** and falls off sharply at cap 5 — the cliff sits exactly where
+the measured verify curve leaves its cheap region (width 5 → 6). Bonsai is the counter-example
+that shows why the cap is not a constant: its 2-bit verify cost climbs from width 2, so it peaks
+at cap 2 (cap 1 = 1.00×, cap 3 = 1.06×) and there is no wide-draft regime to reach.
 
 ² Community-drafter rows. Qwen3.6-27B runs a **4-bit** target (its drafter's matched
 precision — trained against a W4A16 quant); code at cap 2 shown, `--max-draft auto` settles at
@@ -573,9 +606,20 @@ is unchanged):
 
 ### Tuning
 
-- **DSpark** — `--max-draft 2` is the measured optimum for the dense presets (default): verify cost grows
-  per token and the marginal draft token rarely survives. `--confidence-threshold 0.6` truncates the block
+- **DSpark** — the default cap is **measured for your machine, model and quantization**, not hard-coded:
+  with no `--max-draft`, mlx-dspark benchmarks this pair's verify/drafter cost curves once (~5 s, cached
+  on disk) and picks the best fixed cap. It has to be measured, because the answer moves a lot — on one
+  M4 Pro under mlx 0.32 the optimum spans cap 2 to 7, and the *same model* wants cap 2 at 4-bit, 4 at
+  8-bit and 6 at bf16. Pass `--max-draft N` to pin it. `--confidence-threshold 0.6` truncates the block
   adaptively via the confidence head instead. For **Bonsai-27B** use `--max-draft auto` (see its section).
+- **`--wired-limit`** — off by default, and you almost certainly want to leave it that way. It raises MLX's
+  wired-memory ceiling to the recommended working set (~75% of RAM) so weights can't be paged out. Wired
+  pages can't be reclaimed by the OS, so on a machine already holding a large working set this can **hang
+  macOS hard enough to need a power cycle** — and a 16 GB Mac, where "the model nearly fills RAM" is exactly
+  the situation it was meant to help, is the most likely to wedge. It has also corrupted the verify logits on
+  the gemma-4/mlx-vlm route (garbage logits can commit *wrong tokens*, not just crash); mlx-lm targets didn't
+  reproduce that. It bought no measurable speed where tested (<1%, inside run-to-run noise). Reach for it only
+  if you actually see paging stalls, and validate a long run before trusting the output.
 - **`--max-draft auto`** — measures this machine + model's verify/drafter cost curves once (a few seconds,
   cached on disk) and picks the cap per round from the curves + live acceptance **and observed round
   times**, so it tracks the hardware and the mlx version instead of a hard-coded `cap=2`. It can also

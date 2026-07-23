@@ -58,6 +58,12 @@ REGISTRY = [
     {"id": "qwen3-8b",   "target": "mlx-community/Qwen3-8B-8bit",
      "dspark": "deepseek-ai/dspark_qwen3_8b_block7", "dflash": "z-lab/Qwen3-8B-DFlash-b16",
      "ram": "~11 GB"},
+    # Same official DeepSeek drop and recipe as the 4B/8B entries above; registered
+    # 2026-07-22 once it was actually benchmarked (2.03x at cap 4: 2.36x math / 2.11x code /
+    # 1.62x chat, baseline 15.3 tok/s). No z-lab DFlash adapter published at this size.
+    {"id": "qwen3-14b",  "target": "mlx-community/Qwen3-14B-8bit",
+     "dspark": "deepseek-ai/dspark_qwen3_14b_block7",
+     "ram": "~19 GB"},
     {"id": "gemma-4-12b", "target": "mlx-community/gemma-4-12B-it-8bit",
      "dspark": "deepseek-ai/dspark_gemma4_12b_block7", "dflash": "z-lab/gemma4-12B-it-DFlash",
      "ram": "~15 GB"},
@@ -169,7 +175,33 @@ def resolve_mode(model: str | None = None, *, mode: str = "auto", drafter: str |
 
 def apply_wired_limit() -> None:
     """Wire MLX's recommended working set (what mlx-lm's server does) so multi-GB weights
-    stay resident under memory pressure instead of getting paged mid-generation."""
+    stay resident under memory pressure instead of getting paged mid-generation.
+
+    **OPT-IN since 0.6.1 — this is no longer called by default, and it can hang the machine.**
+    Wired pages cannot be reclaimed by the OS, so raising the ceiling to the recommended
+    working set (36 GiB of 48 on an M4 Pro) while the process already holds ~23 GiB left
+    macOS nothing to page out: the system locked up hard enough to need a power cycle, during
+    a run that loaded Qwen3-14B and Qwen3-8B back to back. Note the shape of that risk — a
+    16 GB Mac's recommended working set is ~12 GiB, so "the model nearly fills RAM", the very
+    case this was added for, is also the case most likely to wedge.
+
+    Short of hanging, it corrupts memory during long generations on the **gemma-4/mlx-vlm**
+    route: a ~430-token run produced a verify-logits buffer full of garbage, so ``argmax``
+    returned sequential position indices instead of token ids and the accepted-prefix length
+    came back as 350 for a 4-token draft. It surfaced as ``IndexError`` only by luck —
+    different garbage would have committed plausible *wrong* tokens and silently broken
+    losslessness, which is the one guarantee this project makes. 3/3 crashes with it, 3/3
+    clean 1000-token runs without. mlx-lm-route targets did **not** reproduce it (Qwen3-14B
+    1260 tokens, Qwen3-8B 1501 tokens, both clean at a *higher* 22.8 GiB peak), so it is not
+    a simple memory-pressure threshold.
+
+    It also bought nothing measurable where it was tested: same machine, same prompts,
+    baseline 18.2 vs 18.3 tok/s and dspark 47.1 vs 46.7 tok/s with vs without (<1%, well
+    inside the ~14% run-to-run noise), because a 20 GiB working set on a 48 GB machine has
+    no paging pressure to prevent. It earns its keep only when the model nearly fills RAM —
+    a 12 GB model on a 16 GB Mac — which is the case it was added for. Turn it on there with
+    ``--wired-limit`` and verify your own long runs.
+    """
     try:
         if mx.metal.is_available():
             mx.set_wired_limit(mx.device_info()["max_recommended_working_set_size"])

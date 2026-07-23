@@ -367,7 +367,12 @@ class CapController:
         return float(self.drafter_ms)
 
     def expected_committed(self, cap: int) -> float:
-        """1 bonus/replacement token + geometric accepted prefix."""
+        """1 bonus/replacement token + geometric accepted prefix.
+
+        A per-position variant of this (chaining separately-tracked p_i instead of one
+        scalar) was implemented and measured 2026-07-22, and **reverted** — it modelled
+        reality better yet performed worse. See NOTES "Knee detection"; don't re-derive it.
+        """
         return 1.0 + sum(self.p ** i for i in range(1, cap + 1))
 
     def _replay_ms(self, cap: int) -> float:
@@ -392,7 +397,11 @@ class CapController:
 
     def _rate_eff(self, cap: int) -> float:
         """Best available estimate of committed tokens/ms at this cap: measured when this
-        cap has enough observed rounds, else the model (correction-scaled for cap >= 1)."""
+        cap has enough observed rounds, else the model (correction-scaled for cap >= 1).
+
+        Shrinking the measured rate toward the model by observation count (instead of this
+        hard switch) was implemented and measured 2026-07-22, and **reverted** together
+        with the per-position acceptance model — see NOTES "Knee detection"."""
         if self._t_cnt.get(cap, 0) >= self.min_rounds_observed:
             return 1.0 / max(self._t_obs[cap], 1e-6)
         return self.rate(cap) * (self._corr if cap >= 1 else 1.0)
@@ -466,6 +475,17 @@ class CapController:
             return self.expected_committed(c) / max(t, 1e-6)
 
         return max(range(1, self.max_cap + 1), key=rate_b)
+
+    def static_best(self, p: float | None = None) -> int:
+        """The single best FIXED cap for this machine+model+quant, straight off the measured
+        curves. This is the default-cap resolver — see :func:`static_cap`."""
+        if p is not None:
+            saved, self.p = self.p, float(p)
+            try:
+                return max(range(1, self.max_cap + 1), key=self.rate)
+            finally:
+                self.p = saved
+        return max(range(1, self.max_cap + 1), key=self.rate)
 
     def info(self) -> dict:
         lo = 0 if self.allow_zero else 1
@@ -597,3 +617,44 @@ def calibrate(target, drafter, *, mode: str, target_repo: str, drafter_repo: str
         print(f"  predicted tok/s by cap (prior accept): {r} -> starting cap 2, "
               f"knee-best {best}", flush=True)
     return ctrl
+
+
+# Acceptance prior used to pick the static default cap. Deliberately NOT the controller's
+# `prior_p` (0.65): that one guards the cap-0 parking gate, where being pessimistic is the
+# safe direction, whereas here pessimism picks a cap that is too shallow. Fitted against the
+# measured optima of all 8 curves in the calibration cache (2026-07-22): 0.65 scores 5/8 and
+# notably picks cap 1 for Bonsai (measured best 2) and 6 for Ornith-bf16 (7); 0.70 scores 7/8,
+# with the only miss Ornith-4bit (picks 2, measured 3 — adjacent caps, inside noise there).
+# Re-fit this if the measured-optima table in NOTES "Knee detection" is ever regenerated.
+STATIC_PRIOR_P = 0.70
+
+
+def static_cap(target, drafter, *, mode: str, target_repo: str, drafter_repo: str | None,
+               cache_dir: str | None = None, verbose: bool = False,
+               fallback: int = 2) -> int:
+    """The default cap for this machine+model+quant: the cost model's argmax over the
+    MEASURED curves. One-time on-device measurement (~5 s), disk-cached thereafter.
+
+    **Why this is not a constant.** The optimal cap is a property of
+    (model x QUANTIZATION x chip x mlx version), not of the model family. Measured
+    2026-07-22 on one M4 Pro under mlx 0.32, the best cap spans **2 to 7** across the
+    cached curves, and the *same registry row* needs different caps per quantization —
+    Ornith-1.0-9B wants cap 2 at 4-bit, 4 at 8-bit, 6 at bf16 — while drafter resolution
+    is deliberately quant-agnostic, so no per-entry constant can express it. Nor is a
+    knee-derived rule enough: bf16 has a 2x cliff at width 2 and is then FLAT, so the
+    right move there is to go *wide* once the cliff is paid. What generalizes is the
+    argmax itself, which reproduced all 7 documented optima. The old hardcoded 2 was
+    measured when mlx 0.31.2 put the knee at width 4; 0.32 moved it to 6 for every 8-bit
+    family, leaving 10-32% on the table. It will drift again — that is the point.
+
+    Returns ``fallback`` if the curves cannot be measured (unsupported mode, no drafter),
+    so a failure here degrades to the historical default rather than breaking generation.
+    """
+    if mode not in ("dspark", "dflash") or drafter is None:
+        return fallback
+    try:
+        ctrl = calibrate(target, drafter, mode=mode, target_repo=target_repo,
+                         drafter_repo=drafter_repo, cache_dir=cache_dir, verbose=verbose)
+    except Exception:                       # calibration is an optimization, never a gate
+        return fallback
+    return ctrl.static_best(STATIC_PRIOR_P)

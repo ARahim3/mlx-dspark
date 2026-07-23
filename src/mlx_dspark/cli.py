@@ -71,6 +71,17 @@ def cmd_generate(argv: list[str]) -> None:
                     help=argparse.SUPPRESS)          # deprecated alias for --model
     ap.add_argument("--target", default=None, help=argparse.SUPPRESS)  # deprecated alias for --model
     ap.add_argument("--prompt", default="Explain how rainbows form, in a few sentences.")
+    ap.add_argument("--wired-limit", action="store_true",
+                    help="wire MLX's recommended working set (~75%% of RAM) so weights "
+                         "can't be paged out. OFF by default and rarely worth it: wired "
+                         "pages cannot be reclaimed, so on a machine whose working set is "
+                         "already large this can HANG macOS hard enough to need a power "
+                         "cycle (observed on an M4 Pro). Short of that it has corrupted the "
+                         "verify logits on the gemma-4/mlx-vlm route, which can commit "
+                         "wrong tokens rather than crash. It bought no measurable speed "
+                         "where tested (<1%%). Only consider it if the model nearly fills "
+                         "your RAM and you actually see paging stalls - and validate a long "
+                         "run before trusting it.")
     ap.add_argument("--max-new-tokens", type=int, default=220)
     ap.add_argument("--max-draft", default=None,
                     help="tokens verified per round (cap), or 'auto' to calibrate for this "
@@ -134,14 +145,24 @@ def cmd_generate(argv: list[str]) -> None:
                                        target_repo=target_repo, drafter_repo=drafter_repo)
         max_draft = None                                   # controller (or mode default) drives
 
-    apply_wired_limit()
+    if args.wired_limit:
+        apply_wired_limit()
     on_text = None if args.no_stream else _emit
     print("\n" + "=" * 64)
     print(f"  ▶  {label}   ·   {target_repo.split('/')[-1]}")
     print("=" * 64)
 
     if args.mode == "dspark":
-        cap = (2 if max_draft is None and cap_controller is None else max_draft)
+        cap = max_draft
+        if max_draft is None and cap_controller is None:
+            # No explicit --max-draft: derive the cap from THIS machine+model+quant's
+            # measured curves (one-time ~5 s, disk-cached) instead of a hardcoded 2, which
+            # is only right for a curve shape mlx 0.31.2 had. See calibrate.static_cap.
+            from .calibrate import static_cap
+
+            cap = static_cap(target, drafter, mode="dspark", target_repo=target_repo,
+                             drafter_repo=drafter_repo)
+            print(f"  cap {cap} (measured for this model+quant; override with --max-draft)")
         res = speculative_generate(
             target, tok, drafter, args.prompt,
             max_new_tokens=args.max_new_tokens, max_draft_tokens=cap,
@@ -256,6 +277,17 @@ def cmd_serve(argv: list[str]) -> None:
                     help="disable multi-turn prefix caching (reuse the shared conversation "
                          "prefix's KV; on by default for dspark/lookup/baseline on dense or "
                          "under-window sliding-window targets)")
+    ap.add_argument("--wired-limit", action="store_true",
+                    help="wire MLX's recommended working set (~75%% of RAM) so weights "
+                         "can't be paged out. OFF by default and rarely worth it: wired "
+                         "pages cannot be reclaimed, so on a machine whose working set is "
+                         "already large this can HANG macOS hard enough to need a power "
+                         "cycle (observed on an M4 Pro). Short of that it has corrupted the "
+                         "verify logits on the gemma-4/mlx-vlm route, which can commit "
+                         "wrong tokens rather than crash. It bought no measurable speed "
+                         "where tested (<1%%). Only consider it if the model nearly fills "
+                         "your RAM and you actually see paging stalls - and validate a long "
+                         "run before trusting it.")
     ap.add_argument("--prefix-cache-slots", type=int, default=2,
                     help="number of conversations kept in the prefix cache LRU (default 2, "
                          "so an agent and a chat don't evict each other every turn)")
@@ -298,6 +330,7 @@ def cmd_serve(argv: list[str]) -> None:
             prefix_cache_slots=args.prefix_cache_slots,
             lookup_drafts=not args.no_lookup_drafts,
             lookup_long_draft=args.lookup_long_draft,
+            wired_limit=args.wired_limit,
             batch_widths=(sorted({2, args.max_batch}) if args.max_batch > 1 else None),
             kv_bits=args.kv_bits or None,
             context_window=args.context_window,
@@ -463,12 +496,28 @@ def cmd_benchmark(argv: list[str]) -> None:
     ap.add_argument("--caps", default="2,auto",
                     help="comma-separated caps for dspark/dflash: ints and/or 'auto'")
     ap.add_argument("--max-new-tokens", type=int, default=200)
+    ap.add_argument("--trials", type=int, default=1,
+                    help="repeat each prompt N times and report the MEDIAN. Between-trial "
+                         "noise is ~14%% on an M4 Pro (machine state, not content), so a "
+                         "single trial is not quotable — use 3+ for README numbers.")
+    ap.add_argument("--wired-limit", action="store_true",
+                    help="wire MLX's recommended working set (~75%% of RAM) so weights "
+                         "can't be paged out. OFF by default and rarely worth it: wired "
+                         "pages cannot be reclaimed, so on a machine whose working set is "
+                         "already large this can HANG macOS hard enough to need a power "
+                         "cycle (observed on an M4 Pro). Short of that it has corrupted the "
+                         "verify logits on the gemma-4/mlx-vlm route, which can commit "
+                         "wrong tokens rather than crash. It bought no measurable speed "
+                         "where tested (<1%%). Only consider it if the model nearly fills "
+                         "your RAM and you actually see paging stalls - and validate a long "
+                         "run before trusting it.")
     ap.add_argument("--json", default=None, help="also write results to this JSON file")
     args = ap.parse_args(argv)
 
     modes = [m.strip() for m in args.modes.split(",") if m.strip()]
     caps = [c.strip() for c in args.caps.split(",") if c.strip()]
-    apply_wired_limit()
+    if args.wired_limit:
+        apply_wired_limit()
 
     dev = mx.device_info().get("device_name", "?")
     print(f"mlx-dspark benchmark · {dev} · mlx {mx.__version__} · "
@@ -483,21 +532,38 @@ def cmd_benchmark(argv: list[str]) -> None:
     results = {"device": dev, "mlx": mx.__version__, "target": target_repo, "runs": []}
 
     def run(label, fn):
-        toks = tps = accept = 0.0
-        for p in BENCH_PROMPTS.values():
-            r = fn(p)
-            toks += r.num_tokens
-            tps += r.tokens_per_sec
-            accept += r.mean_accept_len
+        """Per-prompt medians over --trials, plus the across-prompt mean. The per-prompt
+        split is what the README's 'N.NNx code · N.NNx chat' figures need — averaging the
+        three prompts into one number (the old behaviour) cannot produce them."""
+        import statistics as _st
+
+        per: dict[str, dict] = {}
+        for name, p in BENCH_PROMPTS.items():
+            tp, ac = [], []
+            for _ in range(max(1, args.trials)):
+                r = fn(p)
+                tp.append(r.tokens_per_sec)
+                ac.append(r.mean_accept_len)
+            per[name] = {"tok_s": round(_st.median(tp), 1),
+                         "accept": round(_st.median(ac), 2)}
         n = len(BENCH_PROMPTS)
-        row = {"run": label, "tok_s": round(tps / n, 1), "accept": round(accept / n, 2)}
+        row = {"run": label,
+               "tok_s": round(sum(v["tok_s"] for v in per.values()) / n, 1),
+               "accept": round(sum(v["accept"] for v in per.values()) / n, 2),
+               "per_prompt": per}
         results["runs"].append(row)
-        base = results["runs"][0]["tok_s"]
-        speedup = f"  ({row['tok_s'] / base:.2f}x)" if label != "baseline" else ""
+        base_row = results["runs"][0]
+        speedup = f"  ({row['tok_s'] / base_row['tok_s']:.2f}x)" if label != "baseline" else ""
         print(f"  {label:<22} {row['tok_s']:>7.1f} tok/s   accept {row['accept']:.2f}{speedup}")
+        detail = []
+        for name, v in per.items():
+            sp = (f" {v['tok_s'] / base_row['per_prompt'][name]['tok_s']:.2f}x"
+                  if label != "baseline" else "")
+            detail.append(f"{name} {v['tok_s']:.1f}{sp}")
+        print(f"  {'':22} {'  ·  '.join(detail)}")
         return row
 
-    print(f"\n{'run':<24} {'tok/s':>7}")
+    print(f"\n{'run':<24} {'tok/s':>7}   (per prompt below each row)")
     run("baseline", lambda p: greedy_generate(
         target, tok, p, max_new_tokens=args.max_new_tokens))
 

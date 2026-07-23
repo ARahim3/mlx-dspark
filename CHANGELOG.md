@@ -2,6 +2,67 @@
 
 All notable changes to `mlx-dspark`. Versions follow [SemVer](https://semver.org/) (pre-1.0: minor-ish features land as patch bumps).
 
+## [0.6.1] — 2026-07-22 — the default draft cap is measured, not hard-coded
+
+### Changed
+- **The default `--max-draft` is now derived from this machine's measured cost curves**
+  instead of the hard-coded `2`. On first use of a target mlx-dspark benchmarks the
+  verify/drafter curves once (~5 s, cached in `~/.cache/mlx_dspark/`) and picks the cap that
+  maximizes expected tokens/second. The old constant was measured when mlx 0.31.2 put the
+  quantized-matmul knee at verify width 4; mlx 0.32 moved that knee to width 6 for every
+  8-bit family, so the default had been leaving **10–35%** on the table since that upgrade.
+  Measured on an M4 Pro (median of 3, cap 2 → derived cap): Gemma-4 12B 2.05×→**2.78×**,
+  Ornith-1.0-9B 1.83×→**2.40×**, Qwen3-8B 1.70×→**2.05×**, Qwen3-14B 1.75×→**2.03×**,
+  Qwen3-4B 1.65×→**1.82×**, Ternary-Bonsai-27B 1.07× (cap 2, unchanged). No model regresses.
+  Output is unaffected — the cap only sets how many drafted tokens are verified per round,
+  and the target verifies every one, so this is lossless as before.
+  Replacing the constant with `4` would not have worked: the optimal cap is a property of
+  (model × **quantization** × chip × mlx version), and one registry row serves several quants
+  — Ornith-1.0-9B wants cap 2 at 4-bit, 4 at 8-bit and 6 at bf16. `--max-draft N` still pins
+  it; `--max-draft auto` still adapts per round.
+
+- **The MLX wired-memory limit is no longer set by default** — it is now opt-in behind
+  `--wired-limit` (`generate` / `serve` / `benchmark`, and `Engine(wired_limit=…)`). Wiring
+  the recommended working set (~75% of RAM) was meant to stop weights being paged out on
+  small Macs, but wired pages cannot be reclaimed by the OS: with the process already holding
+  ~23 GiB it locked up an M4 Pro hard enough to need a power cycle. Short of that it corrupts
+  the verify logits during long generations on the **gemma-4/mlx-vlm** route — a ~430-token
+  run produced a garbage logits buffer, so `argmax` returned position indices instead of token
+  ids. That surfaced as an `IndexError` only by luck; different garbage would have committed
+  plausible *wrong tokens* and broken losslessness silently. 3/3 crashes with it, 3/3 clean
+  1000-token runs without; mlx-lm-route targets did not reproduce it (Qwen3-14B 1260 tokens,
+  Qwen3-8B 1501 tokens, both clean at a higher 22.8 GiB peak). It also bought no measurable
+  speed where tested (<1%, inside run-to-run noise). If you are on a Mac where the model
+  nearly fills RAM, turn it on deliberately and validate a long run first.
+
+### Added
+- **`mlx-dspark benchmark --trials N`** — repeats each prompt and reports the median, plus a
+  per-prompt breakdown. It previously averaged its three prompts into a single number, so the
+  per-content figures in the README were not reproducible with the shipped harness.
+  Between-trial noise on an M4 Pro is ~14%, so single runs should not be quoted.
+- **`calibrate.static_cap()`** — the resolver above, public so library users can pick the same
+  cap (`speculative_generate` keeps its `max_draft_tokens=2` default: a library call should not
+  silently trigger a device benchmark).
+- **Qwen3-14B registered** (`mlx-community/Qwen3-14B-8bit` →
+  `deepseek-ai/dspark_qwen3_14b_block7`), so `--model` resolves its drafter with no `--drafter`
+  flag. It was already listed as supported but raised `ValueError`. Measured 2.03× at cap 4 and
+  lossless (cap 2 and cap 4 agree bit-for-bit; both diverge from single-row greedy at one
+  floating-point tie, margin 0.25 = 1–2 bf16 ulps).
+
+### Fixed
+- **`knee_width()` misreported the verify-cost knee** on any curve with a flat step — which is
+  every 8-bit model under mlx 0.32. It tracked the cheap region's marginal cost as a running
+  minimum, so one flat step drove the baseline to zero and every later `+1 ms` read as the
+  jump (measured Qwen3-4B: reported width 4, where the curve is still flat; the real jump is
+  at 6). It also structurally could not report a knee at width 2 — the bf16 shape, where an
+  unquantized matmul reads the weight stream twice and is flat afterwards — so on a bf16
+  target it returned the top width, implying wide verify was cheap, the opposite of the truth.
+  Now the baseline is the *mean* of the cheap region's steps, a jump must also clear 15% of
+  the single-row cost (a ratio test on ±1 ms of noise is meaningless), and the first step is
+  judged against the rest of the curve. This is reporting only — it feeds `/metrics`,
+  `mlx-dspark doctor` and the DSpark-vs-DFlash recommendation; cap selection reads the curves
+  directly and was never affected.
+
 ## [0.6.0] — 2026-07-21 — Claude Code support (Anthropic Messages API)
 
 ### Added

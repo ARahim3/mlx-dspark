@@ -128,6 +128,7 @@ class Engine:
         prefix_cache_slots: int = 2,
         lookup_drafts: bool = True,
         lookup_long_draft: int = 32,
+        wired_limit: bool = False,
         context_window: int | None = None,
         executor: ThreadPoolExecutor | None = None,
     ):
@@ -148,7 +149,8 @@ class Engine:
         self.lookup_drafts = lookup_drafts                 # hybrid n-gram drafts in dspark mode
         self.lookup_long_draft = lookup_long_draft         # match-scaled long-draft ceiling
         self.context_window = context_window               # target's trained positions, if known
-        apply_wired_limit()                                # keep the weights resident
+        if wired_limit:                                    # opt-in: see apply_wired_limit
+            apply_wired_limit()
         # chat-template kwargs applied to every request unless the request overrides them
         # (e.g. {"enable_thinking": False} to silence Qwen3's <think> blocks by default).
         self.template_defaults = dict(template_defaults or {})
@@ -216,6 +218,7 @@ class Engine:
         prefix_cache_slots: int = 2,
         lookup_drafts: bool = True,
         lookup_long_draft: int = 32,
+        wired_limit: bool = False,
         batch_widths: list[int] | None = None,   # e.g. [2, max_batch]: calibrate (B,cap) grid
         kv_bits: int | None = None,              # quantize the target KV cache (4/8)
         context_window: int | None = None,       # override the target's own limit
@@ -256,11 +259,18 @@ class Engine:
         tgt, tok, draft, cap_controller = executor.submit(_load_models).result()
         if max_draft_tokens == "auto":
             max_draft_tokens = None                     # controller drives, up to the full block
-        # default cap: dspark's measured optimum is 2; dflash's native point is the full
-        # block; lookup drafts are free so a modest 6 balances hit gains vs miss-free rounds
+        # default cap: dspark derives it from this machine+model+quant's measured curves
+        # (one-time ~5 s, disk-cached — a hardcoded constant is only right for one curve
+        # shape, and mlx 0.32 already invalidated the old 2; see calibrate.static_cap);
+        # dflash's native point is the full block; lookup drafts are free so a modest 6
+        # balances hit gains vs miss-free rounds
         if max_draft_tokens is None and cap_controller is None:
             if mode == "dspark":
-                max_draft_tokens = 2
+                from .calibrate import static_cap
+
+                max_draft_tokens = executor.submit(
+                    static_cap, tgt, draft, mode="dspark", target_repo=target_repo,
+                    drafter_repo=drafter_repo).result()
             elif mode == "lookup":
                 max_draft_tokens = 6
         model_id = target_repo.rstrip("/").split("/")[-1]
@@ -283,6 +293,7 @@ class Engine:
                    default_max_tokens=default_max_tokens, max_tokens_cap=max_tokens_cap,
                    prefix_cache_slots=prefix_cache_slots, lookup_drafts=lookup_drafts,
                    lookup_long_draft=lookup_long_draft,
+                   wired_limit=wired_limit,
                    context_window=context_window or _context_window(target_repo),
                    executor=executor)
 
@@ -380,6 +391,8 @@ class Engine:
         }
         if self.cap_controller is not None:
             info["cap"] = self.cap_controller.cap
+        elif self.max_draft_tokens is not None:
+            info["cap"] = self.max_draft_tokens      # incl. the curve-derived default
         if res.lookup_rounds:
             info["lookup_rounds"] = res.lookup_rounds
         return info
