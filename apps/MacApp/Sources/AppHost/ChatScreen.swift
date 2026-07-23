@@ -64,9 +64,7 @@ struct MessageView: View {
             if message.text.isEmpty && isStreaming {
                 ProgressView().controlSize(.small)
             } else if message.role == .assistant {
-                // Assistant output is markdown (a coding model emits fenced code constantly);
-                // the user's own message stays plain so their literal text isn't reinterpreted.
-                MarkdownText(text: message.text)
+                AssistantContent(text: message.text)
                     .frame(maxWidth: .infinity, alignment: .leading)
             } else {
                 Text(message.text)
@@ -75,6 +73,29 @@ struct MessageView: View {
             }
 
             if let stats = message.stats { StatsStrip(stats: stats) }
+        }
+    }
+}
+
+/// Assistant output: a reasoning trace (if any) as a collapsible card, then the answer as
+/// markdown. Splitting `<think>` out here means the answer leads instead of trailing a wall of
+/// the model reasoning to itself. A coding model emits fenced code constantly, so the answer
+/// goes through the markdown renderer; the user's own message stays literal (handled upstream).
+struct AssistantContent: View {
+    let text: String
+
+    var body: some View {
+        let split = ThinkingSplit.parse(text)
+        VStack(alignment: .leading, spacing: 8) {
+            if let reasoning = split.reasoning {
+                ThinkingCard(reasoning: reasoning, thinking: split.thinking)
+            }
+            if !split.answer.isEmpty {
+                MarkdownText(text: split.answer)
+            } else if split.reasoning == nil {
+                // No think block and no answer yet — render whatever text there is verbatim.
+                MarkdownText(text: text)
+            }
         }
     }
 }
