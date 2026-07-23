@@ -4,7 +4,7 @@ import SwiftUI
 
 /// Which screen the sidebar is showing.
 enum Screen: String, CaseIterable, Identifiable {
-    case chat, lab, models, settings
+    case chat, lab, agents, models, settings
 
     var id: String { rawValue }
 
@@ -12,6 +12,7 @@ enum Screen: String, CaseIterable, Identifiable {
         switch self {
         case .chat:     return "Chat"
         case .lab:      return "Lab"
+        case .agents:   return "Agents"
         case .models:   return "Models"
         case .settings: return "Settings"
         }
@@ -21,6 +22,7 @@ enum Screen: String, CaseIterable, Identifiable {
         switch self {
         case .chat:     return "bubble.left.and.bubble.right"
         case .lab:      return "chart.xyaxis.line"
+        case .agents:   return "terminal"
         case .models:   return "shippingbox"
         case .settings: return "gearshape"
         }

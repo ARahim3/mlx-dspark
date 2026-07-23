@@ -1118,6 +1118,20 @@ def make_handler(engine: Engine, api_key: str | None):
 
                 return self._send_json(200, {"models": model_inventory(),
                                              "loaded": engine.target_repo})
+            if route == "/admin/integrations":
+                from .integrations import integrations
+
+                # The base URL a client should use is whatever this request came in on — so a
+                # user on another machine, or behind a rename, gets a URL that actually reaches
+                # the server, not a hardcoded 127.0.0.1.
+                host = self.headers.get("Host") or f"{self.server.server_address[0]}:" \
+                    f"{self.server.server_address[1]}"
+                base = f"http://{host}"
+                return self._send_json(200, {
+                    "base_url": base,
+                    "model": engine.model_id,
+                    "integrations": integrations(base, engine.model_id, api_key),
+                })
             if route == "/rounds":
                 # Recent rounds as one JSON blob — the pull-based sibling of /events, for
                 # clients that would rather poll than hold a stream open.

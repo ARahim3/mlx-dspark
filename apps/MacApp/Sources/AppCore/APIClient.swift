@@ -77,7 +77,7 @@ public enum APIError: LocalizedError {
 public struct APIClient: Sendable {
     public let baseURL: URL
     public let apiKey: String?
-    private let session: URLSession
+    let session: URLSession   // internal: shared with APIClient extensions in other files
 
     public init(baseURL: URL, apiKey: String? = nil) {
         self.baseURL = baseURL
@@ -90,7 +90,7 @@ public struct APIClient: Sendable {
         self.session = URLSession(configuration: config)
     }
 
-    private func request(_ path: String, method: String = "GET", body: Data? = nil) -> URLRequest {
+    func request(_ path: String, method: String = "GET", body: Data? = nil) -> URLRequest {
         var req = URLRequest(url: baseURL.appendingPathComponent(path))
         req.httpMethod = method
         if let apiKey, !apiKey.isEmpty {
@@ -257,7 +257,7 @@ public struct APIClient: Sendable {
         }
     }
 
-    private static func check(_ response: URLResponse, _ data: Data) throws {
+    static func check(_ response: URLResponse, _ data: Data) throws {
         guard let http = response as? HTTPURLResponse else { return }
         guard http.statusCode == 200 else {
             throw APIError.badStatus(http.statusCode,

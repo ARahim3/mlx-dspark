@@ -39,6 +39,7 @@ struct MainWindow: View {
                 switch model.screen {
                 case .chat:     ChatScreen()
                 case .lab:      LabScreen()
+                case .agents:   AgentsScreen()
                 case .models:   ModelsScreen()
                 case .settings: SettingsScreen()
                 }
