@@ -7,8 +7,12 @@ struct RootView: View {
     var body: some View {
         Group {
             switch model.phase {
-            case .launching, .settingUp, .startingServer:
+            case .launching, .settingUp:
                 SetupView()
+            case .onboarding:
+                OnboardingView()
+            case .startingServer:
+                LoadingView()
             case .ready:
                 MainWindow()
             case .failed:
@@ -223,6 +227,50 @@ struct LogPane: View {
                 proxy.scrollTo(count - 1, anchor: .bottom)
             }
         }
+    }
+}
+
+/// Shown while the chosen model loads. On a first download this is minutes, so it surfaces the
+/// engine's own log tail — honest progress beats a spinner that looks stuck. The download
+/// progress genuinely lands in that log (huggingface_hub writes it to stderr, which the
+/// supervisor captures).
+struct LoadingView: View {
+    @EnvironmentObject private var model: AppModel
+
+    private var recentLog: [String] {
+        Array(model.logLines.suffix(8))
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 18) {
+            VStack(alignment: .leading, spacing: 6) {
+                HStack(spacing: 10) {
+                    ProgressView().controlSize(.small)
+                    Text("Loading \(model.model.components(separatedBy: "/").last ?? model.model)")
+                        .font(.system(size: 20, weight: .semibold))
+                }
+                Text("The first time a model runs, it downloads first — this can take a few "
+                     + "minutes. After that it's cached and starts in seconds.")
+                    .foregroundStyle(.secondary).font(.callout)
+            }
+
+            if !recentLog.isEmpty {
+                VStack(alignment: .leading, spacing: 2) {
+                    ForEach(Array(recentLog.enumerated()), id: \.offset) { _, line in
+                        Text(line)
+                            .font(.system(size: 10, design: .monospaced))
+                            .foregroundStyle(.tertiary)
+                            .lineLimit(1).truncationMode(.middle)
+                    }
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(10)
+                .background(.quaternary.opacity(0.25), in: RoundedRectangle(cornerRadius: 8))
+            }
+            Spacer()
+        }
+        .padding(28)
+        .frame(maxWidth: .infinity, alignment: .leading)
     }
 }
 

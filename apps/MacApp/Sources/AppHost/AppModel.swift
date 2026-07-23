@@ -95,9 +95,18 @@ final class AppModel: ObservableObject {
     @Published var logLines: [String] = []
     @Published var showLogs = false
 
-    @Published var model: String = "mlx-community/Qwen3-4B-8bit"
+    /// The target the server is (or will be) loaded with. Persisted after onboarding.
+    @Published var model: String = Defaults.selectedModel ?? "mlx-community/Qwen3-4B-8bit"
 
-    enum Phase: Equatable { case launching, settingUp, startingServer, ready, failed }
+    // MARK: Onboarding
+    /// Hardware + inventory, probed model-free before any server starts.
+    @Published var onboarding: DoctorReport?
+
+    enum Phase: Equatable {
+        case launching, settingUp
+        case onboarding            // first run only: choose a model before loading anything
+        case startingServer, ready, failed
+    }
 
     /// Rounds kept for the live charts. A few hundred is several seconds of the fastest
     /// decoding — enough to see shape, cheap enough to re-render every frame.
@@ -124,6 +133,8 @@ final class AppModel: ObservableObject {
 
     // MARK: - Boot
 
+    private var engineURL: URL?
+
     func boot() async {
         guard phase == .launching || phase == .failed else { return }
         phase = .settingUp
@@ -140,8 +151,34 @@ final class AppModel: ObservableObject {
         } catch {
             return fail(error)
         }
+        engineURL = engine
 
+        // First run: choose a model before loading anything heavy. The machine check is
+        // model-free, so it runs without a server and without committing to a multi-GB
+        // download the user might not have meant.
+        if Defaults.selectedModel == nil {
+            phase = .onboarding
+            onboarding = try? await DoctorProbe.run(engine: engine)
+            if onboarding == nil {
+                // The machine check couldn't run (offline before any weights, a broken engine
+                // install). Don't strand the user on a spinner — fall through to the default
+                // model, whose own load will surface a real error if something is truly wrong.
+                await startServer(model: model)
+            }
+            return                                  // otherwise resumes on the user's pick
+        }
+        await startServer(model: model)
+    }
+
+    /// Load a target and go. Called from onboarding's pick, or straight from boot on a return
+    /// visit. The first-ever load of a model downloads it, which is why the "starting" state is
+    /// worded for minutes, not seconds.
+    func startServer(model: String) async {
+        guard let engine = engineURL else { return }
+        self.model = model
+        Defaults.selectedModel = model
         phase = .startingServer
+
         let supervisor = ServerSupervisor(engine: engine, logStore: logStore)
         self.supervisor = supervisor
         await supervisor.observeState { [weak self] state in
@@ -159,6 +196,24 @@ final class AppModel: ObservableObject {
         } catch {
             fail(error)
         }
+    }
+
+    /// Switch to a different target. Restart-based, not a hot swap: MLX holds one device
+    /// context and the weights are gigabytes, so the honest way to change models is to stop the
+    /// server and start a fresh one. The UI shows the loading screen again meanwhile.
+    ///
+    /// (A true in-place `/admin/load` — swap weights without dropping the process — is the
+    /// eventual control-plane work; this restart is correct and simple until then.)
+    func switchModel(to target: String) async {
+        guard target != model || !isServerReady else { return }
+        generationTask?.cancel()
+        telemetryTask?.cancel()
+        await supervisor?.stop()
+        apiClient = nil
+        rounds = []
+        stats = nil
+        calibration = nil
+        await startServer(model: target)
     }
 
     private func fail(_ error: Error) {
@@ -338,6 +393,13 @@ enum Defaults {
     static var labTab: String {
         get { store.string(forKey: "labTab") ?? "Live" }
         set { store.set(newValue, forKey: "labTab") }
+    }
+
+    /// The target chosen during onboarding. `nil` means onboarding hasn't run — the signal
+    /// that gates the model-pick flow, so it must only be set once a model is actually chosen.
+    static var selectedModel: String? {
+        get { store.string(forKey: "selectedModel") }
+        set { store.set(newValue, forKey: "selectedModel") }
     }
 }
 

@@ -18,8 +18,15 @@ struct ModelsScreen: View {
                         .font(.caption).foregroundStyle(.secondary)
                 }
 
+                Text("Click a downloaded model to load it. Switching restarts the engine, "
+                     + "so it takes a moment.")
+                    .font(.caption).foregroundStyle(.secondary)
+
                 ForEach(model.models) { row in
-                    ModelRowView(row: row, isLoaded: row.target == model.model)
+                    ModelRowView(row: row, isLoaded: row.target == model.model,
+                                 canLoad: row.ready && row.target != model.model) {
+                        Task { await model.switchModel(to: row.target) }
+                    }
                 }
 
                 if model.models.isEmpty {
@@ -36,8 +43,18 @@ struct ModelsScreen: View {
 struct ModelRowView: View {
     let row: ModelRow
     let isLoaded: Bool
+    var canLoad: Bool = false
+    var onLoad: () -> Void = {}
 
     var body: some View {
+        Button(action: onLoad) {
+            content
+        }
+        .buttonStyle(.plain)
+        .disabled(!canLoad)
+    }
+
+    private var content: some View {
         HStack(alignment: .top, spacing: 14) {
             VStack(alignment: .leading, spacing: 5) {
                 HStack(spacing: 8) {
@@ -68,6 +85,10 @@ struct ModelRowView: View {
                 }
             }
             Spacer()
+            if canLoad {
+                Image(systemName: "arrow.right.circle").foregroundStyle(.tint)
+                    .help("Load this model")
+            }
         }
         .padding(14)
         .frame(maxWidth: .infinity, alignment: .leading)
