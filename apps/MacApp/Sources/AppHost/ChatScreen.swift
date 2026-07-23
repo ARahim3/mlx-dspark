@@ -63,6 +63,11 @@ struct MessageView: View {
 
             if message.text.isEmpty && isStreaming {
                 ProgressView().controlSize(.small)
+            } else if message.role == .assistant {
+                // Assistant output is markdown (a coding model emits fenced code constantly);
+                // the user's own message stays plain so their literal text isn't reinterpreted.
+                MarkdownText(text: message.text)
+                    .frame(maxWidth: .infinity, alignment: .leading)
             } else {
                 Text(message.text)
                     .textSelection(.enabled)
