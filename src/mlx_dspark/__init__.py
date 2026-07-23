@@ -16,7 +16,7 @@ This package targets single-user local inference on Apple Silicon.
 # Single source of truth for the package version — pyproject.toml reads it from here
 # (hatchling dynamic version), so the two can never drift again (0.4.0 shipped with a
 # stale module attribute because they were bumped separately).
-__version__ = "0.6.0"
+__version__ = "0.6.1"
 
 
 # --- transformers>=5.13 compat shim (must run before mlx_lm/mlx_vlm import below) ---

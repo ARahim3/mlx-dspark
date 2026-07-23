@@ -73,6 +73,88 @@ def test_controller_update_at_any_cap_feeds_one_estimate():
     assert c.p > 0.65
 
 
+def test_static_best_tracks_the_measured_curve_shape_not_a_constant():
+    """The default cap is per-(model x quant x chip x mlx version). These are the REAL
+    measured M4 Pro / mlx 0.32 curves for one model at three quantizations — one registry
+    row serves all three, so no per-entry constant can be right."""
+    from mlx_dspark.calibrate import CapController
+    drafter = {c: 10.4 + 0.9 * c for c in range(1, 8)}
+    ornith = {
+        # 4-bit: rises from width 3 -> stay shallow
+        "4bit": ({1: 21.5, 2: 22.0, 3: 25.4, 4: 31.8, 5: 37.4, 6: 45.6, 7: 56.9, 8: 57.8}, 2),
+        # 8-bit: flat through width 5, knee at 6 -> cap 4
+        "8bit": ({1: 36.7, 2: 37.0, 3: 37.8, 4: 38.5, 5: 40.6, 6: 51.8, 7: 61.9, 8: 62.7}, 4),
+        # bf16: 2x cliff at width 2 then FLAT -> once the cliff is paid, width is free.
+        # (>=6 rather than an exact value: the argmax there is flat-topped, so the drafter
+        # curve and per-round overhead decide between 6 and 7. "Go wide" is the claim.)
+        "bf16": ({1: 67.8, 2: 134.4, 3: 135.0, 4: 136.8, 5: 136.8, 6: 137.3, 7: 138.1,
+                  8: 139.1}, 6),
+    }
+    picks = {}
+    for name, (curve, want) in ornith.items():
+        ctrl = CapController(curve, drafter, max_cap=7)
+        ctrl.p = 0.65
+        picks[name] = ctrl.static_best()
+    assert picks["4bit"] == ornith["4bit"][1], picks
+    assert picks["8bit"] == ornith["8bit"][1], picks
+    assert picks["bf16"] >= ornith["bf16"][1], picks
+    # the ordering is the load-bearing part: same model, same registry row, three answers
+    assert picks["4bit"] < picks["8bit"] < picks["bf16"], picks
+
+
+def test_static_prior_reproduces_the_measured_optima():
+    """Locks `STATIC_PRIOR_P` against the real M4 Pro / mlx 0.32 curves and the caps that
+    were actually measured fastest. The prior is load-bearing: at the controller's 0.65
+    parking prior this picks cap 1 for Bonsai (measured best 2) — i.e. WORSE than the old
+    hardcoded 2 — and 6 for Ornith-bf16 (7). Re-fit if the curves are regenerated."""
+    from mlx_dspark.calibrate import STATIC_PRIOR_P, CapController
+    # (verify curve, drafter curve, per-round overhead ms, cap measured fastest end-to-end).
+    # All four inputs are the REAL cached measurements — the drafter curve and overhead
+    # matter as much as the verify curve here (a synthetic drafter cost flips Bonsai to 1).
+    cases = {
+        "bonsai-27b-2bit": (
+            {1: 40.8, 2: 53.2, 3: 72.0, 4: 89.6, 5: 107.9},
+            {1: 7.7, 2: 7.9, 3: 8.3, 4: 9.7}, 7.9, 2),
+        "qwen3.6-27b-4bit": (
+            {1: 68.4, 2: 69.6, 3: 75.2, 4: 93.8, 5: 112.3, 6: 141.5, 7: 175.3, 8: 176.3},
+            {1: 14.4, 2: 14.8, 3: 15.3, 4: 16.5, 5: 17.6, 6: 19.3, 7: 21.3}, 4.7, 2),
+        "ornith-9b-8bit": (
+            {1: 36.7, 2: 37.0, 3: 37.8, 4: 38.5, 5: 40.6, 6: 51.8, 7: 61.9, 8: 62.7},
+            {1: 10.4, 2: 10.8, 3: 11.4, 4: 12.5, 5: 13.5, 6: 14.9, 7: 16.5}, 0.3, 4),
+        "qwen3-4b-8bit": (
+            {1: 21.4, 2: 22.0, 3: 22.2, 4: 22.8, 5: 24.1, 6: 29.6, 7: 34.5, 8: 36.2},
+            {1: 5.4, 2: 5.5, 3: 5.8, 4: 6.3, 5: 6.9, 6: 8.2, 7: 8.0}, 0.0, 4),
+        "gemma-12b-8bit": (
+            {1: 57.9, 2: 58.4, 3: 59.6, 4: 60.8, 5: 63.7, 6: 81.9, 7: 97.0, 8: 97.7},
+            {1: 11.6, 2: 11.9, 3: 12.6, 4: 13.8, 5: 14.9, 6: 16.1, 7: 18.0}, 4.7, 4),
+    }
+    for name, (verify, drafter, overhead, want) in cases.items():
+        ctrl = CapController(verify, drafter, max_cap=min(7, max(drafter)),
+                             overhead_ms=overhead)
+        assert ctrl.static_best(STATIC_PRIOR_P) == want, name
+
+
+def test_static_best_goes_wide_on_a_flat_curve_and_shallow_on_a_steep_one():
+    """Sanity on the two extremes, independent of any measured data."""
+    from mlx_dspark.calibrate import CapController
+    flat = CapController({w: 50.0 for w in range(1, 9)}, 5.0, max_cap=7)
+    flat.p = 0.8
+    assert flat.static_best() == 7                # free width -> draft as deep as allowed
+    steep = CapController({w: 20.0 * w for w in range(1, 9)}, 5.0, max_cap=7)
+    steep.p = 0.8
+    assert steep.static_best() == 1               # every row costs a full step -> barely draft
+
+
+def test_static_cap_falls_back_rather_than_raising():
+    """Calibration is an optimization, never a gate: an unsupported mode or a missing
+    drafter must degrade to the historical default, not break generation."""
+    from mlx_dspark.calibrate import static_cap
+    assert static_cap(None, None, mode="lookup", target_repo="x", drafter_repo=None) == 2
+    assert static_cap(None, None, mode="dspark", target_repo="x", drafter_repo=None) == 2
+    assert static_cap(object(), object(), mode="dspark", target_repo="x",
+                      drafter_repo="y", fallback=3) == 3      # calibrate() blows up -> 3
+
+
 def test_disk_cache_roundtrip(tmp_path):
     key = _cache_key("dspark", "org/Model-8bit", "org/drafter")
     assert "dspark" in key and "Model-8bit" in key
@@ -93,6 +175,30 @@ def test_knee_width_convex_curve():
 def test_knee_width_linear_no_knee():
     from mlx_dspark.calibrate import knee_width
     assert knee_width({1: 5, 2: 10, 3: 15, 4: 20, 5: 25}) == 5   # no jump -> top width
+
+
+def test_knee_width_flat_step_does_not_fake_a_knee():
+    """Regression: a flat step used to collapse the running baseline to ~0, after which any
+    +1 ms read as a jump. Measured Qwen3-4B 8-bit (mlx 0.32) reported a knee at 4 while the
+    curve is still flat there; the real jump is 24 -> 30 at width 6."""
+    from mlx_dspark.calibrate import knee_width
+    measured = {1: 21.0, 2: 22.0, 3: 22.0, 4: 23.0, 5: 24.0, 6: 30.0, 7: 34.0, 8: 36.0}
+    assert knee_width(measured) == 6
+
+
+def test_knee_width_detects_a_cliff_at_the_first_step():
+    """Regression: the first delta was the baseline and so could never be reported as the
+    knee — but that is exactly the bf16 shape, where an unquantized matmul reads the weight
+    stream twice from width 2 and then stays flat (measured Ornith-9B ctx512)."""
+    from mlx_dspark.calibrate import knee_width
+    assert knee_width({1: 67.8, 2: 134.4, 4: 136.0, 8: 139.0}) == 2
+
+
+def test_knee_width_noise_does_not_trigger_on_a_flat_cheap_region():
+    """+-1 ms of measurement noise on a nearly-flat region must not read as leaving it."""
+    from mlx_dspark.calibrate import knee_width
+    measured = {1: 36.7, 2: 37.5, 3: 38.4, 4: 39.5, 5: 40.6, 6: 52.0, 7: 58.0}
+    assert knee_width(measured) == 6
 
 
 def test_drafter_recommendation_small_knee_is_dspark():

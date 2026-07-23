@@ -210,16 +210,44 @@ def knee_width(verify_ms: dict[int, float]) -> int:
     machine-dependent quantity that decides dspark-vs-DFlash: a *small* knee means wide verify is
     expensive → dspark's short blocks win (what ``--mode auto`` already picks); a knee that has
     moved out to the DFlash block width (M5-class hardware) means DFlash full-block verify stays
-    cheap and re-enters play. Returns the top measured width if no clear knee is found."""
+    cheap and re-enters play. Returns the top measured width if no clear knee is found.
+
+    A jump has to clear **two** bars, because either alone misfires on a real curve:
+
+    - *relative*: above 1.8x the mean marginal cost of the cheap region so far. The mean, not
+      the running minimum — a minimum collapses to ~0 the moment one step is flat, after which
+      every later step trivially "jumps". (Measured Qwen3-4B 8-bit, mlx 0.32, ms by width
+      1..8 = 21 22 22 23 24 30 34 36: the flat 22->22 step drove the old baseline to 0 and the
+      knee was reported at 4, where the curve is still flat. The real jump is at 6.)
+    - *absolute*: at least 15% of the single-row cost. On a nearly-flat cheap region the
+      deltas are +-1 ms of measurement noise, and a ratio test on noise is meaningless.
+
+    Reporting only — cap selection reads the curves directly (see :meth:`CapController.rate`),
+    so this never changes what gets drafted, only what is shown and recommended.
+    """
     ks = sorted(verify_ms)
     if len(ks) < 3:
         return ks[-1] if ks else 0
     deltas = [(ks[i], verify_ms[ks[i]] - verify_ms[ks[i - 1]]) for i in range(1, len(ks))]
-    base = deltas[0][1]
+    floor = 0.15 * verify_ms[ks[0]]          # noise gate, scaled to the model's own cost
+
+    # The very first step can itself be the knee — that is exactly the bf16 case, where an
+    # unquantized matmul reads the full weight stream twice from width 2 and then stays flat
+    # (Ornith-9B: 67.8 -> 134.4 -> ~139 ms). It has no cheap region *below* it to compare
+    # against, so judge it against the rest of the curve instead. Without this the detector
+    # structurally cannot see a cliff at width 2, and reports the top width instead.
+    if len(deltas) >= 2:
+        rest = [d for _, d in deltas[1:]]
+        tail_mean = sum(rest) / len(rest)
+        if deltas[0][1] > max(1.8 * tail_mean, floor):
+            return deltas[0][0]
+
+    seen = [deltas[0][1]]
     for w, d in deltas[1:]:
-        if d > 1.8 * max(base, 1e-6):        # marginal cost jumped clearly above the cheap region
+        base = sum(seen) / len(seen)
+        if d > max(1.8 * base, floor):       # marginal cost left the cheap region
             return w
-        base = min(base, d)
+        seen.append(d)
     return ks[-1]
 
 
@@ -339,7 +367,12 @@ class CapController:
         return float(self.drafter_ms)
 
     def expected_committed(self, cap: int) -> float:
-        """1 bonus/replacement token + geometric accepted prefix."""
+        """1 bonus/replacement token + geometric accepted prefix.
+
+        A per-position variant of this (chaining separately-tracked p_i instead of one
+        scalar) was implemented and measured 2026-07-22, and **reverted** — it modelled
+        reality better yet performed worse. See NOTES "Knee detection"; don't re-derive it.
+        """
         return 1.0 + sum(self.p ** i for i in range(1, cap + 1))
 
     def _replay_ms(self, cap: int) -> float:
@@ -364,7 +397,11 @@ class CapController:
 
     def _rate_eff(self, cap: int) -> float:
         """Best available estimate of committed tokens/ms at this cap: measured when this
-        cap has enough observed rounds, else the model (correction-scaled for cap >= 1)."""
+        cap has enough observed rounds, else the model (correction-scaled for cap >= 1).
+
+        Shrinking the measured rate toward the model by observation count (instead of this
+        hard switch) was implemented and measured 2026-07-22, and **reverted** together
+        with the per-position acceptance model — see NOTES "Knee detection"."""
         if self._t_cnt.get(cap, 0) >= self.min_rounds_observed:
             return 1.0 / max(self._t_obs[cap], 1e-6)
         return self.rate(cap) * (self._corr if cap >= 1 else 1.0)
@@ -438,6 +475,17 @@ class CapController:
             return self.expected_committed(c) / max(t, 1e-6)
 
         return max(range(1, self.max_cap + 1), key=rate_b)
+
+    def static_best(self, p: float | None = None) -> int:
+        """The single best FIXED cap for this machine+model+quant, straight off the measured
+        curves. This is the default-cap resolver — see :func:`static_cap`."""
+        if p is not None:
+            saved, self.p = self.p, float(p)
+            try:
+                return max(range(1, self.max_cap + 1), key=self.rate)
+            finally:
+                self.p = saved
+        return max(range(1, self.max_cap + 1), key=self.rate)
 
     def info(self) -> dict:
         lo = 0 if self.allow_zero else 1
@@ -569,3 +617,44 @@ def calibrate(target, drafter, *, mode: str, target_repo: str, drafter_repo: str
         print(f"  predicted tok/s by cap (prior accept): {r} -> starting cap 2, "
               f"knee-best {best}", flush=True)
     return ctrl
+
+
+# Acceptance prior used to pick the static default cap. Deliberately NOT the controller's
+# `prior_p` (0.65): that one guards the cap-0 parking gate, where being pessimistic is the
+# safe direction, whereas here pessimism picks a cap that is too shallow. Fitted against the
+# measured optima of all 8 curves in the calibration cache (2026-07-22): 0.65 scores 5/8 and
+# notably picks cap 1 for Bonsai (measured best 2) and 6 for Ornith-bf16 (7); 0.70 scores 7/8,
+# with the only miss Ornith-4bit (picks 2, measured 3 — adjacent caps, inside noise there).
+# Re-fit this if the measured-optima table in NOTES "Knee detection" is ever regenerated.
+STATIC_PRIOR_P = 0.70
+
+
+def static_cap(target, drafter, *, mode: str, target_repo: str, drafter_repo: str | None,
+               cache_dir: str | None = None, verbose: bool = False,
+               fallback: int = 2) -> int:
+    """The default cap for this machine+model+quant: the cost model's argmax over the
+    MEASURED curves. One-time on-device measurement (~5 s), disk-cached thereafter.
+
+    **Why this is not a constant.** The optimal cap is a property of
+    (model x QUANTIZATION x chip x mlx version), not of the model family. Measured
+    2026-07-22 on one M4 Pro under mlx 0.32, the best cap spans **2 to 7** across the
+    cached curves, and the *same registry row* needs different caps per quantization —
+    Ornith-1.0-9B wants cap 2 at 4-bit, 4 at 8-bit, 6 at bf16 — while drafter resolution
+    is deliberately quant-agnostic, so no per-entry constant can express it. Nor is a
+    knee-derived rule enough: bf16 has a 2x cliff at width 2 and is then FLAT, so the
+    right move there is to go *wide* once the cliff is paid. What generalizes is the
+    argmax itself, which reproduced all 7 documented optima. The old hardcoded 2 was
+    measured when mlx 0.31.2 put the knee at width 4; 0.32 moved it to 6 for every 8-bit
+    family, leaving 10-32% on the table. It will drift again — that is the point.
+
+    Returns ``fallback`` if the curves cannot be measured (unsupported mode, no drafter),
+    so a failure here degrades to the historical default rather than breaking generation.
+    """
+    if mode not in ("dspark", "dflash") or drafter is None:
+        return fallback
+    try:
+        ctrl = calibrate(target, drafter, mode=mode, target_repo=target_repo,
+                         drafter_repo=drafter_repo, cache_dir=cache_dir, verbose=verbose)
+    except Exception:                       # calibration is an optimization, never a gate
+        return fallback
+    return ctrl.static_best(STATIC_PRIOR_P)
