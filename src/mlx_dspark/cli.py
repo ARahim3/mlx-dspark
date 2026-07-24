@@ -100,6 +100,12 @@ def cmd_generate(argv: list[str]) -> None:
     ap.add_argument("--no-lookup-drafts", action="store_true",
                     help="disable hybrid n-gram drafting inside dspark mode (on by default; "
                          "free extra speedup on copy-heavy spans, lossless either way)")
+    ap.add_argument("--wide-gemm-min", type=int, default=None, metavar="N",
+                    help="prefill only: row count from which QuantizedLinear dequantizes the "
+                         "weight once and runs a plain GEMM instead of quantized_matmul "
+                         "(mlx re-dequantizes per output tile, which is redundant at prefill "
+                         "widths). Default: calibrate the crossover for this machine+model "
+                         "once and cache it; 0 disables. Bit-identical, ~1.09x prefill")
     ap.add_argument("--lookup-long-draft", type=int, default=32,
                     help="match-scaled long-draft ceiling for lookup drafts (dspark hybrid "
                          "+ lookup mode): a deep context match (real copy run) earns drafts "
@@ -147,6 +153,11 @@ def cmd_generate(argv: list[str]) -> None:
 
     if args.wired_limit:
         apply_wired_limit()
+    # prefill wide-GEMM path: dequantize the weight once above a calibrated row count
+    # instead of paying quantized_matmul's per-tile dequant (see wide_gemm.py)
+    from .calibrate import apply_wide_gemm
+
+    apply_wide_gemm(target, drafter, target_repo=target_repo, min_rows=args.wide_gemm_min)
     on_text = None if args.no_stream else _emit
     print("\n" + "=" * 64)
     print(f"  ▶  {label}   ·   {target_repo.split('/')[-1]}")
@@ -296,6 +307,9 @@ def cmd_serve(argv: list[str]) -> None:
     ap.add_argument("--lookup-long-draft", type=int, default=32,
                     help="match-scaled long-draft ceiling for lookup drafts (default 32; "
                          "set to 6 to disable — see `mlx-dspark generate -h`)")
+    ap.add_argument("--wide-gemm-min", type=int, default=None, metavar="N",
+                    help="prefill wide-GEMM crossover row count (default: calibrated once and "
+                         "cached; 0 disables — see `mlx-dspark generate -h`)")
     ap.add_argument("--prefix-cache-dir", default=None,
                     help="directory for the L2 SSD spill tier (enables spilling the cache to disk)")
     ap.add_argument("--prefix-cache-max-ram-mb", type=int, default=0,
@@ -330,7 +344,7 @@ def cmd_serve(argv: list[str]) -> None:
             prefix_cache_slots=args.prefix_cache_slots,
             lookup_drafts=not args.no_lookup_drafts,
             lookup_long_draft=args.lookup_long_draft,
-            wired_limit=args.wired_limit,
+            wired_limit=args.wired_limit, wide_gemm_min=args.wide_gemm_min,
             batch_widths=(sorted({2, args.max_batch}) if args.max_batch > 1 else None),
             kv_bits=args.kv_bits or None,
             context_window=args.context_window,

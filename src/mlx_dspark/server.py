@@ -172,21 +172,24 @@ class Engine:
         }
 
     def _build_prefix_cache(self, enabled, l2_dir, max_ram_mb):
-        """Enable prefix caching where reuse is exact: dspark/lookup/baseline on dense
-        (KVCache) targets, and on sliding-window (RotatingKVCache) targets like Gemma-4
-        while under the window — entries are refused at store time once any layer wraps.
-        Disabled for DFlash (its drafter cache can't roll back)."""
+        """Enable prefix caching for dspark/lookup/baseline, in whichever mode this target
+        supports (see :mod:`~mlx_dspark.prefix_cache`): **trim** for dense (KVCache) and
+        sliding-window targets — which latches to checkpoint the first time a window wraps
+        — and **checkpoint** from the start for targets whose caches can't be rolled back
+        at all (hybrid linear-attention: Ornith, Bonsai, Qwen3.6-27B). Those used to get no
+        prefix caching whatsoever, which cost them the agent workload outright: prefill is
+        ~90% of an uncached Claude Code turn. Still disabled for DFlash (its *drafter*
+        cache can't roll back, and it isn't snapshotted here)."""
         if not enabled or self.mode == "dflash":
             return None
         try:
-            if not target_cache_reusable(self.target.make_cache()):
-                return None
+            checkpoint = not target_cache_reusable(self.target.make_cache())
         except Exception:  # noqa: BLE001
             return None
         make_ctx = self.drafter.make_ctx_cache if self.mode == "dspark" else None
         return PrefixCache(self.target.make_cache, make_ctx,
                            l2_dir=l2_dir, max_ram_bytes=max(0, max_ram_mb) * 1024 * 1024,
-                           slots=self.prefix_cache_slots)
+                           slots=self.prefix_cache_slots, checkpoint=checkpoint)
 
     # --- construction ---
     @classmethod
@@ -217,6 +220,7 @@ class Engine:
         batch_widths: list[int] | None = None,   # e.g. [2, max_batch]: calibrate (B,cap) grid
         kv_bits: int | None = None,              # quantize the target KV cache (4/8)
         context_window: int | None = None,       # override the target's own limit
+        wide_gemm_min: int | None = None,        # prefill wide-GEMM: None=calibrate, 0=off, N=forced
     ) -> "Engine":
         if mode != "auto" and mode not in MODES:
             raise ValueError(f"mode must be one of {MODES} or 'auto', got {mode!r}")
@@ -249,6 +253,11 @@ class Engine:
 
                 ctrl = calibrate(tgt, draft, mode=mode, target_repo=target_repo,
                                  drafter_repo=drafter_repo, batch_widths=batch_widths)
+            # prefill wide-GEMM path (dequantize once above a calibrated width) — process
+            # -wide, measured once and cached like the cap
+            from .calibrate import apply_wide_gemm
+
+            apply_wide_gemm(tgt, draft, target_repo=target_repo, min_rows=wide_gemm_min)
             return tgt, tok, draft, ctrl
 
         tgt, tok, draft, cap_controller = executor.submit(_load_models).result()
@@ -320,8 +329,14 @@ class Engine:
         # dense target); `cache is None` means this mode/target doesn't reuse.
         cache = ctx = None
         reuse_len = 0
+        on_prefill = None
         if self.prefix is not None:
             cache, ctx, reuse_len = self.prefix.acquire(prompt_ids)
+            if self.prefix.wants_checkpoint():
+                # snapshot at the prompt boundary (the only moment the caches hold exactly
+                # the prompt) — the reuse path for caches that cannot be trimmed back
+                def on_prefill(c, x, n, _ids=prompt_ids):
+                    self.prefix.checkpoint(c, x, n, _ids)
         try:
             if self.mode == "dspark":
                 res = speculative_generate(
@@ -334,6 +349,7 @@ class Engine:
                     temperature=temperature, top_p=top_p, top_k=top_k,
                     presence_penalty=presence_penalty, frequency_penalty=frequency_penalty,
                     logprobs=logprobs, seed=seed, stop=stop, on_text=on_text,
+                    on_prefill=on_prefill,
                 )
             elif self.mode == "dflash":
                 res = dflash_generate(
@@ -350,7 +366,7 @@ class Engine:
                     max_new_tokens=max_tokens, max_draft_tokens=self.max_draft_tokens or 6,
                     long_draft_tokens=max(self.max_draft_tokens or 6, self.lookup_long_draft),
                     temperature=temperature, top_p=top_p, top_k=top_k,
-                    seed=seed, stop=stop, on_text=on_text,
+                    seed=seed, stop=stop, on_text=on_text, on_prefill=on_prefill,
                 )
             else:
                 res = greedy_generate(
@@ -359,7 +375,7 @@ class Engine:
                     max_new_tokens=max_tokens, temperature=temperature, top_p=top_p,
                     top_k=top_k, presence_penalty=presence_penalty,
                     frequency_penalty=frequency_penalty, logprobs=logprobs, seed=seed,
-                    stop=stop, on_text=on_text,
+                    stop=stop, on_text=on_text, on_prefill=on_prefill,
                 )
         except BaseException:                     # never leave a desynced cache behind
             if self.prefix is not None:

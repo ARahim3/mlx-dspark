@@ -157,6 +157,7 @@ def lookup_generate(
     apply_chat_template: bool = True,
     stop: list[str] | None = None,
     on_text=None,
+    on_prefill=None,
 ) -> GenResult:
     """Prompt-lookup speculative decoding (batch=1) — no drafter model.
 
@@ -187,6 +188,8 @@ def lookup_generate(
     t0 = time.time()
     suffix = ids[reuse_len:] if reuse_len else ids
     logits = _prefill_plain(target_model, suffix, cache)
+    if on_prefill is not None:
+        on_prefill(cache, None, len(ids))   # caches hold exactly `ids` right now
     pending = _pick(logits[0, -1], temperature, top_p, top_k)
     out_ids: list[int] = [pending]
     index.extend([pending])

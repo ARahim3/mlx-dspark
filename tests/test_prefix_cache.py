@@ -220,3 +220,129 @@ def test_store_leaves_an_exact_cache_untouched():
     pc.store(cache, ctx, prompt, generated)
     for c in cache:
         assert c.offset == 4
+
+
+# --- checkpoint mode: reuse for caches that cannot be trimmed back -----------------------
+
+
+class LinearStateCache:
+    """A hybrid-style cache: recurrent state, no trim (mlx-lm's ArraysCache shape)."""
+
+    def __init__(self):
+        self.cache = [None, None]
+        self.fed = 0
+
+    def feed(self, n):                     # stand-in for a forward advancing the state
+        self.fed += n
+        self.cache = [f"state@{self.fed}", f"conv@{self.fed}"]
+
+    def is_trimmable(self):
+        return False
+
+    @property
+    def state(self):
+        return self.cache
+
+    @state.setter
+    def state(self, v):
+        self.cache = list(v)
+
+    @property
+    def meta_state(self):
+        return ""
+
+    @meta_state.setter
+    def meta_state(self, v):
+        pass
+
+
+def _mk_hybrid():
+    return [LinearStateCache(), LinearStateCache()]
+
+
+def test_checkpoint_reuses_only_at_the_exact_boundary():
+    pc = PrefixCache(_mk_hybrid, None, min_reuse=4, checkpoint=True)
+    assert pc.wants_checkpoint() is True
+    prompt = list(range(20))
+    cache, _, reuse = pc.acquire(prompt)
+    assert reuse == 0                                   # cold
+    for c in cache:
+        c.feed(len(prompt))
+    pc.checkpoint(cache, None, len(prompt), prompt)
+
+    # next turn = same prompt + more -> reuse the whole boundary
+    nxt = prompt + [99, 100, 101]
+    got, _, reuse = pc.acquire(nxt)
+    assert reuse == len(prompt)
+    assert got is not cache                             # restored into fresh caches
+    assert got[0].state == ["state@20", "conv@20"]      # ...carrying the snapshot's state
+
+    # a prompt that diverges inside the boundary cannot use it at all
+    _, _, reuse = pc.acquire(list(range(10)) + [777] * 15)
+    assert reuse == 0
+    # nor can one that merely shares a shorter prefix (no trimming a recurrent state)
+    _, _, reuse = pc.acquire(list(range(15)))
+    assert reuse == 0
+
+
+def test_checkpoint_survives_a_failed_generation():
+    """The snapshot is never checked out, so a request that blows up mid-generation
+    cannot take the cached prefix with it."""
+    pc = PrefixCache(_mk_hybrid, None, min_reuse=4, checkpoint=True)
+    prompt = list(range(20))
+    cache, _, _ = pc.acquire(prompt)
+    for c in cache:
+        c.feed(len(prompt))
+    pc.checkpoint(cache, None, len(prompt), prompt)
+    borrowed, _, reuse = pc.acquire(prompt + [1])
+    assert reuse == len(prompt)
+    for c in borrowed:                                  # generation mutates its copy...
+        c.feed(50)
+    again, _, reuse = pc.acquire(prompt + [2])          # ...and the slot is still intact
+    assert reuse == len(prompt)
+    assert again[0].state == ["state@20", "conv@20"]
+
+
+def test_checkpoint_is_not_taken_below_min_reuse():
+    pc = PrefixCache(_mk_hybrid, None, min_reuse=16, checkpoint=True)
+    prompt = list(range(4))
+    cache, _, _ = pc.acquire(prompt)
+    pc.checkpoint(cache, None, len(prompt), prompt)
+    assert pc.info()["cached_tokens"] == 0
+
+
+def test_checkpoint_off_by_default():
+    pc = PrefixCache(_mk_cache, _mk_ctx, min_reuse=4)
+    assert pc.wants_checkpoint() is False
+    cache, ctx, _ = pc.acquire(list(range(20)))
+    pc.checkpoint(cache, ctx, 20, list(range(20)))      # no-op in trim mode
+    assert pc.info()["cached_tokens"] == 0
+
+
+def test_wrapped_rotating_latches_checkpoint_mode_on():
+    """gemma-4 at agent prompt sizes wraps its window immediately; before this it simply
+    lost prefix caching for the rest of the process. Now the refused store flips it to
+    checkpoint mode so the NEXT request snapshots instead."""
+    pc = PrefixCache(_mk_cache, _mk_ctx, min_reuse=1)
+    prompt = list(range(20))
+    cache = [RealRotatingKVCache(max_size=16), KVCache()]
+    cache[0].offset = 16                                # wrapped
+    cache[1].offset = 21
+    assert pc.wants_checkpoint() is False
+    pc.store(cache, _mk_ctx(), prompt, [99, 100])
+    assert pc.info()["cached_tokens"] == 0              # still refused, as before
+    assert pc.wants_checkpoint() is True                # ...but now it will snapshot
+
+
+def test_checkpoint_restores_ctx_caches_too():
+    pc = PrefixCache(_mk_hybrid, _mk_ctx, min_reuse=4, checkpoint=True)
+    prompt = list(range(20))
+    cache, ctx, _ = pc.acquire(prompt)
+    for c in cache:
+        c.feed(len(prompt))
+    for c in ctx:
+        c.k = c.v = None                                # drafter ctx may be empty
+    pc.checkpoint(cache, ctx, len(prompt), prompt)
+    _, got_ctx, reuse = pc.acquire(prompt + [7])
+    assert reuse == len(prompt)
+    assert got_ctx is not None and len(got_ctx) == len(ctx)

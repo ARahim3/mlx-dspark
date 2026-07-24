@@ -89,11 +89,15 @@ class Target:
             return self._run_hybrid(ids, cache, tap)
         return self._run_mlxlm(ids, cache, tap)
 
-    def _run_mlxlm(self, ids, cache, tap):
+    # The mlx-lm paths are split body/head so a prefill chunk can skip the vocab
+    # projection it would throw away (see :meth:`prefill`); run() is body+full head,
+    # byte-identical to the single-function version it replaced.
+    def _body_mlxlm(self, ids, cache, tap):
+        """Replicated mlx-lm forward through the final norm -> (hidden, fused|None)."""
         from mlx_lm.models.base import create_attention_mask
 
         mm = self._inner.model
-        tapset = set(tap)
+        tapset = set(tap) if tap is not None else ()
         h = mm.embed_tokens(ids)
         mask = create_attention_mask(h, cache[0])
         captured = []
@@ -101,21 +105,16 @@ class Target:
             h = layer(h, mask, c)
             if i in tapset:
                 captured.append(h)
-        hn = mm.norm(h)
-        if self._tied:
-            logits = mm.embed_tokens.as_linear(hn)
-        else:
-            logits = self._inner.lm_head(hn)
-        return logits, mx.concatenate(captured, axis=-1)
+        return mm.norm(h), (mx.concatenate(captured, axis=-1) if tap is not None else None)
 
-    def _run_hybrid(self, ids, cache, tap):
+    def _body_hybrid(self, ids, cache, tap):
         """Replicates mlx-lm's hybrid text forward (qwen3_5-style: per-layer fa/ssm mask
         selection) with the residual-stream capture. Faithfulness is proven by
         :meth:`verify_tap` at load, exactly like the dense path."""
         from mlx_lm.models.base import create_attention_mask, create_ssm_mask
 
         mm = self._inner.model
-        tapset = set(tap)
+        tapset = set(tap) if tap is not None else ()
         h = mm.embed_tokens(ids)
         fa_mask = create_attention_mask(h, cache[mm.fa_idx])
         ssm_mask = create_ssm_mask(h, cache[mm.ssm_idx])
@@ -124,12 +123,54 @@ class Target:
             h = layer(h, mask=(ssm_mask if layer.is_linear else fa_mask), cache=c)
             if i in tapset:
                 captured.append(h)
-        hn = mm.norm(h)
-        if self._tied:
-            logits = mm.embed_tokens.as_linear(hn)
+        return mm.norm(h), (mx.concatenate(captured, axis=-1) if tap is not None else None)
+
+    def _head_mlxlm(self, hn):
+        # mlx-lm convention: tied models have no lm_head, they project through the embedding
+        return (self._inner.model.embed_tokens.as_linear(hn) if self._tied
+                else self._inner.lm_head(hn))
+
+    def _run_mlxlm(self, ids, cache, tap):
+        hn, fused = self._body_mlxlm(ids, cache, tap)
+        return self._head_mlxlm(hn), fused
+
+    def _run_hybrid(self, ids, cache, tap):
+        hn, fused = self._body_hybrid(ids, cache, tap)
+        return self._head_mlxlm(hn), fused
+
+    # -- prefill forward (skips the vocab projection it would discard) ------------------
+    #
+    # A prefill chunk's logits are read at exactly ONE row — the last one of the last
+    # chunk, which becomes the first sampled token. Projecting the other rows to vocab is
+    # pure waste: measured ~7-8% of prefill FLOPs on an 8-bit Qwen3-8B, plus a
+    # [chunk, vocab] transient (622 MB at chunk 2048) that is the reason PREFILL_CHUNK
+    # has to be small at all. See NOTES "Prefill pass".
+
+    def prefill(self, ids: mx.array, cache, tap: list[int] | None = None, *,
+                want_logits: bool = False, head_last_row: bool = True):
+        """One prefill chunk -> ``(logits | None, fused | None)``.
+
+        ``want_logits=False`` (any non-final chunk) skips the vocab projection entirely
+        and is **bit-identical** to :meth:`run` in everything it keeps — the KV cache and
+        the tapped hidden states are untouched. ``head_last_row`` additionally projects
+        only the final row, which moves that row from the quantized matmul path to the
+        matvec path (the one every decode step already takes): the usual fp-tie class,
+        measured max|Δlogit| = 0.06 on Qwen3-8B-8bit = 1-2 bf16 ulps. Set
+        ``generate.PREFILL_LAST_ROW_HEAD = False`` for the bit-identical-but-slower form.
+        ``tap=None`` skips the hidden-state capture."""
+        if self.is_vlm:
+            lm = self.model.language_model
+            sink = [] if tap is not None else None
+            hn = lm.model(ids, cache=cache, capture_layer_ids=tap, hidden_sink=sink)
+            fused = mx.concatenate(sink, axis=-1) if tap is not None else None
+            head = lm.logits_from_hidden
         else:
-            logits = self._inner.lm_head(hn)
-        return logits, mx.concatenate(captured, axis=-1)
+            hn, fused = ((self._body_hybrid if self.is_hybrid else self._body_mlxlm)
+                         (ids, cache, tap))
+            head = self._head_mlxlm
+        if not want_logits:
+            return None, fused
+        return head(hn[:, -1:, :] if head_last_row else hn), fused
 
     # -- plain forward (no capture) for the greedy baseline --
     def plain(self, ids: mx.array, cache):

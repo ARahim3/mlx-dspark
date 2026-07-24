@@ -536,6 +536,60 @@ def save_cached(key: str, entry: dict, cache_dir: str | None = None) -> None:
         json.dump(data, f, indent=1)
 
 
+def wide_gemm_min_rows(target, drafter=None, *, target_repo: str,
+                       cache_dir: str | None = None,
+                       verbose: bool = True) -> tuple[int | None, list[str]]:
+    """Row count from which prefill should route ``QuantizedLinear`` through
+    dequantize-once + GEMM instead of ``quantized_matmul`` (see :mod:`.wide_gemm`), or
+    ``None`` when that never pays on this machine.
+
+    Same doctrine as the cap: the crossover is a property of
+    (chip x mlx version x weight shape), so it is measured once (~1-2 s) and cached to disk
+    under a key that includes both the device and the mlx version — a hardcoded threshold
+    would be stale the day a chip or a kernel changes."""
+    from .wide_gemm import measure_crossover
+
+    key = _cache_key("widegemm", target_repo, None)
+    entry = load_cached(key, cache_dir)
+    if entry is None:
+        if verbose:
+            print("calibrating prefill wide-GEMM crossover (one-time, cached)…", flush=True)
+        # the drafter's context projections run at prefill width too, so its shapes are
+        # part of the bit-identity check
+        got = measure_crossover(target.model, drafter)
+        entry = ({"min_rows": got[0], "shapes": got[1]} if got
+                 else {"min_rows": None, "shapes": []})
+        save_cached(key, entry, cache_dir)
+        if verbose:
+            mr, sh = entry["min_rows"], entry["shapes"]
+            state = (f"on from M={mr} for {len(sh)} weight shapes (verified bit-identical)"
+                     if mr else "off (no gain, or not exact on this machine)")
+            print(f"  prefill wide-GEMM: {state}", flush=True)
+    return entry.get("min_rows"), entry.get("shapes")
+
+
+def apply_wide_gemm(target, drafter=None, *, target_repo: str,
+                    min_rows: int | None = None, verbose: bool = True) -> int | None:
+    """Turn the prefill wide-GEMM path on for this process and return the threshold used.
+
+    ``min_rows=None`` calibrates (and caches); ``0`` disables; ``N`` forces N. Sets the
+    process-wide ``generate.WIDE_GEMM_MIN_ROWS`` rather than a library default, because a
+    plain ``speculative_generate`` call must never silently trigger a device benchmark."""
+    from . import generate as _gen
+    from .wide_gemm import verified_shapes
+
+    if min_rows is None:
+        _gen.WIDE_GEMM_MIN_ROWS, _gen.WIDE_GEMM_SHAPES = wide_gemm_min_rows(
+            target, drafter, target_repo=target_repo, verbose=verbose)
+    else:
+        # an explicit threshold still only applies to shapes verified at it
+        _gen.WIDE_GEMM_MIN_ROWS = int(min_rows) or None
+        _gen.WIDE_GEMM_SHAPES = (
+            verified_shapes([target.model, drafter], _gen.WIDE_GEMM_MIN_ROWS)
+            if _gen.WIDE_GEMM_MIN_ROWS else [])
+    return _gen.WIDE_GEMM_MIN_ROWS
+
+
 # --------------------------------------------------------------------------- entry point
 
 
