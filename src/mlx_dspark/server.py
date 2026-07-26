@@ -674,11 +674,20 @@ class BatchEngine:
 
 def maybe_batch_engine(engine: Engine, max_batch: int):
     """Wrap ``engine`` in a :class:`BatchEngine` iff batching can help and is safe here: opt-in
-    (``max_batch > 1``), a batchable dense mlx-lm target, and a mode with a batched kernel
-    (dspark/baseline). Otherwise return the engine unchanged (serialized)."""
-    from .batch_engine import batchable
+    (``max_batch > 1``), a batchable mlx-lm target, and a mode with a batched kernel
+    (dspark/baseline). Otherwise return the engine unchanged (serialized).
 
-    if max_batch <= 1 or engine.mode not in ("dspark", "baseline") or not batchable(engine.target):
+    The two modes have different requirements: baseline batching needs only a batched forward
+    (:func:`batchable`, which covers the qwen3_5 hybrids), while dspark batching additionally
+    needs per-row rollback of every layer (:func:`batch_spec_supported`). A hybrid target in
+    dspark mode therefore stays serialized rather than silently taking a path its recurrent
+    caches cannot roll back."""
+    from .batch_engine import batch_spec_supported, batchable
+
+    if max_batch <= 1 or engine.mode not in ("dspark", "baseline"):
+        return engine
+    ok = batch_spec_supported if engine.mode == "dspark" else batchable
+    if not ok(engine.target):
         return engine
     return BatchEngine(engine, max_batch=max_batch)
 

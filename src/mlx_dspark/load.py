@@ -78,16 +78,18 @@ REGISTRY = [
      "dspark": "Rahim/Ternary-Bonsai-27B-dspark",
      "ram": "~12 GB"},
     # Qwen3.6-27B (qwen3_5 hybrid — the full-precision sibling of Ternary-Bonsai above; same
-    # 64-layer/5120-hidden shape, same tap layers). Community drafter by Avesed: its config says
-    # architectures=["DFlashDraftModel"] (their vLLM-fork class label) and carries target-config
-    # noise (attn_output_gate etc.), but the weights are a standard DeepSpec-standalone DSpark
-    # checkpoint with a plain dense-qwen3 backbone — config.py parses it as family "qwen3" and
-    # ignores the noise (tests/test_formats.py locks this in). Trained on-policy against a
-    # W4A16 (4-bit) quant of Qwen/Qwen3.6-27B, so a 4-bit mlx target is the matched precision;
-    # English-centric (accepts ~4.1-4.7 code/math, ~2.6 chat-EN, ~1.7 chat-ZH per its card).
-    {"id": "qwen3.6-27b", "target": "mlx-community/Qwen3.6-27B-4bit",
-     "dspark": "Avesed/Qwen3.6-27B-DSpark",
-     "ram": "~20 GB"},
+    # 64-layer/5120-hidden shape, same tap layers). Community drafter by satgeze: a
+    # DeepSpec-standalone head (architectures ["Qwen3DSparkModel"]) with block_size 15 — the
+    # only non-7 block here, and nothing assumes 7. Trained against the bf16 target with
+    # DeepSpec online mode, warm-started from z-lab's DFlash head for the same target.
+    # Its config carries partial_rotary_factor/mrope/gate fields copied from the TARGET's
+    # config (DeepSpec builds the drafter config as a deepcopy); config.py treats them as the
+    # noise they are — see the qwen35_native gate there and tests/test_formats.py.
+    # 8-bit is the measured target (2.29x at cap 4, accept 3.15); 4-bit resolves the same
+    # drafter and by the Ornith pattern should trade ratio for absolute tok/s — unmeasured.
+    {"id": "qwen3.6-27b", "target": "mlx-community/Qwen3.6-27B-8bit",
+     "dspark": "satgeze/Qwen3.6-27B-DSpark",
+     "ram": "~32 GB"},
     # DeepReinforce Ornith-1.0-9B (qwen3_5 hybrid, agentic coding). Community drafter by
     # stanleyphoong — DeepSpec-standalone layout with a qwen3_5-flavored backbone (gated
     # q_proj + partial rotary; handled by the qwen3 config branch's gated_q_proj/rope_dims
@@ -98,6 +100,20 @@ REGISTRY = [
     {"id": "ornith-1.0-9b", "target": "mlx-community/Ornith-1.0-9B-8bit",
      "dspark": "stanleyphoong/Ornith-1.0-9B-DSpark",
      "ram": "~13 GB"},
+    # Qwen3.6-35B-A3B — the first **MoE** target here (qwen3_5_moe: 40 layers, 30 linear +
+    # 10 full attention, 256 experts top-8, ~3.8B active). Community drafter by Koopah:
+    # DeepSpec-standalone, block_size 8, 8 taps, plain dense-qwen3 backbone; loaded with zero
+    # model-code change (the qwen3_5_moe route and the hybrid tap/rollback already existed).
+    # **4-bit is the registered quant on purpose.** The drafter was trained on-policy against
+    # unsloth/Qwen3.6-35B-A3B-NVFP4, and 4-bit is also where an MoE target belongs here: only
+    # ~3.8B params are active, so the baseline is already ~87 tok/s and 8-bit would halve that
+    # to buy ratio. Measured best 1.32x (see README) — modest, and the reason is structural
+    # rather than a bad drafter: acceptance is high (up to 7.0/round on math), but a target
+    # step is only ~11.5 ms while the 1.53B DENSE drafter costs ~5.7 ms of it. See NOTES
+    # "Qwen3.6-35B-A3B: the first MoE target".
+    {"id": "qwen3.6-35b-a3b", "target": "mlx-community/Qwen3.6-35B-A3B-4bit",
+     "dspark": "Koopah/Qwen3.6-35B-A3B-NVFP4-DSPARK",
+     "ram": "~23 GB"},
 ]
 
 # legacy `--family` / load_pair("qwen3") values -> a concrete target repo (deprecated).
@@ -331,13 +347,23 @@ def load_dflash(repo_or_path: str, *, quantize: bool = True, bits: int = 4, grou
     rope = cfg.get("rope_parameters") or {}
     rope_theta = cfg.get("rope_theta", rope.get("rope_theta", 1_000_000.0))
     layer_types = tuple(cfg.get("layer_types") or ["full_attention"] * cfg["num_hidden_layers"])
+    # z-lab ships the DFlash-specific fields either at the top level (the gemma4 / Qwen3-4B
+    # era heads) or nested under `dflash_config` (Qwen3.6-35B-A3B and later). Read every one
+    # of them the same way — block_size used to be the odd one out, which made a nested-config
+    # head die with a bare KeyError instead of loading.
     dfc = cfg.get("dflash_config", {})
+    block_size = dfc.get("block_size", cfg.get("block_size"))
+    if block_size is None:
+        raise ValueError(
+            f"{repo_or_path}: no block_size in the config (looked at the top level and under "
+            f"'dflash_config') — this does not look like a z-lab DFlash drafter checkpoint."
+        )
     config = DFlashConfig(
         hidden_size=cfg["hidden_size"], num_hidden_layers=cfg["num_hidden_layers"],
         num_attention_heads=cfg["num_attention_heads"], num_key_value_heads=cfg["num_key_value_heads"],
         head_dim=cfg["head_dim"], intermediate_size=cfg["intermediate_size"], vocab_size=cfg["vocab_size"],
         rms_norm_eps=cfg["rms_norm_eps"], rope_theta=rope_theta,
-        max_position_embeddings=cfg["max_position_embeddings"], block_size=cfg["block_size"],
+        max_position_embeddings=cfg["max_position_embeddings"], block_size=int(block_size),
         target_layer_ids=tuple(dfc.get("target_layer_ids") or cfg["target_layer_ids"]),
         num_target_layers=cfg["num_target_layers"],
         mask_token_id=dfc.get("mask_token_id", cfg.get("mask_token_id", 0)),

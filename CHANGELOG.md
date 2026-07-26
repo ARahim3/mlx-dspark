@@ -2,6 +2,121 @@
 
 All notable changes to `mlx-dspark`. Versions follow [SemVer](https://semver.org/) (pre-1.0: minor-ish features land as patch bumps).
 
+## [0.7.0] — 2026-07-26 — faster prompt processing, the first MoE target, and batching for hybrids
+
+### Added
+- **Qwen3.6-35B-A3B is supported — the first Mixture-of-Experts target**, via the community
+  drafter `Koopah/Qwen3.6-35B-A3B-NVFP4-DSPARK` (DeepSpec-standalone, block size 8, 8 tap
+  layers). `--model mlx-community/Qwen3.6-35B-A3B-4bit` resolves it automatically. It needed
+  **no model code**: the `qwen3_5_moe` route, the hybrid linear-attention tap and the
+  capture-and-rerun rollback all applied unchanged, and the drafter's tensor names matched 1:1.
+  Measured on an M4 Pro at 4-bit (median of 5, `--confidence-threshold 0.3 --no-lookup-drafts`):
+  baseline **86.9 tok/s** → **114.5 tok/s (1.32×)**, accept 4.72 — 1.67× math / 1.24× code /
+  1.05× chat. Lossless as always (divergences from sequential greedy are fp ties, margins
+  0.000–0.500, and code/math land at the same position under both thresholds).
+  Three results here are specific to MoE and worth reading before tuning it: the shipped-on
+  hybrid **lookup drafts are a net loss** (use `--no-lookup-drafts`), the **confidence head is
+  a win for the first time** in this project, and the **wide-GEMM prefill lever barely applies**
+  (1.03×) because expert weights are `SwitchLinear`, not `QuantizedLinear`. The modest ratio is
+  structural rather than a weak drafter: only ~3.8B parameters are active per token, so the
+  baseline is the fastest in the table and a target step (~11.5 ms) is barely twice the cost of
+  the 1.53B *dense* drafter round (~5.7 ms). 4-bit is the registered quant — it is what the
+  drafter was trained against (NVFP4) and where an already-fast MoE belongs.
+  Head-to-head against `z-lab/Qwen3.6-35B-A3B-DFlash` on the same target: DFlash **out-drafts
+  DSpark on every prompt** — 9.62 accepted tokens/round on math at full block, the highest
+  acceptance measured in this project — and still loses on throughput (1.11× at block 8, 0.94×
+  at full 16, vs DSpark's 1.33×), because this target's verify cost rises from the very first
+  extra row. Acceptance is not the objective; acceptance per unit of verify width is.
+- **Hybrid targets can be batched.** `--max-batch N` previously required a model whose every
+  layer holds a plain KV cache, which excluded every qwen3_5-family target (Ornith, Bonsai,
+  Qwen3.6-27B, Qwen3.6-35B-A3B) because most of their layers hold recurrent linear-attention
+  state. That state turns out to be the easy case: it is a fixed-size summary rather than a
+  per-token buffer, so rows of **different prompt lengths merge by plain concatenation** — no
+  padding, no per-row offsets, no mask — and only the minority attention layers need the
+  left-aligned per-row cache that already existed. Measured aggregate throughput over 8 varied
+  prompts on an M4 Pro: **Ornith-1.0-9B 3.52× at B=4**, **Qwen3.6-35B-A3B 2.11× at B=8**
+  (dense Qwen3-4B, already supported, 4.00× at B=8). Batched *speculative* decoding remains
+  dense-only — a spec round rolls each row back by a different amount, and recurrent state has
+  no per-row trim — so a hybrid target batches its baseline and takes the serial path for
+  dspark rather than silently degrading.
+- **Prompt processing is 1.07–1.15× faster, bit-identically, on every target.** Every previous
+  performance pass in this project was a decode pass, but a long prompt — an agent system
+  prompt, a pasted file, a long chat — spends most of its wall clock in prefill. Two changes:
+  (1) **stop computing prefill logits that are thrown away.** The full `lm_head` ran on every
+  prefill chunk, producing `[1, chunk, vocab]`, while every caller reads only the last row —
+  ~7–8% of prefill FLOPs and a 622 MB transient that was the reason prefill chunks had to be
+  small. Skipping it on non-final chunks is unconditional and bit-identical.
+  (2) **dequantize wide weights once, then GEMM** (new `wide_gemm.py`). `quantized_matmul`
+  re-dequantizes each weight tile per output row-block, which is free at decode widths and pure
+  overhead at prefill widths. Above a calibrated width mlx-dspark dequantizes once instead.
+  Both are on by default; `--wide-gemm-min N` forces the width, `0` disables it.
+- **Multi-turn chat can skip prefill entirely on targets that previously could not cache at
+  all.** Prefix caching used to require a trimmable KV cache, which ruled out every hybrid
+  target (Ornith, Bonsai, Qwen3.6-27B) and gemma-4 once its sliding window wraps. Reuse never
+  actually needed trimming, only a snapshot at a boundary — so the caches are now snapshotted at
+  the prompt boundary and reused whole when a later prompt extends it, which is exactly the
+  agent access pattern. Measured **5.5× on turn 2** (Ornith-1.0-9B, 2420 of 2483 tokens reused,
+  1.15 s vs 6.30 s), with the reused generation token-identical to a cold one. The mode is
+  automatic: forced for targets that cannot trim, and latched on for gemma-4 the first time a
+  store is refused, so dense targets never pay the snapshot.
+
+### Fixed
+- **`batch_generate_baseline`'s docstring promised a guarantee the code does not make.** It
+  claimed each row of a batch reproduces the same prompt run at B=1 bit-for-bit. What is
+  actually guaranteed is *row isolation* — rows never influence each other (an all-identical
+  batch produces exactly identical rows, max spread 0.0) — but a batched matmul takes a
+  different kernel path than a single-row one, so near-ties can land the other way. Measured on
+  the shipped dense path: 2 of 4 rows diverge from their single-stream run within 96 tokens on
+  Qwen3-4B-8bit. MoE targets amplify it roughly 4×, because top-k expert routing is a discrete
+  function of the hidden state and an ulp can change which experts a token visits. The
+  docstring now states the real contract, which is the one `batch_spec_generate` already
+  documented.
+- **DFlash drafters that nest `block_size` under `dflash_config` now load.** z-lab's newer heads
+  (`Qwen3.6-35B-A3B-DFlash`) put every DFlash-specific field inside `dflash_config`, while the
+  older ones (gemma-4, Qwen3-4B) put `block_size` at the top level. `load_dflash` already read
+  `target_layer_ids` and `mask_token_id` from either place but not `block_size`, so a newer head
+  died with a bare `KeyError: 'block_size'`. Both layouts now parse, and a config with the field
+  in neither place fails with that sentence instead of a traceback.
+- **A drafter config's `partial_rotary_factor` is no longer taken at face value.** DeepSpec's
+  reference trainer builds the drafter config as a `deepcopy` of the *target's*, so every
+  DeepSpec-stock head for a Qwen3.5/3.6-family target inherits `partial_rotary_factor`,
+  `mrope_*` and gated-attention fields that describe the target and not the drafter. The
+  reference drafter ropes the full `head_dim` regardless (its rope init keys off `head_dim`
+  alone, and its `apply_rotary_pos_emb` multiplies `q` at full width — a quarter-width `cos`
+  would not broadcast), so honoring the field roped a quarter of each head. There was no error
+  anywhere — the weights key-match 1:1 — only lost acceptance: **1.18 → 3.05** on the
+  Qwen3.6-27B head and **1.29 → 1.59** (code) / **1.36 → 1.78** (chat) on the Qwen3.5-0.8B one.
+  Partial rotary is now honored only for qwen3_5-*native* drafters (Ornith's
+  `Qwen35DSparkModel` lineage, where it is real); no previously-working checkpoint changes how
+  it parses. Output was lossless before and after — this is speed, not correctness.
+
+### Changed
+- **Qwen3.6-27B now resolves `satgeze/Qwen3.6-27B-DSpark` on the 8-bit target**, replacing the
+  drafter/target pair the row shipped with in 0.5.0. It is a block-15 head (vs 7 everywhere else)
+  trained against the bf16 target with DeepSpec's online mode and warm-started from z-lab's
+  DFlash head for the same target. Measured on an M4 Pro at cap 4 (median of 3): baseline 8.4 tok/s →
+  **19.2 tok/s (2.29×)**, accept 3.15 — 2.26× chat / 1.96× code / 2.67× math. Lossless as always
+  (divergences from sequential greedy are fp ties: margins 0.125/0.250, same position under both
+  caps). `--model mlx-community/Qwen3.6-27B-4bit` resolves the same drafter; that pairing is not
+  measured.
+
+### Known limitations
+- **Turn-2 prefix reuse depends on the model's chat template, not just its cache type.** Reuse is
+  all-or-nothing at the snapshot boundary, so the next turn's prompt must extend the previous
+  one exactly — which requires the template's generation-prompt suffix to be a prefix of how it
+  renders a *completed* assistant turn. Templates that prefill a `<think>` opener break that by
+  a few tokens and get no reuse: measured, Ornith-1.0-9B reuses under `--no-thinking` but
+  Qwen3.6-27B misses by 2 tokens with thinking on and 4 with `--no-thinking`. A miss costs
+  nothing (measured 1.00×, output identical) — it simply falls back to a full prefill. Targets
+  in that state still get the prefill speedups above.
+
+### Not added
+- `satgeze/Qwen3.5-0.8B-DSpark` runs correctly and losslessly but is **not** registered: on a
+  target this small speculation does not pay (best **0.96×**, on the 8-bit target; 0.76× at
+  4-bit, 0.74× at bf16). The registry is the set of pairs we have measured *and* vouch for. It
+  runs with `--drafter`, and the README says so under "bring your own drafter" so nobody spends
+  the download to find out.
+
 ## [0.6.1] — 2026-07-22 — the default draft cap is measured, not hard-coded
 
 ### Changed

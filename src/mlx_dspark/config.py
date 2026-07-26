@@ -162,11 +162,28 @@ class DSparkConfig:
             # partial rotary in the same DeepSpec layout; plain qwen3 configs carry neither,
             # so both knobs default to the classic behavior. The config's mrope fields are a
             # text-only no-op (equal position ids collapse mrope to standard rope — mlx-lm's
-            # own qwen3_5 text module does the same).
+            # own qwen3_5 text module does the same). Careful: a drafter config is a deepcopy
+            # of the TARGET's, so several fields here describe the target and not the drafter
+            # (see the rope note below, and `attn_output_gate`/`linear_*`, which the drafter's
+            # own weight shapes contradict). Trust weight shapes and provenance, not fields.
             gated_q = bool(c.get("enable_qwen35_gated_q_proj", False))
-            rope_dims = int(head_dim * float(rp.get("partial_rotary_factor", 1.0)))
             # qwen3_5 house style: norm weights stored offset-from-one (see field docs).
             offset_norms = mt == "qwen3_5"
+            # `partial_rotary_factor` means partial rotary only on the qwen3_5-NATIVE fork
+            # (architectures "Qwen35DSparkModel", e.g. Ornith: Qwen3Next-style gated
+            # attention + offset norms — the same code path that ropes a head_dim slice).
+            # DeepSpec's stock trainer builds the drafter config as a deepcopy of the
+            # TARGET's, so every stock head for a Qwen3.5/3.6 target carries the field as
+            # inherited noise while its rope is full head_dim: the reference builds rope
+            # with transformers' Qwen3RotaryEmbedding (whose default init keys off head_dim
+            # alone) and its apply_rotary_pos_emb multiplies q at full head_dim width — a
+            # quarter-width cos would not even broadcast. Honoring the field there ropes a
+            # quarter of each head and quietly costs acceptance with no error anywhere
+            # (measured on satgeze/Qwen3.5-0.8B-DSpark: accept 1.29 -> 1.59 code,
+            # 1.36 -> 1.78 chat, once the rope went back to full width).
+            qwen35_native = gated_q or offset_norms
+            rope_dims = (int(head_dim * float(rp.get("partial_rotary_factor", 1.0)))
+                         if qwen35_native else head_dim)
             if c.get("log_snr_conditioning"):
                 lo, hi = c.get("min_log_snr"), c.get("max_log_snr")
                 if lo is None or hi is None or not (float(hi) > float(lo)):
