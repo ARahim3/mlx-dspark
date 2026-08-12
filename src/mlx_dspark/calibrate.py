@@ -37,7 +37,10 @@ import mlx.core as mx
 
 CACHE_DIR = os.path.expanduser("~/.cache/mlx_dspark")
 CACHE_FILE = "calibration.json"
-SCHEMA = 2   # 2: verify curve includes width 1; adds the measured per-round overhead
+SCHEMA = 3   # 2: verify curve includes width 1; adds the measured per-round overhead
+# 3: causal-block (DFlash-lineage) drafter curves are measured at draft_width(cap) — the
+# truncated backbone the loop now runs — so cached full-width curves must re-measure
+# (they priced Muse's drafter ~2.5x too high at small caps and flat in cap).
 CTX_LEN = 512          # curve shape is nearly ctx-independent (SDPA is flat in width)
 TOKEN_ID = 7           # arbitrary; timings are content-independent
 
@@ -80,20 +83,22 @@ def measure_verify_curve(target, tap: list[int], widths: list[int],
 
 def measure_dspark_drafter_curve(drafter, caps: list[int],
                                  ctx_len: int = CTX_LEN) -> dict[int, float]:
-    """ms per DSpark draft round at each cap (backbone is full-width; lm_head/markov
-    run over ``cap`` positions — the slice fix — so cost grows mildly with cap)."""
+    """ms per DSpark draft round at each cap (backbone runs at ``drafter.draft_width(cap)``
+    — full block for bidirectional heads, truncated for causal DFlash-lineage heads, exactly
+    as the production loop does; lm_head/markov run over ``cap`` positions — the slice fix).
+    So cost grows mildly with cap on a bidirectional head and tracks the truncated width on
+    a causal one — the controller's model must price what the loop will actually run."""
     cfg = drafter.config
-    k = cfg.block_size
     ctx = drafter.make_ctx_cache()
     fused = mx.random.normal(
         (1, ctx_len, len(cfg.target_layer_ids) * cfg.hidden_size)).astype(mx.bfloat16)
     drafter.update_context(fused, ctx_offset=0, ctx_caches=ctx)
     mx.eval([c.k for c in ctx])
-    block_ids = [TOKEN_ID] * k
     curve: dict[int, float] = {}
     for cap in sorted(caps):
+        block_ids = [TOKEN_ID] * drafter.draft_width(cap)
 
-        def fn(cap=cap):
+        def fn(cap=cap, block_ids=block_ids):
             noise = drafter.embed(mx.array([block_ids]))
             hidden = drafter.backbone(noise, ctx_len, ctx)
             logits = drafter.compute_logits(drafter.head_slice(hidden, cap))[0]
@@ -155,6 +160,7 @@ def measure_dspark_round_overhead(target, drafter, verify_ms: dict[int, float],
     tap = list(cfg.target_layer_ids)
     k = int(cfg.block_size)
     cap = max(1, min(int(cap), k))
+    w = drafter.draft_width(cap)   # what the production loop will run at this cap
     cache = target.make_cache()
     if hasattr(target, "reset_spec"):
         target.reset_spec()
@@ -168,7 +174,7 @@ def measure_dspark_round_overhead(target, drafter, verify_ms: dict[int, float],
 
     def round_fn():
         nonlocal pos
-        noise = drafter.embed(mx.array([[TOKEN_ID] * k]))
+        noise = drafter.embed(mx.array([[TOKEN_ID] * w]))
         hidden = drafter.backbone(noise, pos, ctx)
         logits = drafter.compute_logits(drafter.head_slice(hidden, cap))[0]
         draft_arr = drafter.sample_block(logits, first_prev_token=TOKEN_ID)

@@ -822,7 +822,6 @@ def speculative_generate(
     if not getattr(cfg, "has_own_embed", True):
         drafter.bind_embed(target_model.draft_embed)
     tap = list(cfg.target_layer_ids)
-    k = cfg.block_size
     mask_id = cfg.mask_token_id
     # A DFlash-derived head spends slot 0 on the anchor, so it can propose block_size-1.
     kdraft = drafter.max_draft
@@ -975,13 +974,17 @@ def speculative_generate(
                 committed = draft[:n] + [tt[n]]
         else:
             # ---- 1. draft a block ----
-            # The backbone runs full-width: block attention is bidirectional, so each
-            # position's hidden depends on the whole block, and shrinking it would change
-            # the distribution the drafter was trained on. But we only ever *verify* `cap`
-            # tokens, so run the lm_head and the sequential markov head over just the first
-            # `cap` positions instead of all `k` — the rest used to be computed and thrown
-            # away every round (the dominant slice of drafter time at small caps).
-            block_ids = [pending] + [mask_id] * (k - 1)
+            # A bidirectional block (DeepSpec-native heads) runs the backbone full-width:
+            # each position's hidden depends on the whole block, and shrinking it would
+            # change the distribution the drafter was trained on. A CAUSAL block
+            # (DFlash-lineage: Nemotron, Muse-Glimmer) truncates to the rows the head
+            # actually reads — bit-identical, and on Muse's 15-wide 2.3B backbone worth
+            # ~16 ms/round (see DSparkDrafter.draft_width). Either way the lm_head and the
+            # sequential markov head run over just the first `cap` positions instead of
+            # all `k` — the rest used to be computed and thrown away every round (the
+            # dominant slice of drafter time at small caps).
+            w = drafter.draft_width(cap)
+            block_ids = [pending] + [mask_id] * (w - 1)
             noise = drafter.embed(mx.array([block_ids]))            # [1, k, H]
             block_hidden = drafter.backbone(noise, n_cached, ctx_caches)
             head_hidden = drafter.head_slice(block_hidden, cap)     # only the verified positions

@@ -106,3 +106,62 @@ def test_partial_rotary_ropes_only_rope_dims():
     attn = DSparkAttention(_PartialCfg())
     assert attn.rope.dims == 4
     assert DSparkAttention(_AttnCfg()).rope.dims == _AttnCfg.attn_head_dim
+
+
+def _tiny_drafter(**over):
+    from mlx_dspark.config import DSparkConfig
+    from mlx_dspark.model import DSparkDrafter
+
+    cfg = DSparkConfig(
+        family="qwen3", hidden_size=32, vocab_size=64, num_hidden_layers=2,
+        intermediate_size=48, num_attention_heads=4, num_key_value_heads=2,
+        head_dim=8, attention_k_eq_v=False, block_size=8, mask_token_id=4,
+        markov_rank=0, enable_confidence_head=False,
+        final_logit_softcapping=None, mlp_activation="silu", norm_style="qwen",
+        use_v_norm=False, target_layer_ids=[0, 1],
+    )
+    for k, v in over.items():
+        setattr(cfg, k, v)
+    d = DSparkDrafter(cfg)
+    mx.eval(d.parameters())
+    return d
+
+
+def test_draft_width_full_for_bidirectional_truncated_for_causal():
+    """A bidirectional block (DeepSpec-native heads) must always run the trained full width —
+    each position's hidden depends on the whole block. A causal block (DFlash-lineage:
+    Nemotron logits_start=1, Muse logits_start=0) computes only the rows the head reads:
+    logits_start + cap, clamped to the block."""
+    assert _tiny_drafter().draft_width(2) == 8                       # bidirectional: full
+    assert _tiny_drafter().draft_width(99) == 8
+    d = _tiny_drafter(causal_block=True)                             # anchor-as-pos0 (muse)
+    assert [d.draft_width(c) for c in (1, 2, 4, 99)] == [1, 2, 4, 8]
+    d = _tiny_drafter(causal_block=True, logits_start=1)             # anchor slot (nemotron)
+    assert [d.draft_width(c) for c in (1, 4, 99)] == [2, 5, 8]
+
+
+def test_causal_backbone_truncation_matches_full_width_rows():
+    """The load-bearing invariant behind draft_width: with a causal block mask, position i
+    attends only positions <= i, so running the backbone at a truncated width must reproduce
+    the full-width forward's first rows (this is what makes the truncation a pure speed
+    lever — measured ~16 ms/round on Muse-Glimmer's 15-wide 2.3B backbone). Exercised with
+    and without a sliding window over the context."""
+    for window in (None, 6):
+        d = _tiny_drafter(causal_block=True, sliding_window=window)
+        ctx = d.make_ctx_cache()
+        fused = mx.random.normal((1, 10, 2 * 32))
+        d.update_context(fused, ctx_offset=0, ctx_caches=ctx)
+        mx.eval([c.k for c in ctx])
+        noise_full = mx.random.normal((1, 8, 32))
+        cap = 3
+        full = d.backbone(noise_full, 10, ctx)
+        trunc = d.backbone(noise_full[:, :cap, :], 10, ctx)
+        assert mx.allclose(full[:, :cap, :], trunc, atol=1e-5).item()
+        # sanity: bidirectional would NOT truncate cleanly (later rows feed earlier ones)
+    d = _tiny_drafter()
+    ctx = d.make_ctx_cache()
+    d.update_context(mx.random.normal((1, 10, 2 * 32)), ctx_offset=0, ctx_caches=ctx)
+    noise = mx.random.normal((1, 8, 32))
+    full = d.backbone(noise, 10, ctx)
+    trunc = d.backbone(noise[:, :3, :], 10, ctx)
+    assert not mx.allclose(full[:, :3, :], trunc, atol=1e-5).item()

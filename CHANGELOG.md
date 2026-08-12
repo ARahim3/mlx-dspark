@@ -4,6 +4,27 @@ All notable changes to `mlx-dspark`. Versions follow [SemVer](https://semver.org
 
 ## [Unreleased]
 
+## [0.8.1] — 2026-08-12 — causal-block drafter truncation: Muse-Glimmer +10–13%, Nemotron +2.5–3%
+
+### Changed
+- **Causal-block drafters (Muse-Glimmer, Nemotron) truncate the backbone to the rows the head
+  reads — +10–13% on Muse-Glimmer, +2.5–2.8% on Nemotron, output ids unchanged.** The DSpark
+  loop ran every drafter backbone at its full trained block width (15 for Muse) because a
+  *bidirectional* block can't be shrunk without changing the drafting distribution — but the
+  DFlash-lineage heads attend **causally** within the block, so position i never sees positions
+  > i and computing only `logits_start + cap` rows is mathematically identical. Muse's 2.3B-param
+  backbone was 17% of the round at width 15 (25.7 ms) and costs 10 ms at width 4. New
+  `DSparkDrafter.draft_width(cap)` drives the generate loop and both calibration measurers (the
+  auto-cap cost model now prices the truncated width; drafter cost rises with cap instead of
+  being flat, so the calibration cache schema was bumped and cached curves re-measure). The
+  drafter's block attention mask is also built once per forward instead of once per layer.
+  Re-stamped on the benchmark prompts (M4 Pro, `--no-lookup-drafts`): Muse-Glimmer-30B **8-bit
+  cap 4: 1.97× chat / 2.45× code / 2.99× math** (baseline 8.2 tok/s); **4-bit cap 2: 1.57× /
+  1.70× / 1.94× (~25 tok/s, was ~1.47× mean)**; Nemotron-3.5-Lightning on the suite peaks at
+  **cap 3 = 1.10× mean** (its 1.27×-code stamp is from higher-acceptance prompts — v0.8.0 vs
+  0.8.1 verified byte-identical there, 0.8.1 +2.1% faster). Bidirectional heads (every
+  DeepSpec-native drafter) keep the full-width path, byte-identical.
+
 ## [0.8.0] — 2026-08-11 — the first Mamba-2 hybrid target (NVIDIA Nemotron-3.5-Lightning), the first `muse_glimmer` target (Meta Muse-Glimmer-30B), + vLLM speculators-format heads
 
 ### Added

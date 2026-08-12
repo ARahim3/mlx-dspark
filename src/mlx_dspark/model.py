@@ -313,6 +313,7 @@ class DSparkDrafter(nn.Module):
         self.block_size = config.block_size
         self.mask_token_id = config.mask_token_id
         self.logits_start = config.logits_start
+        self.causal_block = getattr(config, "causal_block", False)
         self.embed_scale = (float(config.hidden_size) ** 0.5) if config.family == "gemma4" else 1.0
         self.softcap = config.final_logit_softcapping
 
@@ -379,6 +380,15 @@ class DSparkDrafter(nn.Module):
 
     def backbone(self, noise_embedding, block_offset, ctx_caches, mask=None) -> mx.array:
         h = noise_embedding
+        if mask is None and isinstance(block_offset, int) and self.layers:
+            # Every layer shares one attention config, so the block mask (a function of
+            # block_offset / ctx_len / q_len only) is identical across them — build it once
+            # here instead of 5x per round. attend() keeps its own fallback for direct
+            # callers; None stays None for the default bidirectional DSpark head.
+            attn = self.layers[0].self_attn
+            if attn.causal_block or attn.sliding_window:
+                mask = attn._block_mask(
+                    block_offset, ctx_len=ctx_caches[0].length, q_len=h.shape[1])
         for layer, cache in zip(self.layers, ctx_caches):
             h = layer(h, block_offset, cache, mask)
         return self.norm(h)
@@ -387,6 +397,22 @@ class DSparkDrafter(nn.Module):
     def max_draft(self) -> int:
         """Most tokens this head can propose from one block (anchor slots excluded)."""
         return self.block_size - self.logits_start
+
+    def draft_width(self, cap: int) -> int:
+        """Block positions the backbone must compute to draft ``cap`` tokens.
+
+        A bidirectional block (every DeepSpec-native head) needs the full trained width —
+        each position's hidden depends on the whole block, so shrinking it would change the
+        distribution the drafter was trained on. A CAUSAL block (DFlash-lineage heads:
+        Nemotron, Muse-Glimmer) is mathematically invariant to truncation — position i
+        attends only positions <= i, so rows past the last one the head reads
+        (``logits_start + cap``) contribute nothing to the draft. Muse-Glimmer's block is 15
+        wide while the shipped cap is 4: running the 2.3B-param backbone at width 4 instead
+        of 15 measured ~16 ms/round back (~10% end-to-end) with the draft rows bit-identical.
+        """
+        if not self.causal_block:
+            return self.block_size
+        return min(self.block_size, self.logits_start + max(1, cap))
 
     def head_slice(self, block_hidden: mx.array, cap: int) -> mx.array:
         """The block positions whose logits are draft predictions: ``[:, s : s+cap, :]``.
