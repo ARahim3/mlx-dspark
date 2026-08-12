@@ -607,6 +607,7 @@ class _FakeEngine:
     max_tokens_cap = 32768
     cap_controller = None
     context_window = None
+    is_muse = False           # mirrors Engine.is_muse (muse_glimmer channel parsing off)
 
     def __init__(self, response_text="Hello world"):
         self.tokenizer = _FakeTok()
@@ -616,9 +617,9 @@ class _FakeEngine:
     def generate(self, prompt_ids, *, max_tokens, temperature, top_p=1.0, top_k=0,
                  presence_penalty=0.0, frequency_penalty=0.0, logprobs=None,
                  stop=None, seed=None, on_text=None):
-        self.calls.append(dict(prompt_ids=prompt_ids, max_tokens=max_tokens,
-                               temperature=temperature, top_p=top_p, top_k=top_k,
-                               stop=stop, seed=seed))
+        self.calls.append({"prompt_ids": prompt_ids, "max_tokens": max_tokens,
+                               "temperature": temperature, "top_p": top_p, "top_k": top_k,
+                               "stop": stop, "seed": seed})
         text = self.response_text
         if on_text:
             for i in range(0, len(text), 5):
@@ -936,3 +937,196 @@ def test_claude_env_skips_an_auto_compact_window_claude_code_would_clamp():
     assert "CLAUDE_CODE_AUTO_COMPACT_WINDOW" not in small
     big = claude_env("http://h:1", {**HEALTH, "context_window": 200_000}, None)
     assert int(big["CLAUDE_CODE_AUTO_COMPACT_WINDOW"]) == 160_000
+
+
+# ------------------------------------------------------- muse_glimmer "Onyx ATEM" channels
+
+# muse emits recipient-tagged sub-messages `[<|start|>]HEADER<|message|>BODY<|eom|>`, where
+# `to=self` is the analysis channel and `to=user` (or a tool name) the final one. These strings
+# are the real shapes captured from the 8-bit target (math reasoning -> answer, and a tool call).
+_MUSE_MATH = (" to=self<|message|>17*23 = 391. Provide answer.<|eom|>"
+              "<|start|>assistant to=user<|message|>17 × 23 = **391**.")
+_MUSE_TOOL = (" to=self<|message|>I should look it up.<|eom|>"
+              "<|start|>assistant to=get_weather<|message|><atem:function_calls>\n"
+              '<atem:invoke name="get_weather">\n'
+              '<atem:parameter name="city">Paris</atem:parameter>\n'
+              "</atem:invoke>\n</atem:function_calls>")
+
+
+def test_split_thinking_muse_reasoning_then_answer():
+    assert A.split_thinking(_MUSE_MATH) == ("17*23 = 391. Provide answer.", "17 × 23 = **391**.")
+
+
+def test_split_thinking_muse_answer_only():
+    # a response with no analysis channel goes straight to `to=user`
+    assert A.split_thinking(" to=user<|message|>Hello there.") == ("", "Hello there.")
+
+
+def test_split_thinking_muse_unterminated_reasoning_is_all_reasoning():
+    # muse reasons by default and can ramble past max_tokens without ever reaching the answer;
+    # that must read as all-thinking, with no stray markers leaking
+    assert A.split_thinking(" to=self<|message|>still thinking") == ("still thinking", "")
+
+
+def test_parse_atem_tool_call():
+    from mlx_dspark.tools import parse_tool_calls
+
+    _, answer = A.split_thinking(_MUSE_TOOL)
+    calls, cleaned = parse_tool_calls(answer)
+    assert cleaned == ""
+    assert len(calls) == 1 and calls[0]["function"]["name"] == "get_weather"
+    assert json.loads(calls[0]["function"]["arguments"]) == {"city": "Paris"}
+
+
+def test_parse_atem_types_values_as_json_with_string_fallback():
+    from mlx_dspark.tools import parse_tool_calls
+
+    body = ('<atem:invoke name="f">'
+            '<atem:parameter name="n">3</atem:parameter>'
+            '<atem:parameter name="flag">true</atem:parameter>'
+            '<atem:parameter name="who">Paris</atem:parameter>'
+            "</atem:invoke>")
+    calls, _ = parse_tool_calls(body)
+    assert json.loads(calls[0]["function"]["arguments"]) == {"n": 3, "flag": True, "who": "Paris"}
+
+
+def test_parse_atem_truncated_call_does_not_leak_markup():
+    from mlx_dspark.tools import parse_tool_calls
+
+    # cut off at max_tokens mid-call: the unclosed invoke is an aborted call, not prose
+    calls, cleaned = parse_tool_calls('<atem:function_calls>\n<atem:invoke name="f">\n'
+                                      '<atem:parameter name="x">1')
+    assert cleaned == "" and calls and calls[0]["function"]["name"] == "f"
+
+
+def test_build_message_muse_reasoning_and_tool_call():
+    msg = A.build_message(_MUSE_TOOL, model="m", input_tokens=1, output_tokens=1,
+                          finish_reason="stop")
+    assert [b["type"] for b in msg["content"]] == ["thinking", "tool_use"]
+    assert msg["content"][0]["thinking"] == "I should look it up."
+    assert msg["content"][1]["name"] == "get_weather"
+    assert msg["stop_reason"] == "tool_use"
+
+
+def _drive_muse(pieces, *, thinking=True, finish_reason="stop"):
+    st = A.MessageStream(model="m", input_tokens=7, thinking=thinking, muse=True)
+    events = list(st.start())
+    for p in pieces:
+        events.extend(st.delta(p))
+    events.extend(st.finish(finish_reason=finish_reason, output_tokens=5))
+    return events
+
+
+def _thinking_text(events):
+    return "".join(d["delta"]["thinking"] for n, d in events
+                   if n == "content_block_delta" and d["delta"]["type"] == "thinking_delta")
+
+
+def test_muse_stream_reasoning_becomes_thinking_then_answer_text():
+    ev = _drive_muse([_MUSE_MATH])
+    assert _assert_well_formed(ev) == {0: "thinking", 1: "text"}
+    assert _thinking_text(ev) == "17*23 = 391. Provide answer."
+    assert _streamed_text(ev) == "17 × 23 = **391**."
+
+
+def test_muse_stream_markers_split_across_chunks():
+    # the structural special tokens can straddle a round boundary; the parser must still
+    # recover the channels and never leak a marker as prose
+    pieces = [" to=se", "lf<|mess", "age|>weighing<|e", "om|><|start|>assistant to=u",
+              "ser<|message|>Answer here."]
+    ev = _drive_muse(pieces)
+    assert _assert_well_formed(ev) == {0: "thinking", 1: "text"}
+    assert _thinking_text(ev) == "weighing"
+    assert _streamed_text(ev) == "Answer here."
+
+
+def test_muse_stream_emits_atem_tool_call_and_never_leaks_it():
+    ev = _drive_muse([_MUSE_TOOL])
+    kinds = _assert_well_formed(ev)
+    assert kinds[max(kinds)] == "tool_use"
+    assert "<atem:" not in _streamed_text(ev)          # tool XML never streamed as prose
+    starts = [d for n, d in ev if n == "content_block_start"]
+    tool = next(d for d in starts if d["content_block"]["type"] == "tool_use")
+    assert tool["content_block"]["name"] == "get_weather"
+    (delta,) = [d for n, d in ev if n == "message_delta"]
+    assert delta["delta"]["stop_reason"] == "tool_use"
+
+
+def test_muse_stream_thinking_disabled_drops_the_analysis_channel():
+    ev = _drive_muse([_MUSE_MATH], thinking=False)
+    assert _assert_well_formed(ev) == {0: "text"}      # no thinking block published
+    assert _thinking_text(ev) == ""
+    assert _streamed_text(ev) == "17 × 23 = **391**."
+
+
+def test_muse_channel_parser_is_char_by_char_incremental():
+    # feeding one character at a time must yield the same channels as one whole feed
+    whole = A.MuseChannelParser().feed(_MUSE_MATH, final=True)
+    p = A.MuseChannelParser()
+    chunks = []
+    for c in _MUSE_MATH:
+        chunks += p.feed(c)
+    chunks += p.feed("", final=True)
+    join = lambda cs, k: "".join(t for kk, t in cs if kk == k)  # noqa: E731
+    for kind in ("reasoning", "answer"):
+        assert join(chunks, kind) == join(whole, kind)
+
+
+def _muse_engine(text):
+    eng = _FakeEngine(text)
+    eng.is_muse = True                 # engage the muse_glimmer channel parser server-side
+    return eng
+
+
+def test_messages_streaming_muse_splits_channels_into_blocks():
+    eng = _muse_engine(_MUSE_MATH)
+    httpd, base = _serve(eng)
+    try:
+        body = _post(base, "/v1/messages", {"max_tokens": 50, "messages": USER,
+                                            "stream": True}, raw=True)
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+    ev = _read_sse(body)
+    thinking = "".join(d["delta"]["thinking"] for n, d in ev
+                       if n == "content_block_delta" and d["delta"]["type"] == "thinking_delta")
+    text = "".join(d["delta"]["text"] for n, d in ev
+                   if n == "content_block_delta" and d["delta"]["type"] == "text_delta")
+    assert thinking == "17*23 = 391. Provide answer."
+    assert text == "17 × 23 = **391**."
+    assert "<|message|>" not in body and "to=self" not in body   # no raw markers leak
+
+
+def _openai_stream_deltas(body):
+    return [json.loads(line[6:]) for line in body.splitlines()
+            if line.startswith("data: ") and line[6:].strip() != "[DONE]"]
+
+
+def test_openai_streaming_muse_splits_reasoning_from_content():
+    eng = _muse_engine(_MUSE_MATH)
+    httpd, base = _serve(eng)
+    try:
+        body = _post(base, "/v1/chat/completions", {"model": "m", "messages": USER,
+                                                    "stream": True}, raw=True)
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+    deltas = [c["choices"][0]["delta"] for c in _openai_stream_deltas(body)]
+    reasoning = "".join(d.get("reasoning_content", "") for d in deltas)
+    content = "".join(d.get("content", "") for d in deltas)
+    assert reasoning == "17*23 = 391. Provide answer."
+    assert content == "17 × 23 = **391**."
+    assert "<|message|>" not in body
+
+
+def test_openai_nonstream_muse_puts_reasoning_in_reasoning_content():
+    eng = _muse_engine(_MUSE_MATH)
+    httpd, base = _serve(eng)
+    try:
+        r = _post(base, "/v1/chat/completions", {"model": "m", "messages": USER})
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+    msg = r["choices"][0]["message"]
+    assert msg["reasoning_content"] == "17*23 = 391. Provide answer."
+    assert msg["content"] == "17 × 23 = **391**."

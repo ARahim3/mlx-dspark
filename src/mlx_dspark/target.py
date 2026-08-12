@@ -36,9 +36,23 @@ class Target:
                        if (not self.is_vlm and hasattr(model, "language_model")) else model)
         self.family = ("gemma4" if self.is_vlm else
                        getattr(getattr(model, "args", None), "model_type", "qwen3"))
-        # hybrid = some layers hold recurrent (linear-attention) state instead of KV.
-        self.is_hybrid = (not self.is_vlm and any(
-            getattr(layer, "is_linear", False) for layer in getattr(model, "layers", [])))
+        # muse_glimmer (Meta, mlx-vlm) is a VLM but — unlike gemma4/qwen3_5 — its language
+        # model ships NO capture_layer_ids/hidden_sink hook, so the drafter's hidden-state
+        # tap can't use the native capture path. We replicate its text forward instead
+        # (_body_muse_glimmer, the same approach the mlx-lm paths take), reusing the model's
+        # own layer modules + per-layer sliding/full masks; verify_tap() proves it faithful.
+        self._muse = self.is_vlm and getattr(model, "model_type", "") == "muse_glimmer"
+        # hybrid = some layers hold recurrent state (no trimmable KV). Two recurrences are
+        # supported, each with its own capture/rollback: qwen3_5 gated-DeltaNet (layers flagged
+        # ``is_linear``, e.g. Bonsai/Qwen3.6) and Nemotron-H Mamba-2 (blocks ``block_type=="M"``).
+        _layers = getattr(model, "layers", [])
+        if not self.is_vlm and any(getattr(ly, "is_linear", False) for ly in _layers):
+            self._recurrence = "gated_delta"
+        elif not self.is_vlm and any(getattr(ly, "block_type", None) == "M" for ly in _layers):
+            self._recurrence = "mamba2"
+        else:
+            self._recurrence = None
+        self.is_hybrid = self._recurrence is not None
         if kv_bits and self.is_vlm:
             raise ValueError("--kv-bits is supported for mlx-lm text targets only "
                              "(the mlx-vlm/gemma-4 cache layout is managed by mlx-vlm)")
@@ -55,7 +69,8 @@ class Target:
         # hybrid targets: the linear-attention modules, in layer order. verify() hooks
         # their recurrence + conv calls to capture per-round inputs so rollback() can
         # rebuild the state at the accept point exactly (see the section comment below).
-        if self.is_hybrid:
+        # Mamba-2 (nemotron_h) hooks class-level methods instead of per-instance flags.
+        if self._recurrence == "gated_delta":
             self._gdn_modules = [layer.linear_attn for layer in model.layers
                                  if getattr(layer, "is_linear", False)]
             for m in self._gdn_modules:
@@ -82,9 +97,13 @@ class Target:
     # -- forward with hidden-state tap --
     def run(self, ids: mx.array, cache, tap: list[int]):
         """ids [1,L] -> (logits [1,L,V], fused_hidden [1,L,n_tap*H])."""
+        if self._muse:
+            return self._run_muse_glimmer(ids, cache, tap)
         if self.is_vlm:
             out = self.model.language_model(inputs=ids, cache=cache, capture_layer_ids=tap)
             return out.logits, mx.concatenate(out.hidden_states, axis=-1)
+        if self._recurrence == "mamba2":
+            return self._run_nemotron(ids, cache, tap)
         if self.is_hybrid:
             return self._run_hybrid(ids, cache, tap)
         return self._run_mlxlm(ids, cache, tap)
@@ -125,6 +144,38 @@ class Target:
                 captured.append(h)
         return mm.norm(h), (mx.concatenate(captured, axis=-1) if tap is not None else None)
 
+    def _body_nemotron(self, ids, cache, tap):
+        """Replicates mlx-lm's Nemotron-H forward (hybrid Mamba-2 / attention / MoE / MLP)
+        with the residual-stream capture. Differs from the qwen3_5 hybrid path in three ways
+        the generic loops can't absorb: the backbone hangs off ``.backbone`` (not ``.model``)
+        with ``.embeddings`` / ``.norm_f``; the cache list is COMPACTED (only ``M``/``*`` blocks
+        hold a cache, indexed by a running counter — MoE/MLP blocks have none); and the per-layer
+        mask is chosen by block type. Faithfulness is proven by :meth:`verify_tap` at load."""
+        from mlx_lm.models.base import create_attention_mask, create_ssm_mask
+
+        bb = self._inner.backbone
+        tapset = set(tap) if tap is not None else ()
+        h = bb.embeddings(ids)
+        attn_mask = create_attention_mask(h, cache[bb.fa_idx])
+        ssm_mask = create_ssm_mask(h, cache[bb.ssm_idx])
+        captured = []
+        ci = 0
+        for i, layer in enumerate(bb.layers):
+            if layer.block_type in ("M", "*"):
+                c = cache[ci]
+                ci += 1
+            else:
+                c = None
+            mask = attn_mask if layer.block_type == "*" else ssm_mask
+            h = layer(h, mask=mask, cache=c)
+            if i in tapset:
+                captured.append(h)
+        return bb.norm_f(h), (mx.concatenate(captured, axis=-1) if tap is not None else None)
+
+    def _run_nemotron(self, ids, cache, tap):
+        hn, fused = self._body_nemotron(ids, cache, tap)
+        return self._head_mlxlm(hn), fused
+
     def _head_mlxlm(self, hn):
         # mlx-lm convention: tied models have no lm_head, they project through the embedding
         return (self._inner.model.embed_tokens.as_linear(hn) if self._tied
@@ -137,6 +188,73 @@ class Target:
     def _run_hybrid(self, ids, cache, tap):
         hn, fused = self._body_hybrid(ids, cache, tap)
         return self._head_mlxlm(hn), fused
+
+    def _body_muse_glimmer(self, ids, cache, tap):
+        """Replicates mlx-vlm's muse_glimmer text forward (3:1 sliding/full attention with
+        NoPE global layers, centered RMSNorms) with the residual-stream capture. muse_glimmer
+        is a VLM but ships no capture hook, so — as for the mlx-lm paths — we replicate the
+        outer loop and reuse the model's OWN layer modules and its OWN per-layer masks (built
+        from a representative cache of each attention type, exactly as TextModel does). Reusing
+        the native sliding-window mask is what makes this correct despite the windowing that
+        the generic mlx-lm tap refuses. Faithfulness is proven by :meth:`verify_tap` at load."""
+        from mlx_vlm.models.base import create_attention_mask
+
+        tm = self.model.language_model.model   # muse_glimmer TextModel
+        tapset = set(tap) if tap is not None else ()
+        h = tm.embed_norm(tm.embed_tokens(ids))
+        full_mask = create_attention_mask(h, cache[tm.full_attention_idx])
+        sliding_mask = (create_attention_mask(h, cache[tm.sliding_attention_idx],
+                                              window_size=tm.sliding_window)
+                        if tm.sliding_attention_idx is not None else None)
+        captured = []
+        for i, (layer, c) in enumerate(zip(tm.layers, cache)):
+            mask = sliding_mask if layer.is_sliding else full_mask
+            h = layer(h, mask=mask, cache=c)
+            if i in tapset:
+                captured.append(h)
+        return tm.norm(h), (mx.concatenate(captured, axis=-1) if tap is not None else None)
+
+    def _head_muse_glimmer(self, hn):
+        """Project post-norm hidden -> logits with muse_glimmer's head: lm_head, scaled by
+        output_multiplier, then tanh logit-softcapping (matches LanguageModel.__call__)."""
+        lang = self.model.language_model
+        logits = lang.lm_head(hn) * lang.output_multiplier
+        sc = lang.final_logit_softcapping
+        return mx.tanh(logits / sc) * sc
+
+    def _run_muse_glimmer(self, ids, cache, tap):
+        hn, fused = self._body_muse_glimmer(ids, cache, tap)
+        return self._head_muse_glimmer(hn), fused
+
+    def lm_head_proj(self, hidden: mx.array) -> mx.array:
+        """Project drafter hidden ``[..., H]`` -> target-vocab logits with the TARGET's own
+        head. For drafters that ship no lm_head (``has_lm_head=false``, the Nemotron / Muse-Glimmer
+        DSpark heads) and reuse the target's — generate binds this via ``drafter.bind_lm_head``.
+
+        This is the drafter's *proposal* head, which is the RAW ``lm_head`` projection — NOT the
+        verifier's output transform. muse_glimmer's output head scales logits by
+        ``output_multiplier`` (~0.196) and softcaps them; those belong to verification only.
+        Applying them to a draft proposal shrinks the base logits so the raw-scale markov bias
+        overwhelms them and d0 collapses ~85% -> ~29% with no error anywhere (the standard DSpark
+        head adds markov to raw ``lm_head`` logits — every own-head family does the same). So the
+        reuse path returns raw logits here while :meth:`run`/:meth:`verify` keep the full head."""
+        if self._muse:
+            return self.model.language_model.lm_head(hidden)
+        if self.is_vlm:
+            return self.model.language_model.logits_from_hidden(hidden)
+        return self._head_mlxlm(hidden)
+
+    def draft_embed(self, ids: mx.array) -> mx.array:
+        """Block embedding for a drafter that reuses the target's embed_tokens
+        (``has_own_embed=false``). This is the RAW token-embedding table — the DFlash reuse
+        convention (``dflash_model.bind`` uses ``embed_tokens(x) * embed_scale``), which a
+        DFlash-warm-started head like Muse-Glimmer was trained on. Do NOT apply muse_glimmer's
+        ``embed_norm`` here: feeding the normalized input embedding measured a clear acceptance
+        loss (accept 3.73 raw vs 2.86 normed on code), because the drafter's own input_layernorm
+        already normalizes and the residual it carries is the raw table output, not the normed
+        one. Other families fold their scaling into the table (gemma ×√H, qwen ×1)."""
+        inner = self.model.language_model.model if self.is_vlm else self._inner.model
+        return inner.embed_tokens(ids) * getattr(inner, "embed_scale", 1.0)
 
     # -- prefill forward (skips the vocab projection it would discard) ------------------
     #
@@ -158,15 +276,19 @@ class Target:
         measured max|Δlogit| = 0.06 on Qwen3-8B-8bit = 1-2 bf16 ulps. Set
         ``generate.PREFILL_LAST_ROW_HEAD = False`` for the bit-identical-but-slower form.
         ``tap=None`` skips the hidden-state capture."""
-        if self.is_vlm:
+        if self._muse:
+            hn, fused = self._body_muse_glimmer(ids, cache, tap)
+            head = self._head_muse_glimmer
+        elif self.is_vlm:
             lm = self.model.language_model
             sink = [] if tap is not None else None
             hn = lm.model(ids, cache=cache, capture_layer_ids=tap, hidden_sink=sink)
             fused = mx.concatenate(sink, axis=-1) if tap is not None else None
             head = lm.logits_from_hidden
         else:
-            hn, fused = ((self._body_hybrid if self.is_hybrid else self._body_mlxlm)
-                         (ids, cache, tap))
+            body = (self._body_nemotron if self._recurrence == "mamba2"
+                    else self._body_hybrid if self.is_hybrid else self._body_mlxlm)
+            hn, fused = body(ids, cache, tap)
             head = self._head_mlxlm
         if not want_logits:
             return None, fused
@@ -253,6 +375,41 @@ class Target:
             mod.gated_delta_update = orig_gdu
             conv_cls.__call__ = orig_conv
 
+    @contextmanager
+    def _capture_mamba(self):
+        """Scoped hooks recording each Nemotron-H Mamba-2 layer's ssm inputs (incl. the
+        pre-round ssm state, which arrives as ``ssm_update``'s ``state`` arg) and its conv
+        input + pre-round conv window, for the forward built inside the context. Both call
+        straight through — verify_tap() runs with them active, so a semantic drift fails loudly
+        at load. ``_conv`` fires before ``ssm_update`` within a mixer and mixers run in layer
+        order, so ``rec_conv[i]`` / ``rec_ssm[i]`` are the i-th Mamba layer — the same order the
+        non-trimmable caches appear in the compacted cache list rollback() walks."""
+        import mlx_lm.models.nemotron_h as nmod
+
+        mix_cls = nmod.NemotronHMamba2Mixer
+        orig_ssm = nmod.ssm_update
+        orig_conv = mix_cls._conv
+        rec_ssm, rec_conv = [], []
+
+        def rec_ssm_fn(hidden_states, A_log, B, C, D, dt, dt_bias, state=None,
+                       time_step_limit=(0.001, 100.0), mask=None, lengths=None):
+            rec_ssm.append((hidden_states, A_log, B, C, D, dt, dt_bias, state,
+                            time_step_limit, mask))
+            return orig_ssm(hidden_states, A_log, B, C, D, dt, dt_bias, state,
+                            time_step_limit, mask, lengths)
+
+        def rec_conv_fn(mix_self, conv_input, cache, mask):
+            rec_conv.append((conv_input, None if cache is None else cache[0]))
+            return orig_conv(mix_self, conv_input, cache, mask)
+
+        nmod.ssm_update = rec_ssm_fn
+        mix_cls._conv = rec_conv_fn
+        try:
+            yield rec_ssm, rec_conv
+        finally:
+            nmod.ssm_update = orig_ssm
+            mix_cls._conv = orig_conv
+
     def verify(self, ids: mx.array, cache, tap: list[int] | None):
         """Spec-round verify forward: ``ids`` [1, 1+m] = [anchor] + m draft tokens.
         Returns (logits [1, 1+m, V], fused [1, 1+m, n_tap*H]) at those rows.
@@ -271,9 +428,11 @@ class Target:
         if want == 1:
             # no drafts (lookup miss / plain step): fully committed, nothing to capture
             return fwd(ids)
-        with self._capture_linear() as (rec_delta, rec_conv):
+        capture = (self._capture_mamba if self._recurrence == "mamba2"
+                   else self._capture_linear)
+        with capture() as stash:
             logits, fused = fwd(ids)
-        self._stash = (rec_delta, rec_conv)
+        self._stash = stash
         self._spec_width = want
         return logits, fused
 
@@ -292,26 +451,64 @@ class Target:
                 raise RuntimeError(
                     "rollback() with rejected tokens but no preceding verify() capture "
                     "on a hybrid target")
-            from mlx_lm.models.gated_delta import gated_delta_update
-
-            rec_delta, rec_conv = self._stash
             keep = self._spec_width - n_rejected     # anchor + accepted drafts, >= 1
-            li = 0
-            for c in cache:
-                if self._is_trimmable(c):
-                    c.trim(n_rejected)
-                    continue
-                q, k, v, a, b, A_log, dt_bias, state, mask, use_kernel = rec_delta[li]
-                conv_input = rec_conv[li]
-                m = mask[:, :keep] if mask is not None else None
-                _, new_state = gated_delta_update(
-                    q[:, :keep], k[:, :keep], v[:, :keep], a[:, :keep], b[:, :keep],
-                    A_log, dt_bias, state, m, use_kernel=use_kernel)
-                n_keep = conv_input.shape[1] - self._spec_width   # conv kernel size - 1
-                c[0] = mx.contiguous(conv_input[:, keep:keep + n_keep, :])
-                c[1] = new_state
-                li += 1
+            if self._recurrence == "mamba2":
+                self._rollback_mamba(cache, keep)
+            else:
+                self._rollback_gated_delta(cache, keep)
         self._stash = None
+
+    def _rollback_gated_delta(self, cache, keep: int) -> None:
+        from mlx_lm.models.gated_delta import gated_delta_update
+
+        rec_delta, rec_conv = self._stash
+        li = 0
+        for c in cache:
+            if self._is_trimmable(c):
+                c.trim(self._spec_width - keep)
+                continue
+            q, k, v, a, b, A_log, dt_bias, state, mask, use_kernel = rec_delta[li]
+            conv_input = rec_conv[li]
+            m = mask[:, :keep] if mask is not None else None
+            _, new_state = gated_delta_update(
+                q[:, :keep], k[:, :keep], v[:, :keep], a[:, :keep], b[:, :keep],
+                A_log, dt_bias, state, m, use_kernel=use_kernel)
+            n_keep = conv_input.shape[1] - self._spec_width   # conv kernel size - 1
+            c[0] = mx.contiguous(conv_input[:, keep:keep + n_keep, :])
+            c[1] = new_state
+            li += 1
+
+    def _rollback_mamba(self, cache, keep: int) -> None:
+        """Rebuild each Nemotron-H Mamba-2 cache at the accept point (``keep`` = anchor +
+        accepted drafts). Attention layers KV-trim the rejected tail; each Mamba layer:
+          ssm state (``cache[1]``) → re-run ``ssm_update`` over the accepted prefix from the
+              pre-round state (captured as the ssm ``state`` arg). The recurrence is causal, so
+              the state after ``keep`` tokens is a function of the pre-round state and inputs
+              [0, keep) only — the re-run reproduces a committed-``keep`` forward bit-for-bit.
+          conv window (``cache[0]``) → the last (kernel-1) rows of
+              ``[pre-round window ‖ conv_input[:keep]]`` — exactly what a committed forward of
+              the accepted prefix would have kept (conv_input is per-position, so its first
+              ``keep`` rows are unchanged by the rejected tail)."""
+        import mlx_lm.models.nemotron_h as nmod
+
+        rec_ssm, rec_conv = self._stash
+        li = 0
+        for c in cache:
+            if self._is_trimmable(c):
+                c.trim(self._spec_width - keep)
+                continue
+            hs, A_log, B, C, D, dt, dt_bias, state0, tsl, mask = rec_ssm[li]
+            conv_input, conv_state0 = rec_conv[li]
+            m = mask[..., :keep] if mask is not None else None
+            _, new_state = nmod.ssm_update(
+                hs[:, :keep], A_log, B[:, :keep], C[:, :keep], D,
+                dt[:, :keep], dt_bias, state0, tsl, m)
+            head = conv_input[:, :keep, :]
+            padded = head if conv_state0 is None else mx.concatenate([conv_state0, head], axis=1)
+            n_keep = c[0].shape[1]                    # conv_kernel - 1 (post-round window size)
+            c[0] = mx.contiguous(padded[:, -n_keep:, :])
+            c[1] = new_state
+            li += 1
 
     @staticmethod
     def _is_trimmable(c) -> bool:
@@ -331,12 +528,13 @@ class Target:
         it has its own replicated path; (2) numeric: the replicated loop must reproduce
         the model's own logits on a tiny input (identical ops/widths → should match
         bit-for-bit; 1e-3 is generous headroom). Costs two 4-token forwards, once per
-        load. VLM targets use the native capture hook — nothing replicated, nothing to
-        verify."""
-        if self.is_vlm:
+        load. VLM targets with a native capture hook (gemma4) replicate nothing, so there is
+        nothing to verify; muse_glimmer replicates its forward and IS probed like the mlx-lm
+        paths (its windowing is reproduced from the model's own masks, so it is not refused)."""
+        if self.is_vlm and not self._muse:
             return
         args = getattr(self.model, "args", None)
-        mt = getattr(args, "model_type", "?")
+        mt = getattr(args, "model_type", None) or getattr(self.model, "model_type", "?")
         layer_types = getattr(args, "layer_types", None) or []
         windowed = (any(t not in ("full_attention", "linear_attention") for t in layer_types)
                     or (getattr(args, "use_sliding_window", False)
@@ -357,6 +555,8 @@ class Target:
                 # probe — proves the recording plumbing is a pure pass-through too
                 got, _ = self.verify(ids, self.make_cache(), [0])
                 self.reset_spec()
+            elif self._muse:
+                got, _ = self._run_muse_glimmer(ids, self.make_cache(), [0])
             else:
                 got, _ = self._run_mlxlm(ids, self.make_cache(), [0])
             diff = float(mx.abs(ref - got).max())

@@ -2,6 +2,149 @@
 
 All notable changes to `mlx-dspark`. Versions follow [SemVer](https://semver.org/) (pre-1.0: minor-ish features land as patch bumps).
 
+## [Unreleased]
+
+## [0.8.0] — 2026-08-11 — the first Mamba-2 hybrid target (NVIDIA Nemotron-3.5-Lightning), the first `muse_glimmer` target (Meta Muse-Glimmer-30B), + vLLM speculators-format heads
+
+### Added
+- **NVIDIA Nemotron-3.5-Lightning-30B-A3B runs — the first Mamba-2 hybrid target, and the
+  project's first non-attention recurrence.** The target is `model_type: nemotron_h` — 52
+  interleaved **Mamba-2 + latent-MoE (128 experts, top-6, +1 shared) + full-attention** blocks,
+  ~3B active. Two new pieces in `target.py`: a `nemotron_h` hidden-state tap (its backbone hangs
+  off `.backbone`/`.embeddings`/`.norm_f`, the cache list is *compacted* to only the M/`*` blocks,
+  and the mask is chosen per block type), and an exact **Mamba-2 rollback** — the hybrid
+  capture-and-rerun that made rejected drafts free on qwen3_5 gated-DeltaNet, generalized to a
+  second recurrence: hook `ssm_update` + `_conv`, then on a partial accept re-run the SSD
+  recurrence over the accepted prefix and reslice the conv window (attention layers KV-trim as
+  before). The drafter is NVIDIA's official head — a plain qwen3 GQA backbone with DFlash-lineage
+  traits (causal sliding-window-1024 block attention, a per-head attention-sink bias fed to SDPA,
+  `block_size 8`, `sample_from_anchor=false`, markov-512 fixup) that reuses the target's lm_head
+  (`has_lm_head=false`, bound at run time). Measured (M4 Pro, 4-bit target, greedy, warm):
+  baseline ~91 tok/s → **cap 4 = 1.27× code / 1.24× math / 1.06× chat** (accept 4.55/4.41/3.74);
+  lossless (the divergences from single-row greedy are floating-point / recurrent-state ties, a
+  touch wider than a dense target's because the Mamba state drifts between single-row and
+  multi-row forwards). Throughput peaks at cap 4 and regresses past it: the MoE verify-width cost
+  bounds the ratio, not the drafter, whose acceptance is strong.
+- **Meta Muse-Glimmer-30B runs — the first `muse_glimmer` target.** A multimodal, DENSE ~30B
+  model (3:1 sliding/full attention, NoPE global layers, `output_multiplier` + logit softcap),
+  loaded via **mlx-vlm ≥ 0.6.12** (the floor was bumped for its module). Unlike gemma4, its
+  language model ships no `capture_layer_ids` hook, so `target.py` replicates its text forward for
+  the hidden-state tap (per-layer sliding/full masks reproduced from the model's own mask builder,
+  so the windowing is correct; `verify_tap` proves it faithful). The drafter is a community DSpark
+  head by **DaoCloud** in the vLLM speculators packaging, warm-started from Meta's DFlash assistant
+  — a 5-layer qwen3 GQA backbone with **causal sliding-window-2048** block attention (the
+  `_translate_speculators` step now carries the causal-SWA markers when the backbone declares
+  `sliding_attention` layer types) that reuses the target's `embed_tokens` **and** `lm_head`
+  (`block_size 15`, `sample_from_anchor`, full 202048 vocab, markov + confidence). It is the first
+  head to reuse *both* embed and head, detected from the checkpoint (the weights are simply absent);
+  `has_own_embed` + `bind_embed` were added alongside the existing `has_own_lm_head` reuse. The
+  reused proposal head is the **raw** `lm_head` — the target's `output_multiplier` (~0.196) + softcap
+  are the verifier's output transform, not part of a draft proposal; applying them shrinks the base
+  logits so the raw-scale markov bias overwhelms them and acceptance silently collapses (d0 ~85% →
+  ~29%). Measured (M4 Pro, 4-bit target, greedy, warm, paired): baseline ~14 tok/s → **cap 2 (auto)
+  = 1.50× code / 1.50× math / 1.40× chat** (accept ~2.5); cap 4 lifts accept to ~3.3 at ~1.4×.
+  Lossless (muse's compressed logits make fp near-ties more frequent than a dense model, but every
+  divergence margin is sub-ulp).
+- **Muse-Glimmer-30B **8-bit** target measured — the ratio ~doubles.** An 8-bit MLX build now
+  exists (`mlx-community/Muse-Glimmer-30B-8bit`, 33 GB). Its verify curve is flat to width 5 then
+  knees at 6 (vs 4-bit's knee at 3), so auto-cap picks **4**, and 8-bit sits closer to the drafter's
+  BF16 training verifier — together those lift baseline 8.2 tok/s → **cap 4 = 2.44× code / 2.04×
+  math / 1.74× chat** (accept 3.58/3.00/2.51; decode-only, prefill removed, reaches 2.53× on code),
+  vs 4-bit's 1.50×/1.50×/1.40× at cap 2. Lossless (cap 2 and cap 4 diverge from single-row greedy at
+  the *same* fp-tie position). The trade-off: 8-bit decode reads ~2× the weight bytes per token, so
+  *absolute* throughput is ~parity with 4-bit on code (~22 tok/s) and lower on math/chat — the better
+  ratio buys 8-bit **quality at ~4-bit speed**, not raw speed, and peaks at **~40 GB RAM** (fits 48
+  but tight). The registry default target stays 4-bit (~18 GB, broad-RAM); the same drafter
+  auto-resolves for either quant. bf16 (~60 GB) still does not fit 48 GB.
+- **Muse-Glimmer channel + tool parsing when serving Claude Code / OpenAI clients.** muse emits
+  Meta's "Onyx ATEM" harmony format — recipient-tagged sub-messages (`to=self<|message|>…<|eom|>` =
+  analysis/reasoning, `to=user<|message|>…` = the final answer, `to=<tool><|message|><atem:invoke
+  name="X">…</atem:invoke>` = a tool call) — not the `<|channel|>` gpt-oss syntax. Left unparsed the
+  raw markers leaked into the assistant text and tool calls never ran. `split_thinking` +
+  `MessageStream` now recover the channels (analysis → a `thinking` block / `reasoning_content`,
+  answer → text) via a new incremental `MuseChannelParser`, and `tools.py` parses the `<atem:invoke>`
+  syntax (value grammar taken from the tokenizer's own `response_template`: JSON with a raw-string
+  fallback). Both endpoints, streaming and non-streaming. Validated end-to-end on the 8-bit model
+  (reasoning→answer and a real `get_weather` call parse clean; no marker leakage). Server-detected by
+  model type (`Engine.is_muse`) so non-muse output is byte-identical; +12 model-free tests.
+- **modelopt NVFP4 drafters are auto-decoded to bf16** (`nvfp4_convert.py`). NVIDIA ships the
+  Nemotron head as `W4A16_NVFP4` (packed FP4/E2M1 + FP8/E4M3 block scales + an FP32 per-tensor
+  scale), which mlx-lm has no loader for; `load_drafter` hand-decodes it to bf16 on first use and
+  caches it, exactly as the PrismML GGUF drafters are converted. The dequantized head is published
+  at `mlx-community/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-DSpark-bf16` and registered against the
+  `mlx-community/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-4bit` target (the MIXED_PRECISION NVFP4
+  target — FP8 Mamba proj + NVFP4 experts — was converted from the BF16 source with `mlx_lm.convert`).
+- **vLLM `speculators`-format DSpark heads now load.** This packaging (`speculators_config`,
+  `transformer_layer_config`, `aux_hidden_state_layer_ids`) was previously refused by name. It
+  turns out to be a *schema rename* rather than a different model: the tensor names are already
+  the DeepSpec ones (`fc` / `hidden_norm` / `layers.N.*` / `markov_head.markov_w{1,2}` /
+  `confidence_head.proj`) and the 5-tap fusion layout matches every head already shipped, so the
+  config is translated on load and the existing drafter path runs unchanged. Verified against
+  `makora-ai/gemma4-26b-a4b-dspark` and `mgoin/Qwen3-8B-speculator.dspark`. Only the `dspark`
+  algorithm is translated; eagle/eagle3 heads are refused by name, and a head whose
+  `transformer_layer_config` is too sparse to rebuild a backbone is refused with the missing
+  fields listed.
+- **Reduced draft vocabularies (EAGLE-3 style).** These heads emit logits over a frequent-token
+  subset (`draft_vocab_size`, e.g. 32000 against a 262144-token target) and ship a `d2t` table
+  mapping a draft id back to a target id. The split is asymmetric: `lm_head` and `markov_w2`
+  work in draft space, while `embed_tokens` and `markov_w1` stay target-indexed because they
+  consume previously *accepted* tokens. `d2t` is an offset table (`target = draft + d2t[draft]`),
+  and both directions of config/weight mismatch are refused rather than silently mis-decoded.
+  Temperature sampling widens the draft distribution onto the target vocabulary before the
+  accept test, so the reject residual still runs over the full vocab and losslessness holds.
+- **`mlx-dspark benchmark --no-lookup-drafts`.** The benchmark could not disable the 4-gram
+  *hybrid* lookup draft that dspark mode runs by default — it exposed only `--modes lookup`, the
+  unrelated standalone drafter-free mode — so every dspark row it had ever printed had the hybrid
+  silently on, with no way to tell from the invocation. The setting is now also printed in the
+  run header. This matters most on MoE targets, where it is measurably a net loss.
+- **`gemma-4-26B-A4B` runs** via `--drafter makora-ai/gemma4-26b-a4b-dspark` against
+  `mlx-community/gemma-4-26b-a4b-it-8bit`. Measured on an M4 Pro (median of 3, `--max-draft 2
+  --no-lookup-drafts`): baseline **46.9 tok/s** → **59.5 tok/s (1.27×)**, accept 2.36 — 1.38×
+  code / 1.37× math / 1.06× chat. Not registered for auto-resolution: the registry tracks pairs
+  vouched for in the README table, and this ratio is still under review.
+
+### Fixed
+- **`--max-draft auto` crashed on a drafter that reuses the target's lm_head.** The auto-cap
+  calibration measures the drafter's own cost curve by calling `compute_logits` directly, which
+  fails on a `has_lm_head=false` head (the Nemotron drafter) because the target head is only bound
+  at generation time. `calibrate()` now binds it first; no other drafter is affected.
+- **DFlash-derived heads read their first prediction from the wrong block slot.**
+  `DSparkSpeculatorConfig` subclasses `DFlashSpeculatorConfig`, so a `speculators` head reserves
+  block slot 0 as a pure anchor and predicts from slot 1 — where DeepSpec heads use
+  anchor-as-pos0. Reading slot 0 re-predicts the token already known, putting every draft one
+  position late; acceptance roughly halves (**1.50 → 3.10 at cap 4**) with no error raised and no
+  visible defect in the output, because the target verifies every token. Now a config field
+  (`logits_start`, derived from `block_size − speculative_tokens`) applied through one helper.
+  DeepSpec heads are unaffected — the gemma-4-12B pair is byte-identical before and after.
+- **…and the same derivation then rejected the opposite convention.** A `speculators` head that
+  proposes as many tokens as it has block slots has *no* anchor slot, so `logits_start` must be
+  0 — but the guard read `0 < block_size − speculative_tokens`, so such a head silently fell
+  back to 1 and drafted one position *early*, at the same invisible cost (measured on one such
+  head: accept 1.77 vs 2.63, 0.88× vs 1.30× — a net slowdown rather than a working drafter). The
+  newer `sample_from_anchor` field is honored as a fallback, but only when actually present: the
+  pydantic class defaults it to `True` while the heads that omit it do reserve an anchor slot.
+
+### Notes
+- Two results from the gemma-4-26B-A4B work generalize past this model. **Hybrid lookup drafts
+  are a net loss on MoE targets** — 1.27× off vs 1.22× on here, matching Qwen3.6-35B-A3B's
+  1.27→1.21× — because a free draft still costs verify rows and each extra row pulls fresh
+  routed experts. And **drafter cost is not what limits an MoE ratio**: this drafter is roughly
+  8× better proportioned to its target than Qwen3.6-35B-A3B's (~6% of a target step vs ~50%),
+  yet both land near 1.3×. Acceptance here climbs monotonically to 3.25 at cap 6 while throughput
+  peaks at cap 2, so only something that flattens the verify curve can move the number.
+- The **confidence head does not help on this target** (parity with a plain cap at best), unlike
+  Qwen3.6-35B-A3B where it was a win. Adaptive truncation needs acceptance *variance* to exploit:
+  that target swung 2.8→7.0 across content, this one sits in a 2.36–3.25 band where a fixed cap
+  is already near optimal.
+
+### Changed
+- **The OpenAI `/v1/chat/completions` endpoint now surfaces reasoning as `reasoning_content`**
+  instead of leaving the model's `<think>…</think>` (Qwen3) / thought-channel (Gemma-4) / analysis
+  channel (muse) markup inline in `content`. This unifies it with the Anthropic endpoint (which
+  already split reasoning into a `thinking` block) and matches the DeepSeek/vLLM convention that
+  most OpenAI clients understand. Non-reasoning responses are unchanged (no reasoning → no
+  `reasoning_content` field); tool calls now parse from the answer channel, not the reasoning.
+
 ## [0.7.0] — 2026-07-26 — faster prompt processing, the first MoE target, and batching for hybrids
 
 ### Added

@@ -54,9 +54,8 @@ def test_patch_applies_and_restores():
 
 
 def test_patch_restores_on_exception():
-    with pytest.raises(RuntimeError):
-        with wide_matmul(64):
-            raise RuntimeError("boom")
+    with pytest.raises(RuntimeError), wide_matmul(64):
+        raise RuntimeError("boom")
     assert not active()
     assert nn.QuantizedLinear.__call__ is _orig_call
 

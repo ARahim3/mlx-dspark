@@ -95,6 +95,12 @@ class DSparkAttention(nn.Module):
         self.scale = config.scaling
         self.use_v_norm = config.use_v_norm
         self.gated = config.gated_q_proj
+        # DFlash-lineage block attention (Nemotron DSpark head): causal within the block,
+        # sliding-window over the context, per-head learned sink. All no-ops when unset
+        # (getattr defaults keep minimal config-like doubles working).
+        self.causal_block = getattr(config, "causal_block", False)
+        self.sliding_window = getattr(config, "sliding_window", None)
+        self.sink = getattr(config, "attention_sink", False)
 
         h = config.hidden_size
         b = config.attention_bias
@@ -110,6 +116,9 @@ class DSparkAttention(nn.Module):
         self.k_norm = nn.RMSNorm(self.head_dim, eps=config.rms_norm_eps)
         if self.use_v_norm:
             self.v_norm = RMSNormNoScale(eps=config.rms_norm_eps)
+        if self.sink:
+            # per-head sink logit, fed to SDPA as an extra always-present key with no value
+            self.attention_sink_bias = mx.zeros((self.n_heads,))
 
         self.rope = initialize_rope(
             dims=config.rope_dims or self.head_dim, base=config.rope_theta,
@@ -151,6 +160,15 @@ class DSparkAttention(nn.Module):
         k = mx.concatenate([cache.k, k_blk], axis=2)
         v = mx.concatenate([cache.v, v_blk], axis=2)
 
+        # DFlash-lineage heads mask the block attention (causal within the block, sliding window
+        # over the context) and add a per-head sink logit. The default DSpark head does neither:
+        # mask stays None (full bidirectional block over the whole context) and sinks stays None,
+        # so this is byte-identical there. The mask is only built for the single-sequence path
+        # (int offset); the batched drafter path already supplies its own [B,1,k,L] mask.
+        if mask is None and (self.causal_block or self.sliding_window) and isinstance(block_offset, int):
+            mask = self._block_mask(block_offset, ctx_len=k.shape[2] - q_len, q_len=q_len)
+        sinks = self.attention_sink_bias if self.sink else None
+
         # SDPA does GQA/MQA head broadcast internally — pass the n_kv-head K/V straight through.
         # The old code tiled K/V up to full heads (`_repeat_kv`, n_rep=4 Qwen / 16 Gemma) across the
         # *whole* context cache every round: O(n_rep · ctx_len) of pure wasted memory traffic that
@@ -160,11 +178,32 @@ class DSparkAttention(nn.Module):
         # to 12k+. On expensive-verify targets (Gemma-12B) the drafter is a small fraction, so it was
         # already amortized — neutral there. Bit-for-bit identical output (same math, no redundant
         # tiling), strictly less work on every target.
-        out = mx.fast.scaled_dot_product_attention(q, k, v, scale=self.scale, mask=mask)
+        out = mx.fast.scaled_dot_product_attention(q, k, v, scale=self.scale, mask=mask, sinks=sinks)
         out = out.transpose(0, 2, 1, 3).reshape(B, q_len, -1)
         if gate is not None:
             out = out * mx.sigmoid(gate)
         return self.o_proj(out)
+
+    def _block_mask(self, block_offset: int, ctx_len: int, q_len: int) -> mx.array | None:
+        """Boolean ``[1, 1, q_len, ctx_len+q_len]`` attention mask (True = attend) for the block.
+
+        Keys are ``[context(0..ctx_len-1), block(ctx_len..ctx_len+q_len-1)]`` at contiguous
+        absolute positions (context length == block_offset). Query i sits at absolute
+        ``block_offset + i``. Causal keeps ``key_pos <= query_pos`` (block causal, full context);
+        the sliding window additionally keeps ``key_pos > query_pos - W``. Returns None when
+        neither constraint bites (short context, no causality) so SDPA takes its fast path."""
+        total = ctx_len + q_len
+        W = self.sliding_window
+        if not self.causal_block and (W is None or total <= W):
+            return None
+        qpos = block_offset + mx.arange(q_len)[:, None]        # [q_len, 1]
+        kpos = mx.arange(total)[None, :]                       # [1, total]
+        allowed = mx.ones((q_len, total), dtype=mx.bool_)
+        if self.causal_block:
+            allowed = allowed & (kpos <= qpos)
+        if W is not None:
+            allowed = allowed & (kpos > qpos - W)
+        return allowed[None, None]
 
 
 class DSparkDecoderLayer(nn.Module):
@@ -210,8 +249,10 @@ class VanillaMarkov(nn.Module):
 
     def __init__(self, config: DSparkConfig):
         super().__init__()
+        # Asymmetric on a reduced-draft-vocab head: w1 is indexed by the PREVIOUS token,
+        # which is a target id, while w2's bias adds onto lm_head's draft-space logits.
         self.markov_w1 = nn.Embedding(config.vocab_size, config.markov_rank)
-        self.markov_w2 = nn.Linear(config.markov_rank, config.vocab_size, bias=False)
+        self.markov_w2 = nn.Linear(config.markov_rank, config.out_vocab_size, bias=False)
 
     def prev_embeddings(self, token_ids: mx.array) -> mx.array:
         return self.markov_w1(token_ids)
@@ -271,17 +312,27 @@ class DSparkDrafter(nn.Module):
         self.config = config
         self.block_size = config.block_size
         self.mask_token_id = config.mask_token_id
+        self.logits_start = config.logits_start
         self.embed_scale = (float(config.hidden_size) ** 0.5) if config.family == "gemma4" else 1.0
         self.softcap = config.final_logit_softcapping
 
-        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
+        # A has_own_embed=false drafter (DFlash-warm-started, e.g. Muse-Glimmer) ships no
+        # embed_tokens and reuses the TARGET's input embedding for the draft block; bind_embed()
+        # supplies it at run time. True = the drafter embeds the block with its own table.
+        self.embed_tokens = (nn.Embedding(config.vocab_size, config.hidden_size)
+                             if getattr(config, "has_own_embed", True) else None)
+        self._ext_embed = None       # target's input-embedding fn, bound by generate for reuse
         self.fc = nn.Linear(
             len(config.target_layer_ids) * config.hidden_size, config.hidden_size, bias=False
         )
         self.hidden_norm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.layers = [DSparkDecoderLayer(config) for _ in range(config.num_hidden_layers)]
         self.norm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+        # A has_lm_head=false drafter (Nemotron DSpark head) reuses the TARGET's lm_head — it
+        # ships no lm_head weight, so we don't build one; bind_lm_head() supplies it at run time.
+        self.lm_head = (nn.Linear(config.hidden_size, config.out_vocab_size, bias=False)
+                        if getattr(config, "has_own_lm_head", True) else None)
+        self._ext_lm_head = None    # target's head projection, bound by generate for reuse heads
 
         self.markov_head = VanillaMarkov(config) if config.markov_rank > 0 else None
         self.confidence_head = None
@@ -290,9 +341,22 @@ class DSparkDrafter(nn.Module):
             self.confidence_head = ConfidenceHead(in_dim)
         self.log_snr_embed = LogSnrEmbed(config) if config.log_snr_conditioning else None
         self._snr_addend = None       # lazily-built [1, block_size, H] constant
+        # Draft->target id table for reduced-vocab heads; load_drafter installs it via
+        # set_draft_vocab_map(). Leading underscore keeps it out of mlx's parameter filter —
+        # it is an index table, and must be neither quantized nor name-checked as a weight.
+        self._draft_to_target = None
 
     def embed(self, ids: mx.array) -> mx.array:
-        e = self.embed_tokens(ids) * self.embed_scale
+        if self.embed_tokens is not None:
+            e = self.embed_tokens(ids) * self.embed_scale
+        else:
+            if self._ext_embed is None:
+                raise RuntimeError(
+                    "drafter has has_own_embed=false but no target embedding was bound — call "
+                    "drafter.bind_embed(target.draft_embed) before generating.")
+            # The bound fn already returns the target's full input embedding (norm/scale folded
+            # in), so embed_scale is not reapplied here.
+            e = self._ext_embed(ids)
         if self.log_snr_embed is not None:
             if self._snr_addend is None:
                 feat = log_snr_features(
@@ -319,21 +383,96 @@ class DSparkDrafter(nn.Module):
             h = layer(h, block_offset, cache, mask)
         return self.norm(h)
 
+    @property
+    def max_draft(self) -> int:
+        """Most tokens this head can propose from one block (anchor slots excluded)."""
+        return self.block_size - self.logits_start
+
+    def head_slice(self, block_hidden: mx.array, cap: int) -> mx.array:
+        """The block positions whose logits are draft predictions: ``[:, s : s+cap, :]``.
+
+        DeepSpec heads use anchor-as-pos0 (``s=0``) — slot 0 both embeds the known token and
+        predicts the first draft token. DFlash-derived speculators heads reserve slot 0 as a
+        pure anchor and predict from slot 1 (``s=1``). Slicing from 0 on those re-predicts the
+        token we already have, so every draft lands one position late (draft[i+1] == target[i])
+        and acceptance quietly halves — measured 1.50 -> 3.10 at cap 4 on
+        makora-ai/gemma4-26b-a4b-dspark. There is no error and the text stays correct, because
+        the target verifies everything; only the speedup disappears.
+        """
+        s = self.logits_start
+        return block_hidden[:, s : s + cap, :]
+
+    def bind_lm_head(self, project) -> None:
+        """Give a reuse head (``has_lm_head=false``) the target's own projection. ``project``
+        maps drafter hidden ``[..., H]`` -> target-vocab logits; generate binds it once from
+        the loaded Target so the drafter emits into the same vocabulary it was trained against."""
+        self._ext_lm_head = project
+
+    def bind_embed(self, embed_fn) -> None:
+        """Give a reuse-embed drafter (``has_own_embed=false``) the target's input-embedding
+        function. ``embed_fn`` maps token ids -> the same ``[..., H]`` representation the
+        target's own layers consume (e.g. muse_glimmer's ``embed_norm∘embed_tokens``); generate
+        binds it once from the loaded Target so the drafter embeds the block exactly as trained."""
+        self._ext_embed = embed_fn
+
     def compute_logits(self, hidden: mx.array) -> mx.array:
-        logits = self.lm_head(hidden)
+        """Logits over the drafter's own vocabulary — the *draft* space on a reduced-vocab
+        head (width ``config.out_vocab_size``). Callers that turn these into token ids must
+        go through ``sample_block`` / ``to_target_ids``."""
+        head = self.lm_head if self.lm_head is not None else self._ext_lm_head
+        if head is None:
+            raise RuntimeError(
+                "drafter has has_lm_head=false but no target head was bound — call "
+                "drafter.bind_lm_head(target.lm_head_proj) before generating.")
+        logits = head(hidden)
         if self.softcap is not None:
             logits = mx.tanh(logits / self.softcap) * self.softcap
         return logits
 
+    def set_draft_vocab_map(self, d2t_offsets: mx.array) -> None:
+        """Install a reduced-vocab head's draft->target id mapping.
+
+        Checkpoints store ``d2t`` as OFFSETS (``target = draft + d2t[draft]``), not absolute
+        ids; we materialize the absolute table once so the hot path is a plain gather.
+        The encoding is self-proving: applying the offsets to ``0..draft_vocab-1``
+        reproduces exactly the set of ids the checkpoint's own ``t2d`` boolean mask marks
+        (verified on makora-ai/gemma4-26b-a4b-dspark, all 32000).
+        """
+        n = d2t_offsets.size
+        self._draft_to_target = (
+            mx.arange(n, dtype=mx.int32) + d2t_offsets.astype(mx.int32)
+        )
+
+    def to_target_ids(self, draft_ids: mx.array) -> mx.array:
+        """Map draft-vocabulary ids to target ids (identity on a full-vocab head)."""
+        if self._draft_to_target is None:
+            return draft_ids
+        return self._draft_to_target[draft_ids]
+
+    def widen_to_target(self, q: mx.array) -> mx.array:
+        """Widen a draft-space probability vector to the target vocabulary, zeros elsewhere.
+
+        Speculative *sampling* compares the draft q against the target p index-by-index and
+        resamples rejects from ``norm(max(0, p - q))`` over the full target vocab — the
+        target routinely puts mass on tokens a reduced draft head cannot represent, and
+        those must survive into the residual rather than be dropped.
+        """
+        if self._draft_to_target is None:
+            return q
+        full = mx.zeros(q.shape[:-1] + (self.config.vocab_size,), dtype=q.dtype)
+        return full.at[..., self._draft_to_target].add(q)
+
     def sample_block(self, base_logits: mx.array, first_prev_token: int) -> mx.array:
+        """Greedy draft block. Returns TARGET-vocabulary ids."""
         k = base_logits.shape[0]
         if self.markov_head is None:
-            return mx.argmax(base_logits, axis=-1)
+            return self.to_target_ids(mx.argmax(base_logits, axis=-1))
         tokens = []
         prev = mx.array([first_prev_token])
         for i in range(k):
             step = base_logits[i] + self.markov_head.step_bias(prev)[0]
-            nxt = mx.argmax(step, axis=-1, keepdims=True)
+            # Map before the id is emitted OR fed back: markov_w1 indexes target ids.
+            nxt = self.to_target_ids(mx.argmax(step, axis=-1, keepdims=True))
             tokens.append(nxt)
             prev = nxt
         return mx.concatenate(tokens)
@@ -348,7 +487,11 @@ class DSparkDrafter(nn.Module):
         residual resampling. Truncating q here (same top-p/top-k as the target) keeps
         acceptance from collapsing when a client asks for nucleus sampling; losslessness comes
         from the *target* side (see ``_spec_sample_accept``). Sequential because the Markov
-        bias for position i depends on the token sampled at i-1."""
+        bias for position i depends on the token sampled at i-1.
+
+        Both returns are in TARGET index space: on a reduced-vocab head the sampling happens
+        in draft space and the id/distribution are mapped out before returning, so V is the
+        target vocab either way."""
         from .sampling import sample_probs, truncate_probs
 
         k = base_logits.shape[0]
@@ -360,8 +503,9 @@ class DSparkDrafter(nn.Module):
             if self.markov_head is not None:
                 logits = logits + self.markov_head.step_bias(prev)[0]
             q = truncate_probs(mx.softmax(logits * inv_t, axis=-1), top_p, top_k)
-            probs.append(q)
-            nxt = sample_probs(q).reshape(1)
+            # Sample against q's own index space, then move both onto the target's.
+            nxt = self.to_target_ids(sample_probs(q).reshape(1))
+            probs.append(self.widen_to_target(q))
             tokens.append(nxt)
             prev = nxt
         return mx.concatenate(tokens), mx.stack(probs, axis=0)

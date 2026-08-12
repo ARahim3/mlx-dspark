@@ -112,7 +112,7 @@ def test_local_path_basename_matched():
 def test_resolve_mode_auto_known_target_picks_dspark():
     from mlx_dspark.load import resolve_mode
 
-    mode, tgt, drf = resolve_mode("mlx-community/Qwen3-8B-8bit", mode="auto")
+    mode, _tgt, drf = resolve_mode("mlx-community/Qwen3-8B-8bit", mode="auto")
     assert mode == "dspark" and drf == "deepseek-ai/dspark_qwen3_8b_block7"
 
 
@@ -126,7 +126,7 @@ def test_resolve_mode_auto_unknown_target_falls_back_to_lookup():
 def test_resolve_mode_auto_with_explicit_drafter_is_dspark():
     from mlx_dspark.load import resolve_mode
 
-    mode, tgt, drf = resolve_mode("some-org/Weird-Model-3B", mode="auto", drafter="org/d")
+    mode, _tgt, drf = resolve_mode("some-org/Weird-Model-3B", mode="auto", drafter="org/d")
     assert mode == "dspark" and drf == "org/d"
 
 

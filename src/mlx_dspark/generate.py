@@ -132,12 +132,15 @@ def eos_token_ids(tokenizer) -> set[int]:
     if isinstance(e1, int):
         ids.add(e1)
     unk = getattr(tokenizer, "unk_token_id", None)
-    # Gemma-4 (<turn|>, <|tool_response>), Gemma-3 (<end_of_turn>), Qwen (<|im_end|>), raw eos
-    for t in ("<turn|>", "<|tool_response>", "<end_of_turn>", "<|im_end|>",
+    # Gemma-4 (<turn|>, <|tool_response>), Gemma-3 (<end_of_turn>), Qwen (<|im_end|>),
+    # muse_glimmer (<|eot|>=200008 ends the assistant turn; its config eos is [200001, 200008]
+    # but the tokenizer only exposes 200001 as eos_token_id, so the turn-end must be named here
+    # or every chat turn overruns to max_tokens), raw eos
+    for t in ("<turn|>", "<|tool_response>", "<end_of_turn>", "<|im_end|>", "<|eot|>",
               "<|endoftext|>", "<eos>"):
         try:
             i = tokenizer.convert_tokens_to_ids(t)
-        except Exception:
+        except Exception:  # noqa: BLE001 — tokenizers raise various types for unknown tokens
             continue
         if isinstance(i, int) and i >= 0 and i != unk:
             ids.add(i)
@@ -375,7 +378,7 @@ class _Streamer:
 
 
 def _finish_reason(out_ids: list[int], max_new_tokens: int, last_tok: int,
-                   eos_ids: set[int], streamer: "_Streamer") -> str:
+                   eos_ids: set[int], streamer: _Streamer) -> str:
     """'stop' if a stop string / eos ended it, else 'length' if we hit the token cap."""
     if streamer.stopped or last_tok in eos_ids:
         return "stop"
@@ -812,10 +815,18 @@ def speculative_generate(
     if seed is not None:
         mx.random.seed(seed)
     cfg = drafter.config
+    # DFlash-warm-started heads reuse the target's own embed_tokens and/or lm_head (they ship
+    # neither weight): Nemotron reuses the head, Muse-Glimmer reuses both. Bind what's reused.
+    if not getattr(cfg, "has_own_lm_head", True):
+        drafter.bind_lm_head(target_model.lm_head_proj)
+    if not getattr(cfg, "has_own_embed", True):
+        drafter.bind_embed(target_model.draft_embed)
     tap = list(cfg.target_layer_ids)
     k = cfg.block_size
     mask_id = cfg.mask_token_id
-    cap_ceiling = k if max_draft_tokens is None else max(1, min(max_draft_tokens, k))
+    # A DFlash-derived head spends slot 0 on the anchor, so it can propose block_size-1.
+    kdraft = drafter.max_draft
+    cap_ceiling = kdraft if max_draft_tokens is None else max(1, min(max_draft_tokens, kdraft))
     cap = cap_ceiling
 
     eos_ids = eos_token_ids(tokenizer)
@@ -854,7 +865,7 @@ def speculative_generate(
     index = None
     lk_gate = None
     if lookup_drafts:
-        from .lookup import LongDraftGate, NGramIndex   # deferred: lookup.py imports this module
+        from .lookup import LongDraftGate, NGramIndex  # deferred: lookup.py imports this module
 
         # Hybrid uses a stricter 4-gram minimum than pure lookup mode: here a spurious hit
         # doesn't just cost a wider verify — it forgoes a productive drafter round (~2.3
@@ -973,7 +984,7 @@ def speculative_generate(
             block_ids = [pending] + [mask_id] * (k - 1)
             noise = drafter.embed(mx.array([block_ids]))            # [1, k, H]
             block_hidden = drafter.backbone(noise, n_cached, ctx_caches)
-            head_hidden = block_hidden[:, :cap, :]                  # only the verified positions
+            head_hidden = drafter.head_slice(block_hidden, cap)     # only the verified positions
             base_logits = drafter.compute_logits(head_hidden)[0]    # [cap, V]
 
             if temperature > 0.0 or use_conf or pen.active:

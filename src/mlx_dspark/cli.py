@@ -525,10 +525,19 @@ def cmd_benchmark(argv: list[str]) -> None:
                          "where tested (<1%%). Only consider it if the model nearly fills "
                          "your RAM and you actually see paging stalls - and validate a long "
                          "run before trusting it.")
+    ap.add_argument("--no-lookup-drafts", action="store_true",
+                    help="dspark mode only: disable the 4-gram HYBRID lookup draft (on by "
+                         "default), where an n-gram hit supplies a free draft instead of "
+                         "running the drafter that round. Distinct from `--modes lookup`, "
+                         "which is the standalone drafter-free mode. Worth measuring on MoE "
+                         "targets: a free draft still costs verify rows, and each extra row "
+                         "pulls fresh routed experts (Qwen3.6-35B-A3B measured 1.27x -> "
+                         "1.21x with it ON).")
     ap.add_argument("--json", default=None, help="also write results to this JSON file")
     args = ap.parse_args(argv)
 
     modes = [m.strip() for m in args.modes.split(",") if m.strip()]
+    lookup_drafts = not args.no_lookup_drafts
     caps = [c.strip() for c in args.caps.split(",") if c.strip()]
     if args.wired_limit:
         apply_wired_limit()
@@ -538,7 +547,11 @@ def cmd_benchmark(argv: list[str]) -> None:
           f"{platform.machine()} {platform.system()}")
 
     _, target_repo, _ = resolve_mode(args.model, mode="auto", drafter=args.drafter)
-    print(f"target: {target_repo}\nloading + warming up…")
+    # State the hybrid-lookup setting explicitly: it materially moves dspark numbers and used
+    # to be invisible from the invocation, which makes results non-comparable after the fact.
+    print(f"target: {target_repo}\n"
+          f"hybrid lookup drafts: {'on (default)' if lookup_drafts else 'OFF'}\n"
+          f"loading + warming up…")
     target, tok = load_target(
         target_repo, require_tap=any(m in ("dspark", "dflash") for m in modes))
     greedy_generate(target, tok, "Tell me about the sea.", max_new_tokens=100)
@@ -606,14 +619,20 @@ def cmd_benchmark(argv: list[str]) -> None:
                                  drafter_repo=drafter_repo, verbose=False)
             else:
                 md = int(cap)
+            # drafter/md/ctrl bound as defaults: each lambda is consumed by run() inside this
+            # iteration, but binding makes that explicit rather than implicit (ruff B023)
             if mode == "dspark":
-                run(f"dspark cap={cap}", lambda p: speculative_generate(
-                    target, tok, drafter, p, max_new_tokens=args.max_new_tokens,
-                    max_draft_tokens=md if md else None, cap_controller=ctrl))
+                tag = "" if lookup_drafts else " nolookup"
+                run(f"dspark cap={cap}{tag}", lambda p, d=drafter, md=md, ctrl=ctrl:
+                    speculative_generate(
+                        target, tok, d, p, max_new_tokens=args.max_new_tokens,
+                        max_draft_tokens=md if md else None, cap_controller=ctrl,
+                        lookup_drafts=lookup_drafts))
             else:
-                run(f"dflash cap={cap}", lambda p: dflash_generate(
-                    target, tok, drafter, p, max_new_tokens=args.max_new_tokens,
-                    max_draft_tokens=md if md else None, cap_controller=ctrl))
+                run(f"dflash cap={cap}", lambda p, d=drafter, md=md, ctrl=ctrl:
+                    dflash_generate(
+                        target, tok, d, p, max_new_tokens=args.max_new_tokens,
+                        max_draft_tokens=md if md else None, cap_controller=ctrl))
         drafter = None                     # release before the next mode's drafter loads
 
     if args.json:
@@ -677,13 +696,13 @@ def cmd_doctor(argv: list[str]) -> None:
             check(f"{pkg} importable", False, str(e))
 
     try:
-        import mlx.core as mx  # noqa: F401
+        import mlx.core as mx
         try:
             mx.zeros((2, 2))  # exercise the Metal path
             check("MLX Metal device works", True)
         except Exception as e:  # noqa: BLE001
             check("MLX Metal device works", False, str(e))
-    except Exception:
+    except Exception:  # noqa: BLE001 — doctor reports what it can; it must never itself fail
         pass
 
     # gemma4 preset compat: mlx-vlm 0.6.4's Gemma4UnifiedProcessor breaks under

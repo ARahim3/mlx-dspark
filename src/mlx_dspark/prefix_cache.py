@@ -44,6 +44,7 @@ safetensors) and dropped from RAM, reloaded on their next reuse.
 
 from __future__ import annotations
 
+import contextlib
 import glob
 import json
 import os
@@ -162,7 +163,7 @@ class _Slot:
     state reusable only at exactly ``len(tokens)``, and never checked out (so a failed
     generation cannot invalidate it)."""
 
-    __slots__ = ("tokens", "cache", "ctx", "spilled", "sid", "snapshot")
+    __slots__ = ("cache", "ctx", "sid", "snapshot", "spilled", "tokens")
 
     def __init__(self, tokens, cache, ctx, sid: int, snapshot=None):
         self.tokens: list[int] = tokens
@@ -309,10 +310,8 @@ class PrefixCache:
         if not self.l2_dir:
             return
         for p in self._spill_paths(slot.sid):
-            try:
+            with contextlib.suppress(OSError):
                 os.remove(p)
-            except OSError:
-                pass
 
     def _maybe_spill(self) -> None:
         if self.max_ram_bytes <= 0 or not self.l2_dir:
@@ -375,7 +374,5 @@ class PrefixCache:
         if not self.l2_dir:
             return
         for p in glob.glob(os.path.join(self.l2_dir, "*_cache_*.safetensors")):
-            try:
+            with contextlib.suppress(OSError):
                 os.remove(p)
-            except OSError:
-                pass

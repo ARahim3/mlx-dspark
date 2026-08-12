@@ -37,13 +37,59 @@ GEMMA4_MIN = {
     "mask_token_id": 3, "target_layer_ids": [0, 1], "num_target_layers": 2, "markov_rank": 4,
 }
 
-SPECULATORS = {  # vLLM speculators packaging — drafter backbone is ALSO model_type "qwen3"
+SPECULATORS = {  # vLLM speculators packaging — drafter backbone is ALSO model_type "qwen3".
+    # Truncated transformer_layer_config: not enough to rebuild a backbone.
     "architectures": ["DSparkDraftModel"], "model_type": "qwen3",
     "speculators_model_type": "dspark",
     "speculators_config": {"algorithm": "dspark",
                            "verifier": {"architectures": ["GlmMoeDsaForCausalLM"]}},
     "block_size": 8, "markov_rank": 256, "aux_hidden_state_layer_ids": [1, 2, 3],
     "transformer_layer_config": {"hidden_size": 6144},
+}
+
+SPECULATORS_FULL = {  # makora-ai/gemma4-26b-a4b-dspark shape: complete, and reduced-vocab.
+    # The verifier is gemma-4 but the drafter backbone really is a plain qwen3 block (its
+    # weights carry a separate v_proj and no layer_scalar/sandwich norms), so "qwen3" here
+    # is accurate rather than the inherited-noise case the qwen3_5 heads suffer from.
+    "architectures": ["DSparkDraftModel"],
+    "speculators_model_type": "dspark",
+    "speculators_config": {"algorithm": "dspark",
+                           "verifier": {"architectures": ["Gemma4ForConditionalGeneration"]}},
+    "block_size": 7, "mask_token_id": 4, "draft_vocab_size": 8,
+    "markov_rank": 4, "markov_head_type": "vanilla",
+    "enable_confidence_head": True, "confidence_head_with_markov": True,
+    "aux_hidden_state_layer_ids": [0, 1],
+    "transformer_layer_config": {
+        "model_type": "qwen3", "hidden_size": 16, "vocab_size": 32, "num_hidden_layers": 1,
+        "intermediate_size": 32, "num_attention_heads": 2, "num_key_value_heads": 1,
+        "head_dim": 8, "rms_norm_eps": 1e-6,
+        "rope_parameters": {"rope_theta": 10000.0, "rope_type": "default"},
+    },
+}
+
+MUSE_SPECULATORS = {  # DaoCloud/Muse-Glimmer-30B-DSpark shape: a speculators DSpark head
+    # warm-started from a DFlash assistant. Two things set it apart from the makora/mgoin
+    # speculators heads above: (1) its qwen3 backbone attends CAUSALLY over a sliding window
+    # (sliding_attention layer_types + use_sliding_window + sliding_window_non_causal False),
+    # (2) it reuses the target's embed_tokens AND lm_head (the round-trip test drops both from
+    # the checkpoint). draft_vocab_size == vocab_size => full vocab (no reduction).
+    "architectures": ["DSparkDraftModel"],
+    "speculators_model_type": "dspark",
+    "speculators_config": {"algorithm": "dspark",
+                           "proposal_methods": [{"speculative_tokens": 15}],
+                           "verifier": {"architectures": ["MuseGlimmerForConditionalGeneration"]}},
+    "block_size": 15, "mask_token_id": 201818, "draft_vocab_size": 32,
+    "markov_rank": 4, "markov_head_type": "vanilla",
+    "enable_confidence_head": True, "confidence_head_with_markov": True,
+    "sample_from_anchor": True, "sliding_window_non_causal": False,
+    "aux_hidden_state_layer_ids": [0, 1],
+    "transformer_layer_config": {
+        "model_type": "qwen3", "hidden_size": 16, "vocab_size": 32, "num_hidden_layers": 1,
+        "intermediate_size": 32, "num_attention_heads": 2, "num_key_value_heads": 1,
+        "head_dim": 8, "rms_norm_eps": 1e-5,
+        "rope_parameters": {"rope_theta": 500000.0, "rope_type": "default"},
+        "layer_types": ["sliding_attention"], "use_sliding_window": True, "sliding_window": 2048,
+    },
 }
 
 EMBEDDED_V4 = {  # full 893 GB target with dspark_* fields — not a standalone drafter
@@ -234,7 +280,7 @@ def test_load_drafter_koopah_block8_roundtrips(tmp_path):
     # block 8 is a third distinct block size (7, 15, 8) — nothing may assume any of them.
     path = _write_drafter_ckpt(tmp_path, _reference_weights(KOOPAH_QWEN36_35B_A3B),
                                cfg=KOOPAH_QWEN36_35B_A3B)
-    drafter, cfg = load_drafter(path, quantize=False)
+    drafter, _cfg = load_drafter(path, quantize=False)
     assert drafter.block_size == 8
     q = drafter.layers[0].self_attn.q_proj.weight
     assert q.shape[0] == 2 * 8                        # heads × head_dim, not doubled (no gate)
@@ -253,10 +299,132 @@ def test_plain_qwen3_unaffected_by_qwen35_knobs(tmp_path):
     assert not cfg.gated_q_proj and cfg.rope_dims is None and not cfg.offset_rms_norm
 
 
-def test_speculators_format_refused_with_reason(tmp_path):
-    # must be caught BEFORE family detection — model_type says "qwen3"
-    with pytest.raises(ValueError, match="speculators"):
+def test_speculators_dspark_config_is_translated(tmp_path):
+    """The speculators packaging is a rename of the DeepSpec schema, so it loads: the
+    backbone comes out of transformer_layer_config and the fusion taps out of
+    aux_hidden_state_layer_ids. Must run BEFORE family detection — a speculators head's
+    top-level model_type is absent or misleading, and the real one is nested."""
+    cfg = DSparkConfig.from_json(_cfg_path(tmp_path, SPECULATORS_FULL))
+    assert cfg.family == "qwen3"
+    assert (cfg.hidden_size, cfg.vocab_size, cfg.num_attention_heads) == (16, 32, 2)
+    assert cfg.head_dim == 8 and cfg.num_key_value_heads == 1
+    assert cfg.target_layer_ids == [0, 1]
+    assert cfg.block_size == 7 and cfg.mask_token_id == 4
+    assert cfg.rope_theta == 10000.0
+    # plain qwen3 backbone: neither of the qwen3_5-native knobs, and full-width rope
+    assert not cfg.gated_q_proj and not cfg.offset_rms_norm and cfg.rope_dims is None
+    # and no softcap is inherited from the gemma-4 verifier
+    assert cfg.final_logit_softcapping is None
+
+
+def test_speculators_anchor_slot_is_read_from_the_declared_proposal_width(tmp_path):
+    """logits_start = block_size - speculative_tokens, and 0 is a legitimate answer.
+
+    A head that proposes as many tokens as it has block slots has no anchor slot at all
+    (RedHatAI/Qwen3.6-35B-A3B-speculator.dspark: block 8, speculative_tokens 8, val_metrics
+    position_0..position_7). Reading slot 1 there shifts every draft one position and costs
+    ~2x the speedup with no error and correct output text, so this bound is load-bearing.
+    """
+    def start_for(**over):
+        cfg = {**SPECULATORS_FULL, **over}
+        return DSparkConfig.from_json(_cfg_path(tmp_path, cfg)).logits_start
+
+    def proposal(n):
+        return {"speculators_config": {**SPECULATORS_FULL["speculators_config"],
+                                       "proposal_methods": [{"speculative_tokens": n}]}}
+
+    assert start_for(block_size=8, **proposal(8)) == 0    # no anchor slot
+    assert start_for(block_size=8, **proposal(7)) == 1    # mgoin: one anchor slot
+    assert start_for(block_size=7, **proposal(6)) == 1    # makora: one anchor slot
+    # Nonsense widths fall back to the DFlash-derived default rather than slicing negatively.
+    assert start_for(block_size=7, **proposal(9)) == 1
+
+
+def test_speculators_sample_from_anchor_only_counts_when_present(tmp_path):
+    """The explicit field names the same choice, but the pydantic class defaults it to True
+    while the heads that OMIT it do reserve an anchor slot — so absent must not read as True."""
+    def start_for(**over):
+        return DSparkConfig.from_json(_cfg_path(tmp_path, {**SPECULATORS_FULL, **over})).logits_start
+
+    assert start_for(sample_from_anchor=True) == 0
+    assert start_for(sample_from_anchor=False) == 1
+    assert start_for() == 1                                    # absent -> anchor slot assumed
+    # The declared width wins over the flag when both are present (it is the verifiable one).
+    assert start_for(block_size=8, sample_from_anchor=False,
+                     speculators_config={**SPECULATORS_FULL["speculators_config"],
+                                         "proposal_methods": [{"speculative_tokens": 8}]}) == 0
+
+
+def test_speculators_dflash_lineage_causal_sliding_window(tmp_path):
+    """A speculators DSpark head warm-started from DFlash (Muse-Glimmer) declares
+    sliding_attention layer_types + a causal window (sliding_window_non_causal False). The
+    translation carries these as the causal-block + sliding-window markers the qwen3 branch
+    already reads, so the drafter attends exactly as trained. A stock bidirectional head
+    (full_attention, e.g. makora) is left untouched — running a causal backbone bidirectionally
+    is lossless but silently costs acceptance, the same class of bug as the wrong anchor slot."""
+    cfg = DSparkConfig.from_json(_cfg_path(tmp_path, MUSE_SPECULATORS))
+    assert cfg.family == "qwen3"
+    assert cfg.causal_block is True and cfg.sliding_window == 2048
+    assert cfg.logits_start == 0            # sample_from_anchor True / block == speculative_tokens
+    assert cfg.draft_vocab_size is None     # draft_vocab == vocab -> full vocab
+    assert not cfg.attention_sink and cfg.rope_dims is None
+    # regression: the bidirectional makora/mgoin heads (full_attention) stay unwindowed
+    base = DSparkConfig.from_json(_cfg_path(tmp_path, SPECULATORS_FULL))
+    assert base.causal_block is False and base.sliding_window is None
+
+
+def test_load_drafter_reuses_target_embed_and_head_when_absent(tmp_path):
+    """A DFlash-warm-started head (Muse-Glimmer) ships neither embed_tokens nor lm_head and
+    reuses the target's. load_drafter reads that from the checkpoint (the weights are simply
+    absent, mirroring nvfp4_convert's has_lm_head detection) and builds a drafter that binds
+    both at run time — not a load error. Unbound use raises a directed message, not NoneType."""
+    weights = _reference_weights(MUSE_SPECULATORS)
+    del weights["embed_tokens.weight"], weights["lm_head.weight"]
+    path = _write_drafter_ckpt(tmp_path, weights, MUSE_SPECULATORS)
+    drafter, cfg = load_drafter(path, quantize=False)
+    assert cfg.has_own_embed is False and cfg.has_own_lm_head is False
+    assert drafter.embed_tokens is None and drafter.lm_head is None
+    with pytest.raises(RuntimeError, match="bind_embed"):
+        drafter.embed(mx.array([[1, 2, 3]]))
+    with pytest.raises(RuntimeError, match="bind_lm_head"):
+        drafter.compute_logits(mx.zeros((1, cfg.hidden_size)))
+
+
+def test_speculators_reduced_draft_vocab_sizes_only_the_output_heads(tmp_path):
+    """draft_vocab_size narrows lm_head/markov_w2 (draft space) but NOT embed_tokens or
+    markov_w1, which are indexed by previously-accepted tokens — i.e. target ids."""
+    cfg = DSparkConfig.from_json(_cfg_path(tmp_path, SPECULATORS_FULL))
+    assert cfg.draft_vocab_size == 8 and cfg.out_vocab_size == 8 and cfg.vocab_size == 32
+
+    shapes = dict(tree_flatten(DSparkDrafter(cfg).parameters()))
+    assert shapes["lm_head.weight"].shape == (8, 16)
+    assert shapes["markov_head.markov_w2.weight"].shape == (8, 4)
+    assert shapes["embed_tokens.weight"].shape == (32, 16)
+    assert shapes["markov_head.markov_w1.weight"].shape == (32, 4)
+
+
+def test_full_vocab_head_is_unaffected_by_the_reduced_vocab_path(tmp_path):
+    """No draft_vocab_size => every head stays full width and ids pass through unmapped."""
+    cfg = DSparkConfig.from_json(_cfg_path(tmp_path, QWEN3_MIN))
+    assert cfg.draft_vocab_size is None and cfg.out_vocab_size == cfg.vocab_size
+    d = DSparkDrafter(cfg)
+    ids = mx.array([3, 7])
+    assert d.to_target_ids(ids).tolist() == [3, 7]
+    q = mx.zeros((cfg.vocab_size,))
+    assert d.widen_to_target(q).shape == (cfg.vocab_size,)
+
+
+def test_speculators_truncated_backbone_refused_with_the_missing_fields(tmp_path):
+    with pytest.raises(ValueError, match="transformer_layer_config missing"):
         DSparkConfig.from_json(_cfg_path(tmp_path, SPECULATORS))
+
+
+def test_speculators_non_dspark_algorithm_refused(tmp_path):
+    """eagle3/dflash heads are different models, not different spellings of this one."""
+    cfg = {**SPECULATORS_FULL, "speculators_model_type": "eagle3",
+           "speculators_config": {"algorithm": "eagle3"}}
+    with pytest.raises(ValueError, match="only translates 'dspark'"):
+        DSparkConfig.from_json(_cfg_path(tmp_path, cfg))
 
 
 def test_embedded_full_model_refused_with_reason(tmp_path):
@@ -465,3 +633,91 @@ def test_verify_tap_refuses_sliding_window_flag():
     model = _TinyLM(model_type="sw_fam", use_sliding_window=True, sliding_window=2048)
     with pytest.raises(ValueError, match="windowed"):
         Target(model, tokenizer=None).verify_tap()
+
+
+# ------------------------------------------------- reduced draft vocabulary (speculators)
+
+def _d2t_offsets(target_ids: list[int]) -> mx.array:
+    """Checkpoints store the map as OFFSETS from the draft id, not absolute target ids."""
+    return mx.array([t - d for d, t in enumerate(target_ids)])
+
+
+def test_set_draft_vocab_map_reads_offsets_not_absolute_ids(tmp_path):
+    """`d2t` is an offset table: target = draft + d2t[draft]. Reading it as absolute ids
+    would still "work" and silently emit the wrong token for every draft position."""
+    cfg = DSparkConfig.from_json(_cfg_path(tmp_path, SPECULATORS_FULL))
+    d = DSparkDrafter(cfg)
+    targets = [3, 5, 6, 11, 12, 13, 20, 31]           # 8 draft slots -> target vocab of 32
+    d.set_draft_vocab_map(_d2t_offsets(targets))
+    assert d.to_target_ids(mx.array([0, 1, 7, 4])).tolist() == [3, 5, 31, 12]
+
+
+def test_sample_block_reduced_vocab_emits_and_feeds_back_target_ids(tmp_path):
+    """The greedy block must map the argmax before it is emitted AND before it becomes the
+    next position's `prev` — markov_w1 is indexed by target ids, so feeding a raw draft id
+    back reads the wrong row with no error anywhere."""
+    cfg = DSparkConfig.from_json(_cfg_path(tmp_path, SPECULATORS_FULL))
+    d = DSparkDrafter(cfg)
+    targets = [3, 5, 6, 11, 12, 13, 20, 31]
+    d.set_draft_vocab_map(_d2t_offsets(targets))
+
+    seen = []
+
+    class _Markov:
+        def step_bias(self, prev):
+            seen.append(int(prev.item()))
+            return mx.zeros((1, cfg.out_vocab_size))
+
+    d.markov_head = _Markov()
+    base = mx.zeros((3, cfg.out_vocab_size))
+    base[0, 1] = 1.0      # draft 1 -> target 5
+    base[1, 7] = 1.0      # draft 7 -> target 31
+    base[2, 0] = 1.0      # draft 0 -> target 3
+    out = d.sample_block(base, first_prev_token=9)
+    assert out.tolist() == [5, 31, 3]
+    assert seen == [9, 5, 31]          # markov only ever sees target-space ids
+
+
+def test_widen_to_target_moves_q_onto_the_target_index_space(tmp_path):
+    """Speculative sampling compares q with the target's p elementwise and resamples from
+    max(0, p - q) over the FULL target vocab, so q has to be widened rather than compared
+    in draft space — tokens the draft head cannot represent must keep their residual mass."""
+    cfg = DSparkConfig.from_json(_cfg_path(tmp_path, SPECULATORS_FULL))
+    d = DSparkDrafter(cfg)
+    targets = [3, 5, 6, 11, 12, 13, 20, 31]
+    d.set_draft_vocab_map(_d2t_offsets(targets))
+
+    q = mx.zeros((cfg.out_vocab_size,))
+    q[1] = 0.25
+    q[7] = 0.75
+    wide = d.widen_to_target(q)
+    assert wide.shape == (cfg.vocab_size,)
+    assert abs(float(wide.sum()) - 1.0) < 1e-6          # mass preserved
+    assert float(wide[5]) == 0.25 and float(wide[31]) == 0.75
+    assert float(wide[0]) == 0.0                        # untouched target ids stay empty
+
+
+def test_load_drafter_speculators_reduced_vocab_round_trips(tmp_path):
+    weights = _reference_weights(SPECULATORS_FULL)
+    weights["d2t"] = _d2t_offsets([3, 5, 6, 11, 12, 13, 20, 31])
+    weights["t2d"] = mx.zeros((32,), dtype=mx.bool_)    # trainer-only; must be ignored
+    path = _write_drafter_ckpt(tmp_path, weights, SPECULATORS_FULL)
+    drafter, cfg = load_drafter(path, quantize=False)
+    assert cfg.draft_vocab_size == 8 and cfg.family == "qwen3"
+    assert drafter.to_target_ids(mx.array([0, 7])).tolist() == [3, 31]
+
+
+def test_load_drafter_reduced_vocab_without_d2t_refused(tmp_path):
+    """No table means draft ids would be emitted as target ids — every token wrong, and
+    the drafter would still appear to run."""
+    path = _write_drafter_ckpt(tmp_path, _reference_weights(SPECULATORS_FULL), SPECULATORS_FULL)
+    with pytest.raises(ValueError, match="no `d2t` table"):
+        load_drafter(path, quantize=False)
+
+
+def test_load_drafter_d2t_without_declared_draft_vocab_refused(tmp_path):
+    weights = _reference_weights()
+    weights["d2t"] = mx.zeros((4,), dtype=mx.int32)
+    path = _write_drafter_ckpt(tmp_path, weights)
+    with pytest.raises(ValueError, match="declares no "):
+        load_drafter(path, quantize=False)

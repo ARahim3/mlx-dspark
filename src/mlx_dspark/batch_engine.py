@@ -129,7 +129,7 @@ class BatchCache:
 
     # -- construction --
     @classmethod
-    def from_rows(cls, kv_pairs: list[tuple[mx.array, mx.array]]) -> "BatchCache":
+    def from_rows(cls, kv_pairs: list[tuple[mx.array, mx.array]]) -> BatchCache:
         """Merge per-row single-seq (keys, values) — each ``[1, H, len_b, D]`` — into one
         left-aligned batched buffer (row b at columns ``0..len_b``)."""
         lens = [k.shape[2] for k, _ in kv_pairs]
@@ -148,7 +148,7 @@ class BatchCache:
         return cls(keys, values, lens)
 
     @classmethod
-    def empty(cls, capacity: int, n_heads: int, dk: int, dv: int, dtype) -> "BatchCache":
+    def empty(cls, capacity: int, n_heads: int, dk: int, dv: int, dtype) -> BatchCache:
         """A fixed-capacity cache with every row empty — the slot-reuse form (SpecSlots):
         rows are filled by :meth:`set_row` on admission and vacated by trimming to 0."""
         return cls(mx.zeros((capacity, n_heads, STEP, dk), dtype=dtype),
@@ -186,7 +186,7 @@ class BatchCache:
         full ``[B, H, Lcur, D]`` key/value tensors (``Lcur = max(new offsets)``). Rows shorter
         than ``Lcur`` carry stale/other-row content past their offset — the mask hides it.
         ``keys`` may cover only the first B rows of the buffer (the active-prefix view)."""
-        B, H, T, _ = keys.shape
+        B, _H, T, _ = keys.shape
         need = max(o + T for o in self.offsets[:B])
         if need > self.keys.shape[2]:
             self._grow(_round_step(need))
@@ -510,15 +510,18 @@ def _ctx_block_mask(lens: list[int], k: int) -> mx.array:
 def _batched_sample_block(drafter, base_logits: mx.array, first_prev: list[int]) -> mx.array:
     """Batched greedy DSpark block sampling: ``base_logits [B, cap, V]``, ``first_prev [B]`` ->
     ``[B, cap]``. The Markov head is sequential over the cap positions (position i's bias depends
-    on the token at i-1) but vectorized across rows."""
-    B, cap, _ = base_logits.shape
+    on the token at i-1) but vectorized across rows. Returns TARGET-vocabulary ids — on a
+    reduced-vocab head the argmax is a draft id and has to be mapped before it is emitted or
+    fed back as ``prev`` (markov_w1 is indexed by target ids). Mirrors
+    ``DSparkDrafter.sample_block``; keep the two in step."""
+    _B, cap, _ = base_logits.shape
     if drafter.markov_head is None:
-        return mx.argmax(base_logits, axis=-1)
+        return drafter.to_target_ids(mx.argmax(base_logits, axis=-1))
     prev = mx.array(first_prev)                                  # [B]
     toks = []
     for i in range(cap):
         step = base_logits[:, i, :] + drafter.markov_head.step_bias(prev)   # [B, V]
-        nxt = mx.argmax(step, axis=-1)                          # [B]
+        nxt = drafter.to_target_ids(mx.argmax(step, axis=-1))   # [B]
         toks.append(nxt)
         prev = nxt
     return mx.stack(toks, axis=1)                               # [B, cap]
@@ -646,7 +649,7 @@ class SpecSlots:
             bctx, ctx_lens = _batched_ctx([self.ctx[b] for b in range(B)])
             mask = _ctx_block_mask(ctx_lens, k)
             block_hidden = drafter.backbone(noise, mx.array(ctx_lens), bctx, mask)  # [B, k, H]
-            base_logits = drafter.compute_logits(block_hidden[:, :cap, :])      # [B, cap, V]
+            base_logits = drafter.compute_logits(drafter.head_slice(block_hidden, cap))  # [B,cap,V]
             drafts_arr = _batched_sample_block(drafter, base_logits, pend)      # [B, cap]
             drafts = [drafts_arr[b] for b in range(B)]
         else:
@@ -656,7 +659,7 @@ class SpecSlots:
                 block_ids = [pend[b]] + [mask_id] * (k - 1)
                 noise = drafter.embed(mx.array([block_ids]))
                 block_hidden = drafter.backbone(noise, self.n_cached[b], self.ctx[b])
-                base_logits = drafter.compute_logits(block_hidden[:, :cap, :])[0]   # [cap, V]
+                base_logits = drafter.compute_logits(drafter.head_slice(block_hidden, cap))[0]  # [cap,V]
                 drafts.append(drafter.sample_block(base_logits, first_prev_token=pend[b]))
 
         # ---- 2. batched verify (the shared weight-read), at the active width ----

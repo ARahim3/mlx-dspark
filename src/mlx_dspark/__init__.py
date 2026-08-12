@@ -16,7 +16,9 @@ This package targets single-user local inference on Apple Silicon.
 # Single source of truth for the package version — pyproject.toml reads it from here
 # (hatchling dynamic version), so the two can never drift again (0.4.0 shipped with a
 # stale module attribute because they were bumped separately).
-__version__ = "0.7.0"
+import contextlib
+
+__version__ = "0.8.0"
 
 
 # --- transformers>=5.13 compat shim (must run before mlx_lm/mlx_vlm import below) ---
@@ -32,7 +34,7 @@ __version__ = "0.7.0"
 def _patch_transformers_string_register() -> None:
     try:
         from transformers.models.auto.auto_factory import _LazyAutoMapping
-    except Exception:
+    except Exception:  # noqa: BLE001 — any transformers layout we don't recognise: no shim
         return
     _orig = _LazyAutoMapping.register
     if getattr(_orig, "_mlx_dspark_patched", False):
@@ -41,10 +43,8 @@ def _patch_transformers_string_register() -> None:
     def register(self, key, value, exist_ok=False):
         if not isinstance(key, type):
             # pre-5.13 behavior: non-class keys are stored directly, not introspected
-            try:
+            with contextlib.suppress(AttributeError):
                 self._extra_content[key] = value
-            except AttributeError:
-                pass
             return None
         return _orig(self, key, value, exist_ok=exist_ok)
 
@@ -54,8 +54,18 @@ def _patch_transformers_string_register() -> None:
 
 _patch_transformers_string_register()
 
+from .calibrate import CapController, calibrate
 from .config import DSparkConfig
 from .dflash_model import DFlashConfig, DFlashDraftModel
+from .generate import (
+    GenResult,
+    StopStreaming,
+    dflash_generate,
+    encode_messages,
+    encode_prompt,
+    greedy_generate,
+    speculative_generate,
+)
 from .load import (
     DEFAULT_DRAFTER,
     DEFAULT_TARGET,
@@ -71,49 +81,39 @@ from .load import (
     resolve,
     resolve_mode,
 )
-from .calibrate import CapController, calibrate
-from .generate import (
-    GenResult,
-    StopStreaming,
-    dflash_generate,
-    encode_messages,
-    encode_prompt,
-    greedy_generate,
-    speculative_generate,
-)
 from .lookup import NGramIndex, lookup_generate
 from .server import Engine, run_server
 from .target import Target
 
 __all__ = [
-    "DSparkConfig",
+    "DEFAULT_DRAFTER",
+    "DEFAULT_TARGET",
+    "DFLASH_PRESETS",
+    "PRESETS",
+    "REGISTRY",
+    "CapController",
     "DFlashConfig",
     "DFlashDraftModel",
-    "Target",
-    "load_drafter",
-    "load_dflash",
-    "load_target",
-    "load_pair",
-    "load_dflash_pair",
-    "speculative_generate",
-    "dflash_generate",
-    "lookup_generate",
-    "greedy_generate",
-    "calibrate",
-    "CapController",
+    "DSparkConfig",
+    "Engine",
+    "GenResult",
     "NGramIndex",
     "StopStreaming",
+    "Target",
+    "apply_wired_limit",
+    "calibrate",
+    "dflash_generate",
     "encode_messages",
     "encode_prompt",
-    "GenResult",
-    "Engine",
-    "run_server",
-    "PRESETS",
-    "DFLASH_PRESETS",
-    "REGISTRY",
+    "greedy_generate",
+    "load_dflash",
+    "load_dflash_pair",
+    "load_drafter",
+    "load_pair",
+    "load_target",
+    "lookup_generate",
     "resolve",
     "resolve_mode",
-    "apply_wired_limit",
-    "DEFAULT_TARGET",
-    "DEFAULT_DRAFTER",
+    "run_server",
+    "speculative_generate",
 ]

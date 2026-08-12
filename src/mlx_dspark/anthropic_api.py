@@ -48,13 +48,16 @@ anyway.
 from __future__ import annotations
 
 import json
+import re
 import uuid
 
 from .tools import parse_tool_calls
 
 # Native tool-call openers we must not stream to the client as prose. Only the *opening*
 # markers matter: once one appears, everything after it is buffered for `parse_tool_calls`.
-_TOOL_MARKERS = ("<tool_call>", "<|tool_call>")
+# muse_glimmer wraps its calls in `<atem:function_calls>` then `<atem:invoke …>`; gate on both
+# so a call is caught whichever the round boundary lands on.
+_TOOL_MARKERS = ("<tool_call>", "<|tool_call>", "<atem:function_calls>", "<atem:invoke")
 _MAX_MARKER = max(len(m) for m in _TOOL_MARKERS)
 
 # Reasoning models wrap their chain of thought in these. Anthropic carries reasoning as
@@ -67,6 +70,19 @@ _THINK_PAIRS = (
     ("<|channel>thought\n", "<channel|>"),      # Gemma-4
 )
 _THINK_OPEN, _THINK_CLOSE = _THINK_PAIRS[0]
+
+# muse_glimmer ("Onyx ATEM" harmony format) doesn't use an open/close *pair* — it emits a run of
+# recipient-tagged sub-messages, `[<|start|>]HEADER<|message|>BODY<|eom|>`, where the header
+# carries `to=<recipient>` (`to=self` = analysis/reasoning, anything else = the final answer or a
+# tool call) and `<|eot|>` (eos, never reaches us) ends the turn. These three special tokens are
+# the only structural delimiters and they survive detokenization, so a small state machine over
+# them recovers the channels. The tokenizer ships the authoritative grammar in its own
+# `response_template` (fields.reasoning_content.open_pattern = `to=self<|message|>` … close
+# `<|eom|>`; fields.content.open_pattern = `to=user<|message|>`). See NOTES "Muse-Glimmer-30B".
+_MUSE_MSG, _MUSE_EOM, _MUSE_START = "<|message|>", "<|eom|>", "<|start|>"
+_MUSE_STRUCT = (_MUSE_MSG, _MUSE_EOM, _MUSE_START)
+_MUSE_HOLD = max(len(s) for s in _MUSE_STRUCT) - 1     # straddle look-back when streaming
+_MUSE_RECIPIENT = re.compile(r"to=([^\s<]+)\s*$")      # the recipient at the end of a header
 
 ANTHROPIC_VERSION = "2023-06-01"
 
@@ -96,10 +112,98 @@ def prompt_opens_thinking(tail_text: str) -> str | None:
     return None
 
 
+class MuseChannelParser:
+    """Incrementally splits muse_glimmer's raw Onyx-ATEM output into a stream of
+    ``('reasoning' | 'answer', text)`` chunks. Tool XML is left inside ``'answer'`` for
+    :func:`~mlx_dspark.tools.parse_tool_calls`, so this is the *channel* split, not the tool one.
+
+    A three-state machine driven only by the structural special tokens (``<|start|>``,
+    ``<|message|>``, ``<|eom|>``): ``header`` buffers a sub-message header (the ``to=<recipient>``
+    line) without emitting; on ``<|message|>`` the recipient decides the channel and we enter
+    ``content``; ``<|eom|>`` ends the body (``idle``) until the next ``<|start|>`` opens the next
+    header. In ``content`` we hold back the last ``_MUSE_HOLD`` chars so a special token split
+    across two rounds is still recognised (the tool gate and stop-string scanner use the same
+    trick). ``feed`` is incremental; ``feed(text, final=True)`` in one shot is the whole-string
+    parse that :func:`split_thinking` uses."""
+
+    def __init__(self):
+        self.buf = ""
+        self.state = "header"     # 'header' | 'content' | 'idle'
+        self.channel: str | None = None   # 'reasoning' | 'answer'
+
+    def _next_struct(self) -> tuple[int, str]:
+        best, tok = -1, ""
+        for t in _MUSE_STRUCT:
+            j = self.buf.find(t)
+            if j != -1 and (best == -1 or j < best):
+                best, tok = j, t
+        return best, tok
+
+    def feed(self, piece: str, final: bool = False) -> list[tuple[str, str]]:
+        self.buf += piece
+        out: list[tuple[str, str]] = []
+        while True:
+            idx, tok = self._next_struct()
+
+            if self.state == "content":
+                if idx == -1:                       # no marker yet: emit, holding back a tail
+                    hold = 0 if final else _MUSE_HOLD
+                    upto = max(0, len(self.buf) - hold)
+                    if upto:
+                        out.append((self.channel, self.buf[:upto]))
+                        self.buf = self.buf[upto:]
+                    return out
+                if idx:
+                    out.append((self.channel, self.buf[:idx]))
+                self.buf = self.buf[idx + len(tok):]
+                if tok == _MUSE_EOM:
+                    self.state, self.channel = "idle", None
+                elif tok == _MUSE_START:
+                    self.state, self.channel = "header", None
+                # a bare <|message|> mid-body (no header) keeps the current channel
+                continue
+
+            if self.state == "header":              # buffer the recipient line, emit nothing
+                if idx == -1:
+                    if final:
+                        self.buf = ""               # drop a trailing partial header
+                    return out
+                if tok == _MUSE_MSG:
+                    header, self.buf = self.buf[:idx], self.buf[idx + len(tok):]
+                    m = _MUSE_RECIPIENT.search(header)
+                    rcpt = m.group(1) if m else "user"
+                    self.channel = "reasoning" if rcpt == "self" else "answer"
+                    self.state = "content"
+                    continue
+                self.buf = self.buf[idx + len(tok):]  # <|start|> / <|eom|> inside a header: skip
+                continue
+
+            # idle: between <|eom|> and the next sub-message; drop stray text, act on markers
+            if idx == -1:
+                if final:
+                    self.buf = ""
+                return out
+            self.buf = self.buf[idx + len(tok):]
+            if tok == _MUSE_START:
+                self.state = "header"
+            elif tok == _MUSE_MSG:                  # body with no header: assume answer
+                self.channel, self.state = "answer", "content"
+            # <|eom|> in idle: ignore
+
+
+def _split_muse(text: str) -> tuple[str, str]:
+    chunks = MuseChannelParser().feed(text, final=True)
+    reasoning = "".join(t for k, t in chunks if k == "reasoning")
+    answer = "".join(t for k, t in chunks if k == "answer")
+    return reasoning.strip(), answer.strip()
+
+
 def split_thinking(text: str) -> tuple[str, str]:
-    """``(reasoning, answer)``. Handles both the self-opened form and the prefilled one
-    (output that closes a block it never opened). Returns ``("", text)`` when there's no
-    reasoning, and treats an unterminated block as all-reasoning."""
+    """``(reasoning, answer)``. Handles the self-opened form, the prefilled one (output that
+    closes a block it never opened), and muse_glimmer's recipient-tagged channels. Returns
+    ``("", text)`` when there's no reasoning, and treats an unterminated block as all-reasoning."""
+    if _MUSE_MSG in text:            # muse Onyx-ATEM channels (the marker is muse-only)
+        return _split_muse(text)
     s = text.lstrip()
     for open_, close in _THINK_PAIRS:
         if s.startswith(open_):
@@ -420,7 +524,7 @@ class MessageStream:
 
     def __init__(self, *, model: str, input_tokens: int, msg_id: str | None = None,
                  thinking: bool = True, in_thinking: str | None = None,
-                 schemas: dict | None = None):
+                 schemas: dict | None = None, muse: bool = False):
         self.model = model
         self.input_tokens = input_tokens
         self.id = msg_id or _msg_id()
@@ -428,6 +532,11 @@ class MessageStream:
         self.schemas = schemas
         self.gate = _ToolGate()
         self.pending = ""             # input not yet routed to a block
+        # muse_glimmer routes its recipient-tagged channels through a dedicated parser (the
+        # open/close-pair machinery below doesn't model its `<|eom|>` handoffs); everything else
+        # uses the pair state machine. The flag comes from the server (it knows the model), so a
+        # non-muse stream never touches muse code and stays byte-identical.
+        self._muse = MuseChannelParser() if muse else None
         # "thinking" when the chat template prefilled the opener (see prompt_opens_thinking);
         # `close` is the marker that ends the reasoning block, which differs per model family
         self.phase = "thinking" if in_thinking else "pending"
@@ -489,7 +598,25 @@ class MessageStream:
         self.pending += piece
         return self._consume(final=False)
 
+    def _consume_muse(self, final: bool) -> list[tuple[str, dict]]:
+        """Drive the muse channel parser and route its chunks to blocks: reasoning -> the
+        thinking block, answer -> the text block (via the tool gate, so atem XML is buffered for
+        the tool pass instead of streamed as prose). A channel switch closes the open block and
+        opens the other, so a client never sees interleaved kinds."""
+        ev: list[tuple[str, dict]] = []
+        piece, self.pending = self.pending, ""
+        for kind, text in self._muse.feed(piece, final=final):
+            want = "thinking" if kind == "reasoning" else "text"
+            if self.open is None or self.open[0] != want:
+                if self.open is not None:
+                    ev += self._close_block()
+                ev += self._open_block(want)
+            ev += self._content_delta(text if want == "thinking" else self.gate.feed(text))
+        return ev
+
     def _consume(self, final: bool) -> list[tuple[str, dict]]:
+        if self._muse is not None:
+            return self._consume_muse(final)
         ev: list[tuple[str, dict]] = []
         while True:
             if self.phase == "pending":

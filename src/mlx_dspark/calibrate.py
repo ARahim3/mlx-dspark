@@ -28,6 +28,7 @@ lossless for ANY per-round cap sequence. Auto-cap can never change what is gener
 
 from __future__ import annotations
 
+import itertools
 import json
 import os
 import time
@@ -64,7 +65,9 @@ def measure_verify_curve(target, tap: list[int], widths: list[int],
     for m in sorted(widths):
         x = mx.array([[TOKEN_ID] * m])
 
-        def fn():
+        # loop vars bound as defaults: fn is consumed inside this iteration, but binding
+        # makes that explicit rather than relying on it (ruff B023)
+        def fn(x=x, m=m):
             logits, _ = target.run(x, cache, tap)
             for c in cache:                      # roll back so every iteration is identical
                 if c is not None and hasattr(c, "trim"):
@@ -90,10 +93,10 @@ def measure_dspark_drafter_curve(drafter, caps: list[int],
     curve: dict[int, float] = {}
     for cap in sorted(caps):
 
-        def fn():
+        def fn(cap=cap):
             noise = drafter.embed(mx.array([block_ids]))
             hidden = drafter.backbone(noise, ctx_len, ctx)
-            logits = drafter.compute_logits(hidden[:, :cap, :])[0]
+            logits = drafter.compute_logits(drafter.head_slice(hidden, cap))[0]
             return drafter.sample_block(logits, first_prev_token=TOKEN_ID)
 
         curve[cap] = _bench(fn)
@@ -127,7 +130,7 @@ def measure_batch_verify_grid(target, tap: list[int], batch_widths: list[int],
         for m in sorted(widths):
             ids = mx.array([[TOKEN_ID] * m] * B)
 
-            def fn():
+            def fn(ids=ids, caches=caches, m=m, B=B):
                 mask = build_batch_mask(caches[0].offsets, m)
                 logits, _ = batched_forward(target, ids, caches, tap, mask=mask)
                 for c in caches:                 # roll back so every iteration is identical
@@ -167,7 +170,7 @@ def measure_dspark_round_overhead(target, drafter, verify_ms: dict[int, float],
         nonlocal pos
         noise = drafter.embed(mx.array([[TOKEN_ID] * k]))
         hidden = drafter.backbone(noise, pos, ctx)
-        logits = drafter.compute_logits(hidden[:, :cap, :])[0]
+        logits = drafter.compute_logits(drafter.head_slice(hidden, cap))[0]
         draft_arr = drafter.sample_block(logits, first_prev_token=TOKEN_ID)
         verify_ids = mx.concatenate(
             [mx.array([TOKEN_ID], dtype=draft_arr.dtype), draft_arr]).reshape(1, -1)
@@ -275,7 +278,7 @@ def _interp(curve: dict[int, float], x: int) -> float:
             return curve[ks[-1]]
         slope = (curve[ks[-1]] - curve[ks[-2]]) / (ks[-1] - ks[-2])
         return curve[ks[-1]] + slope * (x - ks[-1])
-    for lo, hi in zip(ks, ks[1:]):
+    for lo, hi in itertools.pairwise(ks):
         if lo < x < hi:
             f = (x - lo) / (hi - lo)
             return curve[lo] + f * (curve[hi] - curve[lo])
@@ -601,6 +604,13 @@ def calibrate(target, drafter, *, mode: str, target_repo: str, drafter_repo: str
     (e.g. ``[2, 4]`` when serving with ``--max-batch 4``) additionally measures the batched
     verify grid so :meth:`CapController.cap_for` can pick a per-batch-width cap."""
     cfg = drafter.config
+    # A has_lm_head=false drafter (Nemotron DSpark head) reuses the target's lm_head; the
+    # drafter-curve measurement below calls compute_logits directly, so bind it here too
+    # (speculative_generate binds independently at generation time).
+    if not getattr(cfg, "has_own_lm_head", True) and getattr(drafter, "_ext_lm_head", None) is None:
+        drafter.bind_lm_head(target.lm_head_proj)
+    if not getattr(cfg, "has_own_embed", True) and getattr(drafter, "_ext_embed", None) is None:
+        drafter.bind_embed(target.draft_embed)
     if mode == "dspark":
         max_cap = int(cfg.block_size)
         widths = list(range(1, max_cap + 2))     # verify width = cap + 1; width 1 = the
@@ -709,6 +719,6 @@ def static_cap(target, drafter, *, mode: str, target_repo: str, drafter_repo: st
     try:
         ctrl = calibrate(target, drafter, mode=mode, target_repo=target_repo,
                          drafter_repo=drafter_repo, cache_dir=cache_dir, verbose=verbose)
-    except Exception:                       # calibration is an optimization, never a gate
+    except Exception:  # noqa: BLE001 — calibration is an optimization, never a gate
         return fallback
     return ctrl.static_best(STATIC_PRIOR_P)
