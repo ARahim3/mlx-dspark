@@ -89,14 +89,15 @@ public actor RuntimeBootstrapper {
     /// Where the engine is installed from.
     ///
     /// A local source tree wins when present, which is what makes development bearable — a
-    /// release build has no such override and always installs the pinned version.
+    /// release build has no such override and always tracks the latest released engine.
     public enum EngineSource: Equatable, Sendable {
-        case pypi(version: String)
+        /// The newest release on PyPI, resolved at launch.
+        case pypi
         case localSourceTree(URL)
 
         var fingerprint: String {
             switch self {
-            case .pypi(let v): return "pypi:\(v)"
+            case .pypi: return "pypi"
             case .localSourceTree(let url): return "local:\(url.path)"
             }
         }
@@ -108,11 +109,32 @@ public actor RuntimeBootstrapper {
             if let path = env["MLXDSPARK_ENGINE_SOURCE"], !path.isEmpty {
                 return .localSourceTree(URL(fileURLWithPath: path))
             }
-            return .pypi(version: AppIdentity.engineVersion)
+            return .pypi
         }
     }
 
+    /// The newest released engine version, or nil when PyPI is unreachable (offline launch).
+    static func latestReleasedVersion(timeout: TimeInterval = 5) async -> String? {
+        struct Payload: Decodable {
+            struct Info: Decodable { let version: String }
+            let info: Info
+        }
+        guard let url = URL(string: "https://pypi.org/pypi/\(AppIdentity.enginePackage)/json")
+        else { return nil }
+        var request = URLRequest(url: url)
+        request.timeoutInterval = timeout
+        guard let (data, response) = try? await URLSession.shared.data(for: request),
+              (response as? HTTPURLResponse)?.statusCode == 200,
+              let payload = try? JSONDecoder().decode(Payload.self, from: data)
+        else { return nil }
+        return payload.info.version
+    }
+
     /// Ensure a working runtime exists, reinstalling if the fingerprint doesn't match.
+    ///
+    /// For the PyPI source this is also the auto-update path: the newest release is resolved
+    /// on every launch, and a runtime built from an older release is rebuilt. Offline, an
+    /// existing runtime is used as-is — a network check must never brick a working install.
     /// - Returns: the engine executable to drive.
     @discardableResult
     public func ensureRuntime(
@@ -121,12 +143,14 @@ public actor RuntimeBootstrapper {
     ) async throws -> URL {
         try Paths.ensureDirectories()
 
-        let want = RuntimeFingerprint(engineVersion: AppIdentity.engineVersion,
-                                      pythonVersion: AppIdentity.pythonVersion,
-                                      source: source.fingerprint)
-        if currentFingerprint() == want,
-           FileManager.default.isExecutableFile(atPath: Paths.engineExecutable.path) {
-            // Already correct — mark every row done so onboarding can skip past instantly.
+        let latest: String? = source == .pypi ? await Self.latestReleasedVersion() : nil
+        if let current = currentFingerprint(),
+           current.source == source.fingerprint,
+           current.pythonVersion == AppIdentity.pythonVersion,
+           FileManager.default.isExecutableFile(atPath: Paths.engineExecutable.path),
+           source != .pypi || latest == nil || latest == current.engineVersion {
+            // Already current (or offline with a working install) — mark every row done so
+            // onboarding can skip past instantly.
             steps = SetupStepID.allCases.map { SetupStep(id: $0, state: .done, detail: "Ready") }
             onProgress?(steps)
             return Paths.engineExecutable
@@ -173,8 +197,11 @@ public actor RuntimeBootstrapper {
         onProgress?(steps)
         var installArgs = ["pip", "install", "--python", venvPython().path]
         switch source {
-        case .pypi(let version):
-            installArgs.append("\(AppIdentity.enginePackage)==\(version)")
+        case .pypi:
+            // The exact version when the check succeeded, else let uv resolve the newest —
+            // either way the runtime lands on the latest release.
+            installArgs.append(latest.map { "\(AppIdentity.enginePackage)==\($0)" }
+                               ?? AppIdentity.enginePackage)
         case .localSourceTree(let url):
             installArgs.append(contentsOf: ["--editable", url.path])
         }
@@ -192,7 +219,7 @@ public actor RuntimeBootstrapper {
             onProgress?(steps)
             throw error
         }
-        set(.engine, .done, "\(AppIdentity.enginePackage) \(AppIdentity.engineVersion)")
+        set(.engine, .done, "\(AppIdentity.enginePackage) \(latest ?? "latest")")
         onProgress?(steps)
 
         // --- verify --------------------------------------------------------------
@@ -208,7 +235,11 @@ public actor RuntimeBootstrapper {
             onProgress?(steps)
             throw BootstrapError.verifyFailed(installed.isEmpty ? "no version reported" : installed)
         }
-        try writeFingerprint(want)
+        // Fingerprint the version that actually installed (the probe's answer, not the
+        // query's) — that is what the next launch's latest-check compares against.
+        try writeFingerprint(RuntimeFingerprint(engineVersion: installed,
+                                                pythonVersion: AppIdentity.pythonVersion,
+                                                source: source.fingerprint))
         set(.verify, .done, "Engine \(installed)")
         onProgress?(steps)
 

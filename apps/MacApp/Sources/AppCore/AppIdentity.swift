@@ -16,11 +16,11 @@ public enum AppIdentity {
     /// The PyPI package this app installs and drives.
     public static let enginePackage = "mlx-dspark"
 
-    /// Minimum engine version this app's UI expects. The bootstrapper installs exactly this;
-    /// a runtime built from a different version is torn down and reinstalled (see
-    /// `RuntimeBootstrapper`) — same-version rebuilds are the trap that MTPLX documents.
-    /// 0.6.1: the measured default cap (`static_cap`) — the app's Curves/Race lean on it.
-    public static let engineVersion = "0.6.1"
+    /// The engine tracks the **latest PyPI release automatically**: the bootstrapper resolves
+    /// the newest version at launch and rebuilds the runtime when a newer one exists (offline
+    /// launches keep whatever is installed). There is deliberately no pinned version — a pin
+    /// rots the moment the engine ships a release, which is how the app once sat on 0.6.1
+    /// while 0.8.1 was current and could not load the newer model families.
 
     /// CPython the runtime venv is built against. uv fetches a managed build if the machine
     /// has none, which is what lets onboarding avoid ever mentioning Homebrew.

@@ -73,9 +73,8 @@ struct ServerSupervisorTests {
 
 @Suite("Engine source resolution")
 struct EngineSourceTests {
-    @Test func defaultsToPinnedPyPIVersion() {
-        #expect(RuntimeBootstrapper.EngineSource.fromEnvironment([:])
-                == .pypi(version: AppIdentity.engineVersion))
+    @Test func defaultsToLatestPyPIRelease() {
+        #expect(RuntimeBootstrapper.EngineSource.fromEnvironment([:]) == .pypi)
     }
 
     @Test func environmentOverridePointsAtWorkingTree() {
@@ -87,7 +86,7 @@ struct EngineSourceTests {
     /// A dev runtime and a released one must not share a fingerprint, or switching between
     /// them would silently keep the wrong engine installed — the same-version-rebuild trap.
     @Test func fingerprintsDifferBySource() {
-        let pypi = RuntimeBootstrapper.EngineSource.pypi(version: "0.6.0")
+        let pypi = RuntimeBootstrapper.EngineSource.pypi
         let local = RuntimeBootstrapper.EngineSource.localSourceTree(URL(fileURLWithPath: "/tmp/x"))
         #expect(pypi.fingerprint != local.fingerprint)
     }
