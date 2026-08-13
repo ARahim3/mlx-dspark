@@ -51,22 +51,24 @@ DFLASH_PRESETS = {
 # for anything else, pass `--drafter`. Matching is quant-agnostic (the drafter matches the *model*,
 # not its quantization), so Qwen3-8B-4bit / -8bit / -bf16 all resolve the same drafter. There are
 # **no user-facing nicknames** — `id` is only the substring we match against a target repo name.
+# `speedup` is the measured headline ratio from the README table (M4 Pro, mlx 0.32, warm,
+# vs greedy baseline) — a human string for pickers, not a promise; content and machine move it.
 REGISTRY = [
     {"id": "qwen3-4b",   "target": "mlx-community/Qwen3-4B-8bit",
      "dspark": "deepseek-ai/dspark_qwen3_4b_block7", "dflash": "z-lab/Qwen3-4B-DFlash-b16",
-     "ram": "~8 GB"},
+     "ram": "~8 GB", "speedup": "~1.8×"},
     {"id": "qwen3-8b",   "target": "mlx-community/Qwen3-8B-8bit",
      "dspark": "deepseek-ai/dspark_qwen3_8b_block7", "dflash": "z-lab/Qwen3-8B-DFlash-b16",
-     "ram": "~11 GB"},
+     "ram": "~11 GB", "speedup": "~1.6×"},
     # Same official DeepSeek drop and recipe as the 4B/8B entries above; registered
     # 2026-07-22 once it was actually benchmarked (2.03x at cap 4: 2.36x math / 2.11x code /
     # 1.62x chat, baseline 15.3 tok/s). No z-lab DFlash adapter published at this size.
     {"id": "qwen3-14b",  "target": "mlx-community/Qwen3-14B-8bit",
      "dspark": "deepseek-ai/dspark_qwen3_14b_block7",
-     "ram": "~19 GB"},
+     "ram": "~19 GB", "speedup": "~2.0×"},
     {"id": "gemma-4-12b", "target": "mlx-community/gemma-4-12B-it-8bit",
      "dspark": "deepseek-ai/dspark_gemma4_12b_block7", "dflash": "z-lab/gemma4-12B-it-DFlash",
-     "ram": "~15 GB"},
+     "ram": "~15 GB", "speedup": "~2.1×"},
     # PrismML Ternary-Bonsai 27B (ternary rebuild of Qwen3.6-27B, hybrid linear attention).
     # PrismML ships the DSpark drafter GGUF-only (no safetensors export exists); the repo
     # below is our 1:1 bf16 repack into the DeepSpec layout (converted with gguf_convert.py —
@@ -76,7 +78,7 @@ REGISTRY = [
     # (load_target refuses it with the reason). Drafters are variant-specific.
     {"id": "ternary-bonsai-27b", "target": "prism-ml/Ternary-Bonsai-27B-mlx-2bit",
      "dspark": "Rahim/Ternary-Bonsai-27B-dspark",
-     "ram": "~12 GB"},
+     "ram": "~12 GB", "speedup": "~1.15× code"},
     # Qwen3.6-27B (qwen3_5 hybrid — the full-precision sibling of Ternary-Bonsai above; same
     # 64-layer/5120-hidden shape, same tap layers). Community drafter by Avesed: its config says
     # architectures=["DFlashDraftModel"] (their vLLM-fork class label) and carries target-config
@@ -87,7 +89,7 @@ REGISTRY = [
     # English-centric (accepts ~4.1-4.7 code/math, ~2.6 chat-EN, ~1.7 chat-ZH per its card).
     {"id": "qwen3.6-27b", "target": "mlx-community/Qwen3.6-27B-4bit",
      "dspark": "Avesed/Qwen3.6-27B-DSpark",
-     "ram": "~20 GB"},
+     "ram": "~20 GB", "speedup": "~1.8× math"},
     # DeepReinforce Ornith-1.0-9B (qwen3_5 hybrid, agentic coding). Community drafter by
     # stanleyphoong — DeepSpec-standalone layout with a qwen3_5-flavored backbone (gated
     # q_proj + partial rotary; handled by the qwen3 config branch's gated_q_proj/rope_dims
@@ -97,7 +99,7 @@ REGISTRY = [
     # on the 4-bit target — 4-bit trades those ratios for ~10-15% more absolute tok/s.
     {"id": "ornith-1.0-9b", "target": "mlx-community/Ornith-1.0-9B-8bit",
      "dspark": "stanleyphoong/Ornith-1.0-9B-DSpark",
-     "ram": "~13 GB"},
+     "ram": "~13 GB", "speedup": "~2.2×"},
 ]
 
 # legacy `--family` / load_pair("qwen3") values -> a concrete target repo (deprecated).

@@ -1237,7 +1237,14 @@ def make_handler(engine: Engine, api_key: str | None):
             if route in ("/v1/models", "/models"):
                 return self._send_json(200, self._models_payload())
             if route == "/metrics":
-                return self._send_json(200, engine.metrics())
+                from .diagnostics import memory_info
+
+                payload = engine.metrics()
+                # Allocator state rides along so a client can show what the loaded model
+                # actually holds resident — added handler-side so every engine (incl.
+                # BatchEngine) reports it without owning the concern.
+                payload["memory"] = memory_info()
+                return self._send_json(200, payload)
             if route == "/calibration":
                 return self._send_json(200, engine.calibration())
             if route == "/doctor":
@@ -1245,9 +1252,12 @@ def make_handler(engine: Engine, api_key: str | None):
 
                 return self._send_json(200, doctor())
             if route == "/admin/models":
-                from .diagnostics import model_inventory
+                from .diagnostics import disk_usage, installed_models, model_inventory
 
+                installed = installed_models()
                 return self._send_json(200, {"models": model_inventory(),
+                                             "installed": installed,
+                                             "disk": disk_usage(installed),
                                              "loaded": engine.target_repo})
             if route == "/admin/integrations":
                 from .integrations import integrations

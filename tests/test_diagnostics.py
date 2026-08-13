@@ -58,6 +58,13 @@ class TestInventory:
         assert qwen["target"] == "mlx-community/Qwen3-4B-8bit"
         assert qwen["dspark_drafter"] == "deepseek-ai/dspark_qwen3_4b_block7"
 
+    def test_rows_carry_the_measured_speedup_hook(self):
+        """The model pickers show the measured ratio next to each pair — the number that
+        answers 'why this one'. Every registered pair has been benchmarked (registry policy),
+        so every row must carry it."""
+        for row in diagnostics.model_inventory(ram_gb=48):
+            assert row["speedup"]
+
     def test_ready_requires_both_halves_present(self):
         for row in diagnostics.model_inventory(ram_gb=48):
             assert row["ready"] == (row["target_installed"] and row["drafter_installed"])
@@ -89,6 +96,87 @@ class TestIsLocal:
 
         monkeypatch.setattr(load, "snapshot_download", boom, raising=False)
         diagnostics.model_inventory(ram_gb=48)
+
+
+class TestMemoryInfo:
+    def test_reports_allocator_state_when_mlx_present(self):
+        info = diagnostics.memory_info()
+        if info["available"]:
+            for key in ("active_bytes", "peak_bytes", "cache_bytes"):
+                assert isinstance(info[key], int) and info[key] >= 0
+        else:                                       # non-mlx environment: shape still valid
+            assert set(info) == {"available"}
+
+
+def _write(path, size):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(b"x" * size)
+
+
+class TestInstalledModels:
+    """The on-disk scan behind the app's 'what's already on this Mac' list."""
+
+    def _fake_caches(self, tmp_path):
+        hub = tmp_path / "hub"
+        plain = tmp_path / "plain"
+        # HF layout: blobs hold the bytes, snapshots symlink into them.
+        target = hub / "models--mlx-community--Qwen3-4B-8bit"
+        _write(target / "blobs" / "abc", 1000)
+        snap = target / "snapshots" / "deadbeef"
+        snap.mkdir(parents=True)
+        os.symlink(target / "blobs" / "abc", snap / "model.safetensors")
+        _write(hub / "models--deepseek-ai--dspark_qwen3_4b_block7" / "blobs" / "d", 200)
+        _write(plain / "Ornith-1.0-9B-8bit" / "model.safetensors", 500)
+        (hub / "datasets--something").mkdir()       # non-model entry: ignored
+        return str(hub), str(plain)
+
+    def test_lists_hub_and_plain_dir_models(self, tmp_path):
+        hub, plain = self._fake_caches(tmp_path)
+        rows = {r["repo"]: r for r in diagnostics.installed_models(hub, plain)}
+        assert "mlx-community/Qwen3-4B-8bit" in rows
+        assert "Ornith-1.0-9B-8bit" in rows
+        assert "datasets/something" not in rows
+
+    def test_symlinks_are_not_double_counted(self, tmp_path):
+        """HF snapshots are symlink farms into blobs/ — following them would double every
+        weight file and the disk numbers would be off by ~2x."""
+        hub, plain = self._fake_caches(tmp_path)
+        rows = {r["repo"]: r for r in diagnostics.installed_models(hub, plain)}
+        row = rows["mlx-community/Qwen3-4B-8bit"]
+        assert row["size_bytes"] < 1200              # 1000 blob + tiny symlink, not 2000
+
+    def test_drafters_are_marked_not_offered_as_models(self, tmp_path):
+        hub, plain = self._fake_caches(tmp_path)
+        rows = {r["repo"]: r for r in diagnostics.installed_models(hub, plain)}
+        assert rows["deepseek-ai/dspark_qwen3_4b_block7"]["kind"] == "drafter"
+        assert rows["mlx-community/Qwen3-4B-8bit"]["kind"] == "model"
+
+    def test_registry_pairing_is_annotated_quant_agnostically(self, tmp_path):
+        hub, plain = self._fake_caches(tmp_path)
+        rows = {r["repo"]: r for r in diagnostics.installed_models(hub, plain)}
+        assert rows["mlx-community/Qwen3-4B-8bit"]["registry_id"] == "qwen3-4b"
+        assert rows["Ornith-1.0-9B-8bit"]["registry_id"] == "ornith-1.0-9b"
+
+    def test_rows_carry_paths_for_reveal_and_delete(self, tmp_path):
+        hub, plain = self._fake_caches(tmp_path)
+        for row in diagnostics.installed_models(hub, plain):
+            assert os.path.isdir(row["path"])
+
+    def test_models_sort_before_drafters(self, tmp_path):
+        hub, plain = self._fake_caches(tmp_path)
+        kinds = [r["kind"] for r in diagnostics.installed_models(hub, plain)]
+        assert kinds == sorted(kinds, key=lambda k: k != "model")
+
+    def test_empty_caches_are_fine(self, tmp_path):
+        assert diagnostics.installed_models(str(tmp_path / "nope"),
+                                            str(tmp_path / "also-nope")) == []
+
+    def test_disk_usage_totals_the_rows(self, tmp_path):
+        hub, plain = self._fake_caches(tmp_path)
+        rows = diagnostics.installed_models(hub, plain)
+        usage = diagnostics.disk_usage(rows, drafters_dir=str(tmp_path / "none"))
+        assert usage["total_bytes"] == sum(r["size_bytes"] for r in rows)
+        assert usage["total"]
 
 
 class TestDoctor:

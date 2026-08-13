@@ -103,6 +103,138 @@ def _parse_ram_gb(text: str) -> float | None:
     return float(m.group(1)) if m else None
 
 
+def memory_info() -> dict:
+    """MLX allocator state — what the loaded model actually holds resident right now.
+
+    Reads the allocator, so it costs nothing and never touches the GPU. ``available: False``
+    (rather than an exception) when mlx isn't importable, so ``/metrics`` stays serveable
+    from any environment.
+    """
+    try:
+        import mlx.core as mx
+
+        return {
+            "available": True,
+            "active_bytes": int(mx.get_active_memory()),
+            "peak_bytes": int(mx.get_peak_memory()),
+            "cache_bytes": int(mx.get_cache_memory()),
+        }
+    except Exception:  # noqa: BLE001 — mlx missing / non-macOS
+        return {"available": False}
+
+
+_HUB_DIR = "~/.cache/huggingface/hub"
+_PLAIN_DIR = "~/.cache/mlx_dspark/models"
+_DRAFTERS_DIR = "~/.cache/mlx_dspark/drafters"
+
+
+def _dir_size_bytes(path: str) -> int:
+    """Real bytes under ``path``. ``lstat`` on purpose: HF hub snapshots are symlink farms
+    into ``blobs/``, so following links would double-count every weight file."""
+    total = 0
+    for root, _dirs, files in os.walk(path):
+        for name in files:
+            try:
+                total += os.lstat(os.path.join(root, name)).st_size
+            except OSError:
+                continue
+    return total
+
+
+def _human_size(n: int) -> str:
+    if n >= 1024 ** 3:
+        return f"{n / 1024 ** 3:.1f} GB"
+    if n >= 1024 ** 2:
+        return f"{n / 1024 ** 2:.0f} MB"
+    return f"{n} B"
+
+
+def _drafter_repos() -> set[str]:
+    """Every drafter repo the registry names (gguf: scheme reduced to its repo)."""
+    repos = set()
+    for entry in REGISTRY:
+        for key in ("dspark", "dflash"):
+            repo = entry.get(key)
+            if not repo:
+                continue
+            if repo.startswith("gguf:"):
+                repo = repo[len("gguf:"):].rsplit("/", 1)[0]
+            repos.add(repo)
+    return repos
+
+
+def installed_models(hub_dir: str | None = None, plain_dir: str | None = None) -> list[dict]:
+    """Every model actually on this disk — the inventory the registry can't see.
+
+    The registry answers "which pairs do we vouch for"; this answers "what has this user
+    already downloaded", which is what a model picker should offer first. Sources are the
+    two places the loaders read from: the HF hub cache and the plain-dir cache that
+    ``_resolve`` prefers. Rows carry ``path`` and ``size_bytes`` so a client can offer
+    reveal/delete and honest disk accounting without re-walking anything.
+    """
+    from .load import _registry_entry
+
+    hub = os.path.expanduser(hub_dir or _HUB_DIR)
+    plain = os.path.expanduser(plain_dir or _PLAIN_DIR)
+    drafters = _drafter_repos()
+    drafter_basenames = {os.path.basename(r).lower() for r in drafters}
+
+    rows: dict[str, dict] = {}
+
+    def add(repo: str, path: str) -> None:
+        if repo in rows:                       # plain dir wins (scanned first, _resolve's order)
+            return
+        entry = _registry_entry(repo)
+        is_drafter = (repo in drafters
+                      or os.path.basename(repo).lower() in drafter_basenames
+                      or "dspark" in repo.lower() or "dflash" in repo.lower())
+        size = _dir_size_bytes(path)
+        rows[repo] = {
+            "repo": repo,
+            "path": path,
+            "size_bytes": size,
+            "size": _human_size(size),
+            # A drafter checkpoint is not something you can load as a target; the app
+            # shows these greyed/grouped rather than pretending they're chat models.
+            "kind": "drafter" if is_drafter else "model",
+            # Which registry pairing this repo would resolve into (quant-agnostic) —
+            # i.e. whether `--mode auto` gets it a real drafter or falls back to lookup.
+            "registry_id": entry["id"] if (entry and not is_drafter) else None,
+        }
+
+    if os.path.isdir(plain):
+        for name in sorted(os.listdir(plain)):
+            path = os.path.join(plain, name)
+            if os.path.isdir(path):
+                add(name, path)
+    if os.path.isdir(hub):
+        for name in sorted(os.listdir(hub)):
+            if not name.startswith("models--"):
+                continue
+            path = os.path.join(hub, name)
+            if not os.path.isdir(path):
+                continue
+            repo = name[len("models--"):].replace("--", "/")
+            add(repo, path)
+
+    return sorted(rows.values(), key=lambda r: (r["kind"] != "model", -r["size_bytes"]))
+
+
+def disk_usage(rows: list[dict] | None = None, *, hub_dir: str | None = None,
+               plain_dir: str | None = None, drafters_dir: str | None = None) -> dict:
+    """Total bytes the model caches hold, including auto-converted drafters.
+
+    Pass ``rows`` (a prior :func:`installed_models` result) to avoid re-walking the caches.
+    """
+    if rows is None:
+        rows = installed_models(hub_dir, plain_dir)
+    total = sum(r["size_bytes"] for r in rows)
+    conv = os.path.expanduser(drafters_dir or _DRAFTERS_DIR)
+    if os.path.isdir(conv):
+        total += _dir_size_bytes(conv)
+    return {"total_bytes": total, "total": _human_size(total)}
+
+
 def _is_local(repo: str | None) -> bool:
     """Whether a repo's weights are already on disk — no download, no network.
 
@@ -145,6 +277,7 @@ def model_inventory(ram_gb: float | None = _DETECT) -> list[dict]:  # type: igno
             "dspark_drafter": entry.get("dspark"),
             "dflash_drafter": entry.get("dflash"),
             "ram": entry.get("ram"),
+            "speedup": entry.get("speedup"),
             "ram_gb": need,
             "fits": (None if (need is None or ram_gb is None) else need <= ram_gb * 0.8),
             "target_installed": _is_local(entry["target"]),

@@ -220,6 +220,26 @@ def test_metrics(server):
     assert mt["model"] == "FakeModel" and mt["requests"] >= 1
 
 
+def test_metrics_reports_allocator_memory(server):
+    """The app's memory gauge reads this — it must exist for any engine, fakes included."""
+    _, base = server
+    memory = _get(base, "/metrics")["memory"]
+    assert "available" in memory
+    if memory["available"]:
+        assert memory["active_bytes"] >= 0 and memory["peak_bytes"] >= 0
+
+
+def test_admin_models_lists_registry_installed_and_disk(server):
+    _, base = server
+    payload = _get(base, "/admin/models")
+    assert payload["loaded"] == "org/Target"
+    assert isinstance(payload["models"], list) and payload["models"]
+    assert isinstance(payload["installed"], list)      # may be empty on a clean machine
+    for row in payload["installed"]:
+        assert {"repo", "path", "size_bytes", "size", "kind"} <= set(row)
+    assert payload["disk"]["total_bytes"] >= 0
+
+
 def test_unknown_route_404(server):
     _, base = server
     with pytest.raises(urllib.error.HTTPError) as e:
