@@ -4,8 +4,17 @@ A native SwiftUI app for the mlx-dspark engine. It does **not** link Python: it 
 app-owned runtime, launches `mlx-dspark serve`, and drives it over HTTP + SSE — the same CLI a
 terminal user would run.
 
-> Status: **bootstrap spike**. The runtime → server → stream spine is working and verified;
-> the real screens (Lab, Models, Agents) are not built yet.
+> Status: **feature-complete for a first release, unreleased.** Chat (sessions, markdown +
+> syntax highlighting, collapsible reasoning), Lab (Race with lossless verdict, live
+> acceptance decay, this Mac's cost curves), Models (measured pairs with speedups, anything
+> on disk, any HF repo, hot swap via `/admin/load`), Agents (per-client config + round-trip
+> test), menu bar with live rate/memory/accept ribbon, DMG + Homebrew cask tooling.
+>
+> **Engine version:** the bootstrapper installs the **latest PyPI release** at launch (no
+> pin; it rebuilds the runtime when a newer release exists, and offline launches keep the
+> working install). Note the app's Lab/Models/telemetry endpoints have not shipped to PyPI
+> yet — until the next engine release, run against this working tree (below) for the full
+> feature set.
 
 ## Build
 
@@ -38,12 +47,17 @@ Sources/AppCore/   logic, no SwiftUI — unit-testable, no running app required
   AppIdentity      every branded string (renaming the app is 3 strings, see below)
   Paths            install locations — everything lives OUTSIDE the .app bundle
   Shell            line-streamed subprocesses
-  RuntimeBootstrapper   vendored uv → managed CPython → app-owned venv → engine
+  RuntimeBootstrapper   vendored uv → managed CPython → app-owned venv → latest engine
   ServerSupervisor      free-port preflight, spawn, /health readiness, shutdown
-  APIClient        /health, /v1/models, /metrics, SSE chat + the x_mlx_dspark stats block
+  APIClient        /health, /v1/models, /metrics (+memory), /admin/load, SSE chat + stats
+  Telemetry        /events round stream, /rounds, /calibration wire types
+  Diagnostics      /doctor + /admin/models (registry, on-disk scan, disk usage)
+  Integrations     /admin/integrations (agent configs)
+  Race             /admin/race streaming + verdict wire types
+  ChatStore        persisted conversations (one JSON per session)
   LogStore         bounded ring, mirrored to logs/app.log
-Sources/AppHost/   SwiftUI views
-packaging/         make_app.sh
+Sources/AppHost/   SwiftUI views (screens, Theme, AcceptRibbon, SyntaxHighlight, markdown)
+packaging/         make_app.sh, make_dmg.sh, Homebrew cask; full release runbook in README
 ```
 
 There is **no `.xcodeproj`** on purpose: `swift build` is reproducible and an xcodeproj is a
