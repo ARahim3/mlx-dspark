@@ -10,17 +10,17 @@ so a string-key register must be tolerated on any installed transformers.
 
 
 def test_string_register_shim_applied():
-    import mlx_dspark  # noqa: F401 — importing applies the shim
-
     from transformers.models.auto.auto_factory import _LazyAutoMapping
+
+    import mlx_dspark  # noqa: F401 — importing applies the shim
 
     assert getattr(_LazyAutoMapping.register, "_mlx_dspark_patched", False)
 
 
 def test_string_key_register_does_not_raise():
-    import mlx_dspark  # noqa: F401
-
     from transformers.models.auto.tokenization_auto import TOKENIZER_MAPPING
+
+    import mlx_dspark  # noqa: F401
 
     # Pre-shim this raised AttributeError on transformers>=5.13.
     TOKENIZER_MAPPING.register("_mlx_dspark_test_key", (None, None), exist_ok=True)
@@ -29,9 +29,9 @@ def test_string_key_register_does_not_raise():
 
 def test_class_key_register_still_routes_to_original():
     """A real config-class key must not take the string fallback path."""
-    import mlx_dspark  # noqa: F401
-
     from transformers.models.auto.auto_factory import _LazyAutoMapping
+
+    import mlx_dspark  # noqa: F401
 
     reg = _LazyAutoMapping.register
     # The wrapper only diverts non-class keys; class keys defer to the original.
@@ -134,7 +134,7 @@ def test_gemma4_shim_real_class_never_left_broken():
         from mlx_vlm.models.gemma4_unified.processing_gemma4_unified import (
             Gemma4UnifiedProcessor,
         )
-    except Exception:
+    except Exception:  # noqa: BLE001 — any import failure means the module isn't there to test
         pytest.skip("mlx_vlm has no gemma4_unified processing module")
 
     from mlx_dspark.load import _shim_gemma4_unified_processor

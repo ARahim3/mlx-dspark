@@ -40,19 +40,71 @@ STEP = 256  # KV buffer grows in chunks of this many columns (like mlx-lm's cach
 # --------------------------------------------------------------------------- capability
 
 
-def batchable(target) -> bool:
-    """True iff this target supports the batched path: a dense mlx-lm model whose layers use
-    the standard ``KVCache`` (so per-row offsets + our mask are correct). VLM/gemma-4 (rotating
-    / sliding cache, mlx-vlm wrapper) returns False -> caller falls back to the serialized
-    engine. Extending to a new family means teaching the forward loop + cache, not a silent break.
+def batch_spec_supported(target) -> bool:
+    """True iff **batched speculative** decoding works here, which is stricter than
+    :func:`batchable`.
+
+    A spec round rolls each row back by a different amount (rows accept different numbers of
+    drafted tokens). For an attention layer that is per-row metadata on :class:`BatchCache`.
+    For a *recurrent* layer there is no trim at all — the single-row path rebuilds the state by
+    re-running the recurrence over the accepted prefix (``Target.rollback``), and doing that at
+    a **different ``keep`` per row** needs a masked batched re-run that does not exist yet. So
+    hybrids batch their baseline but not their spec rounds; they still get full single-stream
+    speculation. See NOTES "Batching hybrid targets"."""
+    return batchable(target) and all(
+        type(c).__name__ == "KVCache" for c in target.make_cache())
+
+
+def _is_trimmable(c) -> bool:
+    fn = getattr(c, "is_trimmable", None)
+    return bool(fn()) if callable(fn) else hasattr(c, "trim")
+
+
+# Recurrent (linear-attention / SSM) layer caches we know how to batch. Named explicitly
+# rather than duck-typed: a *wrapped* RotatingKVCache also looks like "not trimmable, holds
+# arrays", and merging one by concatenation would silently decode garbage past the window.
+_RECURRENT_CACHES = ("ArraysCache", "MambaCache")
+
+
+def _recurrent_mergeable(c) -> bool:
+    """True for a linear-attention (gated-DeltaNet) layer cache we can batch.
+
+    The enabling property, and the reason hybrids turn out to be *easy* to batch: a linear
+    layer's cache is **length-independent**. It holds a fixed-size recurrent state plus a
+    conv window of ``kernel-1`` columns — a summary of the sequence so far, not a per-token
+    buffer. So rows with different prompt lengths merge with a plain concatenate on the batch
+    axis, with no padding, no per-row offsets and no mask. Only the (minority) full-attention
+    layers need the left-aligned :class:`BatchCache`.
+
+    Note a *fresh* cache holds ``[None, ...]`` — the states are allocated by the first forward
+    — so this is a check on shape-of-cache, not on contents; it has to answer before any
+    prefill has run (:func:`batchable` is a capability query).
     """
+    st = getattr(c, "state", None)
+    return (type(c).__name__ in _RECURRENT_CACHES and not _is_trimmable(c)
+            and isinstance(st, (list, tuple)) and len(st) > 0
+            and all(s is None or isinstance(s, mx.array) for s in st))
+
+
+def batchable(target) -> bool:
+    """True iff this target supports the batched path.
+
+    Two cache shapes qualify, per layer: the standard ``KVCache`` (batched as a left-aligned
+    per-row :class:`BatchCache`) and a length-independent recurrent cache (batched by
+    concatenation — see :func:`_recurrent_mergeable`). A model may mix them, which is exactly
+    the qwen3_5 / qwen3_5_moe hybrids (Ornith, Bonsai, Qwen3.6-27B, Qwen3.6-35B-A3B): 30 of 40
+    layers recurrent, 10 attention. VLM/gemma-4 (rotating / sliding cache, mlx-vlm wrapper)
+    returns False -> caller falls back to the serialized engine. Anything else unproven falls
+    back too, rather than decoding wrong."""
     if getattr(target, "is_vlm", False):
         return False
     try:
         cache = target.make_cache()
     except Exception:  # noqa: BLE001
         return False
-    return bool(cache) and all(type(c).__name__ == "KVCache" for c in cache)
+    if not cache:
+        return False
+    return all(type(c).__name__ == "KVCache" or _recurrent_mergeable(c) for c in cache)
 
 
 # --------------------------------------------------------------------------- batched cache
@@ -77,7 +129,7 @@ class BatchCache:
 
     # -- construction --
     @classmethod
-    def from_rows(cls, kv_pairs: list[tuple[mx.array, mx.array]]) -> "BatchCache":
+    def from_rows(cls, kv_pairs: list[tuple[mx.array, mx.array]]) -> BatchCache:
         """Merge per-row single-seq (keys, values) — each ``[1, H, len_b, D]`` — into one
         left-aligned batched buffer (row b at columns ``0..len_b``)."""
         lens = [k.shape[2] for k, _ in kv_pairs]
@@ -96,7 +148,7 @@ class BatchCache:
         return cls(keys, values, lens)
 
     @classmethod
-    def empty(cls, capacity: int, n_heads: int, dk: int, dv: int, dtype) -> "BatchCache":
+    def empty(cls, capacity: int, n_heads: int, dk: int, dv: int, dtype) -> BatchCache:
         """A fixed-capacity cache with every row empty — the slot-reuse form (SpecSlots):
         rows are filled by :meth:`set_row` on admission and vacated by trimming to 0."""
         return cls(mx.zeros((capacity, n_heads, STEP, dk), dtype=dtype),
@@ -134,7 +186,7 @@ class BatchCache:
         full ``[B, H, Lcur, D]`` key/value tensors (``Lcur = max(new offsets)``). Rows shorter
         than ``Lcur`` carry stale/other-row content past their offset — the mask hides it.
         ``keys`` may cover only the first B rows of the buffer (the active-prefix view)."""
-        B, H, T, _ = keys.shape
+        B, _H, T, _ = keys.shape
         need = max(o + T for o in self.offsets[:B])
         if need > self.keys.shape[2]:
             self._grow(_round_step(need))
@@ -181,27 +233,36 @@ def build_batch_mask(offsets: list[int], T: int) -> mx.array:
 # --------------------------------------------------------------------------- batched forward
 
 
-def batched_forward(target, ids: mx.array, caches: list[BatchCache], tap: list[int] | None = None,
+def batched_forward(target, ids: mx.array, caches: list, tap: list[int] | None = None,
                     mask=None):
-    """One batched forward through a dense mlx-lm target with per-row :class:`BatchCache`.
+    """One batched forward through an mlx-lm target with per-row caches.
 
     ``ids`` is ``[B, T]`` (T=1 for baseline decode, cap+1 for verify). Returns
     ``(logits [B, T, V], fused [B, T, n_tap*H] | None)``. The generic layer loop mirrors
-    ``target.py::_run_mlxlm`` (embed -> layers(h, mask, cache) -> norm -> lm_head/tied), so it is
-    not tied to any one model; ``tap`` captures the residual stream after the given layer ids for
-    the DSpark drafter (None = plain forward, the baseline path)."""
-    mm = target.model.model
+    ``target.py::_run_mlxlm`` / ``_body_hybrid`` (embed -> layers(h, mask, cache) -> norm ->
+    head), so it is not tied to any one model; ``tap`` captures the residual stream after the
+    given layer ids for the DSpark drafter (None = plain forward, the baseline path).
+
+    Hybrid targets take the same loop with a per-layer mask choice, exactly as the single-row
+    path does. Their recurrent layers get ``mask=None``: ``create_ssm_mask`` returns None for
+    this cache type, and the batched rows all advance by the same ``T`` tokens per step, so
+    there is nothing to mask — the differing prompt *lengths* already live in each row's own
+    recurrent state, which is length-independent."""
+    mm = target._inner.model
     if mask is None:
-        mask = build_batch_mask(caches[0].offsets, ids.shape[1])
+        mask = build_batch_mask(_row_offsets(caches), ids.shape[1])
     h = mm.embed_tokens(ids)
     tapset = set(tap or [])
     captured = []
+    hybrid = getattr(target, "is_hybrid", False)
     for i, (layer, c) in enumerate(zip(mm.layers, caches)):
-        h = layer(h, mask, c)
+        if hybrid:
+            h = layer(h, mask=(None if getattr(layer, "is_linear", False) else mask), cache=c)
+        else:
+            h = layer(h, mask, c)
         if i in tapset:
             captured.append(h)
-    hn = mm.norm(h)
-    logits = mm.embed_tokens.as_linear(hn) if target._tied else target.model.lm_head(hn)
+    logits = target._head_mlxlm(mm.norm(h))
     fused = mx.concatenate(captured, axis=-1) if captured else None
     return logits, fused
 
@@ -223,15 +284,38 @@ def _prefill_rows(target, prompts_ids: list[list[int]], tap: list[int] | None = 
     return rows
 
 
-def _merge_row_caches(row_caches: list[list]) -> list[BatchCache]:
-    """Per-layer BatchCache list from a list of per-row single-seq cache lists."""
+def _merge_row_caches(row_caches: list[list]) -> list:
+    """Per-layer batched cache list from a list of per-row single-seq cache lists.
+
+    Attention layers merge into a left-aligned :class:`BatchCache` (rows keep their own
+    offsets). Recurrent layers merge by concatenating their state on the batch axis — no
+    padding and no offsets, because that state is a fixed-size summary rather than a per-token
+    buffer (see :func:`_recurrent_mergeable`). A hybrid model simply gets a mix.
+    """
     n_layers = len(row_caches[0])
     out = []
     for l in range(n_layers):
+        proto = row_caches[0][l]
+        if _recurrent_mergeable(proto):
+            merged = type(proto)(len(proto.state))
+            for j in range(len(proto.state)):
+                merged[j] = mx.contiguous(
+                    mx.concatenate([c[l][j] for c in row_caches], axis=0))
+            out.append(merged)
+            continue
         pairs = [(c[l].keys[..., : c[l].offset, :], c[l].values[..., : c[l].offset, :])
                  for c in row_caches]
         out.append(BatchCache.from_rows(pairs))
     return out
+
+
+def _row_offsets(caches: list) -> list[int]:
+    """The per-row token counts, read off whichever layer actually tracks length. A hybrid's
+    recurrent layers do not know the length at all, so the attention layers are the authority."""
+    for c in caches:
+        if isinstance(c, BatchCache):
+            return c.offsets
+    raise ValueError("no attention-layer cache in this model — cannot recover row offsets")
 
 
 def _sample_rows(logits_last: mx.array, temperature: float, top_p: float, top_k: int) -> mx.array:
@@ -334,9 +418,21 @@ def batch_generate_baseline(
 ) -> list[GenResult]:
     """Static batched plain decode of B prompts (no drafter) — the batched baseline. Every row
     advances one token per step through one shared forward; a finished row keeps stepping (its
-    output ignored) until all rows finish. Row isolation is the losslessness contract: B=N
-    produces the same per-row ids as B=1 at decode width 1 (the batched forward is bit-identical
-    there — see NOTES). Returns one :class:`GenResult` per row; batching is pure throughput."""
+    output ignored) until all rows finish. Returns one :class:`GenResult` per row.
+
+    **What is guaranteed is row isolation, not bit-identity with B=1.** Rows never influence
+    each other: an all-identical batch produces exactly identical rows (measured, max spread
+    0.0). But a batched matmul takes a different kernel path than a single-row one, so a row's
+    logits differ from the same prompt run alone by ~1 bf16 ulp, and a near-tie can land the
+    other way — measured on the shipped dense path too (Qwen3-4B-8bit, 2 of 4 rows diverge
+    within 96 tokens). This is the same contract :func:`batch_spec_generate` documents, and it
+    is a property of batched quantized matmul, not of this loop.
+
+    **MoE targets amplify it**: top-k expert routing is a *discrete* function of the hidden
+    state, so an ulp-level difference can send a token to a different expert. Batched-vs-single
+    argmax flips measured ~4x more often on Qwen3.6-35B-A3B than on a dense target of the same
+    quantization. Batching is a throughput knob; if you need a specific single-stream
+    transcript reproduced exactly, run that request unbatched."""
     if seed is not None:
         mx.random.seed(seed)
     B = len(prompts_ids)
@@ -414,15 +510,18 @@ def _ctx_block_mask(lens: list[int], k: int) -> mx.array:
 def _batched_sample_block(drafter, base_logits: mx.array, first_prev: list[int]) -> mx.array:
     """Batched greedy DSpark block sampling: ``base_logits [B, cap, V]``, ``first_prev [B]`` ->
     ``[B, cap]``. The Markov head is sequential over the cap positions (position i's bias depends
-    on the token at i-1) but vectorized across rows."""
-    B, cap, _ = base_logits.shape
+    on the token at i-1) but vectorized across rows. Returns TARGET-vocabulary ids — on a
+    reduced-vocab head the argmax is a draft id and has to be mapped before it is emitted or
+    fed back as ``prev`` (markov_w1 is indexed by target ids). Mirrors
+    ``DSparkDrafter.sample_block``; keep the two in step."""
+    _B, cap, _ = base_logits.shape
     if drafter.markov_head is None:
-        return mx.argmax(base_logits, axis=-1)
+        return drafter.to_target_ids(mx.argmax(base_logits, axis=-1))
     prev = mx.array(first_prev)                                  # [B]
     toks = []
     for i in range(cap):
         step = base_logits[:, i, :] + drafter.markov_head.step_bias(prev)   # [B, V]
-        nxt = mx.argmax(step, axis=-1)                          # [B]
+        nxt = drafter.to_target_ids(mx.argmax(step, axis=-1))   # [B]
         toks.append(nxt)
         prev = nxt
     return mx.stack(toks, axis=1)                               # [B, cap]
@@ -550,7 +649,7 @@ class SpecSlots:
             bctx, ctx_lens = _batched_ctx([self.ctx[b] for b in range(B)])
             mask = _ctx_block_mask(ctx_lens, k)
             block_hidden = drafter.backbone(noise, mx.array(ctx_lens), bctx, mask)  # [B, k, H]
-            base_logits = drafter.compute_logits(block_hidden[:, :cap, :])      # [B, cap, V]
+            base_logits = drafter.compute_logits(drafter.head_slice(block_hidden, cap))  # [B,cap,V]
             drafts_arr = _batched_sample_block(drafter, base_logits, pend)      # [B, cap]
             drafts = [drafts_arr[b] for b in range(B)]
         else:
@@ -560,7 +659,7 @@ class SpecSlots:
                 block_ids = [pend[b]] + [mask_id] * (k - 1)
                 noise = drafter.embed(mx.array([block_ids]))
                 block_hidden = drafter.backbone(noise, self.n_cached[b], self.ctx[b])
-                base_logits = drafter.compute_logits(block_hidden[:, :cap, :])[0]   # [cap, V]
+                base_logits = drafter.compute_logits(drafter.head_slice(block_hidden, cap))[0]  # [cap,V]
                 drafts.append(drafter.sample_block(base_logits, first_prev_token=pend[b]))
 
         # ---- 2. batched verify (the shared weight-read), at the active width ----

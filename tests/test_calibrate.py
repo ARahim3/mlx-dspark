@@ -91,7 +91,7 @@ def test_static_best_tracks_the_measured_curve_shape_not_a_constant():
                   8: 139.1}, 6),
     }
     picks = {}
-    for name, (curve, want) in ornith.items():
+    for name, (curve, _want) in ornith.items():
         ctrl = CapController(curve, drafter, max_cap=7)
         ctrl.p = 0.65
         picks[name] = ctrl.static_best()
@@ -137,7 +137,7 @@ def test_static_prior_reproduces_the_measured_optima():
 def test_static_best_goes_wide_on_a_flat_curve_and_shallow_on_a_steep_one():
     """Sanity on the two extremes, independent of any measured data."""
     from mlx_dspark.calibrate import CapController
-    flat = CapController({w: 50.0 for w in range(1, 9)}, 5.0, max_cap=7)
+    flat = CapController(dict.fromkeys(range(1, 9), 50.0), 5.0, max_cap=7)
     flat.p = 0.8
     assert flat.static_best() == 7                # free width -> draft as deep as allowed
     steep = CapController({w: 20.0 * w for w in range(1, 9)}, 5.0, max_cap=7)

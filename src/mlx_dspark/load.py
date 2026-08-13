@@ -80,16 +80,18 @@ REGISTRY = [
      "dspark": "Rahim/Ternary-Bonsai-27B-dspark",
      "ram": "~12 GB", "speedup": "~1.15× code"},
     # Qwen3.6-27B (qwen3_5 hybrid — the full-precision sibling of Ternary-Bonsai above; same
-    # 64-layer/5120-hidden shape, same tap layers). Community drafter by Avesed: its config says
-    # architectures=["DFlashDraftModel"] (their vLLM-fork class label) and carries target-config
-    # noise (attn_output_gate etc.), but the weights are a standard DeepSpec-standalone DSpark
-    # checkpoint with a plain dense-qwen3 backbone — config.py parses it as family "qwen3" and
-    # ignores the noise (tests/test_formats.py locks this in). Trained on-policy against a
-    # W4A16 (4-bit) quant of Qwen/Qwen3.6-27B, so a 4-bit mlx target is the matched precision;
-    # English-centric (accepts ~4.1-4.7 code/math, ~2.6 chat-EN, ~1.7 chat-ZH per its card).
-    {"id": "qwen3.6-27b", "target": "mlx-community/Qwen3.6-27B-4bit",
-     "dspark": "Avesed/Qwen3.6-27B-DSpark",
-     "ram": "~20 GB", "speedup": "~1.8× math"},
+    # 64-layer/5120-hidden shape, same tap layers). Community drafter by satgeze: a
+    # DeepSpec-standalone head (architectures ["Qwen3DSparkModel"]) with block_size 15 — the
+    # only non-7 block here, and nothing assumes 7. Trained against the bf16 target with
+    # DeepSpec online mode, warm-started from z-lab's DFlash head for the same target.
+    # Its config carries partial_rotary_factor/mrope/gate fields copied from the TARGET's
+    # config (DeepSpec builds the drafter config as a deepcopy); config.py treats them as the
+    # noise they are — see the qwen35_native gate there and tests/test_formats.py.
+    # 8-bit is the measured target (2.29x at cap 4, accept 3.15); 4-bit resolves the same
+    # drafter and by the Ornith pattern should trade ratio for absolute tok/s — unmeasured.
+    {"id": "qwen3.6-27b", "target": "mlx-community/Qwen3.6-27B-8bit",
+     "dspark": "satgeze/Qwen3.6-27B-DSpark",
+     "ram": "~32 GB", "speedup": "~2.3×"},
     # DeepReinforce Ornith-1.0-9B (qwen3_5 hybrid, agentic coding). Community drafter by
     # stanleyphoong — DeepSpec-standalone layout with a qwen3_5-flavored backbone (gated
     # q_proj + partial rotary; handled by the qwen3 config branch's gated_q_proj/rope_dims
@@ -100,6 +102,65 @@ REGISTRY = [
     {"id": "ornith-1.0-9b", "target": "mlx-community/Ornith-1.0-9B-8bit",
      "dspark": "stanleyphoong/Ornith-1.0-9B-DSpark",
      "ram": "~13 GB", "speedup": "~2.2×"},
+    # Qwen3.6-35B-A3B — the first **MoE** target here (qwen3_5_moe: 40 layers, 30 linear +
+    # 10 full attention, 256 experts top-8, ~3.8B active). Community drafter by Koopah:
+    # DeepSpec-standalone, block_size 8, 8 taps, plain dense-qwen3 backbone; loaded with zero
+    # model-code change (the qwen3_5_moe route and the hybrid tap/rollback already existed).
+    # **4-bit is the registered quant on purpose.** The drafter was trained on-policy against
+    # unsloth/Qwen3.6-35B-A3B-NVFP4, and 4-bit is also where an MoE target belongs here: only
+    # ~3.8B params are active, so the baseline is already ~87 tok/s and 8-bit would halve that
+    # to buy ratio. Measured best 1.32x (see README) — modest, and the reason is structural
+    # rather than a bad drafter: acceptance is high (up to 7.0/round on math), but a target
+    # step is only ~11.5 ms while the 1.53B DENSE drafter costs ~5.7 ms of it. See NOTES
+    # "Qwen3.6-35B-A3B: the first MoE target".
+    {"id": "qwen3.6-35b-a3b", "target": "mlx-community/Qwen3.6-35B-A3B-4bit",
+     "dspark": "Koopah/Qwen3.6-35B-A3B-NVFP4-DSPARK",
+     "ram": "~23 GB", "speedup": "~1.3×"},
+    # NVIDIA Nemotron-3.5-Lightning-30B-A3B — a hybrid **Mamba-2 + MoE + attention** target
+    # (model_type nemotron_h: 52 blocks, 128 experts top-6 + 1 shared, ~3B active, latent MoE),
+    # the first non-attention recurrence here. NVIDIA's official DSpark head: a plain qwen3 GQA
+    # backbone with DFlash-lineage traits (causal block, sliding-window-1024, per-head attention
+    # sink, block_size 8, sample_from_anchor=false) and a markov-512 fixup head that reuses the
+    # target's lm_head (has_lm_head=false). Needs the nemotron_h tap + Mamba-2 rollback in
+    # target.py. Measured (M4 Pro, 4-bit target): baseline ~91 tok/s, cap 4 = 1.27x code /
+    # 1.24x math / 1.06x chat (accept 4.55/4.41/3.74); lossless (fp/recurrent-state ties). The
+    # MoE verify-width cost bounds the speedup, not the drafter. Drafter is bf16 (dequantized
+    # from NVIDIA's modelopt NVFP4 head via nvfp4_convert.py); the raw NVFP4 repo also loads
+    # (auto-decoded on first use). See NOTES "Nemotron-3.5-Lightning: the first Mamba hybrid".
+    {"id": "nemotron-3.5-lightning-30b-a3b",
+     "target": "mlx-community/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-4bit",
+     "dspark": "mlx-community/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-DSpark-bf16",
+     "ram": "~20 GB", "speedup": "~1.25× code"},
+    # Meta Muse-Glimmer-30B — the first **muse_glimmer** (multimodal, 3:1 sliding/full attention,
+    # NoPE globals, ~30B DENSE) target, loaded via mlx-vlm >= 0.6.12. Unlike gemma4, its language
+    # model ships no capture_layer_ids hook, so target.py replicates its text forward for the tap.
+    # Community DSpark drafter by DaoCloud (vLLM speculators packaging): a 5-layer qwen3 GQA backbone
+    # warm-started from Meta's DFlash assistant, so its block attention is CAUSAL sliding-window-2048
+    # and it reuses the target's embed_tokens AND lm_head (ships neither; the first head here to reuse
+    # both). block_size 15, sample_from_anchor (logits_start 0), full 202048 vocab, markov + confidence.
+    # Measured (M4 Pro, 4-bit target, warm, paired): baseline ~14 tok/s; cap 2 (auto's pick) = 1.50x
+    # code / 1.50x math / 1.40x chat (accept ~2.5); cap 4 lifts accept to ~3.3 at ~1.4x. Lossless
+    # (fp ties only; muse's output_multiplier 0.196 + softcap 20 compress logits, so near-ties are
+    # more frequent than a dense model but every divergence margin is sub-ulp). Peak RAM ~26 GB.
+    # Modest ratio is structural: a 30B DENSE 4-bit verify is expensive (curve knees at width 3, so
+    # the cap stays at 2), and the drafter was trained against the BF16 verifier — the 4-bit target
+    # is a precision step away (accept 4.6 on bf16 per the card -> ~3.3 here).
+    #
+    # **8-bit target (`mlx-community/Muse-Glimmer-30B-8bit`, 2026-08-12): the ratio ~DOUBLES.**
+    # The verify curve is flat to width 5 then knees at 6 (vs 4-bit's knee at 3), so auto-cap picks
+    # **4**, and 8-bit sits closer to the drafter's BF16 training verifier — both lift the payoff:
+    # baseline 8.2 tok/s -> **cap 4 = 2.44x code / 2.04x math / 1.74x chat** (accept 3.58/3.00/2.51;
+    # decode-only, prefill removed, hits 2.53x on code). Lossless (cap 2 & cap 4 diverge from
+    # single-row greedy at the SAME fp-tie position, 39). Peak RAM ~40 GB (fits 48 but tight). The
+    # catch: 8-bit decode reads ~2x the weight bytes, so ABSOLUTE throughput is ~parity with 4-bit
+    # on code (~22 tok/s) and lower on math/chat — the better ratio buys 8-bit quality at ~4-bit
+    # speed, not raw speed. bf16 (~60 GB) still does not fit 48 GB. Registry stays on 4-bit as the
+    # broad-RAM default (~18 GB); the same drafter auto-resolves for the 8-bit target (basename
+    # match). See NOTES "Muse-Glimmer-30B: the first muse_glimmer target (and reuse-both
+    # DFlash-lineage head)".
+    {"id": "muse-glimmer-30b", "target": "mlx-community/Muse-Glimmer-30B-4bit",
+     "dspark": "DaoCloud/Muse-Glimmer-30B-DSpark",
+     "ram": "~26 GB (4-bit) / ~40 GB (8-bit)", "speedup": "~1.5× (8-bit: ~2.4×)"},
 ]
 
 # legacy `--family` / load_pair("qwen3") values -> a concrete target repo (deprecated).
@@ -249,14 +310,49 @@ def load_drafter(
     A checkpoint whose tensor names don't match the model raises (``strict=True``
     default) — a partially-loaded drafter "works" with near-zero acceptance, which
     is worse than an error. ``strict=False`` restores warn-and-load-anyway.
+
+    A modelopt-NVFP4 drafter (NVIDIA Nemotron DSpark head) is transparently dequantized to a
+    cached bf16 checkpoint first (mlx-lm has no modelopt loader), exactly as the GGUF Bonsai
+    drafters are converted on first use.
     """
-    path = _resolve(repo_or_path)
+    from .nvfp4_convert import ensure_converted as _ensure_nvfp4
+
+    path = _ensure_nvfp4(_resolve(repo_or_path))
     config = DSparkConfig.from_json(os.path.join(path, "config.json"))
-    drafter = DSparkDrafter(config)
 
     weights: dict[str, mx.array] = {}
     for st in glob.glob(os.path.join(path, "*.safetensors")):
         weights.update(mx.load(st))
+
+    # A DFlash-warm-started head reuses the target's own embed_tokens and/or lm_head and ships
+    # neither weight (DaoCloud/Muse-Glimmer-30B-DSpark reuses BOTH; the Nemotron head ships
+    # embed but reuses lm_head). The checkpoint is authoritative about what's present, so read
+    # the reuse flags from it — the same detection nvfp4_convert does for has_lm_head — and
+    # build the drafter without the parts it will bind from the target at generation time.
+    config.has_own_embed = "embed_tokens.weight" in weights
+    config.has_own_lm_head = "lm_head.weight" in weights
+    drafter = DSparkDrafter(config)
+
+    # Reduced-draft-vocab heads ship two index tables next to the weights: `d2t`
+    # (draft->target offsets, which inference needs) and `t2d` (a target-side boolean
+    # membership mask, which only the trainer needs — previous tokens reaching the drafter
+    # are already target ids). Both are index data rather than parameters, so pull them out
+    # before the name check: otherwise they read as "unexpected" keys and would be quantized.
+    d2t = weights.pop("d2t", None)
+    weights.pop("t2d", None)
+    if config.draft_vocab_size and d2t is None:
+        raise ValueError(
+            f"{repo_or_path}: config declares draft_vocab_size={config.draft_vocab_size} "
+            f"but the checkpoint has no `d2t` table, so draft ids cannot be mapped back to "
+            f"target ids. Every draft token would decode as a different word while the "
+            f"drafter still appeared to run — refusing to load."
+        )
+    if d2t is not None and not config.draft_vocab_size:
+        raise ValueError(
+            f"{repo_or_path}: checkpoint ships a `d2t` table but the config declares no "
+            f"draft_vocab_size — the drafter would emit draft-space ids as if they were "
+            f"target ids."
+        )
 
     # Diagnose name mismatches before loading.
     model_keys = {k for k, _ in _flatten_params(drafter)}
@@ -289,6 +385,9 @@ def load_drafter(
             if isinstance(m, nn.RMSNorm):
                 m.weight = m.weight + 1.0
 
+    if d2t is not None:
+        drafter.set_draft_vocab_map(d2t)
+
     if quantize:
         # Quantize Linear/Embedding weights; norms/scalars stay full precision. The GIDD
         # log-SNR MLP (Bonsai drafters) is excluded to match PrismML's own packaging (it
@@ -320,7 +419,8 @@ def load_dflash(repo_or_path: str, *, quantize: bool = True, bits: int = 4, grou
     from .dflash_model import DFlashConfig, DFlashDraftModel
 
     path = _resolve(repo_or_path)
-    cfg = json.loads(open(os.path.join(path, "config.json")).read())
+    with open(os.path.join(path, "config.json")) as f:
+        cfg = json.load(f)
     if cfg.get("markov_rank"):
         # Community hybrids exist (DFlash block-16 backbone + a DSpark Markov head,
         # e.g. Hikari07jp/DSpark-Gemma-4-31B-draft) — our vendored z-lab DFlashDraftModel
@@ -333,13 +433,23 @@ def load_dflash(repo_or_path: str, *, quantize: bool = True, bits: int = 4, grou
     rope = cfg.get("rope_parameters") or {}
     rope_theta = cfg.get("rope_theta", rope.get("rope_theta", 1_000_000.0))
     layer_types = tuple(cfg.get("layer_types") or ["full_attention"] * cfg["num_hidden_layers"])
+    # z-lab ships the DFlash-specific fields either at the top level (the gemma4 / Qwen3-4B
+    # era heads) or nested under `dflash_config` (Qwen3.6-35B-A3B and later). Read every one
+    # of them the same way — block_size used to be the odd one out, which made a nested-config
+    # head die with a bare KeyError instead of loading.
     dfc = cfg.get("dflash_config", {})
+    block_size = dfc.get("block_size", cfg.get("block_size"))
+    if block_size is None:
+        raise ValueError(
+            f"{repo_or_path}: no block_size in the config (looked at the top level and under "
+            f"'dflash_config') — this does not look like a z-lab DFlash drafter checkpoint."
+        )
     config = DFlashConfig(
         hidden_size=cfg["hidden_size"], num_hidden_layers=cfg["num_hidden_layers"],
         num_attention_heads=cfg["num_attention_heads"], num_key_value_heads=cfg["num_key_value_heads"],
         head_dim=cfg["head_dim"], intermediate_size=cfg["intermediate_size"], vocab_size=cfg["vocab_size"],
         rms_norm_eps=cfg["rms_norm_eps"], rope_theta=rope_theta,
-        max_position_embeddings=cfg["max_position_embeddings"], block_size=cfg["block_size"],
+        max_position_embeddings=cfg["max_position_embeddings"], block_size=int(block_size),
         target_layer_ids=tuple(dfc.get("target_layer_ids") or cfg["target_layer_ids"]),
         num_target_layers=cfg["num_target_layers"],
         mask_token_id=dfc.get("mask_token_id", cfg.get("mask_token_id", 0)),
@@ -428,7 +538,7 @@ def _shim_gemma4_unified_processor(cls=None) -> bool:
             from mlx_vlm.models.gemma4_unified.processing_gemma4_unified import (
                 Gemma4UnifiedProcessor,
             )
-        except Exception:
+        except Exception:  # noqa: BLE001 — no mlx-vlm / no gemma4 module: nothing to shim
             return False
         cls = Gemma4UnifiedProcessor
     import inspect

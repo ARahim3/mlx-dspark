@@ -46,7 +46,7 @@ def test_stop_straddling_rounds_held_back():
 
 
 def test_earliest_of_multiple_stops_wins():
-    streamed, text, stopped = _run(["END", "STOP"], ["xxSTOPyyENDzz"])
+    _streamed, text, stopped = _run(["END", "STOP"], ["xxSTOPyyENDzz"])
     assert text == "xx" and stopped
 
 
@@ -72,10 +72,9 @@ def test_streamer_uses_streaming_detokenizer_for_fast_tokenizers():
     # BPE streaming detokenizer — not the O(n²) full-decode fallback — and produce
     # byte-identical text to tokenizer.decode
     __import__("pytest").importorskip("tokenizers")
+    from mlx_lm.tokenizer_utils import BPEStreamingDetokenizer
     from tokenizers import Tokenizer, decoders, models, pre_tokenizers, trainers
     from transformers import PreTrainedTokenizerFast
-
-    from mlx_lm.tokenizer_utils import BPEStreamingDetokenizer
 
     tk = Tokenizer(models.BPE(unk_token=None))
     tk.pre_tokenizer = pre_tokenizers.ByteLevel(add_prefix_space=False)

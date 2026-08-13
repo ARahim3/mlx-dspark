@@ -39,7 +39,7 @@ whole block of mask positions in a single parallel (block-diffusion) pass.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Dict, Optional, Tuple
+from typing import Any
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -62,13 +62,13 @@ class DFlashConfig:
     rope_theta: float
     max_position_embeddings: int
     block_size: int
-    target_layer_ids: Tuple[int, ...]
+    target_layer_ids: tuple[int, ...]
     num_target_layers: int
     mask_token_id: int = 0
-    rope_scaling: Optional[Dict[str, Any]] = None
-    layer_types: Tuple[str, ...] = field(default_factory=tuple)
-    sliding_window: Optional[int] = None
-    final_logit_softcapping: Optional[float] = None
+    rope_scaling: dict[str, Any] | None = None
+    layer_types: tuple[str, ...] = field(default_factory=tuple)
+    sliding_window: int | None = None
+    final_logit_softcapping: float | None = None
 
 
 def _build_rope(head_dim, rope_theta, max_position_embeddings, rope_scaling):
@@ -102,7 +102,7 @@ class DFlashAttention(nn.Module):
         S = x_ctx.shape[1]
         if self.is_sliding:
             keep_ctx = self.sliding_window - 1
-            if S > keep_ctx:
+            if keep_ctx < S:
                 skip = S - keep_ctx
                 x_ctx = x_ctx[:, skip:]
                 S = x_ctx.shape[1]

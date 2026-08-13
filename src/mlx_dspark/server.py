@@ -22,6 +22,7 @@ Endpoints: ``POST /v1/chat/completions`` (stream + non-stream), ``POST /v1/compl
 from __future__ import annotations
 
 import atexit
+import contextlib
 import json
 import os
 import queue as _queue
@@ -43,9 +44,9 @@ from .generate import (
     speculative_generate,
 )
 from .load import apply_wired_limit, load_dflash, load_drafter, load_target, resolve_mode
-from .telemetry import RoundLog, RoundRecorder
 from .lookup import lookup_generate
 from .prefix_cache import PrefixCache, target_cache_reusable
+from .telemetry import RoundLog, RoundRecorder
 from .tools import normalize_tool_messages, parse_tool_calls, schema_types
 
 MODES = ("dspark", "dflash", "lookup", "baseline")
@@ -177,21 +178,32 @@ class Engine:
         }
 
     def _build_prefix_cache(self, enabled, l2_dir, max_ram_mb):
-        """Enable prefix caching where reuse is exact: dspark/lookup/baseline on dense
-        (KVCache) targets, and on sliding-window (RotatingKVCache) targets like Gemma-4
-        while under the window — entries are refused at store time once any layer wraps.
-        Disabled for DFlash (its drafter cache can't roll back)."""
+        """Enable prefix caching for dspark/lookup/baseline, in whichever mode this target
+        supports (see :mod:`~mlx_dspark.prefix_cache`): **trim** for dense (KVCache) and
+        sliding-window targets — which latches to checkpoint the first time a window wraps
+        — and **checkpoint** from the start for targets whose caches can't be rolled back
+        at all (hybrid linear-attention: Ornith, Bonsai, Qwen3.6-27B). Those used to get no
+        prefix caching whatsoever, which cost them the agent workload outright: prefill is
+        ~90% of an uncached Claude Code turn. Still disabled for DFlash (its *drafter*
+        cache can't roll back, and it isn't snapshotted here)."""
         if not enabled or self.mode == "dflash":
             return None
         try:
-            if not target_cache_reusable(self.target.make_cache()):
-                return None
+            checkpoint = not target_cache_reusable(self.target.make_cache())
         except Exception:  # noqa: BLE001
             return None
         make_ctx = self.drafter.make_ctx_cache if self.mode == "dspark" else None
         return PrefixCache(self.target.make_cache, make_ctx,
                            l2_dir=l2_dir, max_ram_bytes=max(0, max_ram_mb) * 1024 * 1024,
-                           slots=self.prefix_cache_slots)
+                           slots=self.prefix_cache_slots, checkpoint=checkpoint)
+
+    @property
+    def is_muse(self) -> bool:
+        """True for muse_glimmer targets, whose "Onyx ATEM" harmony output needs the recipient-
+        channel parser (analysis `to=self` -> thinking, `to=user` -> answer, `<atem:invoke>` ->
+        tool call). The streaming paths use this to engage muse handling without ambiguity; the
+        non-streaming split/tool-parse functions auto-detect from muse's unique markers."""
+        return bool(getattr(self.target, "_muse", False))
 
     # --- construction ---
     @classmethod
@@ -222,7 +234,8 @@ class Engine:
         batch_widths: list[int] | None = None,   # e.g. [2, max_batch]: calibrate (B,cap) grid
         kv_bits: int | None = None,              # quantize the target KV cache (4/8)
         context_window: int | None = None,       # override the target's own limit
-    ) -> "Engine":
+        wide_gemm_min: int | None = None,        # prefill wide-GEMM: None=calibrate, 0=off, N=forced
+    ) -> Engine:
         if mode != "auto" and mode not in MODES:
             raise ValueError(f"mode must be one of {MODES} or 'auto', got {mode!r}")
         # "auto" picks the best available speculation for this target (dspark -> dflash ->
@@ -254,6 +267,11 @@ class Engine:
 
                 ctrl = calibrate(tgt, draft, mode=mode, target_repo=target_repo,
                                  drafter_repo=drafter_repo, batch_widths=batch_widths)
+            # prefill wide-GEMM path (dequantize once above a calibrated width) — process
+            # -wide, measured once and cached like the cap
+            from .calibrate import apply_wide_gemm
+
+            apply_wide_gemm(tgt, draft, target_repo=target_repo, min_rows=wide_gemm_min)
             return tgt, tok, draft, ctrl
 
         tgt, tok, draft, cap_controller = executor.submit(_load_models).result()
@@ -326,8 +344,14 @@ class Engine:
         # dense target); `cache is None` means this mode/target doesn't reuse.
         cache = ctx = None
         reuse_len = 0
+        on_prefill = None
         if self.prefix is not None:
             cache, ctx, reuse_len = self.prefix.acquire(prompt_ids)
+            if self.prefix.wants_checkpoint():
+                # snapshot at the prompt boundary (the only moment the caches hold exactly
+                # the prompt) — the reuse path for caches that cannot be trimmed back
+                def on_prefill(c, x, n, _ids=prompt_ids):
+                    self.prefix.checkpoint(c, x, n, _ids)
         try:
             if self.mode == "dspark":
                 res = speculative_generate(
@@ -340,7 +364,7 @@ class Engine:
                     temperature=temperature, top_p=top_p, top_k=top_k,
                     presence_penalty=presence_penalty, frequency_penalty=frequency_penalty,
                     logprobs=logprobs, seed=seed, stop=stop, on_text=on_text,
-                    on_round=on_round,
+                    on_round=on_round, on_prefill=on_prefill,
                 )
             elif self.mode == "dflash":
                 res = dflash_generate(
@@ -358,6 +382,7 @@ class Engine:
                     long_draft_tokens=max(self.max_draft_tokens or 6, self.lookup_long_draft),
                     temperature=temperature, top_p=top_p, top_k=top_k,
                     seed=seed, stop=stop, on_text=on_text, on_round=on_round,
+                    on_prefill=on_prefill,
                 )
             else:
                 res = greedy_generate(
@@ -367,6 +392,7 @@ class Engine:
                     top_k=top_k, presence_penalty=presence_penalty,
                     frequency_penalty=frequency_penalty, logprobs=logprobs, seed=seed,
                     stop=stop, on_text=on_text, on_round=on_round,
+                    on_prefill=on_prefill,
                 )
         except BaseException:                     # never leave a desynced cache behind
             if self.prefix is not None:
@@ -433,10 +459,8 @@ class Engine:
         self.target = None
         self.drafter = None
         self.cap_controller = None
-        try:
+        with contextlib.suppress(Exception):  # best-effort; a failed cache clear is not fatal
             mx.clear_cache()                 # return the just-freed buffers to the OS
-        except Exception:  # noqa: BLE001 — best-effort; a failed cache clear is not fatal
-            pass
 
     def race_arms_available(self) -> list[str]:
         """Which decode strategies can be raced with what is currently loaded.
@@ -700,7 +724,7 @@ _STOP = object()   # sentinel: unwedges the scheduler thread so the process can 
 
 class _Job:
     """One queued generation request awaiting a (possibly batched) run."""
-    __slots__ = ("prompt_ids", "params", "on_text", "result", "error", "done")
+    __slots__ = ("done", "error", "on_text", "params", "prompt_ids", "result")
 
     def __init__(self, prompt_ids, params, on_text):
         self.prompt_ids = prompt_ids
@@ -752,10 +776,11 @@ class BatchEngine:
     def generate(self, prompt_ids, *, max_tokens, temperature, top_p=1.0, top_k=0,
                  presence_penalty=0.0, frequency_penalty=0.0, logprobs=None, stop=None,
                  seed=None, on_text=None) -> GenResult:
-        job = _Job(prompt_ids, dict(max_tokens=max_tokens, temperature=temperature,
-                                    top_p=top_p, top_k=top_k, presence_penalty=presence_penalty,
-                                    frequency_penalty=frequency_penalty, logprobs=logprobs,
-                                    stop=stop or [], seed=seed), on_text)
+        job = _Job(prompt_ids,
+                   {"max_tokens": max_tokens, "temperature": temperature,
+                    "top_p": top_p, "top_k": top_k, "presence_penalty": presence_penalty,
+                    "frequency_penalty": frequency_penalty, "logprobs": logprobs,
+                    "stop": stop or [], "seed": seed}, on_text)
         self._q.put(job)
         job.done.wait()
         if job.error is not None:
@@ -943,11 +968,20 @@ class BatchEngine:
 
 def maybe_batch_engine(engine: Engine, max_batch: int):
     """Wrap ``engine`` in a :class:`BatchEngine` iff batching can help and is safe here: opt-in
-    (``max_batch > 1``), a batchable dense mlx-lm target, and a mode with a batched kernel
-    (dspark/baseline). Otherwise return the engine unchanged (serialized)."""
-    from .batch_engine import batchable
+    (``max_batch > 1``), a batchable mlx-lm target, and a mode with a batched kernel
+    (dspark/baseline). Otherwise return the engine unchanged (serialized).
 
-    if max_batch <= 1 or engine.mode not in ("dspark", "baseline") or not batchable(engine.target):
+    The two modes have different requirements: baseline batching needs only a batched forward
+    (:func:`batchable`, which covers the qwen3_5 hybrids), while dspark batching additionally
+    needs per-row rollback of every layer (:func:`batch_spec_supported`). A hybrid target in
+    dspark mode therefore stays serialized rather than silently taking a path its recurrent
+    caches cannot roll back."""
+    from .batch_engine import batch_spec_supported, batchable
+
+    if max_batch <= 1 or engine.mode not in ("dspark", "baseline"):
+        return engine
+    ok = batch_spec_supported if engine.mode == "dspark" else batchable
+    if not ok(engine.target):
         return engine
     return BatchEngine(engine, max_batch=max_batch)
 
@@ -1030,7 +1064,7 @@ class EngineHolder:
                 engine = Engine.load(**kwargs)
                 engine = maybe_batch_engine(engine, self._max_batch)
                 self._engine = engine
-            except Exception as e:  # noqa: BLE001 — report the reason to the client
+            except Exception as e:
                 self._load_error = str(e)
                 raise
             finally:
@@ -1165,14 +1199,14 @@ def make_handler(engine: Engine, api_key: str | None):
             before the data line); OpenAI's is unnamed, so ``event`` is optional."""
             head = f"event: {event}\n" if event else ""
             with self._wlock:
-                self.wfile.write(f"{head}data: {json.dumps(obj)}\n\n".encode("utf-8"))
+                self.wfile.write(f"{head}data: {json.dumps(obj)}\n\n".encode())
                 self.wfile.flush()
 
         def _sse_comment(self, text: str):
             """A comment frame — ignored by every SSE client, but it keeps the socket alive
             through an idle stretch (no rounds running) without inventing a fake event."""
             with self._wlock:
-                self.wfile.write(f": {text}\n\n".encode("utf-8"))
+                self.wfile.write(f": {text}\n\n".encode())
                 self.wfile.flush()
 
         # -- auth --
@@ -1399,7 +1433,7 @@ def make_handler(engine: Engine, api_key: str | None):
 
         def do_POST(self):
             route = self._route()
-            anthropic = route.endswith("/messages") or route.endswith("/messages/count_tokens")
+            anthropic = route.endswith(("/messages", "/messages/count_tokens"))
             if not self._authed():
                 if anthropic:
                     return self._send_json(401, A.error_body("invalid api key",
@@ -1432,7 +1466,7 @@ def make_handler(engine: Engine, api_key: str | None):
                     return self._race(req)
             except (BrokenPipeError, ConnectionResetError):
                 return  # client hung up mid-stream; nothing more to do
-            except Exception as e:  # keep the server alive on a bad request
+            except Exception as e:  # noqa: BLE001 — keep the server alive on a bad request
                 if anthropic:
                     traceback.print_exc()
                     return self._send_json(500, A.error_body(
@@ -1476,7 +1510,7 @@ def make_handler(engine: Engine, api_key: str | None):
             try:
                 prompt_ids = encode_messages(
                     engine.tokenizer, normalize_tool_messages(messages), **tkw)
-            except Exception as e:
+            except Exception as e:  # noqa: BLE001 — any template failure is a 400, not a crash
                 return self._send_error(400, f"could not apply chat template: {e}")
             self._run(req, prompt_ids, chat=True)
 
@@ -1527,12 +1561,12 @@ def make_handler(engine: Engine, api_key: str | None):
                 # Phrased so Claude Code's automatic compact-and-retry recognises it.
                 return self._send_json(400, A.context_overflow_error(len(prompt_ids), window))
             temperature, top_p, top_k = _sampling(req, engine.sampling_defaults)
-            params = dict(
-                max_tokens=_clamp_tokens(req.get("max_tokens"), engine.default_max_tokens,
-                                         engine.max_tokens_cap),
-                temperature=temperature, top_p=top_p, top_k=top_k,
-                stop=A.norm_stop_sequences(req), seed=None,
-            )
+            params = {
+                "max_tokens": _clamp_tokens(req.get("max_tokens"), engine.default_max_tokens,
+                                            engine.max_tokens_cap),
+                "temperature": temperature, "top_p": top_p, "top_k": top_k,
+                "stop": A.norm_stop_sequences(req), "seed": None,
+            }
             model = req.get("model") or engine.model_id
             # A reasoning model emits <think>…</think> whatever the request says; `thinking`
             # only decides whether that becomes a thinking block or is dropped. Absent means
@@ -1563,7 +1597,8 @@ def make_handler(engine: Engine, api_key: str | None):
         def _messages_stream(self, prompt_ids, params, model, want_thinking=True, schemas=None):
             stream = A.MessageStream(model=model, input_tokens=len(prompt_ids),
                                      thinking=want_thinking, schemas=schemas,
-                                     in_thinking=self._prompt_opens_thinking(prompt_ids))
+                                     in_thinking=self._prompt_opens_thinking(prompt_ids),
+                                     muse=engine.is_muse)
             self._sse_start()
             for name, payload in stream.start():
                 self._sse(payload, name)
@@ -1610,15 +1645,16 @@ def make_handler(engine: Engine, api_key: str | None):
             # request value > model's generation_config recommendation > library default —
             # explicit client settings always win; the model defaults only fill absences.
             temperature, top_p, top_k = _sampling(req, engine.sampling_defaults)
-            params = dict(
-                max_tokens=_clamp_tokens(req.get("max_tokens") or req.get("max_completion_tokens"),
-                                         engine.default_max_tokens, engine.max_tokens_cap),
-                temperature=temperature, top_p=top_p, top_k=top_k,
-                presence_penalty=float(req.get("presence_penalty") or 0.0),
-                frequency_penalty=float(req.get("frequency_penalty") or 0.0),
-                stop=_norm_stop(req.get("stop")),
-                seed=req.get("seed"),
-            )
+            params = {
+                "max_tokens": _clamp_tokens(
+                    req.get("max_tokens") or req.get("max_completion_tokens"),
+                    engine.default_max_tokens, engine.max_tokens_cap),
+                "temperature": temperature, "top_p": top_p, "top_k": top_k,
+                "presence_penalty": float(req.get("presence_penalty") or 0.0),
+                "frequency_penalty": float(req.get("frequency_penalty") or 0.0),
+                "stop": _norm_stop(req.get("stop")),
+                "seed": req.get("seed"),
+            }
             # logprobs: chat sends {logprobs: bool, top_logprobs: int}; completions {logprobs: int}
             if chat:
                 params["logprobs"] = (int(req.get("top_logprobs") or 0)
@@ -1661,12 +1697,19 @@ def make_handler(engine: Engine, api_key: str | None):
             choices = []
             for i, res in enumerate(res_list):
                 if chat:
-                    content, finish, tool_calls = res.text, res.finish_reason, None
+                    # split reasoning out of the text (Qwen `<think>`, Gemma thought channel,
+                    # muse `to=self` analysis) so it rides in `reasoning_content` instead of
+                    # leaking into content — and so tool calls parse from the answer, not the
+                    # reasoning. split_thinking auto-detects the format; no reasoning -> ("", text).
+                    reasoning, content = A.split_thinking(res.text)
+                    finish, tool_calls = res.finish_reason, None
                     if want_tools:
-                        parsed, cleaned = parse_tool_calls(res.text)
+                        parsed, cleaned = parse_tool_calls(content, schema_types(req.get("tools")))
                         if parsed:
                             tool_calls, content, finish = parsed, (cleaned or None), "tool_calls"
                     message = {"role": "assistant", "content": content}
+                    if reasoning:
+                        message["reasoning_content"] = reasoning
                     if tool_calls:
                         message["tool_calls"] = tool_calls
                     choice = {"index": i, "message": message, "finish_reason": finish}
@@ -1702,7 +1745,10 @@ def make_handler(engine: Engine, api_key: str | None):
                 # buffer, then emit tool_calls (or cleaned content) in one delta — incremental
                 # tool-call streaming isn't reliable to reconstruct, so we resolve at the end
                 res = engine.generate(prompt_ids, on_text=None, **params)
-                parsed, cleaned = parse_tool_calls(res.text)
+                reasoning, answer = A.split_thinking(res.text)
+                parsed, cleaned = parse_tool_calls(answer, schema_types(req.get("tools")))
+                if reasoning:
+                    self._sse(base({"reasoning_content": reasoning}, None))
                 if parsed:
                     self._sse(base({"tool_calls": [{"index": i, **tc}
                                                    for i, tc in enumerate(parsed)]}, None))
@@ -1711,6 +1757,27 @@ def make_handler(engine: Engine, api_key: str | None):
                     if cleaned:
                         self._sse(base({"content": cleaned}, None))
                     finish = res.finish_reason
+            elif chat and engine.is_muse:
+                # muse streams its analysis (`to=self`) and answer (`to=user`) channels
+                # interleaved with structural markers; split them incrementally so reasoning
+                # rides in `reasoning_content` and only the answer lands in `content`.
+                muse = A.MuseChannelParser()
+
+                def _emit_muse(chunks):
+                    for kind, text in chunks:
+                        if not text:
+                            continue
+                        field = "reasoning_content" if kind == "reasoning" else "content"
+                        self._sse(base({field: text}, None))
+
+                def on_text(piece: str):
+                    try:
+                        _emit_muse(muse.feed(piece))
+                    except (BrokenPipeError, ConnectionResetError) as e:
+                        raise StopStreaming() from e
+                res = engine.generate(prompt_ids, on_text=on_text, **params)
+                _emit_muse(muse.feed("", final=True))   # flush the held-back tail
+                finish = res.finish_reason
             else:
                 def on_text(piece: str):
                     try:

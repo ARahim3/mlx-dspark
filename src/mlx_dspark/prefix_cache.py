@@ -6,13 +6,26 @@ for DSpark, the drafter's context cache) from recent conversations and, on the n
 reuses the entry with the longest common prefix: trim the caches back to it and prefill only the
 new suffix.
 
-Scope (chosen for correctness):
-  * **Dense targets, plus sliding-window targets while under the window.** Reuse trims the KV
-    cache back to an arbitrary earlier position. That's always exact for a plain ``KVCache``
-    (Qwen3). A ``RotatingKVCache`` (Gemma-4's sliding-window layers) is linear — identical to a
-    plain cache — until it first wraps at ``max_size``; mlx-lm's own ``is_trimmable()`` encodes
-    exactly this. So rotating caches are reused too, and an entry is refused at store time the
-    moment any layer has wrapped (typical chats stay well under the window).
+Two reuse modes, because "can this cache be rolled back?" and "can this cache be reused?" are
+different questions:
+
+  * **trim** (default) — trim the stored caches back to an arbitrary earlier position and
+    prefill the rest. Exact for a plain ``KVCache`` (Qwen3). A ``RotatingKVCache`` (Gemma-4's
+    sliding-window layers) is linear — identical to a plain cache — until it first wraps at
+    ``max_size``; mlx-lm's own ``is_trimmable()`` encodes exactly this.
+  * **checkpoint** — snapshot the caches at the **prompt boundary** and reuse them only at
+    exactly that length. This needs no rollback at all, so it works for the caches trim mode
+    has to refuse: a hybrid target's linear-attention state (recurrent, no trim) and a wrapped
+    rotating window. It is exact for the same reason ``Target.rollback`` is: the state after k
+    tokens is a function of the first k tokens only, so a snapshot taken there is precisely
+    what a cold prefill of that prefix would produce. Its restriction is that reuse is
+    all-or-nothing at the boundary — which is exactly the agent-loop access pattern, where
+    turn N+1's prompt is turn N's prompt plus the reply and the tool results, so the LCP lands
+    on (or past) the previous prompt boundary every time.
+
+Mode is not a user choice: checkpoint is forced on for targets whose caches are not trimmable
+at all, and switched on adaptively for a rotating-window target the first time a store is
+refused because the window wrapped (so gemma-4 pays the snapshot only once it needs it).
   * **dspark + lookup + baseline modes.** DFlash's drafter keeps its own cache that can't roll
     back, so it isn't reused here.
   * **A small LRU of conversations** (default 2 slots) — so an agent process and a chat window
@@ -31,6 +44,7 @@ safetensors) and dropped from RAM, reloaded on their next reuse.
 
 from __future__ import annotations
 
+import contextlib
 import glob
 import json
 import os
@@ -95,25 +109,79 @@ def _cache_ram_bytes(cache) -> int:
     return total
 
 
+# -- checkpoint snapshots ---------------------------------------------------------------
+#
+# A snapshot is (state, meta_state) per layer cache — mlx-lm's own serialization contract,
+# the same pair save_prompt_cache/load_prompt_cache round-trips — held as COPIES. The copies
+# are load-bearing: a wrapped RotatingKVCache writes its ring in place, so handing out the
+# stored arrays would let one request corrupt the snapshot for every later one.
+
+
+def _copy_tree(v):
+    if isinstance(v, mx.array):
+        return mx.array(v)
+    if isinstance(v, (list, tuple)):
+        return type(v)(_copy_tree(x) for x in v)
+    return v
+
+
+def _snapshot(cache, ctx):
+    snap = [(_copy_tree(c.state), c.meta_state) for c in cache]
+    snap_ctx = None if ctx is None else [(_copy_tree(c.k), _copy_tree(c.v)) for c in ctx]
+    return snap, snap_ctx
+
+
+def _restore(make_cache, make_ctx, snapshot):
+    snap, snap_ctx = snapshot
+    cache = make_cache()
+    for c, (state, meta) in zip(cache, snap):
+        c.state = _copy_tree(state)     # KVCache derives offset from this; Rotating doesn't
+        if meta:                        # ...so a rotating cache's offset/_idx ride here
+            c.meta_state = meta
+    ctx = None
+    if snap_ctx is not None and make_ctx is not None:
+        ctx = make_ctx()
+        for c, (k, v) in zip(ctx, snap_ctx):
+            c.k, c.v = _copy_tree(k), _copy_tree(v)
+    return cache, ctx
+
+
+def _snapshot_ram_bytes(snapshot) -> int:
+    snap, snap_ctx = snapshot
+    total = sum(getattr(v, "nbytes", 0)
+                for state, _ in snap
+                for v in (state if isinstance(state, (list, tuple)) else [state]))
+    if snap_ctx:
+        total += sum(getattr(a, "nbytes", 0) for pair in snap_ctx for a in pair)
+    return total
+
+
 class _Slot:
-    """One cached conversation: its token record + the caches holding that prefix's KV."""
+    """One cached conversation: its token record + the caches holding that prefix's KV.
 
-    __slots__ = ("tokens", "cache", "ctx", "spilled", "sid")
+    ``snapshot`` is set instead of ``cache``/``ctx`` for a checkpoint slot — immutable
+    state reusable only at exactly ``len(tokens)``, and never checked out (so a failed
+    generation cannot invalidate it)."""
 
-    def __init__(self, tokens, cache, ctx, sid: int):
+    __slots__ = ("cache", "ctx", "sid", "snapshot", "spilled", "tokens")
+
+    def __init__(self, tokens, cache, ctx, sid: int, snapshot=None):
         self.tokens: list[int] = tokens
-        self.cache = cache            # None while spilled to disk
+        self.cache = cache            # None while spilled to disk, or for a checkpoint slot
         self.ctx = ctx
         self.spilled = False
         self.sid = sid                # unique id -> distinct spill filenames
+        self.snapshot = snapshot      # not None => checkpoint slot
 
 
 class PrefixCache:
     def __init__(self, make_cache, make_ctx=None, *, min_reuse: int = 16,
-                 l2_dir: str | None = None, max_ram_bytes: int = 0, slots: int = 2):
+                 l2_dir: str | None = None, max_ram_bytes: int = 0, slots: int = 2,
+                 checkpoint: bool = False):
         self.make_cache = make_cache          # () -> list[target layer cache]
         self.make_ctx = make_ctx              # () -> list[CtxCache] | None (None for baseline)
         self.min_reuse = max(1, min_reuse)
+        self.checkpoint_mode = bool(checkpoint)   # see the module docstring; can latch on
         self.l2_dir = l2_dir
         self.max_ram_bytes = max_ram_bytes    # 0 = never spill (pure in-memory)
         self.max_slots = max(1, slots)
@@ -132,10 +200,25 @@ class PrefixCache:
         best, best_len = None, 0
         for slot in self._slots:
             lcp = _lcp(slot.tokens, prompt_ids)
-            reuse = max(0, min(lcp, len(slot.tokens), len(prompt_ids) - 1))
+            if slot.snapshot is not None:
+                # checkpoint: all-or-nothing at the boundary the snapshot was taken at
+                reuse = (len(slot.tokens)
+                         if lcp >= len(slot.tokens) and len(prompt_ids) > len(slot.tokens)
+                         else 0)
+            else:
+                reuse = max(0, min(lcp, len(slot.tokens), len(prompt_ids) - 1))
             if reuse > best_len:
                 best, best_len = slot, reuse
         if best is not None and best_len >= self.min_reuse:
+            if best.snapshot is not None:
+                # not checked out: the snapshot is immutable and every restore is a copy,
+                # so a generation that errors out can't invalidate it
+                cache, ctx = _restore(self.make_cache, self.make_ctx, best.snapshot)
+                self._slots.remove(best)
+                self._slots.insert(0, best)          # LRU touch
+                self.hits += 1
+                self.reused_tokens += best_len
+                return cache, ctx, best_len
             self._slots.remove(best)          # in flight; store() re-validates
             cache, ctx = self._materialize(best)
             if cache is not None:
@@ -148,10 +231,36 @@ class PrefixCache:
                 return cache, ctx, best_len
         return self.make_cache(), (self.make_ctx() if self.make_ctx else None), 0
 
+    def wants_checkpoint(self) -> bool:
+        """True when the generate loops should call :meth:`checkpoint` after prefill."""
+        return self.checkpoint_mode
+
+    def checkpoint(self, cache, ctx, n_prompt: int, prompt_ids: list[int]) -> None:
+        """Snapshot the caches at the prompt boundary — the ``on_prefill`` hook. Only the
+        first ``n_prompt`` tokens are in the caches at this point, by construction: the
+        generate loops call this immediately after prefill and before the first round."""
+        if not self.checkpoint_mode or n_prompt < self.min_reuse:
+            return
+        tokens = list(prompt_ids[:n_prompt])
+        for slot in self._slots:                 # already have this exact boundary
+            if slot.snapshot is not None and slot.tokens == tokens:
+                return
+        slot = _Slot(tokens, None, None, self._next_sid, snapshot=_snapshot(cache, ctx))
+        self._next_sid += 1
+        self._slots.insert(0, slot)
+        while len(self._slots) > self.max_slots:
+            self._evict(self._slots.pop())
+
     def store(self, cache, ctx, prompt_ids: list[int], token_ids: list[int]) -> None:
         # the cache holds KV for the prompt + every generated token EXCEPT the last (that one is
         # the pending token, not yet fed through the target) — see the generate loops.
         if not _storable(cache):              # e.g. a RotatingKVCache wrapped mid-generation
+            # This target's caches can no longer be rolled back to an arbitrary position,
+            # so trim-mode reuse is over for it — latch checkpoint mode on and let the next
+            # request snapshot at its prompt boundary instead. (Before this, gemma-4 simply
+            # lost prefix caching for the rest of the process the first time it wrapped —
+            # which at Claude-Code prompt sizes is immediately.)
+            self.checkpoint_mode = True
             return
         tokens = list(prompt_ids) + list(token_ids[:-1])
         # ...except that a speculative round commits a whole block at once, and the loops stop
@@ -181,8 +290,11 @@ class PrefixCache:
     def info(self) -> dict:
         newest = self._slots[0] if self._slots else None
         return {"enabled": True,
+                "mode": "checkpoint" if self.checkpoint_mode else "trim",
                 "cached_tokens": len(newest.tokens) if newest else 0,
-                "slots": [{"tokens": len(s.tokens), "spilled": s.spilled} for s in self._slots],
+                "slots": [{"tokens": len(s.tokens), "spilled": s.spilled,
+                           "kind": "checkpoint" if s.snapshot is not None else "trim"}
+                          for s in self._slots],
                 "hits": self.hits, "reused_tokens": self.reused_tokens,
                 "l2": bool(self.l2_dir)}
 
@@ -198,23 +310,28 @@ class PrefixCache:
         if not self.l2_dir:
             return
         for p in self._spill_paths(slot.sid):
-            try:
+            with contextlib.suppress(OSError):
                 os.remove(p)
-            except OSError:
-                pass
 
     def _maybe_spill(self) -> None:
         if self.max_ram_bytes <= 0 or not self.l2_dir:
             return
         # spill least-recent in-RAM slots until the total fits the budget (never the newest —
-        # it's the one most likely reused next turn, unless it alone exceeds the budget)
+        # it's the one most likely reused next turn, unless it alone exceeds the budget).
+        # Checkpoint slots count toward the budget but are not spillable yet (their state
+        # isn't in live cache objects, which is what save_prompt_cache wants) — so they are
+        # the floor the trim slots get spilled around. Worth doing later: an SSD-persisted
+        # checkpoint would survive restarts, which for a fixed ~20k agent system prompt is
+        # the single most reusable thing this cache ever holds.
         def total() -> int:
-            return sum(_cache_ram_bytes(s.cache) for s in self._slots if s.cache is not None)
+            return sum(_snapshot_ram_bytes(s.snapshot) if s.snapshot is not None
+                       else _cache_ram_bytes(s.cache)
+                       for s in self._slots if s.cache is not None or s.snapshot is not None)
 
         for slot in reversed(self._slots):
             if total() <= self.max_ram_bytes:
                 return
-            if slot.cache is not None:
+            if slot.snapshot is None and slot.cache is not None:
                 self._save_spill(slot)
                 slot.cache = slot.ctx = None
                 slot.spilled = True
@@ -257,7 +374,5 @@ class PrefixCache:
         if not self.l2_dir:
             return
         for p in glob.glob(os.path.join(self.l2_dir, "*_cache_*.safetensors")):
-            try:
+            with contextlib.suppress(OSError):
                 os.remove(p)
-            except OSError:
-                pass

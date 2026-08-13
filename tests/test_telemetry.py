@@ -4,6 +4,7 @@ Model-free — the whole point of RoundLog is that it's a plain data structure t
 call into, so it can be exercised without weights.
 """
 
+import contextlib
 import queue
 import threading
 
@@ -163,10 +164,8 @@ class TestFanOut:
 
         def drain():
             while not stop.is_set():
-                try:
+                with contextlib.suppress(queue.Empty):
                     q.get(timeout=0.05)
-                except queue.Empty:
-                    pass
 
         reader = threading.Thread(target=drain)
         reader.start()

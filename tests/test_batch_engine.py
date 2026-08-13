@@ -134,6 +134,79 @@ def test_batchable_rejects_rotating_cache():
     assert not batchable(T())
 
 
+# --- hybrid (linear-attention) targets: batched baseline, but not batched spec ---
+
+def _hybrid_target():
+    from mlx_lm.models.cache import ArraysCache, KVCache
+
+    class T:
+        is_vlm = False
+        is_hybrid = True
+
+        def make_cache(self):
+            # the qwen3_5 shape: mostly recurrent layers, a minority of attention layers
+            return [ArraysCache(2), ArraysCache(2), ArraysCache(2), KVCache()]
+
+    return T()
+
+
+def test_batchable_accepts_hybrid_recurrent_layers():
+    # a fresh ArraysCache holds [None, None] — the capability query has to answer before any
+    # prefill has allocated the states
+    assert batchable(_hybrid_target())
+
+
+def test_batch_spec_unsupported_for_hybrid_but_supported_for_dense():
+    from mlx_lm.models.cache import KVCache
+
+    from mlx_dspark.batch_engine import batch_spec_supported
+
+    assert not batch_spec_supported(_hybrid_target())   # no per-row recurrent rollback yet
+
+    class Dense:
+        is_vlm = False
+
+        def make_cache(self):
+            return [KVCache(), KVCache()]
+
+    assert batch_spec_supported(Dense())
+
+
+def test_recurrent_mergeable_rejects_wrapped_rotating_cache():
+    # A wrapped RotatingKVCache is also "not trimmable and holds arrays"; merging one by
+    # concatenation would decode garbage past the window, so the gate is by class, not shape.
+    from mlx_lm.models.cache import RotatingKVCache
+
+    from mlx_dspark.batch_engine import _recurrent_mergeable
+
+    c = RotatingKVCache(8)
+    c.update_and_fetch(mx.zeros((1, 1, 32, 4)), mx.zeros((1, 1, 32, 4)))
+    assert not c.is_trimmable()          # wrapped: the case that could sneak through
+    assert not _recurrent_mergeable(c)
+
+
+def test_merge_row_caches_concatenates_recurrent_state_across_rows():
+    from mlx_lm.models.cache import ArraysCache, KVCache
+
+    from mlx_dspark.batch_engine import _merge_row_caches
+
+    rows = []
+    for b in range(3):
+        rec = ArraysCache(2)
+        rec[0] = mx.full((1, 3, 4), float(b))       # conv window
+        rec[1] = mx.full((1, 2, 4, 4), float(b))    # recurrent state
+        kv = KVCache()
+        # rows deliberately have DIFFERENT lengths — the point of the design
+        kv.update_and_fetch(mx.zeros((1, 2, b + 1, 4)), mx.zeros((1, 2, b + 1, 4)))
+        rows.append([rec, kv])
+
+    merged = _merge_row_caches(rows)
+    assert merged[0][0].shape == (3, 3, 4) and merged[0][1].shape == (3, 2, 4, 4)
+    for b in range(3):
+        assert float(merged[0][0][b].min()) == float(b)   # row b's state landed in row b
+    assert merged[1].offsets == [1, 2, 3]                 # attention layer keeps per-row lengths
+
+
 # --- slot reuse (M4 dynamic admission) ---
 
 def test_empty_then_set_row_admits():
@@ -171,7 +244,7 @@ def test_rows_view_narrows_offset_and_update():
     c.rows = 2                             # active prefix = rows 0..1
     assert c.offset.tolist() == [3, 1]
     k = mx.random.normal((2, 2, 1, 4))     # update covers only the active width
-    K, V = c.update_and_fetch(k, k)
+    K, _V = c.update_and_fetch(k, k)
     assert c.offsets == [4, 2, 4]          # row 2 untouched
     assert K.shape[0] == 2 and K.shape[2] == 4   # Lcur over the active rows only
 
@@ -211,10 +284,18 @@ def test_batched_ctx_pads_and_reports_lens():
     assert mx.allclose(bctx[0].k[1:2, :, :1, :], rows[1][0].k).item()
 
 
+class _FullVocab:
+    """Stand-in for the identity id mapping a full-vocab drafter provides."""
+
+    @staticmethod
+    def to_target_ids(ids):
+        return ids
+
+
 def test_batched_sample_block_no_markov_is_argmax():
     from mlx_dspark.batch_engine import _batched_sample_block
 
-    class D:
+    class D(_FullVocab):
         markov_head = None
 
     base = mx.zeros((2, 3, 5))
@@ -231,8 +312,41 @@ def test_batched_sample_block_markov_batches_rows():
             V = 5
             return (mx.arange(V)[None, :] == ((prev + 1) % V)[:, None]).astype(mx.float32) * 100.0
 
-    class D:
+    class D(_FullVocab):
         markov_head = FakeMarkov()
 
     out = _batched_sample_block(D(), mx.zeros((2, 2, 5)), [0, 2])
     assert out.tolist() == [[1, 2], [3, 4]]        # each row follows its own markov chain
+
+
+def test_batched_sample_block_maps_reduced_draft_vocab_before_feeding_markov():
+    """On a reduced-vocab head the argmax is a DRAFT id: it must be mapped to a target id
+    both on the way out and on the way back into markov_w1 (which is target-indexed).
+    Feeding the raw draft id back would silently pick the wrong Markov row every step."""
+    from mlx_dspark.batch_engine import _batched_sample_block
+
+    seen = []
+
+    class FakeMarkov:
+        def step_bias(self, prev):                 # record what the markov head is indexed by
+            seen.append(prev.tolist())
+            return mx.zeros((prev.shape[0], 4))
+
+    class D:
+        markov_head = FakeMarkov()
+        # draft space {0,1,2,3} -> target space {10,20,30,40}
+        _map = mx.array([10, 20, 30, 40])
+
+        @classmethod
+        def to_target_ids(cls, ids):
+            return cls._map[ids]
+
+    base = mx.zeros((2, 2, 4))
+    base[0, 0, 1] = 1.0   # draft id 1 -> target 20
+    base[0, 1, 3] = 1.0   # draft id 3 -> target 40
+    base[1, 0, 0] = 1.0   # draft id 0 -> target 10
+    base[1, 1, 2] = 1.0   # draft id 2 -> target 30
+
+    out = _batched_sample_block(D(), base, [99, 99])
+    assert out.tolist() == [[20, 40], [10, 30]]    # emitted ids are target-space
+    assert seen[1] == [20, 10]                     # and so is what markov saw at step 2

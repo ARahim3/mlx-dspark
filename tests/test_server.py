@@ -15,8 +15,8 @@ from http.server import ThreadingHTTPServer
 
 import pytest
 
-from mlx_dspark.generate import GenResult
 from mlx_dspark import server as S
+from mlx_dspark.generate import GenResult
 
 
 class _FakeTok:
@@ -38,6 +38,7 @@ class _FakeEngine:
     default_max_tokens = 2048
     max_tokens_cap = 32768
     cap_controller = None
+    is_muse = False           # mirrors Engine.is_muse (muse_glimmer channel parsing off)
 
     def __init__(self):
         self.tokenizer = _FakeTok()
@@ -47,11 +48,11 @@ class _FakeEngine:
     def generate(self, prompt_ids, *, max_tokens, temperature, top_p=1.0, top_k=0,
                  presence_penalty=0.0, frequency_penalty=0.0, logprobs=None,
                  stop, seed, on_text=None):
-        self.calls.append(dict(prompt_ids=prompt_ids, max_tokens=max_tokens,
-                               temperature=temperature, top_p=top_p, top_k=top_k,
-                               presence_penalty=presence_penalty,
-                               frequency_penalty=frequency_penalty, logprobs=logprobs,
-                               stop=stop, seed=seed))
+        self.calls.append({"prompt_ids": prompt_ids, "max_tokens": max_tokens,
+                               "temperature": temperature, "top_p": top_p, "top_k": top_k,
+                               "presence_penalty": presence_penalty,
+                               "frequency_penalty": frequency_penalty, "logprobs": logprobs,
+                               "stop": stop, "seed": seed})
         text = self.response_text
         if on_text:
             for w in text.split(" "):
@@ -109,7 +110,7 @@ def test_models(server):
 
 
 def test_chat_non_stream(server):
-    eng, base = server
+    _eng, base = server
     c = _post(base, "/v1/chat/completions",
               {"model": "x", "messages": [{"role": "user", "content": "hi"}]})
     assert c["object"] == "chat.completion"

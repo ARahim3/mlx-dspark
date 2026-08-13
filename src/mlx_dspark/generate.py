@@ -18,8 +18,10 @@ import time
 from dataclasses import dataclass
 
 import mlx.core as mx
+from mlx.utils import tree_flatten
 
 from .sampling import sample_probs, truncate_probs
+from .wide_gemm import wide_matmul
 
 TAP = None  # set from drafter config at call time
 
@@ -130,12 +132,15 @@ def eos_token_ids(tokenizer) -> set[int]:
     if isinstance(e1, int):
         ids.add(e1)
     unk = getattr(tokenizer, "unk_token_id", None)
-    # Gemma-4 (<turn|>, <|tool_response>), Gemma-3 (<end_of_turn>), Qwen (<|im_end|>), raw eos
-    for t in ("<turn|>", "<|tool_response>", "<end_of_turn>", "<|im_end|>",
+    # Gemma-4 (<turn|>, <|tool_response>), Gemma-3 (<end_of_turn>), Qwen (<|im_end|>),
+    # muse_glimmer (<|eot|>=200008 ends the assistant turn; its config eos is [200001, 200008]
+    # but the tokenizer only exposes 200001 as eos_token_id, so the turn-end must be named here
+    # or every chat turn overruns to max_tokens), raw eos
+    for t in ("<turn|>", "<|tool_response>", "<end_of_turn>", "<|im_end|>", "<|eot|>",
               "<|endoftext|>", "<eos>"):
         try:
             i = tokenizer.convert_tokens_to_ids(t)
-        except Exception:
+        except Exception:  # noqa: BLE001 — tokenizers raise various types for unknown tokens
             continue
         if isinstance(i, int) and i >= 0 and i != unk:
             ids.add(i)
@@ -373,7 +378,7 @@ class _Streamer:
 
 
 def _finish_reason(out_ids: list[int], max_new_tokens: int, last_tok: int,
-                   eos_ids: set[int], streamer: "_Streamer") -> str:
+                   eos_ids: set[int], streamer: _Streamer) -> str:
     """'stop' if a stop string / eos ended it, else 'length' if we hit the token cap."""
     if streamer.stopped or last_tok in eos_ids:
         return "stop"
@@ -400,6 +405,7 @@ def greedy_generate(
     stop: list[str] | None = None,
     on_text=None,
     on_round=None,
+    on_prefill=None,
 ) -> GenResult:
     """Plain decoding of the target (no drafter, no hidden-state capture) — the fair
     'run the model normally' baseline. ``temperature`` 0 = greedy, > 0 = sampling (matches
@@ -421,6 +427,8 @@ def greedy_generate(
     t0 = time.time()
     suffix = ids[reuse_len:] if reuse_len else ids      # only prefill past the reused prefix
     logits = _prefill_plain(target_model, suffix, cache)
+    if on_prefill is not None:
+        on_prefill(cache, None, len(ids))   # caches hold exactly `ids` right now
     out_ids: list[int] = []
     pen = _Penalizer(presence_penalty, frequency_penalty)
     lp_list: list | None = [] if logprobs is not None else None
@@ -629,22 +637,54 @@ def _run_target(target, ids: mx.array, cache, tap: list[int]):
     return target.run(ids, cache, tap)
 
 
-PREFILL_CHUNK = 2048  # long prompts prefill in pieces so activations (especially the
-# [L, vocab] logits) stay bounded, with mx.clear_cache() between pieces. Prompts within one
-# chunk take exactly the old single-forward path, and a chunked prefill is the same cached
-# multi-pass forward the verify rounds already use (lossless to the usual fp-tie standard).
+PREFILL_CHUNK = 2048  # long prompts prefill in pieces so activations stay bounded, with
+# mx.clear_cache() between pieces. Prompts within one chunk take exactly the old
+# single-forward path, and a chunked prefill is the same cached multi-pass forward the
+# verify rounds already use (lossless to the usual fp-tie standard). Since the [chunk,
+# vocab] logits are no longer materialized (see below) this is a pure activation knob;
+# don't go below ~2048, SDPA's prefill efficiency falls off under q_len 1024 (measured
+# 50% of peak at 512, 70% at 1024, 85%+ from 2048 — NOTES "Prefill pass").
+
+PREFILL_LAST_ROW_HEAD = True  # Project only the LAST row of the final prefill chunk to
+# vocab. Every prefill caller reads exactly logits[0, -1] (it becomes the first sampled
+# token), so the rest of that [chunk, vocab] matmul is thrown away — ~7-8% of prefill
+# FLOPs on an 8-bit Qwen3-8B. Skipping it on NON-final chunks is bit-identical and is
+# unconditional; this knob additionally slices the final chunk, which moves that one row
+# onto the quantized matvec path (the path every decode step takes): the usual fp-tie
+# class, measured max|Δlogit| = 0.06 = 1-2 bf16 ulps. Set False for a bit-identical
+# prefill at the cost of the whole win on prompts that fit in one chunk.
+
+WIDE_GEMM_MIN_ROWS = None  # Rows from which QuantizedLinear switches to dequantize-once +
+# GEMM (see wide_gemm.py). None disables. Left None for the library API — a library call
+# must not silently trigger a device benchmark — and set by the CLI/server from
+# wide_gemm.measure_crossover(), cached to disk like every other tuned width here.
+WIDE_GEMM_SHAPES = None    # allowlist of weight shapes verified bit-identical at that
+# width (None = all eligible). Set together with WIDE_GEMM_MIN_ROWS.
+
+
+def _cache_arrays(cache) -> list:
+    """Every mx.array living in a cache list, however the layer caches nest their state
+    (KVCache tuples, ArraysCache lists with None holes, CacheList of caches). Used to
+    force a chunk's forward when there are no logits to force it — without logits to
+    depend on, only the caches tie the whole graph together."""
+    states = [getattr(c, "state", None) for c in cache]
+    return [v for _, v in tree_flatten(states) if isinstance(v, mx.array)]
 
 
 def _prefill_plain(target, ids: list[int], cache, chunk: int | None = None):
-    """Chunked no-tap prefill; returns the last chunk's logits."""
+    """Chunked no-tap prefill; returns the last chunk's logits [1, 1, V]."""
     chunk = chunk or PREFILL_CHUNK      # read the module knob at call time
     logits = None
     many = len(ids) > chunk
-    for i in range(0, len(ids), chunk):
-        logits = target.plain(mx.array([ids[i:i + chunk]]), cache)
-        if many:
-            mx.eval(logits)
-            mx.clear_cache()
+    with wide_matmul(WIDE_GEMM_MIN_ROWS, WIDE_GEMM_SHAPES):
+        for i in range(0, len(ids), chunk):
+            last = i + chunk >= len(ids)
+            logits, _ = target.prefill(mx.array([ids[i:i + chunk]]), cache,
+                                       want_logits=last,
+                                       head_last_row=PREFILL_LAST_ROW_HEAD)
+            if many and not last:
+                mx.eval(_cache_arrays(cache))
+                mx.clear_cache()
     return logits
 
 
@@ -659,17 +699,24 @@ def _prefill_tapped(target, ids: list[int], cache, tap, drafter=None, ctx_caches
     parts = []
     pos = ctx_offset
     many = len(ids) > chunk
-    for i in range(0, len(ids), chunk):
-        piece = ids[i:i + chunk]
-        logits, fused = target.run(mx.array([piece]), cache, tap)
-        if drafter is not None:
-            drafter.update_context(fused, ctx_offset=pos, ctx_caches=ctx_caches)
-        else:
-            parts.append(fused)
-        pos += len(piece)
-        if many:
-            mx.eval(logits, *([c.k for c in ctx_caches] if ctx_caches else [fused]))
-            mx.clear_cache()
+    with wide_matmul(WIDE_GEMM_MIN_ROWS, WIDE_GEMM_SHAPES):
+        for i in range(0, len(ids), chunk):
+            piece = ids[i:i + chunk]
+            last = i + chunk >= len(ids)
+            logits, fused = target.prefill(mx.array([piece]), cache, tap,
+                                           want_logits=last,
+                                           head_last_row=PREFILL_LAST_ROW_HEAD)
+            if drafter is not None:
+                drafter.update_context(fused, ctx_offset=pos, ctx_caches=ctx_caches)
+            else:
+                parts.append(fused)
+            pos += len(piece)
+            if many and not last:
+                # the tap only reaches the tapped layers, so the caches (not `fused`) are
+                # what force the rest of the forward and keep the graph from growing
+                mx.eval(_cache_arrays(cache),
+                        [c.k for c in ctx_caches] if ctx_caches else fused)
+                mx.clear_cache()
     if drafter is None:
         fused = parts[0] if len(parts) == 1 else mx.concatenate(parts, axis=1)
     return logits, fused
@@ -735,6 +782,7 @@ def speculative_generate(
     stop: list[str] | None = None,
     on_text=None,
     on_round=None,
+    on_prefill=None,
     verbose: bool = False,
 ) -> GenResult:
     """Speculative decoding (batch=1).
@@ -780,10 +828,17 @@ def speculative_generate(
     if seed is not None:
         mx.random.seed(seed)
     cfg = drafter.config
+    # DFlash-warm-started heads reuse the target's own embed_tokens and/or lm_head (they ship
+    # neither weight): Nemotron reuses the head, Muse-Glimmer reuses both. Bind what's reused.
+    if not getattr(cfg, "has_own_lm_head", True):
+        drafter.bind_lm_head(target_model.lm_head_proj)
+    if not getattr(cfg, "has_own_embed", True):
+        drafter.bind_embed(target_model.draft_embed)
     tap = list(cfg.target_layer_ids)
-    k = cfg.block_size
     mask_id = cfg.mask_token_id
-    cap_ceiling = k if max_draft_tokens is None else max(1, min(max_draft_tokens, k))
+    # A DFlash-derived head spends slot 0 on the anchor, so it can propose block_size-1.
+    kdraft = drafter.max_draft
+    cap_ceiling = kdraft if max_draft_tokens is None else max(1, min(max_draft_tokens, kdraft))
     cap = cap_ceiling
 
     eos_ids = eos_token_ids(tokenizer)
@@ -808,6 +863,8 @@ def speculative_generate(
     suffix = ids[reuse_len:] if reuse_len else ids
     logits, _ = _prefill_tapped(target_model, suffix, cache, tap,
                                 drafter=drafter, ctx_caches=ctx_caches, ctx_offset=reuse_len)
+    if on_prefill is not None:
+        on_prefill(cache, ctx_caches, len(ids))   # caches hold exactly `ids` right now
     n_cached = len(ids)
     pending = _pick(logits[0, -1], temperature, top_p, top_k)  # first committed token
     mx.async_eval([c.k for c in ctx_caches])   # schedule; round 1's sync will wait on it
@@ -820,7 +877,7 @@ def speculative_generate(
     index = None
     lk_gate = None
     if lookup_drafts:
-        from .lookup import LongDraftGate, NGramIndex   # deferred: lookup.py imports this module
+        from .lookup import LongDraftGate, NGramIndex  # deferred: lookup.py imports this module
 
         # Hybrid uses a stricter 4-gram minimum than pure lookup mode: here a spurious hit
         # doesn't just cost a wider verify — it forgoes a productive drafter round (~2.3
@@ -935,16 +992,20 @@ def speculative_generate(
                 committed = draft[:n] + [tt[n]]
         else:
             # ---- 1. draft a block ----
-            # The backbone runs full-width: block attention is bidirectional, so each
-            # position's hidden depends on the whole block, and shrinking it would change
-            # the distribution the drafter was trained on. But we only ever *verify* `cap`
-            # tokens, so run the lm_head and the sequential markov head over just the first
-            # `cap` positions instead of all `k` — the rest used to be computed and thrown
-            # away every round (the dominant slice of drafter time at small caps).
-            block_ids = [pending] + [mask_id] * (k - 1)
+            # A bidirectional block (DeepSpec-native heads) runs the backbone full-width:
+            # each position's hidden depends on the whole block, and shrinking it would
+            # change the distribution the drafter was trained on. A CAUSAL block
+            # (DFlash-lineage: Nemotron, Muse-Glimmer) truncates to the rows the head
+            # actually reads — bit-identical, and on Muse's 15-wide 2.3B backbone worth
+            # ~16 ms/round (see DSparkDrafter.draft_width). Either way the lm_head and the
+            # sequential markov head run over just the first `cap` positions instead of
+            # all `k` — the rest used to be computed and thrown away every round (the
+            # dominant slice of drafter time at small caps).
+            w = drafter.draft_width(cap)
+            block_ids = [pending] + [mask_id] * (w - 1)
             noise = drafter.embed(mx.array([block_ids]))            # [1, k, H]
             block_hidden = drafter.backbone(noise, n_cached, ctx_caches)
-            head_hidden = block_hidden[:, :cap, :]                  # only the verified positions
+            head_hidden = drafter.head_slice(block_hidden, cap)     # only the verified positions
             base_logits = drafter.compute_logits(head_hidden)[0]    # [cap, V]
 
             if temperature > 0.0 or use_conf or pen.active:

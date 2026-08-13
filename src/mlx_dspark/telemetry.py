@@ -21,6 +21,7 @@ Design notes:
 
 from __future__ import annotations
 
+import contextlib
 import queue
 import threading
 import time
@@ -94,10 +95,8 @@ class RoundLog:
             subscribers = tuple(self._subscribers)
 
         for q in subscribers:
-            try:
+            with contextlib.suppress(queue.Full):   # a slow client must never stall generation
                 q.put_nowait(event)
-            except queue.Full:
-                pass          # a slow client must never stall generation
 
     # ------------------------------------------------------------------ reading
 
@@ -167,7 +166,7 @@ class RoundRecorder:
     telemetry beyond "call this with the numbers you already computed".
     """
 
-    __slots__ = ("log", "request_id", "mode", "_i", "_t")
+    __slots__ = ("_i", "_t", "log", "mode", "request_id")
 
     def __init__(self, log: RoundLog, request_id: str, mode: str):
         self.log = log

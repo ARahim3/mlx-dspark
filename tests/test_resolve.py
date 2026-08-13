@@ -31,11 +31,13 @@ def test_no_cross_match_between_sizes():
         "deepseek-ai/dspark_qwen3_8b_block7"
 
 
-def test_qwen36_27b_resolves_avesed_drafter_quant_agnostic():
+def test_qwen36_27b_resolves_satgeze_drafter_quant_agnostic():
+    # Resolution is quant-agnostic: the 4-bit target gets the same head, it is just not the
+    # measured pairing (the registry's `target` field is the quant we benchmarked).
     for repo in ("mlx-community/Qwen3.6-27B-4bit", "mlx-community/Qwen3.6-27B-8bit",
                  "mlx-community/Qwen3.6-27B-OptiQ-4bit", "Qwen/Qwen3.6-27B",
                  "some-org/Qwen3.6-27B-bf16"):
-        assert resolve(repo, mode="dspark")[1] == "Avesed/Qwen3.6-27B-DSpark", repo
+        assert resolve(repo, mode="dspark")[1] == "satgeze/Qwen3.6-27B-DSpark", repo
 
 
 def test_qwen36_27b_no_cross_match_with_bonsai_or_dense_qwen3():
@@ -56,6 +58,22 @@ def test_ornith_9b_resolves_community_drafter_quant_agnostic():
     for repo in ("mlx-community/Ornith-1.0-9B-4bit", "mlx-community/Ornith-1.0-9B-8bit",
                  "deepreinforce-ai/Ornith-1.0-9B"):
         assert resolve(repo, mode="dspark")[1] == "stanleyphoong/Ornith-1.0-9B-DSpark", repo
+
+
+def test_qwen36_35b_a3b_resolves_koopah_drafter_quant_agnostic():
+    for repo in ("mlx-community/Qwen3.6-35B-A3B-4bit", "mlx-community/Qwen3.6-35B-A3B-8bit",
+                 "Qwen/Qwen3.6-35B-A3B", "unsloth/Qwen3.6-35B-A3B-MLX-8bit"):
+        assert resolve(repo, mode="dspark")[1] == "Koopah/Qwen3.6-35B-A3B-NVFP4-DSPARK", repo
+
+
+def test_qwen36_35b_a3b_does_not_collide_with_27b_or_dense_qwen3():
+    # the two Qwen3.6 ids must not swallow each other, and neither may match dense qwen3-4b
+    assert resolve("mlx-community/Qwen3.6-27B-8bit", mode="dspark")[1] == \
+        "satgeze/Qwen3.6-27B-DSpark"
+    assert resolve("mlx-community/Qwen3.6-35B-A3B-4bit", mode="dspark")[1] == \
+        "Koopah/Qwen3.6-35B-A3B-NVFP4-DSPARK"
+    assert resolve("mlx-community/Qwen3-4B-8bit", mode="dspark")[1] == \
+        "deepseek-ai/dspark_qwen3_4b_block7"
 
 
 def test_legacy_family_alias():
@@ -94,7 +112,7 @@ def test_local_path_basename_matched():
 def test_resolve_mode_auto_known_target_picks_dspark():
     from mlx_dspark.load import resolve_mode
 
-    mode, tgt, drf = resolve_mode("mlx-community/Qwen3-8B-8bit", mode="auto")
+    mode, _tgt, drf = resolve_mode("mlx-community/Qwen3-8B-8bit", mode="auto")
     assert mode == "dspark" and drf == "deepseek-ai/dspark_qwen3_8b_block7"
 
 
@@ -108,7 +126,7 @@ def test_resolve_mode_auto_unknown_target_falls_back_to_lookup():
 def test_resolve_mode_auto_with_explicit_drafter_is_dspark():
     from mlx_dspark.load import resolve_mode
 
-    mode, tgt, drf = resolve_mode("some-org/Weird-Model-3B", mode="auto", drafter="org/d")
+    mode, _tgt, drf = resolve_mode("some-org/Weird-Model-3B", mode="auto", drafter="org/d")
     assert mode == "dspark" and drf == "org/d"
 
 

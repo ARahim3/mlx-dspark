@@ -100,6 +100,12 @@ def cmd_generate(argv: list[str]) -> None:
     ap.add_argument("--no-lookup-drafts", action="store_true",
                     help="disable hybrid n-gram drafting inside dspark mode (on by default; "
                          "free extra speedup on copy-heavy spans, lossless either way)")
+    ap.add_argument("--wide-gemm-min", type=int, default=None, metavar="N",
+                    help="prefill only: row count from which QuantizedLinear dequantizes the "
+                         "weight once and runs a plain GEMM instead of quantized_matmul "
+                         "(mlx re-dequantizes per output tile, which is redundant at prefill "
+                         "widths). Default: calibrate the crossover for this machine+model "
+                         "once and cache it; 0 disables. Bit-identical, ~1.09x prefill")
     ap.add_argument("--lookup-long-draft", type=int, default=32,
                     help="match-scaled long-draft ceiling for lookup drafts (dspark hybrid "
                          "+ lookup mode): a deep context match (real copy run) earns drafts "
@@ -147,6 +153,11 @@ def cmd_generate(argv: list[str]) -> None:
 
     if args.wired_limit:
         apply_wired_limit()
+    # prefill wide-GEMM path: dequantize the weight once above a calibrated row count
+    # instead of paying quantized_matmul's per-tile dequant (see wide_gemm.py)
+    from .calibrate import apply_wide_gemm
+
+    apply_wide_gemm(target, drafter, target_repo=target_repo, min_rows=args.wide_gemm_min)
     on_text = None if args.no_stream else _emit
     print("\n" + "=" * 64)
     print(f"  ▶  {label}   ·   {target_repo.split('/')[-1]}")
@@ -296,6 +307,9 @@ def cmd_serve(argv: list[str]) -> None:
     ap.add_argument("--lookup-long-draft", type=int, default=32,
                     help="match-scaled long-draft ceiling for lookup drafts (default 32; "
                          "set to 6 to disable — see `mlx-dspark generate -h`)")
+    ap.add_argument("--wide-gemm-min", type=int, default=None, metavar="N",
+                    help="prefill wide-GEMM crossover row count (default: calibrated once and "
+                         "cached; 0 disables — see `mlx-dspark generate -h`)")
     ap.add_argument("--prefix-cache-dir", default=None,
                     help="directory for the L2 SSD spill tier (enables spilling the cache to disk)")
     ap.add_argument("--prefix-cache-max-ram-mb", type=int, default=0,
@@ -314,28 +328,29 @@ def cmd_serve(argv: list[str]) -> None:
     print(f"loading {args.mode} engine — first run downloads weights…")
     # Captured so a `/admin/load` model swap re-loads with the same server flags, changing only
     # the model — an in-place swap that keeps the port instead of a full restart.
-    load_kwargs = dict(
-        mode=args.mode, model=args.model, drafter=args.drafter,
-        family=args.family, target=args.target,
-        drafter_bits=args.drafter_bits, max_draft_tokens=max_draft,
-        confidence_threshold=args.confidence_threshold,
-        enable_thinking=False if args.no_thinking else None,
-        prefix_cache=not args.no_prefix_cache,
-        prefix_cache_dir=args.prefix_cache_dir,
-        prefix_cache_max_ram_mb=args.prefix_cache_max_ram_mb,
-        default_max_tokens=args.default_max_tokens,
-        max_tokens_cap=args.max_tokens_cap,
-        default_temperature=args.default_temperature,
-        default_top_p=args.default_top_p,
-        default_top_k=args.default_top_k,
-        prefix_cache_slots=args.prefix_cache_slots,
-        lookup_drafts=not args.no_lookup_drafts,
-        lookup_long_draft=args.lookup_long_draft,
-        wired_limit=args.wired_limit,
-        batch_widths=(sorted({2, args.max_batch}) if args.max_batch > 1 else None),
-        kv_bits=args.kv_bits or None,
-        context_window=args.context_window,
-    )
+    load_kwargs = {
+        "mode": args.mode, "model": args.model, "drafter": args.drafter,
+        "family": args.family, "target": args.target,
+        "drafter_bits": args.drafter_bits, "max_draft_tokens": max_draft,
+        "confidence_threshold": args.confidence_threshold,
+        "enable_thinking": False if args.no_thinking else None,
+        "prefix_cache": not args.no_prefix_cache,
+        "prefix_cache_dir": args.prefix_cache_dir,
+        "prefix_cache_max_ram_mb": args.prefix_cache_max_ram_mb,
+        "default_max_tokens": args.default_max_tokens,
+        "max_tokens_cap": args.max_tokens_cap,
+        "default_temperature": args.default_temperature,
+        "default_top_p": args.default_top_p,
+        "default_top_k": args.default_top_k,
+        "prefix_cache_slots": args.prefix_cache_slots,
+        "lookup_drafts": not args.no_lookup_drafts,
+        "lookup_long_draft": args.lookup_long_draft,
+        "wired_limit": args.wired_limit,
+        "wide_gemm_min": args.wide_gemm_min,
+        "batch_widths": (sorted({2, args.max_batch}) if args.max_batch > 1 else None),
+        "kv_bits": args.kv_bits or None,
+        "context_window": args.context_window,
+    }
     try:
         engine = Engine.load(**load_kwargs)
     except ValueError as e:
@@ -515,10 +530,19 @@ def cmd_benchmark(argv: list[str]) -> None:
                          "where tested (<1%%). Only consider it if the model nearly fills "
                          "your RAM and you actually see paging stalls - and validate a long "
                          "run before trusting it.")
+    ap.add_argument("--no-lookup-drafts", action="store_true",
+                    help="dspark mode only: disable the 4-gram HYBRID lookup draft (on by "
+                         "default), where an n-gram hit supplies a free draft instead of "
+                         "running the drafter that round. Distinct from `--modes lookup`, "
+                         "which is the standalone drafter-free mode. Worth measuring on MoE "
+                         "targets: a free draft still costs verify rows, and each extra row "
+                         "pulls fresh routed experts (Qwen3.6-35B-A3B measured 1.27x -> "
+                         "1.21x with it ON).")
     ap.add_argument("--json", default=None, help="also write results to this JSON file")
     args = ap.parse_args(argv)
 
     modes = [m.strip() for m in args.modes.split(",") if m.strip()]
+    lookup_drafts = not args.no_lookup_drafts
     caps = [c.strip() for c in args.caps.split(",") if c.strip()]
     if args.wired_limit:
         apply_wired_limit()
@@ -528,7 +552,11 @@ def cmd_benchmark(argv: list[str]) -> None:
           f"{platform.machine()} {platform.system()}")
 
     _, target_repo, _ = resolve_mode(args.model, mode="auto", drafter=args.drafter)
-    print(f"target: {target_repo}\nloading + warming up…")
+    # State the hybrid-lookup setting explicitly: it materially moves dspark numbers and used
+    # to be invisible from the invocation, which makes results non-comparable after the fact.
+    print(f"target: {target_repo}\n"
+          f"hybrid lookup drafts: {'on (default)' if lookup_drafts else 'OFF'}\n"
+          f"loading + warming up…")
     target, tok = load_target(
         target_repo, require_tap=any(m in ("dspark", "dflash") for m in modes))
     greedy_generate(target, tok, "Tell me about the sea.", max_new_tokens=100)
@@ -596,14 +624,20 @@ def cmd_benchmark(argv: list[str]) -> None:
                                  drafter_repo=drafter_repo, verbose=False)
             else:
                 md = int(cap)
+            # drafter/md/ctrl bound as defaults: each lambda is consumed by run() inside this
+            # iteration, but binding makes that explicit rather than implicit (ruff B023)
             if mode == "dspark":
-                run(f"dspark cap={cap}", lambda p: speculative_generate(
-                    target, tok, drafter, p, max_new_tokens=args.max_new_tokens,
-                    max_draft_tokens=md if md else None, cap_controller=ctrl))
+                tag = "" if lookup_drafts else " nolookup"
+                run(f"dspark cap={cap}{tag}", lambda p, d=drafter, md=md, ctrl=ctrl:
+                    speculative_generate(
+                        target, tok, d, p, max_new_tokens=args.max_new_tokens,
+                        max_draft_tokens=md if md else None, cap_controller=ctrl,
+                        lookup_drafts=lookup_drafts))
             else:
-                run(f"dflash cap={cap}", lambda p: dflash_generate(
-                    target, tok, drafter, p, max_new_tokens=args.max_new_tokens,
-                    max_draft_tokens=md if md else None, cap_controller=ctrl))
+                run(f"dflash cap={cap}", lambda p, d=drafter, md=md, ctrl=ctrl:
+                    dflash_generate(
+                        target, tok, d, p, max_new_tokens=args.max_new_tokens,
+                        max_draft_tokens=md if md else None, cap_controller=ctrl))
         drafter = None                     # release before the next mode's drafter loads
 
     if args.json:

@@ -31,6 +31,20 @@ loaded — it also covers any model that borrows one of these conventions):
     only touch short single-line scalars, since a multi-line value is essentially always a
     string (file contents, code) and mis-coercing one would corrupt it.
 
+  * **ATEM** (Meta's muse_glimmer "Onyx ATEM" harmony format)::
+
+        <atem:function_calls>
+        <atem:invoke name="example_function_name">
+        <atem:parameter name="example_parameter_1">value_1</atem:parameter>
+        </atem:invoke>
+        </atem:function_calls>
+
+    The value grammar is the model's own: the tokenizer ships a ``response_template`` whose
+    ``value_parser`` is *JSON with an allow-non-json fallback* — so each value is ``json.loads``'d
+    (numbers, booleans, ``null``, objects/arrays parse to their type) and left as a raw string
+    when that fails (a bare unquoted string, code, file contents). No schema needed; the format
+    types its own scalars. See NOTES "Muse-Glimmer-30B".
+
 :func:`parse_tool_calls` returns OpenAI ``tool_calls`` (``function.arguments`` serialized to a
 JSON string, per the OpenAI schema) plus the assistant text with the call blocks removed.
 :func:`normalize_tool_messages` goes the other way for inbound history: it turns an OpenAI
@@ -40,6 +54,7 @@ template (which iterates a mapping) renders prior tool calls correctly.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import re
 import uuid
@@ -54,6 +69,12 @@ _GEMMA_FIELD = re.compile(r'([A-Za-z_]\w*)\s*:\s*(<\|"\|>.*?<\|"\|>|[^,]*)', re.
 _XML = re.compile(r"<tool_call>\s*<function=\s*([^>\s]+?)\s*>(.*?)</function>\s*(?:</tool_call>)?",
                   re.DOTALL)
 _XML_PARAM = re.compile(r"<parameter=\s*([^>\s]+?)\s*>\n?(.*?)\n?</parameter>", re.DOTALL)
+# ATEM (muse_glimmer): <atem:invoke name="NAME">…<atem:parameter name="K">V</atem:parameter>…
+# </atem:invoke>. The regexes are the tokenizer's own (response_template.fields.tool_calls);
+# the closing </atem:invoke> is optional so a call truncated at max_tokens still parses.
+_ATEM = re.compile(r'<atem:invoke\b[^>]*?\bname="([^"]+)"\s*>(.*?)(?:</atem:invoke>|\Z)', re.DOTALL)
+_ATEM_PARAM = re.compile(r'<atem:parameter\b[^>]*?\bname="([^"]+)"[^>]*?>(.*?)</atem:parameter>',
+                         re.DOTALL)
 
 
 def _coerce(raw: str):
@@ -135,6 +156,21 @@ def _parse_xml_args(body: str, types: dict[str, str] | None) -> dict:
             for m in _XML_PARAM.finditer(body)}
 
 
+def _atem_value(raw: str):
+    """A muse ATEM parameter value -> its type, per the model's own ``value_parser`` (JSON with
+    an allow-non-json fallback): parse as JSON (numbers/booleans/null/objects/arrays get their
+    real type), else keep the raw string verbatim. Spaces are intentionally *not* stripped — the
+    template documents that string values keep their whitespace (file contents, code)."""
+    try:
+        return json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        return raw
+
+
+def _parse_atem_args(body: str) -> dict:
+    return {m.group(1): _atem_value(m.group(2)) for m in _ATEM_PARAM.finditer(body)}
+
+
 def _as_openai(name: str, args) -> dict:
     if not isinstance(args, str):
         args = json.dumps(args, ensure_ascii=False)
@@ -171,11 +207,18 @@ def parse_tool_calls(text: str, schemas: dict[str, dict[str, str]] | None = None
         for m in _GEMMA.finditer(text):
             calls.append((m.group(1).strip(), _parse_gemma_args(m.group(2))))
         cleaned = _GEMMA.sub("", cleaned)
+    if "<atem:invoke" in text:
+        for m in _ATEM.finditer(text):
+            calls.append((m.group(1), _parse_atem_args(m.group(2))))
+        cleaned = _ATEM.sub("", cleaned)
+        # the invokes are wrapped in a <atem:function_calls> block; drop the now-empty wrapper
+        cleaned = re.sub(r"</?atem:function_calls>\s*", "", cleaned)
     # A generation cut off at max_tokens mid-call leaves an unclosed opener; everything from
     # it onward is an aborted call, not prose, so drop it rather than render raw markup.
-    dangling = cleaned.find("<tool_call>")
-    if dangling != -1:
-        cleaned = cleaned[:dangling]
+    for opener in ("<tool_call>", "<atem:invoke", "<atem:function_calls>"):
+        dangling = cleaned.find(opener)
+        if dangling != -1:
+            cleaned = cleaned[:dangling]
     return [_as_openai(name, args) for name, args in calls], cleaned.strip()
 
 
@@ -223,10 +266,8 @@ def normalize_tool_messages(messages: list[dict]) -> list[dict]:
                 fn = dict(tc.get("function", {}))
                 a = fn.get("arguments")
                 if isinstance(a, str):
-                    try:
+                    with contextlib.suppress(json.JSONDecodeError, TypeError):
                         fn["arguments"] = json.loads(a)
-                    except (json.JSONDecodeError, TypeError):
-                        pass
                 tc["function"] = fn
                 new.append(tc)
             m["tool_calls"] = new

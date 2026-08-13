@@ -19,8 +19,10 @@ dependencies = [
     # verify row on a 2-bit target cost ~a full weight re-read, making Bonsai spec a wash)
     "mlx>=0.32.0",
     "mlx-lm>=0.31.3",
-    # mlx-vlm gives us Gemma-4 + the existing EAGLE3/DFlash spec-decode reference impl
-    "mlx-vlm>=0.6.3",
+    # mlx-vlm gives us Gemma-4 + the existing EAGLE3/DFlash spec-decode reference impl.
+    # Floor is 0.6.12: the first release shipping the muse_glimmer (Meta) module — earlier
+    # mlx-vlm can't load that target at all. 0.6.12 loads every other target here too.
+    "mlx-vlm>=0.6.12",
     "numpy",
     "huggingface-hub",
 ]
@@ -66,11 +68,48 @@ include = [
 line-length = 100
 
 [tool.ruff.lint]
-ignore = ["E741"]   # l/logits/layer single-letter names are idiomatic in the hot loops
+# Pin the RULE SET, not the ruff version. CI installs `.[dev]` unpinned on purpose — resolving
+# latest deps is what makes it a drift canary — but that also means ruff's *defaults* arrive
+# unpinned, and 0.16.0 widened them from (E4, E7, E9, F) to a much broader set. That turned a
+# green tree into 98 findings across 23 rule families nobody had opted into, and the lint step
+# fails before the test suite runs. Selecting explicitly is what the old default enforced, so
+# this is a no-op on behaviour and immune to the next defaults change. Broadening the set is a
+# deliberate decision to make on its own, not one a tool release should make for us.
+select = [
+    "E4", "E7", "E9", "F",  # pycodestyle errors + pyflakes (what the old default enforced)
+    "W",                    # trailing whitespace / newline hygiene
+    "I",                    # import sorting
+    "UP",                   # pyupgrade — keep syntax current with the 3.12 floor
+    "B",                    # bugbear — real bug classes (e.g. B023 loop-variable capture)
+    "BLE",                  # blind except — the hot paths already annotate these deliberately
+    "C4",                   # comprehensions
+    "SIM",                  # simplify
+    "PIE",
+    "RUF",                  # ruff-specific, incl. RUF100 unused-noqa
+]
+ignore = [
+    "E741",     # l/logits/layer single-letter names are idiomatic in the hot loops
+    # E501 stays off: line-length is a formatter's job and this repo has no formatter, so
+    # enforcing it would only reflow 37 lines that are deliberately laid out.
+    "E501",
+    # The comments and docstrings here use ×, →, — and non-breaking spaces on purpose (they
+    # carry measurements: "2.29×", "1.18 → 3.05"). RUF001-003 flag exactly that as ambiguous.
+    "RUF001", "RUF002", "RUF003",
+    "RUF005",   # [x] + list(y) -> [x, *y]: 26 sites, readability call, no defect
+    # B905 (zip without strict=) is worth adopting, but strict=True *raises* where zip
+    # currently truncates silently — a behaviour change, not a lint fix. Left as its own
+    # decision rather than slipped into a lint pass. It would be a real guard here: almost
+    # every zip in this codebase pairs layers with caches.
+    "B905",
+]
 
 [tool.ruff.lint.per-file-ignores]
 # the transformers-compat shim must run before any mlx_lm import (issue #1)
 "src/mlx_dspark/__init__.py" = ["E402"]
+# Test doubles legitimately trip two rules: stand-in model/cache classes carry mutable
+# class attributes by design (RUF012 wants ClassVar on throwaway fakes), and a few tests
+# open a file to assert on its bytes without needing a context manager (SIM115).
+"tests/*" = ["RUF012", "SIM115"]
 
 [tool.hatch.version]
 path = "src/mlx_dspark/__init__.py"

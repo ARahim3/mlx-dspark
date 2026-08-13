@@ -28,6 +28,7 @@ lossless for ANY per-round cap sequence. Auto-cap can never change what is gener
 
 from __future__ import annotations
 
+import itertools
 import json
 import os
 import time
@@ -36,7 +37,10 @@ import mlx.core as mx
 
 CACHE_DIR = os.path.expanduser("~/.cache/mlx_dspark")
 CACHE_FILE = "calibration.json"
-SCHEMA = 2   # 2: verify curve includes width 1; adds the measured per-round overhead
+SCHEMA = 3   # 2: verify curve includes width 1; adds the measured per-round overhead
+# 3: causal-block (DFlash-lineage) drafter curves are measured at draft_width(cap) — the
+# truncated backbone the loop now runs — so cached full-width curves must re-measure
+# (they priced Muse's drafter ~2.5x too high at small caps and flat in cap).
 CTX_LEN = 512          # curve shape is nearly ctx-independent (SDPA is flat in width)
 TOKEN_ID = 7           # arbitrary; timings are content-independent
 
@@ -64,7 +68,9 @@ def measure_verify_curve(target, tap: list[int], widths: list[int],
     for m in sorted(widths):
         x = mx.array([[TOKEN_ID] * m])
 
-        def fn():
+        # loop vars bound as defaults: fn is consumed inside this iteration, but binding
+        # makes that explicit rather than relying on it (ruff B023)
+        def fn(x=x, m=m):
             logits, _ = target.run(x, cache, tap)
             for c in cache:                      # roll back so every iteration is identical
                 if c is not None and hasattr(c, "trim"):
@@ -77,23 +83,25 @@ def measure_verify_curve(target, tap: list[int], widths: list[int],
 
 def measure_dspark_drafter_curve(drafter, caps: list[int],
                                  ctx_len: int = CTX_LEN) -> dict[int, float]:
-    """ms per DSpark draft round at each cap (backbone is full-width; lm_head/markov
-    run over ``cap`` positions — the slice fix — so cost grows mildly with cap)."""
+    """ms per DSpark draft round at each cap (backbone runs at ``drafter.draft_width(cap)``
+    — full block for bidirectional heads, truncated for causal DFlash-lineage heads, exactly
+    as the production loop does; lm_head/markov run over ``cap`` positions — the slice fix).
+    So cost grows mildly with cap on a bidirectional head and tracks the truncated width on
+    a causal one — the controller's model must price what the loop will actually run."""
     cfg = drafter.config
-    k = cfg.block_size
     ctx = drafter.make_ctx_cache()
     fused = mx.random.normal(
         (1, ctx_len, len(cfg.target_layer_ids) * cfg.hidden_size)).astype(mx.bfloat16)
     drafter.update_context(fused, ctx_offset=0, ctx_caches=ctx)
     mx.eval([c.k for c in ctx])
-    block_ids = [TOKEN_ID] * k
     curve: dict[int, float] = {}
     for cap in sorted(caps):
+        block_ids = [TOKEN_ID] * drafter.draft_width(cap)
 
-        def fn():
+        def fn(cap=cap, block_ids=block_ids):
             noise = drafter.embed(mx.array([block_ids]))
             hidden = drafter.backbone(noise, ctx_len, ctx)
-            logits = drafter.compute_logits(hidden[:, :cap, :])[0]
+            logits = drafter.compute_logits(drafter.head_slice(hidden, cap))[0]
             return drafter.sample_block(logits, first_prev_token=TOKEN_ID)
 
         curve[cap] = _bench(fn)
@@ -127,7 +135,7 @@ def measure_batch_verify_grid(target, tap: list[int], batch_widths: list[int],
         for m in sorted(widths):
             ids = mx.array([[TOKEN_ID] * m] * B)
 
-            def fn():
+            def fn(ids=ids, caches=caches, m=m, B=B):
                 mask = build_batch_mask(caches[0].offsets, m)
                 logits, _ = batched_forward(target, ids, caches, tap, mask=mask)
                 for c in caches:                 # roll back so every iteration is identical
@@ -152,6 +160,7 @@ def measure_dspark_round_overhead(target, drafter, verify_ms: dict[int, float],
     tap = list(cfg.target_layer_ids)
     k = int(cfg.block_size)
     cap = max(1, min(int(cap), k))
+    w = drafter.draft_width(cap)   # what the production loop will run at this cap
     cache = target.make_cache()
     if hasattr(target, "reset_spec"):
         target.reset_spec()
@@ -165,9 +174,9 @@ def measure_dspark_round_overhead(target, drafter, verify_ms: dict[int, float],
 
     def round_fn():
         nonlocal pos
-        noise = drafter.embed(mx.array([[TOKEN_ID] * k]))
+        noise = drafter.embed(mx.array([[TOKEN_ID] * w]))
         hidden = drafter.backbone(noise, pos, ctx)
-        logits = drafter.compute_logits(hidden[:, :cap, :])[0]
+        logits = drafter.compute_logits(drafter.head_slice(hidden, cap))[0]
         draft_arr = drafter.sample_block(logits, first_prev_token=TOKEN_ID)
         verify_ids = mx.concatenate(
             [mx.array([TOKEN_ID], dtype=draft_arr.dtype), draft_arr]).reshape(1, -1)
@@ -275,7 +284,7 @@ def _interp(curve: dict[int, float], x: int) -> float:
             return curve[ks[-1]]
         slope = (curve[ks[-1]] - curve[ks[-2]]) / (ks[-1] - ks[-2])
         return curve[ks[-1]] + slope * (x - ks[-1])
-    for lo, hi in zip(ks, ks[1:]):
+    for lo, hi in itertools.pairwise(ks):
         if lo < x < hi:
             f = (x - lo) / (hi - lo)
             return curve[lo] + f * (curve[hi] - curve[lo])
@@ -536,6 +545,60 @@ def save_cached(key: str, entry: dict, cache_dir: str | None = None) -> None:
         json.dump(data, f, indent=1)
 
 
+def wide_gemm_min_rows(target, drafter=None, *, target_repo: str,
+                       cache_dir: str | None = None,
+                       verbose: bool = True) -> tuple[int | None, list[str]]:
+    """Row count from which prefill should route ``QuantizedLinear`` through
+    dequantize-once + GEMM instead of ``quantized_matmul`` (see :mod:`.wide_gemm`), or
+    ``None`` when that never pays on this machine.
+
+    Same doctrine as the cap: the crossover is a property of
+    (chip x mlx version x weight shape), so it is measured once (~1-2 s) and cached to disk
+    under a key that includes both the device and the mlx version — a hardcoded threshold
+    would be stale the day a chip or a kernel changes."""
+    from .wide_gemm import measure_crossover
+
+    key = _cache_key("widegemm", target_repo, None)
+    entry = load_cached(key, cache_dir)
+    if entry is None:
+        if verbose:
+            print("calibrating prefill wide-GEMM crossover (one-time, cached)…", flush=True)
+        # the drafter's context projections run at prefill width too, so its shapes are
+        # part of the bit-identity check
+        got = measure_crossover(target.model, drafter)
+        entry = ({"min_rows": got[0], "shapes": got[1]} if got
+                 else {"min_rows": None, "shapes": []})
+        save_cached(key, entry, cache_dir)
+        if verbose:
+            mr, sh = entry["min_rows"], entry["shapes"]
+            state = (f"on from M={mr} for {len(sh)} weight shapes (verified bit-identical)"
+                     if mr else "off (no gain, or not exact on this machine)")
+            print(f"  prefill wide-GEMM: {state}", flush=True)
+    return entry.get("min_rows"), entry.get("shapes")
+
+
+def apply_wide_gemm(target, drafter=None, *, target_repo: str,
+                    min_rows: int | None = None, verbose: bool = True) -> int | None:
+    """Turn the prefill wide-GEMM path on for this process and return the threshold used.
+
+    ``min_rows=None`` calibrates (and caches); ``0`` disables; ``N`` forces N. Sets the
+    process-wide ``generate.WIDE_GEMM_MIN_ROWS`` rather than a library default, because a
+    plain ``speculative_generate`` call must never silently trigger a device benchmark."""
+    from . import generate as _gen
+    from .wide_gemm import verified_shapes
+
+    if min_rows is None:
+        _gen.WIDE_GEMM_MIN_ROWS, _gen.WIDE_GEMM_SHAPES = wide_gemm_min_rows(
+            target, drafter, target_repo=target_repo, verbose=verbose)
+    else:
+        # an explicit threshold still only applies to shapes verified at it
+        _gen.WIDE_GEMM_MIN_ROWS = int(min_rows) or None
+        _gen.WIDE_GEMM_SHAPES = (
+            verified_shapes([target.model, drafter], _gen.WIDE_GEMM_MIN_ROWS)
+            if _gen.WIDE_GEMM_MIN_ROWS else [])
+    return _gen.WIDE_GEMM_MIN_ROWS
+
+
 # --------------------------------------------------------------------------- entry point
 
 
@@ -547,6 +610,13 @@ def calibrate(target, drafter, *, mode: str, target_repo: str, drafter_repo: str
     (e.g. ``[2, 4]`` when serving with ``--max-batch 4``) additionally measures the batched
     verify grid so :meth:`CapController.cap_for` can pick a per-batch-width cap."""
     cfg = drafter.config
+    # A has_lm_head=false drafter (Nemotron DSpark head) reuses the target's lm_head; the
+    # drafter-curve measurement below calls compute_logits directly, so bind it here too
+    # (speculative_generate binds independently at generation time).
+    if not getattr(cfg, "has_own_lm_head", True) and getattr(drafter, "_ext_lm_head", None) is None:
+        drafter.bind_lm_head(target.lm_head_proj)
+    if not getattr(cfg, "has_own_embed", True) and getattr(drafter, "_ext_embed", None) is None:
+        drafter.bind_embed(target.draft_embed)
     if mode == "dspark":
         max_cap = int(cfg.block_size)
         widths = list(range(1, max_cap + 2))     # verify width = cap + 1; width 1 = the
@@ -655,6 +725,6 @@ def static_cap(target, drafter, *, mode: str, target_repo: str, drafter_repo: st
     try:
         ctrl = calibrate(target, drafter, mode=mode, target_repo=target_repo,
                          drafter_repo=drafter_repo, cache_dir=cache_dir, verbose=verbose)
-    except Exception:                       # calibration is an optimization, never a gate
+    except Exception:  # noqa: BLE001 — calibration is an optimization, never a gate
         return fallback
     return ctrl.static_best(STATIC_PRIOR_P)

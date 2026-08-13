@@ -142,7 +142,7 @@ def test_gguf_convert_roundtrip(tmp_path):
     gguf = tmp_path / "tiny-dspark-bf16.gguf"
     _write_gguf(gguf, _dspark_meta(), _dspark_tensors())
 
-    meta, tensors, _ = read_gguf_header(gguf)
+    meta, _tensors, _ = read_gguf_header(gguf)
     assert meta["general.architecture"] == "dspark"
     assert meta["dspark.dspark.target_layers"] == [1, 3, 5, 7, 9]
 
@@ -167,7 +167,7 @@ def test_gguf_convert_roundtrip(tmp_path):
 
     # the converted checkpoint must load 1:1 into the drafter (strict key match)
     from mlx_dspark.load import load_drafter
-    drafter, dcfg = load_drafter(str(out), quantize=False)
+    _drafter, dcfg = load_drafter(str(out), quantize=False)
     assert dcfg.log_snr_conditioning and dcfg.num_hidden_layers == 1
 
     # idempotent: converting again returns without rewriting
@@ -211,13 +211,13 @@ def test_log_snr_features_match_reference():
 
 
 def _tiny_drafter_config(**kw) -> DSparkConfig:
-    base = dict(family="qwen3", hidden_size=16, vocab_size=32, num_hidden_layers=1,
-                intermediate_size=32, num_attention_heads=2, num_key_value_heads=1,
-                head_dim=8, attention_k_eq_v=False, rope_theta=1e4, rope_type="default",
-                block_size=4, mask_token_id=31, target_layer_ids=[0, 1],
-                markov_rank=4, enable_confidence_head=False,
-                final_logit_softcapping=None, mlp_activation="silu",
-                norm_style="qwen", use_v_norm=False)
+    base = {"family": "qwen3", "hidden_size": 16, "vocab_size": 32, "num_hidden_layers": 1,
+                "intermediate_size": 32, "num_attention_heads": 2, "num_key_value_heads": 1,
+                "head_dim": 8, "attention_k_eq_v": False, "rope_theta": 1e4, "rope_type": "default",
+                "block_size": 4, "mask_token_id": 31, "target_layer_ids": [0, 1],
+                "markov_rank": 4, "enable_confidence_head": False,
+                "final_logit_softcapping": None, "mlp_activation": "silu",
+                "norm_style": "qwen", "use_v_norm": False}
     base.update(kw)
     return DSparkConfig(**base)
 
@@ -319,7 +319,7 @@ def test_hybrid_full_accept_keeps_state():
     cache = t.make_cache()
     t.reset_spec()
     t.run(mx.array([prompt]), cache, [0])
-    v1, _ = t.verify(mx.array([[6, 7, 8]]), cache, [0])
+    _v1, _ = t.verify(mx.array([[6, 7, 8]]), cache, [0])
     t.rollback(cache, 0, [7, 8])                     # full accept: keep everything
     assert t._stash is None
     v2, _ = t.verify(mx.array([[10]]), cache, [0])   # width-1 = pure commit step
@@ -500,9 +500,9 @@ def test_route_gemma4_unified_stays_mlx_vlm():
 
 
 def test_registry_resolves_bonsai_targets():
-    tgt, drf = resolve("prism-ml/Ternary-Bonsai-27B-mlx-2bit", mode="dspark")
+    _tgt, drf = resolve("prism-ml/Ternary-Bonsai-27B-mlx-2bit", mode="dspark")
     assert drf == "Rahim/Ternary-Bonsai-27B-dspark"
-    mode, tgt, drf = resolve_mode("prism-ml/Ternary-Bonsai-27B-mlx-2bit", mode="auto")
+    mode, _tgt, drf = resolve_mode("prism-ml/Ternary-Bonsai-27B-mlx-2bit", mode="auto")
     assert mode == "dspark" and drf == "Rahim/Ternary-Bonsai-27B-dspark"
     # the 1-bit variant is deliberately NOT registered (1-bit pack needs PrismML's MLX fork)
     with pytest.raises(ValueError, match="no built-in"):
@@ -514,7 +514,7 @@ def test_load_target_refuses_unsupported_quant_bits(tmp_path):
 
     (tmp_path / "config.json").write_text(json.dumps(
         {"model_type": "qwen3_5", "quantization": {"group_size": 128, "bits": 1}}))
-    with pytest.raises(ValueError, match="1 bits.*stock MLX"):
+    with pytest.raises(ValueError, match=r"1 bits.*stock MLX"):
         load_target(str(tmp_path))
 
 

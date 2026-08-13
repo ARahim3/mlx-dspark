@@ -11,6 +11,7 @@ enough to call on every app launch and testable without a GPU.
 
 from __future__ import annotations
 
+import contextlib
 import os
 import platform
 import re
@@ -70,10 +71,8 @@ def environment() -> dict:
     wired_mb = None
     raw = _sysctl("iogpu.wired_limit_mb")
     if raw:
-        try:
+        with contextlib.suppress(ValueError):
             wired_mb = int(raw)
-        except ValueError:
-            pass
 
     return {
         "version": __version__,
