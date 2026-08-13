@@ -73,6 +73,26 @@ context (the daily agent/assistant workload), match-scaled lookup drafts reach *
 (75 tok/s) and **3.6× on Ornith-9B** (93 tok/s). Any model *not* listed still gets drafter-free
 lookup speculation via `--mode auto`.
 
+## The Mac app
+
+Everything below is also available as a **native Mac app** — chat with saved sessions, a model
+manager that answers "will this fit my Mac?" before you download, live speculative-decoding
+telemetry (per-round acceptance, this machine's measured cost curves), a decoder **Race** with a
+checked lossless verdict, one-click coding-agent setup, and a menu-bar gauge with live tok/s and
+model memory.
+
+```bash
+brew tap ARahim3/mlx-dspark https://github.com/ARahim3/mlx-dspark
+brew install --cask --no-quarantine mlx-dspark    # --no-quarantine: signed but not notarized yet
+```
+
+Or download the DMG from [Releases](https://github.com/ARahim3/mlx-dspark/releases) (`app-v*`
+tags) and drag it to Applications. First launch sets up its own private engine runtime (no
+Homebrew Python, no venv of yours touched, ~2–4 min once) and keeps the engine on the latest
+release automatically; the app itself tells you when a newer app version exists
+(`brew upgrade --cask mlx-dspark`). **`pip install mlx-dspark` stays engine-only** — the app is
+not in the wheel, and the app never touches a pip-installed engine.
+
 ## Install
 
 ```bash

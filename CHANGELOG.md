@@ -4,6 +4,46 @@ All notable changes to `mlx-dspark`. Versions follow [SemVer](https://semver.org
 
 ## [Unreleased]
 
+## [0.9.0] — 2026-08-13 — the server grows a control plane + live telemetry (and a native Mac app)
+
+The release that makes the server *observable and drivable*: everything the new Mac app renders
+ships here as plain HTTP endpoints, so the CLI and any script get it too. The app itself lives in
+`apps/MacApp/` (SwiftUI; installed via DMG / Homebrew cask, **not** part of the wheel — `pip
+install mlx-dspark` stays engine-only).
+
+### Added
+- **Hot model swapping — `POST /admin/load`** switches the target in place (release-then-load, so
+  peak memory is one model) while the server and its port stay up; `GET /admin/status` reports
+  ready/loading/error, `/health` answers `status: "loading"` mid-swap, and everything else 503s
+  until the new model settles. A failed load leaves the server up and recoverable.
+- **Live per-round telemetry** (`telemetry.py`): an `on_round` hook in all four decode loops feeds
+  a ring buffer + bounded-queue fan-out (a stalled client can never stall generation). `GET
+  /events` streams every round the engine runs — engine-wide, not request-scoped, so a dashboard
+  keeps updating while Claude Code is the one generating; `GET /rounds` is the polling sibling.
+  Per-position acceptance (d₀, d₁, d₂ …) with honest denominators rides along in `/metrics`.
+- **`GET /calibration`** — this machine's cached verify/drafter cost curves, the qmm knee, and the
+  cost model's predicted tok/s per cap. Zero new measurement; pure surfacing of
+  `~/.cache/mlx_dspark/`.
+- **`GET /doctor` + `GET /admin/models`** — environment (chip, RAM, Metal, package versions,
+  wired-limit hint) and the model inventory: every registry pair annotated with RAM feasibility
+  for *this* machine, plus an **on-disk scan** (HF hub + plain-dir caches — sizes, paths,
+  drafter-vs-model kind, quant-agnostic registry pairing) and total disk usage. `mlx-dspark
+  doctor` renders the same payload (`--json`, `--models`).
+- **`POST /admin/race`** — the same prompt through several decode strategies (dspark/dflash/
+  lookup/baseline, per-arm caps), streamed with per-token timings, finished with per-arm stats and
+  an **ids-identical verdict** — the losslessness claim as a checked result, not an assertion.
+- **`GET /admin/integrations`** — ready-to-paste config for Claude Code, Codex, OpenCode, pi, and
+  any OpenAI-compatible client, with the base URL taken from the request's own Host header.
+- **Allocator memory in `GET /metrics`** (`memory`: active/peak/cache bytes) — what the loaded
+  model actually holds resident.
+- **Registry rows carry a measured `speedup` string** (the README table's headline ratio) so
+  model pickers can answer "why this one".
+
+### Fixed
+- `knee_width` misreported the qmm knee (one flat step collapsed the baseline, so the knee read as
+  4 where the measured curve is still flat; the real jump is at 6). Reporting-only — cap selection
+  reads the curves directly and is unaffected.
+
 ## [0.8.1] — 2026-08-12 — causal-block drafter truncation: Muse-Glimmer +10–13%, Nemotron +2.5–3%
 
 ### Changed
