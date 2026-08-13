@@ -148,8 +148,18 @@ public struct APIClient: Sendable {
     /// Hot-swap the loaded model, keeping the server and its port. Returns once the new model
     /// is loaded (or throws with the reason). Far preferable to a process restart: the port
     /// survives, so nothing pointed at the server has to be reconfigured.
-    public func loadModel(_ target: String) async throws -> LoadStatus {
-        let body = try JSONSerialization.data(withJSONObject: ["model": target])
+    ///
+    /// `mode` (auto/dspark/dflash/lookup/baseline) and `maxDraft` ("auto" or a cap) override
+    /// the server's startup flags for this load only — how the app turns speculation on/off
+    /// or pins a measured cap without touching the model.
+    public func loadModel(_ target: String, mode: String? = nil,
+                          maxDraft: String? = nil) async throws -> LoadStatus {
+        var payload: [String: Any] = ["model": target]
+        if let mode { payload["mode"] = mode }
+        if let maxDraft {
+            payload["max_draft"] = Int(maxDraft).map { $0 as Any } ?? maxDraft
+        }
+        let body = try JSONSerialization.data(withJSONObject: payload)
         var req = request("admin/load", method: "POST", body: body)
         req.timeoutInterval = 1800        // a first-time load downloads weights
         let (data, response) = try await session.data(for: req)

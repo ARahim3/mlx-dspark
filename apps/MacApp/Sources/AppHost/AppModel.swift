@@ -325,6 +325,41 @@ final class AppModel: ObservableObject {
         }
     }
 
+    /// Reload the *current* model with a different decode mode and/or draft cap — the
+    /// engine-level knobs. Same in-place swap as a model change (`/admin/load` takes the
+    /// overrides), so the port survives and output stays byte-identical either way; only
+    /// speed changes.
+    func applyEngineSettings(mode: String?, cap: String?) async {
+        guard let client = apiClient else { return }
+        generationTask?.cancel()
+        modelSwitchError = nil
+        rounds = []
+        stats = nil
+        calibration = nil
+        phase = .startingServer
+        logStore.note("reloading \(model) — mode \(mode ?? "auto") · cap \(cap ?? "auto")")
+        do {
+            _ = try await client.loadModel(model, mode: mode, maxDraft: cap)
+            currentHealth = try? await client.health()
+            phase = .ready
+            startTelemetry()
+            startMemoryPolling()
+            await refreshDiagnostics()
+        } catch {
+            modelSwitchError = error.localizedDescription
+            // The engine is modelless after a failed load — restore with default settings.
+            do {
+                _ = try await client.loadModel(model)
+                currentHealth = try? await client.health()
+                phase = .ready
+                startTelemetry()
+                startMemoryPolling()
+            } catch {
+                fail(error)
+            }
+        }
+    }
+
     private func fail(_ error: Error) {
         errorMessage = error.localizedDescription
         phase = .failed

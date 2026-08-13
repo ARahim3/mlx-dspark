@@ -8,6 +8,7 @@ struct SettingsScreen: View {
         ScrollView {
             VStack(alignment: .leading, spacing: 16) {
                 DetailLevelCard()
+                if model.detail != .simple { DecodingCard() }
                 if let report = model.doctorReport { MachineCard(report: report) }
                 ServerCard()
                 AboutCard()
@@ -78,6 +79,75 @@ struct DetailLevelCard: View {
             .labelsHidden()
 
             Text(model.detail.blurb).font(.callout).foregroundStyle(.secondary)
+        }
+    }
+}
+
+/// The engine-level knobs: decode mode and draft cap.
+///
+/// Both are speed dials, never behavior dials — the target verifies every token, so output is
+/// byte-identical across all of them. Applying reloads the model in place (the CLI's
+/// `--mode` / `--max-draft`, via `/admin/load` overrides); the port survives.
+struct DecodingCard: View {
+    @EnvironmentObject private var model: AppModel
+    @State private var mode: String = "auto"
+    @State private var cap: String = "auto"
+    @State private var applying = false
+
+    private var modes: [(id: String, label: String)] {
+        var options = [(id: "auto", label: "Auto")]
+        for arm in model.availableRaceArms {
+            options.append((id: arm, label: arm == "dspark" ? "DSpark"
+                            : arm == "dflash" ? "DFlash" : arm.capitalized))
+        }
+        return options
+    }
+
+    var body: some View {
+        Card(title: "Decoding",
+             subtitle: currentLine) {
+            HStack(spacing: 14) {
+                Picker("Mode", selection: $mode) {
+                    ForEach(modes, id: \.id) { Text($0.label).tag($0.id) }
+                }
+                .frame(maxWidth: 220)
+
+                Picker("Cap", selection: $cap) {
+                    Text("Auto").tag("auto")
+                    ForEach(1...8, id: \.self) { Text("\($0)").tag("\($0)") }
+                }
+                .frame(maxWidth: 140)
+
+                if applying {
+                    ProgressView().controlSize(.small)
+                } else {
+                    Button("Apply") { apply() }
+                        .disabled(!model.isServerReady)
+                }
+                Spacer()
+            }
+
+            Text("Output is byte-identical in every mode — these change speed, not text. "
+                 + "Cap Auto calibrates this Mac once and adapts per round; pin a value if "
+                 + "you've measured a better fixed cap for this model. Applying reloads the "
+                 + "model in place (the server and its port stay up).")
+                .font(.caption).foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+    }
+
+    private var currentLine: String {
+        var line = "Running \(model.health?.mode ?? "—")"
+        if let cap = model.rounds.last?.cap { line += " · cap \(cap)" }
+        return line
+    }
+
+    private func apply() {
+        applying = true
+        Task {
+            await model.applyEngineSettings(mode: mode == "auto" ? nil : mode,
+                                            cap: cap == "auto" ? nil : cap)
+            applying = false
         }
     }
 }

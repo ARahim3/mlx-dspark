@@ -23,6 +23,8 @@ struct MarkdownText: View {
                     ProseBlock(lines: lines)
                 case .code(let language, let code):
                     CodeCard(language: language, code: code)
+                case .math(let latex):
+                    MathBlock(latex: latex)
                 }
             }
         }
@@ -32,13 +34,17 @@ struct MarkdownText: View {
 enum MarkdownBlock {
     case prose([String])
     case code(language: String?, code: String)
+    case math(String)
 
-    /// Split on ``` fences. An unclosed fence (mid-stream) runs to the end.
+    /// Split on ``` fences and `$$` display-math blocks. An unclosed fence (mid-stream) runs
+    /// to the end.
     static func parse(_ text: String) -> [MarkdownBlock] {
         var blocks: [MarkdownBlock] = []
         var prose: [String] = []
         var inCode = false
+        var inMath = false
         var codeLines: [String] = []
+        var mathLines: [String] = []
         var language: String?
 
         func flushProse() {
@@ -47,6 +53,27 @@ enum MarkdownBlock {
 
         for line in text.components(separatedBy: "\n") {
             let trimmed = line.trimmingCharacters(in: .whitespaces)
+            if !inCode, trimmed.hasPrefix("$$") {
+                // `$$ … $$` on one line, or a `$$` toggle spanning several.
+                let body = trimmed.dropFirst(2)
+                if inMath {
+                    blocks.append(.math(mathLines.joined(separator: " ")))
+                    mathLines = []
+                    inMath = false
+                } else if body.hasSuffix("$$"), body.count >= 2 {
+                    flushProse()
+                    blocks.append(.math(String(body.dropLast(2))))
+                } else {
+                    flushProse()
+                    inMath = true
+                    if !body.isEmpty { mathLines.append(String(body)) }
+                }
+                continue
+            }
+            if inMath {
+                mathLines.append(line)
+                continue
+            }
             if trimmed.hasPrefix("```") {
                 if inCode {
                     blocks.append(.code(language: language, code: codeLines.joined(separator: "\n")))
@@ -67,10 +94,25 @@ enum MarkdownBlock {
                 prose.append(line)
             }
         }
-        // Mid-stream: an open fence renders as code up to whatever has arrived.
+        // Mid-stream: an open fence/block renders up to whatever has arrived.
         if inCode { blocks.append(.code(language: language, code: codeLines.joined(separator: "\n"))) }
+        if inMath { blocks.append(.math(mathLines.joined(separator: " "))) }
         flushProse()
         return blocks
+    }
+}
+
+/// Display math, centered and set slightly larger in a serif — visibly "an equation", even
+/// though it is Unicode translation rather than TeX typesetting (see `MathText`).
+struct MathBlock: View {
+    let latex: String
+
+    var body: some View {
+        Text(MathText.unicode(latex))
+            .font(.system(size: 15, design: .serif))
+            .textSelection(.enabled)
+            .frame(maxWidth: .infinity, alignment: .center)
+            .padding(.vertical, 6)
     }
 }
 
@@ -135,11 +177,13 @@ struct ProseBlock: View {
 
     /// Inline markdown via AttributedString, falling back to plain text if it can't parse
     /// (a stray unbalanced `*` mid-stream, say — better plain than an exception).
+    /// `$…$` math spans are translated to Unicode first (see `MathText`).
     private func inline(_ s: String) -> AttributedString {
-        (try? AttributedString(
-            markdown: s,
+        let text = s.contains("$") || s.contains("\\(") ? MathText.inlineReplaced(s) : s
+        return (try? AttributedString(
+            markdown: text,
             options: .init(interpretedSyntax: .inlineOnlyPreservingWhitespace)))
-            ?? AttributedString(s)
+            ?? AttributedString(text)
     }
 }
 
