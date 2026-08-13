@@ -79,6 +79,13 @@ struct MenuBarPanel: View {
                 Text(model.statusLine).font(.callout).foregroundStyle(.secondary)
             }
 
+            if let update = model.appUpdate {
+                Label("App v\(update.version) available — brew upgrade",
+                      systemImage: "arrow.down.circle")
+                    .font(.caption)
+                    .foregroundStyle(Theme.spark)
+            }
+
             Divider()
 
             HStack {

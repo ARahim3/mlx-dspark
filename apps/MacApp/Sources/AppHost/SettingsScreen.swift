@@ -10,10 +10,57 @@ struct SettingsScreen: View {
                 DetailLevelCard()
                 if let report = model.doctorReport { MachineCard(report: report) }
                 ServerCard()
+                AboutCard()
             }
             .padding(16)
         }
         .task { await model.refreshDiagnostics() }
+    }
+}
+
+/// Versions and updates. Two version numbers on purpose: the app and the engine release
+/// independently — the engine keeps itself on the latest release automatically, the app
+/// updates through Homebrew (or a fresh DMG) and only *tells* you when one exists.
+struct AboutCard: View {
+    @EnvironmentObject private var model: AppModel
+
+    var body: some View {
+        Card(title: "About") {
+            VStack(alignment: .leading, spacing: 7) {
+                row("App", AppIdentity.appVersion)
+                row("Engine", model.doctorReport?.environment.version ?? "—")
+                if let update = model.appUpdate {
+                    VStack(alignment: .leading, spacing: 4) {
+                        Label("App v\(update.version) is available.",
+                              systemImage: "arrow.down.circle.fill")
+                            .font(.callout).foregroundStyle(Theme.spark)
+                        HStack(spacing: 8) {
+                            Text("brew upgrade --cask mlx-dspark")
+                                .font(.caption.monospaced()).textSelection(.enabled)
+                            CopyButton(text: "brew upgrade --cask mlx-dspark")
+                            Button("Release notes") {
+                                if let url = URL(string: update.url) { NSWorkspace.shared.open(url) }
+                            }
+                            .buttonStyle(.link).font(.caption)
+                        }
+                    }
+                    .padding(.top, 4)
+                } else {
+                    Text("The engine stays on the latest release automatically; app updates "
+                         + "are checked at launch.")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+            }
+        }
+    }
+
+    private func row(_ label: String, _ value: String) -> some View {
+        HStack(alignment: .firstTextBaseline) {
+            Text(label).font(.callout).foregroundStyle(.secondary)
+                .frame(width: 78, alignment: .leading)
+            Text(value).font(.callout).textSelection(.enabled)
+            Spacer()
+        }
     }
 }
 

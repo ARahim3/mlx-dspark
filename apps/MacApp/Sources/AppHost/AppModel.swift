@@ -139,6 +139,9 @@ final class AppModel: ObservableObject {
     // MARK: Onboarding
     /// Hardware + inventory, probed model-free before any server starts.
     @Published var onboarding: DoctorReport?
+
+    /// A newer app release on GitHub, if any. Informational — updating is `brew upgrade`.
+    @Published var appUpdate: AppUpdate.Available?
     /// One-time banner after onboarding: land in the Lab with the race ready to run.
     @Published var showLabWelcome = false
 
@@ -189,6 +192,15 @@ final class AppModel: ObservableObject {
         guard phase == .launching || phase == .failed else { return }
         phase = .settingUp
         errorMessage = nil
+
+        // Non-blocking: a release note in Settings/menu bar, never a launch dependency.
+        if AppIdentity.appVersion != "dev" {
+            Task { [weak self] in
+                if let update = await AppUpdate.check(current: AppIdentity.appVersion) {
+                    self?.appUpdate = update
+                }
+            }
+        }
 
         let bootstrapper = RuntimeBootstrapper(logStore: logStore)
         self.bootstrapper = bootstrapper
@@ -349,7 +361,7 @@ final class AppModel: ObservableObject {
                             if self.rounds.count > self.liveWindow {
                                 self.rounds.removeFirst(self.rounds.count - self.liveWindow)
                             }
-                            if round.ms > 0 { self.liveTokensPerSec = round.tokensPerSecond }
+                            if round.ms > 0 { self.observeRate(round.tokensPerSecond) }
                             self.lastActivity = Date()
                         case .stats(let stats):
                             self.stats = stats
@@ -365,6 +377,23 @@ final class AppModel: ObservableObject {
         startIdleDecay()
     }
 
+    /// Smoothed rate accumulator behind `liveTokensPerSec`.
+    private var rateEWMA: Double = 0
+    private var lastRatePublish = Date.distantPast
+
+    /// Per-round instantaneous rates jitter hard (rounds commit 1–5 tokens, so each one's
+    /// implied tok/s swings) — published raw they read as a slot machine. Smooth with an
+    /// EWMA and publish at most ~2×/s so the gauge reads like a needle settling; the exact
+    /// final figure still lands from the completion's own stats.
+    private func observeRate(_ rate: Double) {
+        rateEWMA = rateEWMA == 0 ? rate : 0.8 * rateEWMA + 0.2 * rate
+        let now = Date()
+        if now.timeIntervalSince(lastRatePublish) > 0.5 || liveTokensPerSec == 0 {
+            liveTokensPerSec = rateEWMA
+            lastRatePublish = now
+        }
+    }
+
     /// Zero the live rate a few seconds after the last round, so the sidebar and menu bar
     /// read "idle" instead of showing the last generation's speed forever.
     private func startIdleDecay() {
@@ -376,6 +405,7 @@ final class AppModel: ObservableObject {
                 if self.liveTokensPerSec > 0,
                    Date().timeIntervalSince(self.lastActivity) > 4 {
                     self.liveTokensPerSec = 0
+                    self.rateEWMA = 0
                 }
             }
         }
@@ -469,7 +499,11 @@ final class AppModel: ObservableObject {
                         self.messages[self.messages.count - 1].text = text + piece
                     case .finished(let info):
                         self.messages[self.messages.count - 1].stats = info
-                        if let info { self.liveTokensPerSec = info.tokensPerSec }
+                        // The turn's true mean rate, replacing the smoothed live estimate.
+                        if let info {
+                            self.liveTokensPerSec = info.tokensPerSec
+                            self.rateEWMA = info.tokensPerSec
+                        }
                         self.lastActivity = Date()
                     }
                 }

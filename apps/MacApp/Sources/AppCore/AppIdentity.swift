@@ -25,4 +25,13 @@ public enum AppIdentity {
     /// CPython the runtime venv is built against. uv fetches a managed build if the machine
     /// has none, which is what lets onboarding avoid ever mentioning Homebrew.
     public static let pythonVersion = "3.12"
+
+    /// GitHub repo, for the app-release update check (`app-v*` tags).
+    public static let repoSlug = "ARahim3/mlx-dspark"
+
+    /// This build's version, as stamped into Info.plist by `make_app.sh` (`APP_VERSION`).
+    /// "dev" when running outside a bundle (swift run, tests).
+    public static var appVersion: String {
+        Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "dev"
+    }
 }
