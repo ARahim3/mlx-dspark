@@ -318,8 +318,9 @@ struct LoadingView: View {
                     Text("Loading \(model.model.components(separatedBy: "/").last ?? model.model)")
                         .font(.system(size: 20, weight: .semibold))
                 }
-                Text("The first time a model runs, it downloads first — this can take a few "
-                     + "minutes. After that it's cached and starts in seconds.")
+                Text(model.loadingDetail
+                     ?? "The first time a model runs, it downloads first — this can take a "
+                        + "few minutes. After that it's cached and starts in seconds.")
                     .foregroundStyle(.secondary).font(.callout)
             }
 

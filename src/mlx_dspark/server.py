@@ -1404,14 +1404,23 @@ def make_handler(engine: Engine, api_key: str | None):
             every round the engine runs, whoever asked for it. That is what lets a UI show a
             live accept ribbon while a *different* client (an agent, say) is the one generating.
             """
-            q = engine.rounds.subscribe()
+            # Capture the round log ONCE. This stream outlives requests — including a hot
+            # model swap, during which the holder has no engine and every attribute access
+            # raises. Holding the log object keeps subscribe/unsubscribe paired on the same
+            # log no matter what the holder does meanwhile.
+            try:
+                log = engine.rounds
+            except RuntimeError:
+                return self._send_error(503, "no model is loaded (a model swap is in "
+                                             "progress or failed)", "server_error")
+            q = log.subscribe()
             try:
                 self._sse_start()
                 # Replay a little history so a client that connects mid-generation has
                 # something to draw immediately instead of an empty chart.
-                for event in engine.rounds.snapshot(32):
+                for event in log.snapshot(32):
                     self._sse(event, "round")
-                self._sse(engine.rounds.stats(), "stats")
+                self._sse(log.stats(), "stats")
                 idle = 0.0
                 while True:
                     try:
@@ -1421,15 +1430,23 @@ def make_handler(engine: Engine, api_key: str | None):
                         # Without traffic a proxy or the client can time the socket out; a
                         # comment frame is the cheapest legal keep-alive.
                         self._sse_comment("keepalive")
+                        # A hot swap replaces the engine and its round log; this stream is
+                        # then watching a dead object. End it so the client reconnects to
+                        # the new engine's stream instead of going silent forever.
+                        try:
+                            if engine.rounds is not log:
+                                break
+                        except RuntimeError:
+                            break                     # swap in progress — same conclusion
                         if idle >= 15.0:
-                            self._sse(engine.rounds.stats(), "stats")
+                            self._sse(log.stats(), "stats")
                             idle = 0.0
                         continue
                     self._sse(event, "round")
             except (BrokenPipeError, ConnectionResetError):
                 pass                     # client went away; nothing to report
             finally:
-                engine.rounds.unsubscribe(q)
+                log.unsubscribe(q)
 
         def do_POST(self):
             route = self._route()

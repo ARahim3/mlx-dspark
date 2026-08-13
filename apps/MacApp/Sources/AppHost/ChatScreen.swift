@@ -132,6 +132,21 @@ struct ChatSettingsPanel: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
+            if model.detail != .simple {
+                VStack(alignment: .leading, spacing: 6) {
+                    HStack(spacing: 6) {
+                        Text("Decoding").font(.caption.weight(.medium)).foregroundStyle(.secondary)
+                        Text("· \(model.decodingLine.lowercased()) · applies to every chat")
+                            .font(.caption2).foregroundStyle(.tertiary)
+                    }
+                    DecodingControls()
+                    Text("Speed only — output is identical in every mode. Applying reloads "
+                         + "the model in place.")
+                        .font(.caption2).foregroundStyle(.secondary)
+                }
+                Divider()
+            }
+
             VStack(alignment: .leading, spacing: 6) {
                 Text("System prompt").font(.caption.weight(.medium)).foregroundStyle(.secondary)
                 TextEditor(text: $model.chatSettings.systemPrompt)

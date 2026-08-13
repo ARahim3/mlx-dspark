@@ -230,6 +230,44 @@ def test_metrics_reports_allocator_memory(server):
         assert memory["active_bytes"] >= 0 and memory["peak_bytes"] >= 0
 
 
+def test_events_stream_ends_cleanly_across_a_model_swap():
+    """A hot swap replaces the engine (and its round log) under a live /events stream.
+
+    The stream must END — so the client reconnects to the new engine's log — never
+    traceback through the holder's no-engine guard (that stack trace lands in the app's
+    loading screen and reads as a crash)."""
+    import time
+
+    from mlx_dspark.server import EngineHolder
+    from mlx_dspark.telemetry import RoundLog
+
+    class Eng(_FakeEngine):
+        def __init__(self):
+            super().__init__()
+            self.rounds = RoundLog()
+
+        def close(self):
+            pass
+
+    holder = EngineHolder(Eng(), load_kwargs={})
+    httpd = ThreadingHTTPServer(("127.0.0.1", 0), S.make_handler(holder, api_key=None))
+    port = httpd.server_address[1]
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    base = f"http://127.0.0.1:{port}"
+    try:
+        stream = urllib.request.urlopen(base + "/events", timeout=5)
+        # Swap the engine out from under the stream (a real swap loads weights; identity
+        # of `rounds` changing is all the stream watches).
+        holder._engine = Eng()
+        start = time.time()
+        stream.read()                              # blocks until the server closes the stream
+        assert time.time() - start < 10
+        # The server is still healthy and serving the new engine.
+        assert _get(base, "/health")["status"] == "ok"
+    finally:
+        httpd.shutdown()
+
+
 def test_admin_models_lists_registry_installed_and_disk(server):
     _, base = server
     payload = _get(base, "/admin/models")

@@ -90,6 +90,25 @@ struct DetailLevelCard: View {
 /// `--mode` / `--max-draft`, via `/admin/load` overrides); the port survives.
 struct DecodingCard: View {
     @EnvironmentObject private var model: AppModel
+
+    var body: some View {
+        Card(title: "Decoding", subtitle: model.decodingLine) {
+            DecodingControls()
+
+            Text("Output is byte-identical in every mode — these change speed, not text. "
+                 + "Cap Auto calibrates this Mac once and adapts per round; pin a value if "
+                 + "you've measured a better fixed cap for this model. Applying reloads the "
+                 + "model in place (the server and its port stay up).")
+                .font(.caption).foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+    }
+}
+
+/// Mode + cap pickers with Apply. Shared between Settings → Decoding and the chat toolbar's
+/// settings popover, so the knobs live where the user already is.
+struct DecodingControls: View {
+    @EnvironmentObject private var model: AppModel
     @State private var mode: String = "auto"
     @State private var cap: String = "auto"
     @State private var applying = false
@@ -104,42 +123,26 @@ struct DecodingCard: View {
     }
 
     var body: some View {
-        Card(title: "Decoding",
-             subtitle: currentLine) {
-            HStack(spacing: 14) {
-                Picker("Mode", selection: $mode) {
-                    ForEach(modes, id: \.id) { Text($0.label).tag($0.id) }
-                }
-                .frame(maxWidth: 220)
-
-                Picker("Cap", selection: $cap) {
-                    Text("Auto").tag("auto")
-                    ForEach(1...8, id: \.self) { Text("\($0)").tag("\($0)") }
-                }
-                .frame(maxWidth: 140)
-
-                if applying {
-                    ProgressView().controlSize(.small)
-                } else {
-                    Button("Apply") { apply() }
-                        .disabled(!model.isServerReady)
-                }
-                Spacer()
+        HStack(spacing: 14) {
+            Picker("Mode", selection: $mode) {
+                ForEach(modes, id: \.id) { Text($0.label).tag($0.id) }
             }
+            .frame(maxWidth: 220)
 
-            Text("Output is byte-identical in every mode — these change speed, not text. "
-                 + "Cap Auto calibrates this Mac once and adapts per round; pin a value if "
-                 + "you've measured a better fixed cap for this model. Applying reloads the "
-                 + "model in place (the server and its port stay up).")
-                .font(.caption).foregroundStyle(.secondary)
-                .fixedSize(horizontal: false, vertical: true)
+            Picker("Cap", selection: $cap) {
+                Text("Auto").tag("auto")
+                ForEach(1...8, id: \.self) { Text("\($0)").tag("\($0)") }
+            }
+            .frame(maxWidth: 140)
+
+            if applying {
+                ProgressView().controlSize(.small)
+            } else {
+                Button("Apply") { apply() }
+                    .disabled(!model.isServerReady)
+            }
+            Spacer(minLength: 0)
         }
-    }
-
-    private var currentLine: String {
-        var line = "Running \(model.health?.mode ?? "—")"
-        if let cap = model.rounds.last?.cap { line += " · cap \(cap)" }
-        return line
     }
 
     private func apply() {

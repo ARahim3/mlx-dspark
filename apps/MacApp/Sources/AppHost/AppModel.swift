@@ -142,6 +142,11 @@ final class AppModel: ObservableObject {
 
     /// A newer app release on GitHub, if any. Informational — updating is `brew upgrade`.
     @Published var appUpdate: AppUpdate.Available?
+
+    /// What the loading screen should say this load *is* — a first download, a hot swap, a
+    /// settings reload. Without it every load claims "downloading", which reads as broken
+    /// when the model is already on disk.
+    @Published var loadingDetail: String?
     /// One-time banner after onboarding: land in the Lab with the race ready to run.
     @Published var showLabWelcome = false
 
@@ -254,6 +259,7 @@ final class AppModel: ObservableObject {
             let client = APIClient(baseURL: URL(string: "http://127.0.0.1:\(port)")!)
             self.apiClient = client
             currentHealth = try? await client.health()
+            loadingDetail = nil
             phase = .ready
             startTelemetry()
             startMemoryPolling()
@@ -293,6 +299,8 @@ final class AppModel: ObservableObject {
         rounds = []
         stats = nil
         calibration = nil
+        loadingDetail = "Swapping models in place — the server and its port stay up, so "
+            + "connected agents keep working. A model that isn't downloaded yet downloads first."
         phase = .startingServer
         logStore.note("switching model → \(target)")
         do {
@@ -300,6 +308,7 @@ final class AppModel: ObservableObject {
             // Re-point health at the new model and restart the telemetry stream (the old one
             // ended when the engine it was streaming from was torn down).
             currentHealth = try? await client.health()
+            loadingDetail = nil
             phase = .ready
             startTelemetry()
             startMemoryPolling()
@@ -315,7 +324,8 @@ final class AppModel: ObservableObject {
             do {
                 _ = try await client.loadModel(previous)
                 currentHealth = try? await client.health()
-                phase = .ready
+                loadingDetail = nil
+            phase = .ready
                 startTelemetry()
                 startMemoryPolling()
                 await refreshDiagnostics()
@@ -336,11 +346,15 @@ final class AppModel: ObservableObject {
         rounds = []
         stats = nil
         calibration = nil
+        loadingDetail = "Applying mode \(mode ?? "auto") · cap \(cap ?? "auto") — reloading "
+            + "the model in place. Weights are already on disk; this takes seconds to a "
+            + "minute, and the server's port stays up."
         phase = .startingServer
         logStore.note("reloading \(model) — mode \(mode ?? "auto") · cap \(cap ?? "auto")")
         do {
             _ = try await client.loadModel(model, mode: mode, maxDraft: cap)
             currentHealth = try? await client.health()
+            loadingDetail = nil
             phase = .ready
             startTelemetry()
             startMemoryPolling()
@@ -351,7 +365,8 @@ final class AppModel: ObservableObject {
             do {
                 _ = try await client.loadModel(model)
                 currentHealth = try? await client.health()
-                phase = .ready
+                loadingDetail = nil
+            phase = .ready
                 startTelemetry()
                 startMemoryPolling()
             } catch {
@@ -659,6 +674,13 @@ final class AppModel: ObservableObject {
         case .failed(let message):  return message
         case .stopped:              return "Stopped"
         }
+    }
+
+    /// "Running dspark · cap 4" — what the decode knobs are currently doing.
+    var decodingLine: String {
+        var line = "Running \(health?.mode ?? "—")"
+        if let cap = rounds.last?.cap { line += " · cap \(cap)" }
+        return line
     }
 
     /// "target ← drafter" — the pairing that makes speculative decoding work. Naming both is
