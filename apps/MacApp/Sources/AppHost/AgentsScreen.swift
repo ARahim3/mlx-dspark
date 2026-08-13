@@ -155,6 +155,7 @@ struct RoundTripTest: View {
                 ) {
                     switch event {
                     case .delta(let piece): text += piece
+                    case .reasoning: break        // thinking counts as a live round trip too
                     case .finished(let info): stats = info
                     }
                 }

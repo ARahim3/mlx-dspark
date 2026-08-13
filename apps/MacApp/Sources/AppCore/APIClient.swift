@@ -61,6 +61,9 @@ public struct LoadStatus: Decodable, Sendable {
 /// One event from a streaming completion.
 public enum ChatEvent: Sendable {
     case delta(String)
+    /// Reasoning streamed as a separate channel (`reasoning_content` — Muse-class models,
+    /// whose thinking never appears inline in the content).
+    case reasoning(String)
     /// Arrives on the last chunk, carrying the speculative-decoding stats for the turn.
     case finished(SpecInfo?)
 }
@@ -272,9 +275,14 @@ public struct APIClient: Sendable {
                                   as? [String: Any] else { continue }
 
                         if let choices = obj["choices"] as? [[String: Any]],
-                           let delta = choices.first?["delta"] as? [String: Any],
-                           let text = delta["content"] as? String, !text.isEmpty {
-                            continuation.yield(.delta(text))
+                           let delta = choices.first?["delta"] as? [String: Any] {
+                            if let text = delta["content"] as? String, !text.isEmpty {
+                                continuation.yield(.delta(text))
+                            }
+                            if let thought = delta["reasoning_content"] as? String,
+                               !thought.isEmpty {
+                                continuation.yield(.reasoning(thought))
+                            }
                         }
                         // The engine attaches its stats to the final chunk only.
                         if let specDict = obj["x_mlx_dspark"] {

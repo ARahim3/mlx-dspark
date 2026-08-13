@@ -453,7 +453,20 @@ final class AppModel: ObservableObject {
                 ) {
                     switch event {
                     case .delta(let piece):
-                        self.messages[self.messages.count - 1].text += piece
+                        // If channelled reasoning opened a synthetic think block, the first
+                        // answer text closes it — from here on the message reads exactly
+                        // like an inline-thinking model's output.
+                        var text = self.messages[self.messages.count - 1].text
+                        if text.hasPrefix("<think>"), !text.contains("</think>") {
+                            text += "</think>\n"
+                        }
+                        self.messages[self.messages.count - 1].text = text + piece
+                    case .reasoning(let piece):
+                        // Muse-class models stream thinking as a separate channel; fold it
+                        // into the same `<think>` form the thinking card already renders.
+                        var text = self.messages[self.messages.count - 1].text
+                        if !text.hasPrefix("<think>") { text = "<think>" + text }
+                        self.messages[self.messages.count - 1].text = text + piece
                     case .finished(let info):
                         self.messages[self.messages.count - 1].stats = info
                         if let info { self.liveTokensPerSec = info.tokensPerSec }
