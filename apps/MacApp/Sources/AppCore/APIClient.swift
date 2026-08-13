@@ -16,11 +16,14 @@ public struct HealthInfo: Decodable, Sendable, Equatable {
     /// this app's domain language; no other local-LLM app has a second model to name.
     public let target: String?
     public let drafter: String?
+    /// Configured draft cap — `"auto"` or the pinned/derived value as a string.
+    public let maxDraft: String?
     public let contextWindow: Int?
     public let maxOutputTokens: Int?
 
     enum CodingKeys: String, CodingKey {
         case status, model, mode, target, drafter
+        case maxDraft = "max_draft"
         case contextWindow = "context_window"
         case maxOutputTokens = "max_output_tokens"
     }

@@ -99,6 +99,8 @@ def test_health(server):
     _, base = server
     h = _get(base, "/health")
     assert h["status"] == "ok" and h["model"] == "FakeModel" and h["mode"] == "dspark"
+    # The configured draft cap, so a client can show the knob's real state ("auto" or "N").
+    assert h["max_draft"] == "auto"
 
 
 def test_models(server):

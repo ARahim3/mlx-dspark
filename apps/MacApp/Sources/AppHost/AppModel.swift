@@ -679,7 +679,7 @@ final class AppModel: ObservableObject {
     /// "Running dspark · cap 4" — what the decode knobs are currently doing.
     var decodingLine: String {
         var line = "Running \(health?.mode ?? "—")"
-        if let cap = rounds.last?.cap { line += " · cap \(cap)" }
+        if let cap = health?.maxDraft { line += " · cap \(cap)" }
         return line
     }
 

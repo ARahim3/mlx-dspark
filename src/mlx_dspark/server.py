@@ -1255,9 +1255,14 @@ def make_handler(engine: Engine, api_key: str | None):
                     status = engine.status()
                     return self._send_json(200, {"status": "loading", "model": status["model"],
                                                  "loading": True, "error": status["error"]})
+                # max_draft as a string ("auto" or the pinned/derived cap) so a client can
+                # show the configured knob, not just infer it from round telemetry.
+                max_draft = ("auto" if getattr(engine, "cap_controller", None) is not None
+                             else str(getattr(engine, "max_draft_tokens", None) or "auto"))
                 return self._send_json(200, {
                     "status": "ok", "model": engine.model_id, "mode": engine.mode,
                     "target": engine.target_repo, "drafter": engine.drafter_repo,
+                    "max_draft": max_draft,
                     "context_window": getattr(engine, "context_window", None),
                     "max_output_tokens": engine.max_tokens_cap,
                 })

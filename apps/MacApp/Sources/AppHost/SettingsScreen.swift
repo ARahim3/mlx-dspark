@@ -127,29 +127,39 @@ struct DecodingControls: View {
             Picker("Mode", selection: $mode) {
                 ForEach(modes, id: \.id) { Text($0.label).tag($0.id) }
             }
-            .frame(maxWidth: 220)
+            .fixedSize()
 
             Picker("Cap", selection: $cap) {
                 Text("Auto").tag("auto")
                 ForEach(1...8, id: \.self) { Text("\($0)").tag("\($0)") }
             }
-            .frame(maxWidth: 140)
+            .fixedSize()
 
             if applying {
                 ProgressView().controlSize(.small)
             } else {
                 Button("Apply") { apply() }
-                    .disabled(!model.isServerReady)
+                    .disabled(!model.isServerReady || !isDirty)
             }
             Spacer(minLength: 0)
         }
+        // The pickers show what the engine is actually running, not a stale default — the
+        // server reports both (`/health` mode + max_draft), so a reopened popover agrees
+        // with what was applied.
+        .onAppear {
+            mode = model.health?.mode ?? "auto"
+            cap = model.health?.maxDraft ?? "auto"
+        }
+    }
+
+    private var isDirty: Bool {
+        mode != (model.health?.mode ?? "auto") || cap != (model.health?.maxDraft ?? "auto")
     }
 
     private func apply() {
         applying = true
         Task {
-            await model.applyEngineSettings(mode: mode == "auto" ? nil : mode,
-                                            cap: cap == "auto" ? nil : cap)
+            await model.applyEngineSettings(mode: mode, cap: cap)
             applying = false
         }
     }
