@@ -44,13 +44,29 @@ enum Detail: String, CaseIterable, Identifiable {
     var blurb: String {
         switch self {
         case .simple:    return "Everything automatic. Just chat."
-        case .advanced:  return "Cost curves, live acceptance, mode and cap."
-        case .developer: return "Every knob, raw logs, server internals."
+        case .advanced:  return "The Lab: races, live acceptance, this Mac's cost curves."
+        case .developer: return "Advanced, plus raw engine logs."
         }
     }
 
     var showsLab: Bool { self != .simple }
     var showsRawLogs: Bool { self == .developer }
+}
+
+/// Generation preferences the user can change per conversation. `nil` means "the model's own
+/// default" — the server already reads `generation_config.json`, so absent beats guessed.
+struct ChatSettings: Codable, Equatable {
+    var systemPrompt: String = ""
+    var temperature: Double?
+    var maxTokens: Int?
+    /// Reasoning models spend real tokens thinking; agentic/plain use often wants it off.
+    var thinking: Bool = true
+}
+
+/// A log line with a stable identity, so trimming the buffer never reshuffles SwiftUI ids.
+struct LogRow: Identifiable {
+    let id: Int
+    let text: String
 }
 
 /// Coordinates the runtime, the server process, and everything the screens read.
@@ -81,11 +97,23 @@ final class AppModel: ObservableObject {
     @Published var messages: [ChatMessage] = []
     @Published var isGenerating = false
     @Published var liveTokensPerSec: Double = 0
+    /// A generation that failed mid-stream. Rendered inline in Chat — a chat problem must
+    /// never take over the whole window.
+    @Published var chatError: String?
+    @Published var chatSettings: ChatSettings = Defaults.chatSettings {
+        didSet { Defaults.chatSettings = chatSettings }
+    }
+
+    // MARK: Chat sessions
+    @Published var sessions: [ChatSession] = []
+    @Published private(set) var currentSessionID: UUID?
 
     // MARK: Telemetry (Lab)
     @Published var rounds: [RoundEvent] = []
     @Published var stats: RoundStats?
     @Published var calibration: Calibration?
+    /// MLX allocator state — what the loaded model holds resident, polled from `/metrics`.
+    @Published var memory: EngineMemory?
 
     /// The loaded model's self-description. Fetched from `/health` on start and after every hot
     /// swap, so it stays correct across a model change — the supervisor's own cached health
@@ -94,10 +122,15 @@ final class AppModel: ObservableObject {
 
     // MARK: Models
     @Published var models: [ModelRow] = []
+    @Published var installedModels: [InstalledModel] = []
+    @Published var diskUsage: DiskUsage?
     @Published var doctorReport: DoctorReport?
+    /// A model swap that failed. Rendered inline on the Models screen — the server survives a
+    /// bad load by design, so the app must too.
+    @Published var modelSwitchError: String?
 
     // MARK: Logs
-    @Published var logLines: [String] = []
+    @Published var logLines: [LogRow] = []
     @Published var showLogs = false
 
     /// The target the server is (or will be) loaded with. Persisted after onboarding.
@@ -106,6 +139,8 @@ final class AppModel: ObservableObject {
     // MARK: Onboarding
     /// Hardware + inventory, probed model-free before any server starts.
     @Published var onboarding: DoctorReport?
+    /// One-time banner after onboarding: land in the Lab with the race ready to run.
+    @Published var showLabWelcome = false
 
     enum Phase: Equatable {
         case launching, settingUp
@@ -118,6 +153,7 @@ final class AppModel: ObservableObject {
     private let liveWindow = 400
 
     let logStore = LogStore()
+    private let chatStore = ChatStore()
     private var bootstrapper: RuntimeBootstrapper?
     private var supervisor: ServerSupervisor?
     /// Exposed so feature models (the Race) can drive the engine without re-deriving the port.
@@ -125,15 +161,24 @@ final class AppModel: ObservableObject {
     private var client: APIClient? { apiClient }
     private var generationTask: Task<Void, Never>?
     private var telemetryTask: Task<Void, Never>?
+    private var memoryTask: Task<Void, Never>?
+    private var idleDecayTask: Task<Void, Never>?
+    private var logCounter = 0
+    /// When the last round (or completion) arrived — drives the idle decay of the live rate.
+    private var lastActivity = Date.distantPast
+    /// Set while the first-ever run is in flight, so success can land in the Lab.
+    private var isFirstRun = false
 
     init() {
         logStore.subscribe { [weak self] line in
             Task { @MainActor in
                 guard let self else { return }
-                self.logLines.append(line.text)
+                self.logCounter += 1
+                self.logLines.append(LogRow(id: self.logCounter, text: line.text))
                 if self.logLines.count > 500 { self.logLines.removeFirst(100) }
             }
         }
+        loadSessions()
     }
 
     // MARK: - Boot
@@ -162,6 +207,7 @@ final class AppModel: ObservableObject {
         // model-free, so it runs without a server and without committing to a multi-GB
         // download the user might not have meant.
         if Defaults.selectedModel == nil {
+            isFirstRun = true
             phase = .onboarding
             onboarding = try? await DoctorProbe.run(engine: engine)
             if onboarding == nil {
@@ -198,7 +244,18 @@ final class AppModel: ObservableObject {
             currentHealth = try? await client.health()
             phase = .ready
             startTelemetry()
+            startMemoryPolling()
             await refreshDiagnostics()
+            if isFirstRun {
+                // The plan's "hooked" moment: straight from onboarding into a race the user
+                // can run — not a blank chat that hides why this app exists.
+                isFirstRun = false
+                if detail.showsLab {
+                    Defaults.labTab = "Race"
+                    screen = .lab
+                    showLabWelcome = true
+                }
+            }
         } catch {
             fail(error)
         }
@@ -208,11 +265,17 @@ final class AppModel: ObservableObject {
     ///
     /// The server and its port survive, so anything else pointed at it (a Claude Code session)
     /// keeps working across the change. The engine frees the old model before loading the new
-    /// one (release-then-load), so peak memory stays at one model. The loading screen shows
-    /// meanwhile; telemetry resets because the new model's numbers are its own.
+    /// one (release-then-load), so peak memory stays at one model.
+    ///
+    /// Failure stays contained: the engine survives a bad load by design (400 + not-ready),
+    /// so the app reports the error inline and reloads the previous model rather than
+    /// declaring the whole app failed.
     func switchModel(to target: String) async {
-        guard target != model, let client = apiClient else { return }
+        let target = target.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !target.isEmpty, target != model, let client = apiClient else { return }
         generationTask?.cancel()
+        let previous = model
+        modelSwitchError = nil
         self.model = target
         Defaults.selectedModel = target
         rounds = []
@@ -227,9 +290,26 @@ final class AppModel: ObservableObject {
             currentHealth = try? await client.health()
             phase = .ready
             startTelemetry()
+            startMemoryPolling()
             await refreshDiagnostics()
         } catch {
-            fail(error)
+            modelSwitchError = error.localizedDescription
+            logStore.note("model swap failed: \(error.localizedDescription)")
+            screen = .models                     // the inline error lives there
+            // Release-then-load means the old model is already gone, so restore it — the
+            // app (and anything on the port) should keep working on what it had.
+            self.model = previous
+            Defaults.selectedModel = previous
+            do {
+                _ = try await client.loadModel(previous)
+                currentHealth = try? await client.health()
+                phase = .ready
+                startTelemetry()
+                startMemoryPolling()
+                await refreshDiagnostics()
+            } catch {
+                fail(error)                      // even the old model won't load — real failure
+            }
         }
     }
 
@@ -242,6 +322,9 @@ final class AppModel: ObservableObject {
     func shutdown() async {
         generationTask?.cancel()
         telemetryTask?.cancel()
+        memoryTask?.cancel()
+        idleDecayTask?.cancel()
+        persistCurrentSession()
         await supervisor?.stop()
     }
 
@@ -267,6 +350,7 @@ final class AppModel: ObservableObject {
                                 self.rounds.removeFirst(self.rounds.count - self.liveWindow)
                             }
                             if round.ms > 0 { self.liveTokensPerSec = round.tokensPerSecond }
+                            self.lastActivity = Date()
                         case .stats(let stats):
                             self.stats = stats
                         }
@@ -278,6 +362,38 @@ final class AppModel: ObservableObject {
                 try? await Task.sleep(nanoseconds: 1_000_000_000)
             }
         }
+        startIdleDecay()
+    }
+
+    /// Zero the live rate a few seconds after the last round, so the sidebar and menu bar
+    /// read "idle" instead of showing the last generation's speed forever.
+    private func startIdleDecay() {
+        idleDecayTask?.cancel()
+        idleDecayTask = Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: 1_500_000_000)
+                guard let self else { return }
+                if self.liveTokensPerSec > 0,
+                   Date().timeIntervalSince(self.lastActivity) > 4 {
+                    self.liveTokensPerSec = 0
+                }
+            }
+        }
+    }
+
+    /// Poll the allocator numbers behind the memory gauge. Cheap on the server side (it reads
+    /// the allocator, never the GPU), so a relaxed cadence is plenty.
+    private func startMemoryPolling() {
+        guard let client else { return }
+        memoryTask?.cancel()
+        memoryTask = Task { [weak self] in
+            while !Task.isCancelled {
+                if let memory = try? await client.engineMemory() {
+                    self?.memory = memory
+                }
+                try? await Task.sleep(nanoseconds: 5_000_000_000)
+            }
+        }
     }
 
     func refreshDiagnostics() async {
@@ -286,7 +402,11 @@ final class AppModel: ObservableObject {
         async let inventory = try? client.modelInventory()
         async let curves = try? client.calibration()
         doctorReport = await report
-        models = await inventory ?? []
+        if let inventory = await inventory {
+            models = inventory.models
+            installedModels = inventory.installed ?? []
+            diskUsage = inventory.disk
+        }
         calibration = await curves
     }
 
@@ -303,33 +423,48 @@ final class AppModel: ObservableObject {
         let text = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty else { return }
 
+        chatError = nil
         messages.append(ChatMessage(role: .user, text: text))
         messages.append(ChatMessage(role: .assistant, text: ""))
         prompt = ""
         isGenerating = true
+        persistCurrentSession()
 
-        let history = messages.dropLast().map {
-            ["role": $0.role == .user ? "user" : "assistant", "content": $0.text]
+        // History goes back *without* the reasoning traces: `<think>` blocks are the model
+        // talking to itself, resending them just inflates prefill (which already dominates).
+        var history: [[String: String]] = []
+        let system = chatSettings.systemPrompt.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !system.isEmpty { history.append(["role": "system", "content": system]) }
+        history += messages.dropLast().map { message in
+            let content = message.role == .assistant
+                ? ThinkingSplit.parse(message.text).answer : message.text
+            return ["role": message.role == .user ? "user" : "assistant", "content": content]
         }
 
         generationTask = Task { [weak self] in
             guard let self else { return }
             do {
-                for try await event in client.streamChat(model: self.model,
-                                                         messages: Array(history),
-                                                         maxTokens: 1024) {
+                for try await event in client.streamChat(
+                    model: self.model,
+                    messages: history,
+                    temperature: self.chatSettings.temperature,
+                    maxTokens: self.chatSettings.maxTokens,
+                    enableThinking: self.chatSettings.thinking ? nil : false
+                ) {
                     switch event {
                     case .delta(let piece):
                         self.messages[self.messages.count - 1].text += piece
                     case .finished(let info):
                         self.messages[self.messages.count - 1].stats = info
                         if let info { self.liveTokensPerSec = info.tokensPerSec }
+                        self.lastActivity = Date()
                     }
                 }
             } catch {
-                if !Task.isCancelled { self.errorMessage = error.localizedDescription }
+                if !Task.isCancelled { self.chatError = error.localizedDescription }
             }
             self.isGenerating = false
+            self.persistCurrentSession()
             await self.refreshStats()
         }
     }
@@ -337,11 +472,79 @@ final class AppModel: ObservableObject {
     func cancelGeneration() {
         generationTask?.cancel()
         isGenerating = false
+        persistCurrentSession()
     }
 
-    func clearChat() {
+    // MARK: - Chat sessions
+
+    private func loadSessions() {
+        sessions = chatStore.list()
+        if let saved = Defaults.currentSession,
+           let session = sessions.first(where: { $0.id == saved }) {
+            currentSessionID = session.id
+            messages = session.messages
+        } else if let latest = sessions.first {
+            currentSessionID = latest.id
+            messages = latest.messages
+        }
+        // No sessions yet: stay unsaved until the first message, so quitting a fresh app
+        // doesn't litter empty files.
+    }
+
+    func newChat() {
         cancelGeneration()
-        messages.removeAll()
+        persistCurrentSession()
+        currentSessionID = nil
+        Defaults.currentSession = nil
+        messages = []
+        chatError = nil
+        screen = .chat
+    }
+
+    func selectSession(_ id: UUID) {
+        guard id != currentSessionID else { return }
+        cancelGeneration()
+        persistCurrentSession()
+        guard let session = sessions.first(where: { $0.id == id }) else { return }
+        currentSessionID = session.id
+        Defaults.currentSession = session.id
+        messages = session.messages
+        chatError = nil
+    }
+
+    func deleteSession(_ id: UUID) {
+        chatStore.delete(id)
+        sessions.removeAll { $0.id == id }
+        if id == currentSessionID {
+            currentSessionID = nil
+            Defaults.currentSession = nil
+            messages = []
+        }
+    }
+
+    /// Write the live conversation back to disk (and materialize the session on first use).
+    private func persistCurrentSession() {
+        guard !messages.isEmpty else { return }
+        var session: ChatSession
+        if let id = currentSessionID, let existing = sessions.first(where: { $0.id == id }) {
+            session = existing
+        } else {
+            session = ChatSession()
+            currentSessionID = session.id
+            Defaults.currentSession = session.id
+        }
+        session.messages = messages
+        session.updatedAt = Date()
+        session.retitleFromContent()
+        chatStore.save(session)
+        sessions.removeAll { $0.id == session.id }
+        sessions.insert(session, at: 0)
+    }
+
+    var currentSessionTitle: String {
+        guard let id = currentSessionID,
+              let session = sessions.first(where: { $0.id == id }) else { return "New chat" }
+        return session.title
     }
 
     // MARK: - Derived
@@ -384,6 +587,13 @@ final class AppModel: ObservableObject {
         return "\(short(health.target ?? health.model))  ←  \(short(drafter))"
     }
 
+    /// The loaded model's resident footprint, ready for the chrome. Peak is deliberately not
+    /// shown here — a gauge that never goes down reads as a leak.
+    var memoryLine: String? {
+        guard let gb = memory?.activeGB, gb > 0.05 else { return nil }
+        return String(format: "%.1f GB", gb)
+    }
+
     /// Rounds from the most recent request only — what the live charts should show.
     var currentRunRounds: [RoundEvent] {
         guard let last = rounds.last else { return [] }
@@ -421,12 +631,19 @@ enum Defaults {
         get { store.string(forKey: "selectedModel") }
         set { store.set(newValue, forKey: "selectedModel") }
     }
-}
 
-struct ChatMessage: Identifiable {
-    enum Role { case user, assistant }
-    let id = UUID()
-    let role: Role
-    var text: String
-    var stats: SpecInfo?
+    static var currentSession: UUID? {
+        get { store.string(forKey: "currentSession").flatMap(UUID.init(uuidString:)) }
+        set { store.set(newValue?.uuidString, forKey: "currentSession") }
+    }
+
+    static var chatSettings: ChatSettings {
+        get {
+            guard let data = store.data(forKey: "chatSettings"),
+                  let settings = try? JSONDecoder().decode(ChatSettings.self, from: data)
+            else { return ChatSettings() }
+            return settings
+        }
+        set { store.set(try? JSONEncoder().encode(newValue), forKey: "chatSettings") }
+    }
 }

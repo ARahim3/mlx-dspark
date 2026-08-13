@@ -99,6 +99,11 @@ struct ProseBlock: View {
                 Text("•").foregroundStyle(.secondary)
                 Text(inline(bullet)).frame(maxWidth: .infinity, alignment: .leading)
             }
+        } else if let (marker, body) = numberedBody(trimmed) {
+            HStack(alignment: .firstTextBaseline, spacing: 6) {
+                Text(marker).foregroundStyle(.secondary).monospacedDigit()
+                Text(inline(body)).frame(maxWidth: .infinity, alignment: .leading)
+            }
         } else {
             Text(inline(line)).frame(maxWidth: .infinity, alignment: .leading)
         }
@@ -115,6 +120,17 @@ struct ProseBlock: View {
             return String(line.dropFirst(marker.count))
         }
         return nil
+    }
+
+    /// "1. body" / "12) body" → ("1.", "body"). Models number lists constantly; rendering the
+    /// marker separately keeps the numbers aligned and the body wrapping cleanly.
+    private func numberedBody(_ line: String) -> (String, String)? {
+        let digits = line.prefix(while: \.isNumber)
+        guard !digits.isEmpty, digits.count <= 3 else { return nil }
+        let rest = line.dropFirst(digits.count)
+        guard let punct = rest.first, punct == "." || punct == ")",
+              rest.dropFirst().first == " " else { return nil }
+        return ("\(digits)\(punct)", String(rest.dropFirst(2)))
     }
 
     /// Inline markdown via AttributedString, falling back to plain text if it can't parse
@@ -143,7 +159,7 @@ struct CodeCard: View {
             .background(.quaternary.opacity(0.4))
 
             ScrollView(.horizontal, showsIndicators: false) {
-                Text(code)
+                Text(SyntaxHighlight.highlight(code))
                     .font(.system(size: 12, design: .monospaced))
                     .textSelection(.enabled)
                     .padding(10)

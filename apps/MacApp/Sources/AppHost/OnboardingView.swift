@@ -152,13 +152,19 @@ struct ModelPickRow: View {
                     }
                 }
                 Spacer()
+                if let speedup = row.speedup {
+                    Text(speedup)
+                        .font(.system(.callout, design: .rounded).monospacedDigit())
+                        .fontWeight(.semibold)
+                        .foregroundStyle(Theme.spark)
+                }
                 VStack(alignment: .trailing, spacing: 3) {
                     if let ram = row.ram {
                         Text(ram).font(.caption).foregroundStyle(.secondary)
                     }
                     Text(row.ready ? "ready" : "downloads on first use")
                         .font(.caption2)
-                        .foregroundStyle(row.ready ? .green : .secondary)
+                        .foregroundStyle(row.ready ? Theme.verified : .secondary)
                 }
                 Image(systemName: "chevron.right").foregroundStyle(.tertiary).imageScale(.small)
             }

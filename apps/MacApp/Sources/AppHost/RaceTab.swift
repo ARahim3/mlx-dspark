@@ -35,6 +35,15 @@ struct RaceTab: View {
                 race.selectedArms = race.defaultArms(available: model.availableRaceArms)
             }
         }
+        // A hot swap can change what's raceable (a drafterless target has no dspark arm);
+        // stale arms would 400 the next run.
+        .onChange(of: model.availableRaceArms) { _, available in
+            let valid = Set(available)
+            if race.phase != .running,
+               race.selectedArms.contains(where: { !valid.contains($0.mode) }) {
+                race.selectedArms = race.defaultArms(available: available)
+            }
+        }
     }
 }
 

@@ -10,6 +10,7 @@ struct MlxDsparkApp: App {
         WindowGroup(id: "main") {
             RootView()
                 .environmentObject(model)
+                .tint(Theme.spark)
                 .onAppear { delegate.model = model }
         }
         .windowResizability(.contentMinSize)
@@ -17,7 +18,10 @@ struct MlxDsparkApp: App {
         // look cramped on first launch.
         .defaultSize(width: 1120, height: 760)
         .commands {
-            CommandGroup(replacing: .newItem) { }      // single-window app
+            CommandGroup(replacing: .newItem) {
+                Button("New Chat") { model.newChat() }
+                    .keyboardShortcut("n")
+            }
         }
 
         // Ambient telemetry in the system menu bar — MTPLX's most-liked, cheapest idea: the
@@ -27,6 +31,7 @@ struct MlxDsparkApp: App {
         MenuBarExtra {
             MenuBarPanel()
                 .environmentObject(model)
+                .tint(Theme.spark)
         } label: {
             MenuBarLabel()
                 .environmentObject(model)
@@ -50,7 +55,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         NSApp.activate(ignoringOtherApps: true)
     }
 
-    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
+    /// Closing the window must NOT quit: the flagship use case is serving a coding agent in
+    /// the background, and tearing the engine down under a live Claude Code session because
+    /// the user tidied their windows would be the worst possible surprise. The app stays in
+    /// the menu bar (which is also the way back to the window); quitting is ⌘Q or the menu
+    /// bar's Quit, both of which stop the engine cleanly.
+    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }
+
+    /// Clicking the Dock icon with no window open should bring the window back.
+    func applicationShouldHandleReopen(_ sender: NSApplication,
+                                       hasVisibleWindows flag: Bool) -> Bool {
+        if !flag {
+            for window in NSApp.windows where window.canBecomeMain {
+                window.makeKeyAndOrderFront(nil)
+            }
+        }
+        return true
+    }
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         guard let model = MainActor.assumeIsolated({ self.model }) else { return .terminateNow }

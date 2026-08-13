@@ -48,6 +48,9 @@ struct MenuBarPanel: View {
                         row("Drafter", drafter.components(separatedBy: "/").last ?? drafter)
                     }
                     row("Mode", health.mode)
+                    if let memory = model.memoryLine {
+                        row("Memory", memory)
+                    }
                 }
 
                 Divider()
@@ -56,6 +59,7 @@ struct MenuBarPanel: View {
                     Text("\(model.liveTokensPerSec, specifier: "%.0f")")
                         .font(.system(size: 26, weight: .semibold, design: .rounded))
                         .monospacedDigit()
+                        .foregroundStyle(model.liveTokensPerSec > 0 ? Theme.spark : .secondary)
                         .contentTransition(.numericText())
                         .animation(.easeOut(duration: 0.2), value: model.liveTokensPerSec)
                     Text("tok/s").foregroundStyle(.secondary)
@@ -68,6 +72,9 @@ struct MenuBarPanel: View {
                         .font(.caption)
                     }
                 }
+
+                AcceptRibbon(rounds: model.rounds, maxTicks: 60)
+                    .frame(maxWidth: .infinity)
             } else {
                 Text(model.statusLine).font(.callout).foregroundStyle(.secondary)
             }
@@ -94,9 +101,9 @@ struct MenuBarPanel: View {
 
     private var statusColor: Color {
         switch model.phase {
-        case .ready:  return .green
+        case .ready:  return Theme.verified
         case .failed: return .red
-        default:      return .orange
+        default:      return Theme.warning
         }
     }
 

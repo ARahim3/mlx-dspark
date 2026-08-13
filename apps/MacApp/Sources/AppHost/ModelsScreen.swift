@@ -1,42 +1,166 @@
 import AppCore
 import SwiftUI
 
-/// Which models this Mac can actually run, and which are already on disk.
+/// Everything runnable, in three layers: the measured pairs the registry vouches for, whatever
+/// is already on this disk, and any Hugging Face repo the user cares to type.
 ///
-/// The design borrows LM Studio's most-praised idea — answer "will this fit?" *before* someone
-/// downloads 15 GB — and adds the thing only this project has to show: the **pair**. Every row
+/// The design keeps LM Studio's most-praised idea — answer "will this fit?" *before* someone
+/// downloads 15 GB — and adds the thing only this project has to show: the **pair**. A row
 /// names the target and the drafter that auto-resolves for it, because a speculative setup is
-/// two models or it is nothing.
+/// two models or it is nothing. Anything without a pair still runs: `--mode auto` gives every
+/// model drafter-free lookup speculation.
 struct ModelsScreen: View {
     @EnvironmentObject private var model: AppModel
 
     var body: some View {
         ScrollView {
-            VStack(alignment: .leading, spacing: 12) {
-                if let ram = model.doctorReport?.environment.ramGB {
-                    Text("\(model.doctorReport?.environment.device ?? "This Mac") · \(ram, specifier: "%.0f") GB")
-                        .font(.caption).foregroundStyle(.secondary)
+            VStack(alignment: .leading, spacing: 14) {
+                if let error = model.modelSwitchError {
+                    SwapErrorBanner(message: error) { model.modelSwitchError = nil }
                 }
 
-                Text("Click a downloaded model to load it. Switching restarts the engine, "
-                     + "so it takes a moment.")
-                    .font(.caption).foregroundStyle(.secondary)
+                header
 
+                AnyModelField()
+
+                sectionTitle("Measured pairs",
+                             note: "Benchmarked drafter pairings — the speedups this project vouches for.")
                 ForEach(model.models) { row in
                     ModelRowView(row: row, isLoaded: row.target == model.model,
                                  canLoad: row.ready && row.target != model.model) {
                         Task { await model.switchModel(to: row.target) }
                     }
                 }
-
                 if model.models.isEmpty {
                     ContentUnavailableView("No models listed", systemImage: "shippingbox")
-                        .frame(height: 200)
+                        .frame(height: 160)
+                }
+
+                let onDisk = model.installedModels.filter { !$0.isDrafter }
+                if !onDisk.isEmpty {
+                    sectionTitle("On this Mac",
+                                 note: "Already downloaded. Anything here loads instantly; "
+                                     + "unpaired models run with lookup speculation.")
+                    ForEach(onDisk) { installed in
+                        InstalledRowView(installed: installed,
+                                         isLoaded: installed.repo == model.model)
+                    }
+                }
+
+                let drafters = model.installedModels.filter(\.isDrafter)
+                if !drafters.isEmpty {
+                    DisclosureGroup {
+                        VStack(alignment: .leading, spacing: 6) {
+                            ForEach(drafters) { drafter in
+                                HStack {
+                                    Text(drafter.shortRepo).font(.caption.monospaced())
+                                    Spacer()
+                                    Text(drafter.size).font(.caption).foregroundStyle(.secondary)
+                                    RevealButton(path: drafter.path)
+                                }
+                            }
+                        }
+                        .padding(.top, 6)
+                    } label: {
+                        Text("Drafters on disk (\(drafters.count)) — resolved automatically")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
+                    .padding(.top, 2)
                 }
             }
             .padding(16)
         }
         .task { await model.refreshDiagnostics() }
+    }
+
+    private var header: some View {
+        VStack(alignment: .leading, spacing: 3) {
+            HStack(spacing: 6) {
+                if let ram = model.doctorReport?.environment.ramGB {
+                    Text("\(model.doctorReport?.environment.device ?? "This Mac") · \(ram, specifier: "%.0f") GB memory")
+                }
+                if let disk = model.diskUsage {
+                    Text("· \(disk.total) of models on disk")
+                }
+            }
+            .font(.caption).foregroundStyle(.secondary)
+
+            Text("Switching swaps the model in place — the server and its port stay up, so "
+                 + "connected agents keep working.")
+                .font(.caption).foregroundStyle(.secondary)
+        }
+    }
+
+    private func sectionTitle(_ title: String, note: String) -> some View {
+        VStack(alignment: .leading, spacing: 1) {
+            Text(title).font(.headline)
+            Text(note).font(.caption).foregroundStyle(.secondary)
+        }
+        .padding(.top, 6)
+    }
+}
+
+/// Load any Hugging Face repo — the engine serves anything MLX-compatible.
+struct AnyModelField: View {
+    @EnvironmentObject private var model: AppModel
+    @State private var repo: String = ""
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 8) {
+                TextField("org/model — any MLX model on Hugging Face",
+                          text: $repo)
+                    .textFieldStyle(.roundedBorder)
+                    .font(.callout.monospaced())
+                    .onSubmit(load)
+                Button("Load") { load() }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(trimmed.isEmpty || trimmed == model.model)
+            }
+            Text("Downloads on first load. A known target gets its drafter pair; anything "
+                 + "else runs with drafter-free lookup speculation.")
+                .font(.caption2).foregroundStyle(.secondary)
+        }
+        .padding(12)
+        .background(Theme.cardFill, in: RoundedRectangle(cornerRadius: 10))
+        .overlay(RoundedRectangle(cornerRadius: 10).strokeBorder(Theme.cardStroke, lineWidth: 1))
+    }
+
+    private var trimmed: String {
+        repo.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private func load() {
+        let target = trimmed
+        guard !target.isEmpty else { return }
+        repo = ""
+        Task { await model.switchModel(to: target) }
+    }
+}
+
+struct SwapErrorBanner: View {
+    let message: String
+    let dismiss: () -> Void
+
+    var body: some View {
+        HStack(alignment: .firstTextBaseline, spacing: 8) {
+            Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(Theme.warning)
+            VStack(alignment: .leading, spacing: 2) {
+                Text("That model didn't load — the previous one was restored.")
+                    .font(.callout.weight(.medium))
+                Text(message).font(.caption).foregroundStyle(.secondary)
+                    .textSelection(.enabled)
+            }
+            Spacer()
+            Button {
+                dismiss()
+            } label: {
+                Image(systemName: "xmark").imageScale(.small)
+            }
+            .buttonStyle(.borderless)
+        }
+        .padding(12)
+        .background(Theme.warning.opacity(0.10), in: RoundedRectangle(cornerRadius: 9))
     }
 }
 
@@ -59,12 +183,7 @@ struct ModelRowView: View {
             VStack(alignment: .leading, spacing: 5) {
                 HStack(spacing: 8) {
                     Text(row.shortTarget).font(.headline)
-                    if isLoaded {
-                        Text("loaded")
-                            .font(.caption2.weight(.semibold))
-                            .padding(.horizontal, 6).padding(.vertical, 2)
-                            .background(.tint.opacity(0.18), in: Capsule())
-                    }
+                    if isLoaded { LoadedBadge() }
                 }
 
                 // The pairing — this app's domain language.
@@ -78,13 +197,21 @@ struct ModelRowView: View {
 
                 HStack(spacing: 10) {
                     badge(fitsLabel, systemImage: fitsSymbol, tint: fitsTint)
-                    badge(stateLabel, systemImage: stateSymbol, tint: row.ready ? .green : .secondary)
+                    badge(stateLabel, systemImage: stateSymbol,
+                          tint: row.ready ? Theme.verified : .secondary)
                     if let ram = row.ram {
                         Text(ram).font(.caption).foregroundStyle(.secondary)
                     }
                 }
             }
             Spacer()
+            if let speedup = row.speedup {
+                Text(speedup)
+                    .font(.system(.callout, design: .rounded).monospacedDigit())
+                    .fontWeight(.semibold)
+                    .foregroundStyle(Theme.spark)
+                    .help("Measured on an M4 Pro; yours will differ")
+            }
             if canLoad {
                 Image(systemName: "arrow.right.circle").foregroundStyle(.tint)
                     .help("Load this model")
@@ -92,7 +219,9 @@ struct ModelRowView: View {
         }
         .padding(14)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(.quaternary.opacity(0.25), in: RoundedRectangle(cornerRadius: 10))
+        .background(Theme.cardFill, in: RoundedRectangle(cornerRadius: 10))
+        .overlay(RoundedRectangle(cornerRadius: 10).strokeBorder(
+            isLoaded ? AnyShapeStyle(Theme.spark.opacity(0.45)) : Theme.cardStroke, lineWidth: 1))
     }
 
     private var fitsLabel: String {
@@ -113,8 +242,8 @@ struct ModelRowView: View {
 
     private var fitsTint: Color {
         switch row.fits {
-        case true?:  return .green
-        case false?: return .orange
+        case true?:  return Theme.verified
+        case false?: return Theme.warning
         default:     return .secondary
         }
     }
@@ -139,5 +268,98 @@ struct ModelRowView: View {
         }
         .font(.caption)
         .foregroundStyle(.secondary)
+    }
+}
+
+/// A model that's already on disk — load it, reveal it, or reclaim the space.
+struct InstalledRowView: View {
+    @EnvironmentObject private var model: AppModel
+    let installed: InstalledModel
+    let isLoaded: Bool
+    @State private var confirmingDelete = false
+
+    var body: some View {
+        HStack(alignment: .center, spacing: 12) {
+            VStack(alignment: .leading, spacing: 3) {
+                HStack(spacing: 8) {
+                    Text(installed.shortRepo).font(.body.weight(.medium))
+                    if isLoaded { LoadedBadge() }
+                }
+                HStack(spacing: 8) {
+                    Text(installed.size).font(.caption).foregroundStyle(.secondary)
+                    if installed.registryID != nil {
+                        HStack(spacing: 3) {
+                            Image(systemName: "arrow.triangle.merge").imageScale(.small)
+                            Text("drafter pair available")
+                        }
+                        .font(.caption)
+                        .foregroundStyle(Theme.spark)
+                    } else {
+                        Text("lookup speculation").font(.caption).foregroundStyle(.secondary)
+                    }
+                }
+            }
+            Spacer()
+            if !isLoaded {
+                Button("Load") { Task { await model.switchModel(to: installed.repo) } }
+                    .controlSize(.small)
+            }
+            RevealButton(path: installed.path)
+            Button {
+                confirmingDelete = true
+            } label: {
+                Image(systemName: "trash").imageScale(.small)
+            }
+            .buttonStyle(.borderless)
+            .disabled(isLoaded)
+            .help(isLoaded ? "Can't delete the loaded model" : "Move to Trash")
+        }
+        .padding(.horizontal, 14).padding(.vertical, 10)
+        .background(Theme.cardFill, in: RoundedRectangle(cornerRadius: 10))
+        .overlay(RoundedRectangle(cornerRadius: 10).strokeBorder(
+            isLoaded ? AnyShapeStyle(Theme.spark.opacity(0.45)) : Theme.cardStroke, lineWidth: 1))
+        .confirmationDialog("Move \(installed.shortRepo) to the Trash?",
+                            isPresented: $confirmingDelete, titleVisibility: .visible) {
+            Button("Move to Trash (\(installed.size))", role: .destructive) {
+                delete()
+            }
+        } message: {
+            Text("Recoverable from the Trash. Loading it again later re-downloads it.")
+        }
+    }
+
+    private func delete() {
+        let url = URL(fileURLWithPath: installed.path)
+        do {
+            try FileManager.default.trashItem(at: url, resultingItemURL: nil)
+            Task { await model.refreshDiagnostics() }
+        } catch {
+            model.modelSwitchError = "Couldn't move \(installed.shortRepo) to the Trash: "
+                + error.localizedDescription
+        }
+    }
+}
+
+struct LoadedBadge: View {
+    var body: some View {
+        Text("loaded")
+            .font(.caption2.weight(.semibold))
+            .padding(.horizontal, 6).padding(.vertical, 2)
+            .background(.tint.opacity(0.18), in: Capsule())
+            .foregroundStyle(.tint)
+    }
+}
+
+struct RevealButton: View {
+    let path: String
+
+    var body: some View {
+        Button {
+            NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: path)])
+        } label: {
+            Image(systemName: "magnifyingglass").imageScale(.small)
+        }
+        .buttonStyle(.borderless)
+        .help("Reveal in Finder")
     }
 }

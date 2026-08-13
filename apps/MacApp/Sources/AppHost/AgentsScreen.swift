@@ -89,12 +89,82 @@ struct AgentCard: View {
                             .font(.caption).foregroundStyle(.secondary)
                             .padding(.top, 2)
                     }
+                    RoundTripTest()
                 }
                 .padding(.top, 12)
             }
         }
         .padding(14)
-        .background(.quaternary.opacity(0.25), in: RoundedRectangle(cornerRadius: 10))
+        .background(Theme.cardFill, in: RoundedRectangle(cornerRadius: 10))
+        .overlay(RoundedRectangle(cornerRadius: 10).strokeBorder(Theme.cardStroke, lineWidth: 1))
+    }
+}
+
+/// Proof the endpoint works before the user leaves to configure their agent: one real
+/// completion through the same server the agent will hit, with the measured rate.
+struct RoundTripTest: View {
+    @EnvironmentObject private var model: AppModel
+
+    enum TestState: Equatable {
+        case idle, running
+        case passed(String)
+        case failed(String)
+    }
+
+    @SwiftUI.State private var state: TestState = .idle
+
+    var body: some View {
+        HStack(spacing: 10) {
+            Button {
+                run()
+            } label: {
+                Label("Test the endpoint", systemImage: "checkmark.circle")
+                    .font(.caption)
+            }
+            .buttonStyle(.link)
+            .disabled(state == .running || !model.isServerReady)
+
+            switch state {
+            case .idle:
+                EmptyView()
+            case .running:
+                ProgressView().controlSize(.small)
+            case .passed(let detail):
+                Label(detail, systemImage: "checkmark.seal.fill")
+                    .font(.caption).foregroundStyle(Theme.verified)
+            case .failed(let message):
+                Label(message, systemImage: "xmark.circle")
+                    .font(.caption).foregroundStyle(Theme.warning)
+                    .textSelection(.enabled)
+            }
+            Spacer()
+        }
+    }
+
+    private func run() {
+        guard let client = model.apiClient else { return }
+        state = .running
+        Task {
+            do {
+                var stats: SpecInfo?
+                var text = ""
+                for try await event in client.streamChat(
+                    model: model.model,
+                    messages: [["role": "user", "content": "Reply with the single word: ready"]],
+                    maxTokens: 16, enableThinking: false
+                ) {
+                    switch event {
+                    case .delta(let piece): text += piece
+                    case .finished(let info): stats = info
+                    }
+                }
+                let rate = stats.map { String(format: " · %.0f tok/s", $0.tokensPerSec) } ?? ""
+                state = text.isEmpty ? .failed("The server answered with no text.")
+                                     : .passed("Round trip OK\(rate)")
+            } catch {
+                state = .failed(error.localizedDescription)
+            }
+        }
     }
 }
 

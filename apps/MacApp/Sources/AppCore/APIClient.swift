@@ -26,7 +26,7 @@ public struct HealthInfo: Decodable, Sendable, Equatable {
     }
 }
 
-public struct SpecInfo: Decodable, Sendable, Equatable {
+public struct SpecInfo: Codable, Sendable, Equatable {
     public let mode: String
     public let acceptLen: Double
     public let tokensPerSec: Double
@@ -133,6 +133,15 @@ public struct APIClient: Sendable {
         return (try JSONSerialization.jsonObject(with: data) as? [String: Any]) ?? [:]
     }
 
+    /// What the loaded model holds resident right now — the MLX allocator state that
+    /// `/metrics` reports alongside the throughput stats.
+    public func engineMemory() async throws -> EngineMemory? {
+        struct Envelope: Decodable { let memory: EngineMemory? }
+        let (data, response) = try await session.data(for: request("metrics"))
+        try Self.check(response, data)
+        return try JSONDecoder().decode(Envelope.self, from: data).memory
+    }
+
     /// Hot-swap the loaded model, keeping the server and its port. Returns once the new model
     /// is loaded (or throws with the reason). Far preferable to a process restart: the port
     /// survives, so nothing pointed at the server has to be reconfigured.
@@ -165,10 +174,10 @@ public struct APIClient: Sendable {
         return try JSONDecoder().decode(DoctorReport.self, from: data)
     }
 
-    public func modelInventory() async throws -> [ModelRow] {
+    public func modelInventory() async throws -> ModelInventory {
         let (data, response) = try await session.data(for: request("admin/models"))
         try Self.check(response, data)
-        return try JSONDecoder().decode(ModelInventory.self, from: data).models
+        return try JSONDecoder().decode(ModelInventory.self, from: data)
     }
 
     /// Recent rounds plus aggregates, without holding a stream open.
@@ -231,7 +240,8 @@ public struct APIClient: Sendable {
         model: String,
         messages: [[String: String]],
         temperature: Double? = nil,
-        maxTokens: Int? = nil
+        maxTokens: Int? = nil,
+        enableThinking: Bool? = nil
     ) -> AsyncThrowingStream<ChatEvent, Error> {
         var payload: [String: Any] = [
             "model": model,
@@ -240,6 +250,7 @@ public struct APIClient: Sendable {
         ]
         if let temperature { payload["temperature"] = temperature }
         if let maxTokens { payload["max_tokens"] = maxTokens }
+        if let enableThinking { payload["enable_thinking"] = enableThinking }
 
         return AsyncThrowingStream { continuation in
             let task = Task {
@@ -286,8 +297,39 @@ public struct APIClient: Sendable {
     static func check(_ response: URLResponse, _ data: Data) throws {
         guard let http = response as? HTTPURLResponse else { return }
         guard http.statusCode == 200 else {
-            throw APIError.badStatus(http.statusCode,
-                                     String(data: data, encoding: .utf8) ?? "")
+            throw APIError.badStatus(http.statusCode, Self.errorMessage(from: data))
         }
     }
+
+    /// The engine wraps errors as `{"error": {"message": …}}`; surface that message rather
+    /// than a JSON blob — it's already written for humans (e.g. the drafter-registry hint).
+    static func errorMessage(from data: Data) -> String {
+        struct Wire: Decodable {
+            struct Inner: Decodable { let message: String? }
+            let error: Inner?
+        }
+        if let wire = try? JSONDecoder().decode(Wire.self, from: data),
+           let message = wire.error?.message, !message.isEmpty {
+            return message
+        }
+        return String(data: data, encoding: .utf8) ?? ""
+    }
+}
+
+/// MLX allocator state from `/metrics` — what the loaded model actually holds resident.
+public struct EngineMemory: Decodable, Sendable, Equatable {
+    public let available: Bool
+    public let activeBytes: Int?
+    public let peakBytes: Int?
+    public let cacheBytes: Int?
+
+    enum CodingKeys: String, CodingKey {
+        case available
+        case activeBytes = "active_bytes"
+        case peakBytes = "peak_bytes"
+        case cacheBytes = "cache_bytes"
+    }
+
+    public var activeGB: Double? { activeBytes.map { Double($0) / 1_073_741_824 } }
+    public var peakGB: Double? { peakBytes.map { Double($0) / 1_073_741_824 } }
 }

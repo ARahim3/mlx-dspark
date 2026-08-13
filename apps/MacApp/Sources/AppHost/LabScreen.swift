@@ -30,6 +30,7 @@ struct LabScreen: View {
 
             ScrollView {
                 VStack(alignment: .leading, spacing: 16) {
+                    if model.showLabWelcome { LabWelcomeBanner() }
                     switch tab {
                     case .race:   RaceTab()
                     case .live:   LiveTab()
@@ -41,6 +42,37 @@ struct LabScreen: View {
         }
         .task { await model.refreshStats() }
         .onChange(of: tab) { _, new in Defaults.labTab = new.rawValue }
+    }
+}
+
+/// One-time landing after onboarding: the model is loaded, this Mac has been measured, and
+/// the fastest way to be convinced is to race the decoders — so that's where the user starts.
+struct LabWelcomeBanner: View {
+    @EnvironmentObject private var model: AppModel
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 10) {
+            Image(systemName: "bolt.fill").foregroundStyle(Theme.spark).font(.title3)
+            VStack(alignment: .leading, spacing: 3) {
+                Text("Your Mac has been measured.").font(.headline)
+                Text("Run the race below: the same prompt through speculative and plain "
+                     + "decoding, with the output checked for equality — not asserted. "
+                     + "Curves shows the measurements this machine produced.")
+                    .font(.callout).foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            Spacer()
+            Button {
+                model.showLabWelcome = false
+            } label: {
+                Image(systemName: "xmark").imageScale(.small)
+            }
+            .buttonStyle(.borderless)
+        }
+        .padding(12)
+        .background(Theme.spark.opacity(0.08), in: RoundedRectangle(cornerRadius: 9))
+        .overlay(RoundedRectangle(cornerRadius: 9)
+            .strokeBorder(Theme.spark.opacity(0.35), lineWidth: 1))
     }
 }
 
@@ -104,7 +136,8 @@ struct AcceptanceDecayCard: View {
                         x: .value("Position", "d\(point.position)"),
                         y: .value("Accepted", point.rate)
                     )
-                    .foregroundStyle(by: .value("Position", "d\(point.position)"))
+                    // One hue fading with depth: the color itself reads as the decay.
+                    .foregroundStyle(Theme.spark.opacity(max(0.35, 1.0 - 0.13 * Double(point.position))))
                     .annotation(position: .top) {
                         Text("\(Int(point.rate * 100))%")
                             .font(.caption2.monospacedDigit()).foregroundStyle(.secondary)
@@ -141,7 +174,7 @@ struct AcceptHistogramCard: View {
                     x: .value("Tokens", bar.committed),
                     y: .value("Rounds", bar.rounds)
                 )
-                .foregroundStyle(.tint)
+                .foregroundStyle(Theme.spark)
             }
             .chartXScale(domain: 0...(max(bars.map(\.committed).max() ?? 1, 1) + 1))
             .frame(height: 150)
@@ -170,8 +203,8 @@ struct RoundTimelineCard: View {
                 .frame(height: 140)
 
                 HStack(spacing: 14) {
-                    legend(.accentColor, "drafter")
-                    legend(.purple, "lookup")
+                    legend(Theme.spark, "drafter")
+                    legend(Theme.lookup, "lookup")
                     legend(.secondary, "plain step")
                     Spacer()
                 }
@@ -181,11 +214,7 @@ struct RoundTimelineCard: View {
     }
 
     private func color(for round: RoundEvent) -> Color {
-        switch round.source {
-        case "lookup": return .purple
-        case "plain":  return .secondary
-        default:       return .accentColor
-        }
+        Theme.source(round.source)
     }
 
     private func legend(_ color: Color, _ label: String) -> some View {
@@ -237,11 +266,13 @@ struct VerifyCurveCard: View {
                 ForEach(curve, id: \.width) { point in
                     LineMark(x: .value("Width", point.width), y: .value("ms", point.ms))
                         .interpolationMethod(.monotone)
+                        .foregroundStyle(Theme.spark)
                     PointMark(x: .value("Width", point.width), y: .value("ms", point.ms))
+                        .foregroundStyle(Theme.spark)
                 }
                 if let knee, curve.contains(where: { $0.width == knee }) {
                     RuleMark(x: .value("Knee", knee))
-                        .foregroundStyle(.orange)
+                        .foregroundStyle(Theme.warning)
                         .lineStyle(StrokeStyle(lineWidth: 1, dash: [4, 3]))
                         // Bottom, not top: a top annotation collides with the card's own
                         // subtitle at this chart height.
@@ -283,7 +314,7 @@ struct PredictedRatesCard: View {
              subtitle: "From the measured curves alone, before generating a token. Cap 0 means \"don't speculate this round\".") {
             Chart(rates, id: \.cap) { point in
                 BarMark(x: .value("Cap", point.cap), y: .value("tok/s", point.rate))
-                    .foregroundStyle(point.cap == controller.cap ? Color.accentColor : Color.secondary.opacity(0.45))
+                    .foregroundStyle(point.cap == controller.cap ? Theme.spark : Color.secondary.opacity(0.45))
                     .annotation(position: .top) {
                         Text("\(Int(point.rate))")
                             .font(.caption2.monospacedDigit()).foregroundStyle(.secondary)

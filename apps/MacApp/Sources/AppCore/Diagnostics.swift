@@ -48,6 +48,9 @@ public struct ModelRow: Decodable, Sendable, Identifiable {
     public let dflashDrafter: String?
     public let ram: String?
     public let ramGB: Double?
+    /// Measured headline speedup for this pair (M4 Pro reference numbers) — the "why this
+    /// one" a picker should answer.
+    public let speedup: String?
     /// nil when RAM couldn't be determined — render as "unknown", never as "no".
     public let fits: Bool?
     public let targetInstalled: Bool
@@ -56,7 +59,7 @@ public struct ModelRow: Decodable, Sendable, Identifiable {
     public let ready: Bool
 
     enum CodingKeys: String, CodingKey {
-        case id, target, ram, fits, ready
+        case id, target, ram, fits, ready, speedup
         case dsparkDrafter = "dspark_drafter"
         case dflashDrafter = "dflash_drafter"
         case ramGB = "ram_gb"
@@ -73,7 +76,45 @@ public struct ModelRow: Decodable, Sendable, Identifiable {
     }
 }
 
-struct ModelInventory: Decodable {
-    let models: [ModelRow]
-    let loaded: String?
+/// A model that is actually on this disk — HF hub cache or the plain-dir cache — regardless
+/// of whether the registry knows it. The other half of the Models screen: the registry says
+/// what we vouch for, this says what the user already has.
+public struct InstalledModel: Decodable, Sendable, Identifiable {
+    public let repo: String
+    public let path: String
+    public let sizeBytes: Int
+    public let size: String
+    /// "model" (loadable as a target) or "drafter" (one half of a pair; not a chat model).
+    public let kind: String
+    /// Registry pairing this repo resolves into (quant-agnostic) — nil means `--mode auto`
+    /// will fall back to drafter-free lookup speculation.
+    public let registryID: String?
+
+    public var id: String { repo }
+
+    enum CodingKeys: String, CodingKey {
+        case repo, path, size, kind
+        case sizeBytes = "size_bytes"
+        case registryID = "registry_id"
+    }
+
+    public var shortRepo: String { repo.components(separatedBy: "/").last ?? repo }
+    public var isDrafter: Bool { kind == "drafter" }
+}
+
+public struct DiskUsage: Decodable, Sendable {
+    public let totalBytes: Int
+    public let total: String
+
+    enum CodingKeys: String, CodingKey {
+        case total
+        case totalBytes = "total_bytes"
+    }
+}
+
+public struct ModelInventory: Decodable, Sendable {
+    public let models: [ModelRow]
+    public let installed: [InstalledModel]?
+    public let disk: DiskUsage?
+    public let loaded: String?
 }

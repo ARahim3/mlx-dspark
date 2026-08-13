@@ -54,11 +54,68 @@ struct MainWindow: View {
                     LogPane()
                 }
             }
+            .toolbar {
+                // The model belongs in the chrome: hot-swapping is a headline feature, not a
+                // settings-page errand. One click from any screen.
+                ToolbarItem(placement: .primaryAction) { ModelPill() }
+            }
         }
     }
 
     private var visibleScreens: [Screen] {
         Screen.allCases.filter { $0 != .lab || model.detail.showsLab }
+    }
+}
+
+/// Current model + one-click hot swap, from anywhere.
+struct ModelPill: View {
+    @EnvironmentObject private var model: AppModel
+
+    var body: some View {
+        Menu {
+            Section("Measured pairs") {
+                ForEach(model.models.filter(\.ready)) { row in
+                    Button {
+                        Task { await model.switchModel(to: row.target) }
+                    } label: {
+                        if row.target == model.model {
+                            Label(row.shortTarget, systemImage: "checkmark")
+                        } else {
+                            Text(row.shortTarget)
+                        }
+                    }
+                }
+            }
+            let extras = model.installedModels.filter { !$0.isDrafter && $0.registryID == nil }
+            if !extras.isEmpty {
+                Section("On this Mac") {
+                    ForEach(extras) { installed in
+                        Button {
+                            Task { await model.switchModel(to: installed.repo) }
+                        } label: {
+                            if installed.repo == model.model {
+                                Label(installed.shortRepo, systemImage: "checkmark")
+                            } else {
+                                Text(installed.shortRepo)
+                            }
+                        }
+                    }
+                }
+            }
+            Divider()
+            Button("All models…") { model.screen = .models }
+        } label: {
+            HStack(spacing: 6) {
+                Circle()
+                    .fill(model.isServerReady ? Theme.verified : Theme.warning)
+                    .frame(width: 7, height: 7)
+                Text(model.health?.model ?? "starting…")
+                    .font(.callout.weight(.medium))
+                    .lineLimit(1)
+            }
+        }
+        .menuIndicator(.visible)
+        .help("Switch model — the server and its port stay up")
     }
 }
 
@@ -74,7 +131,7 @@ struct SidebarFooter: View {
             Divider()
             HStack(spacing: 6) {
                 Circle()
-                    .fill(model.isServerReady ? Color.green : Color.orange)
+                    .fill(model.isServerReady ? Theme.verified : Theme.warning)
                     .frame(width: 6, height: 6)
                 Text(model.health?.model ?? "starting…")
                     .font(.caption).lineLimit(1).truncationMode(.middle)
@@ -83,6 +140,7 @@ struct SidebarFooter: View {
                 Text("\(model.liveTokensPerSec, specifier: "%.0f") tok/s")
                     .font(.system(.title3, design: .rounded).monospacedDigit())
                     .fontWeight(.medium)
+                    .foregroundStyle(Theme.spark)
                     .contentTransition(.numericText())
                     .animation(.easeOut(duration: 0.2), value: model.liveTokensPerSec)
             }
@@ -123,7 +181,7 @@ struct SetupView: View {
                 }
             }
             .padding(.vertical, 4)
-            .background(.quaternary.opacity(0.4), in: RoundedRectangle(cornerRadius: 10))
+            .background(Theme.cardFill, in: RoundedRectangle(cornerRadius: 10))
 
             if model.phase == .startingServer {
                 HStack(spacing: 10) {
@@ -170,7 +228,7 @@ struct SetupRow: View {
         switch step.state {
         case .pending: Image(systemName: "circle").foregroundStyle(.tertiary)
         case .running: ProgressView().controlSize(.small)
-        case .done:    Image(systemName: "checkmark.circle.fill").foregroundStyle(.green)
+        case .done:    Image(systemName: "checkmark.circle.fill").foregroundStyle(Theme.verified)
         case .failed:  Image(systemName: "xmark.circle.fill").foregroundStyle(.red)
         }
     }
@@ -186,10 +244,21 @@ struct StatusBar: View {
             if let pairing = model.pairingLine {
                 Image(systemName: "arrow.triangle.merge").imageScale(.small)
                 Text(pairing).font(.caption.monospaced())
+                    .lineLimit(1).truncationMode(.middle)
             } else {
                 Text(model.statusLine).font(.caption)
+                    .lineLimit(1).truncationMode(.middle)
             }
-            Spacer()
+            Spacer(minLength: 12)
+            AcceptRibbon(rounds: model.rounds)
+            if let memory = model.memoryLine {
+                HStack(spacing: 3) {
+                    Image(systemName: "memorychip").imageScale(.small)
+                    Text(memory).monospacedDigit()
+                }
+                .font(.caption)
+                .help("Model memory held resident by the engine")
+            }
             if let stats = model.stats, stats.rounds > 0 {
                 Text("\(stats.rounds) rounds").font(.caption)
             }
@@ -210,21 +279,21 @@ struct LogPane: View {
         ScrollViewReader { proxy in
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 1) {
-                    ForEach(Array(model.logLines.enumerated()), id: \.offset) { index, line in
-                        Text(line)
+                    ForEach(model.logLines) { line in
+                        Text(line.text)
                             .font(.system(size: 10, design: .monospaced))
                             .foregroundStyle(.secondary)
                             .textSelection(.enabled)
                             .frame(maxWidth: .infinity, alignment: .leading)
-                            .id(index)
+                            .id(line.id)
                     }
                 }
                 .padding(8)
             }
             .frame(height: 160)
             .background(.quaternary.opacity(0.3))
-            .onChange(of: model.logLines.count) { _, count in
-                proxy.scrollTo(count - 1, anchor: .bottom)
+            .onChange(of: model.logLines.last?.id) { _, last in
+                if let last { proxy.scrollTo(last, anchor: .bottom) }
             }
         }
     }
@@ -237,7 +306,7 @@ struct LogPane: View {
 struct LoadingView: View {
     @EnvironmentObject private var model: AppModel
 
-    private var recentLog: [String] {
+    private var recentLog: [LogRow] {
         Array(model.logLines.suffix(8))
     }
 
@@ -256,8 +325,8 @@ struct LoadingView: View {
 
             if !recentLog.isEmpty {
                 VStack(alignment: .leading, spacing: 2) {
-                    ForEach(Array(recentLog.enumerated()), id: \.offset) { _, line in
-                        Text(line)
+                    ForEach(recentLog) { line in
+                        Text(line.text)
                             .font(.system(size: 10, design: .monospaced))
                             .foregroundStyle(.tertiary)
                             .lineLimit(1).truncationMode(.middle)
@@ -280,7 +349,7 @@ struct FailureView: View {
     var body: some View {
         VStack(spacing: 14) {
             Image(systemName: "exclamationmark.triangle.fill")
-                .font(.system(size: 32)).foregroundStyle(.orange)
+                .font(.system(size: 32)).foregroundStyle(Theme.warning)
             Text("Something went wrong").font(.title3.weight(.semibold))
             Text(model.errorMessage ?? "Unknown error")
                 .foregroundStyle(.secondary)
@@ -332,6 +401,7 @@ struct Card<Content: View>: View {
         }
         .padding(16)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(.quaternary.opacity(0.25), in: RoundedRectangle(cornerRadius: 10))
+        .background(Theme.cardFill, in: RoundedRectangle(cornerRadius: 10))
+        .overlay(RoundedRectangle(cornerRadius: 10).strokeBorder(Theme.cardStroke, lineWidth: 1))
     }
 }
