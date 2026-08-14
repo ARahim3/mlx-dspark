@@ -178,6 +178,12 @@ class DSparkConfig:
     # qwen3_5 drafters rope only the first rope_dims of head_dim (partial rotary);
     # None = full head_dim (all other families).
     rope_dims: int | None = None
+    # YaRN scaling for the drafter's own rope (SpecForge heads, e.g. RadixArk's Qwen3.8-27B
+    # head: factor 32 over an 8192-token original window). None = unscaled rope (every other
+    # family). Keys follow initialize_rope's yarn schema: factor / beta_fast / beta_slow /
+    # original_max_position_embeddings; the attention factor (0.1·ln(factor)+1, applied by
+    # mlx-vlm's YarnRoPE as an input mscale on q and k) matches transformers' default exactly.
+    rope_yarn: dict | None = None
 
     # qwen3_5 gated attention: q_proj emits [q ‖ gate] per head (2× out-features),
     # attention output is multiplied by sigmoid(gate) before o_proj.
@@ -268,6 +274,8 @@ class DSparkConfig:
 
     @property
     def rope_parameters(self) -> dict:
+        if self.rope_yarn:
+            return {"rope_type": "yarn", **self.rope_yarn}
         return {"rope_type": self.rope_type, "partial_rotary_factor": self.partial_rotary_factor}
 
     @classmethod
@@ -284,6 +292,35 @@ class DSparkConfig:
         if "speculators_config" in c or "speculators_model_type" in c:
             c = _translate_speculators(c, path)
             mt = c.get("model_type", "")
+
+        # SpecForge (sgl-project/SpecForge, served by SGLang) packaging — the fourth one, e.g.
+        # RadixArk/Qwen3.8-27B-DSpark. Its DSparkDraftModel subclasses SpecForge's
+        # DFlashDraftModel, whose config is a plain transformers Qwen3Config plus a nested
+        # `dflash_config` dict tagged `projector_type: "dspark"` — the discriminator (absent
+        # from every other packaging; the fork-labelled heads carry a dflash_config too, but
+        # never that tag). Three things follow from the reference code these repos ship:
+        # (1) target_layer_ids / mask_token_id live only inside dflash_config — hoist them;
+        # (2) the DSpark flavor samples the ANCHOR slot (anchor-as-pos0, the DeepSpec
+        #     convention its markov/confidence code is adapted from): a block_size-7 head
+        #     proposes 7 tokens, and the card's own "verify width 8 including the bonus" is
+        #     that count. Do NOT trust the shipped dflash.py spec_generate for this — it is
+        #     the BASE DFlash loop (reads `[:, -block_size+1:]`, logits_start=1), and running
+        #     the head that way shifts every draft one slot and collapses acceptance with no
+        #     error anywhere (measured on RadixArk/Qwen3.8-27B-DSpark: accept 1.35 as
+        #     logits_start=1 vs 3.42 as 0, same prompt and loop — the makora bug class,
+        #     settled the same way: the production loop printing drafted-vs-target rows);
+        # (3) the backbone rope is transformers' Qwen3RotaryEmbedding built from the head's
+        #     OWN config, so a declared rope_parameters (incl. yarn) is real, not deepcopy
+        #     noise — the qwen3 branch below honors it for this packaging only (also
+        #     measured the right way up: accept 3.42 yarn vs 3.33 default-rope on a short
+        #     prompt, a gap that only grows with position).
+        _sf = (c.get("dflash_config") or {})
+        specforge = _sf.get("projector_type") == "dspark"
+        if specforge:
+            for k in ("target_layer_ids", "mask_token_id"):
+                if k not in c and _sf.get(k) is not None:
+                    c[k] = _sf[k]
+            c.setdefault("logits_start", 0)
         if "block_size" not in c and any(k.startswith("dspark_") for k in c):
             raise ValueError(
                 f"{path}: this looks like a full target model with an embedded DSpark drafter "
@@ -356,6 +393,22 @@ class DSparkConfig:
                     dflc.get("swa_window_size") if dflc.get("use_swa", False) else None)
                 swa = int(w) if w else None
             has_own_lm = bool(c.get("has_lm_head", True))
+            # YaRN rope — honored ONLY for the SpecForge packaging, where the reference builds
+            # transformers' Qwen3RotaryEmbedding from the head's own config and that class
+            # applies the declared scaling (RadixArk/Qwen3.8-27B-DSpark: factor 32 over an
+            # 8192 original window, and yarn's attention factor 0.1·ln(32)+1 ≈ 1.347 scales
+            # cos/sin at EVERY position — so ignoring it would mis-rope even short prompts
+            # and silently cost acceptance). Everywhere else a scaling field is deepcopy
+            # noise until a reference proves otherwise (see the partial-rotary note above).
+            yarn = None
+            if specforge and rp.get("rope_type") == "yarn" and rp.get("factor"):
+                yarn = {"factor": float(rp["factor"])}
+                for k in ("beta_fast", "beta_slow"):
+                    if k in rp:
+                        yarn[k] = float(rp[k])
+                if "original_max_position_embeddings" in rp:
+                    yarn["original_max_position_embeddings"] = int(
+                        rp["original_max_position_embeddings"])
             if "logits_start" in c:
                 logits_start = int(c["logits_start"])
             elif "sample_from_anchor" in c:
@@ -384,6 +437,7 @@ class DSparkConfig:
                 attention_k_eq_v=False, attention_bias=c.get("attention_bias", False),
                 rope_theta=rp.get("rope_theta", c.get("rope_theta", 1_000_000.0)),
                 rope_type="default",
+                rope_yarn=yarn,
                 rope_dims=(rope_dims if rope_dims != head_dim else None),
                 gated_q_proj=gated_q,
                 offset_rms_norm=offset_norms,

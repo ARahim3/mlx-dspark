@@ -211,6 +211,34 @@ KOOPAH_QWEN36_35B_A3B = {  # Koopah/Qwen3.6-35B-A3B-NVFP4-DSPARK: DeepSpec-stock
 }
 
 
+RADIXARK_SPECFORGE = {  # RadixArk/Qwen3.8-27B-DSpark shape: the SpecForge (SGLang) packaging —
+    # a transformers Qwen3Config plus a nested `dflash_config` tagged projector_type "dspark".
+    # Distinguishers vs every other packaging: target_layer_ids/mask_token_id live ONLY inside
+    # dflash_config; slot 0 is a pure anchor (the shipped dflash.py spec_generate reads logits
+    # from [-block_size+1:], i.e. logits_start 1); the block attention is bidirectional
+    # full-attention (no sliding window, no causal marker); the rope is YARN and REAL (the
+    # reference builds Qwen3RotaryEmbedding from this very config); and the checkpoint ships
+    # neither embed_tokens nor lm_head (reuses both from the target).
+    "architectures": ["DSparkDraftModel"], "model_type": "qwen3",
+    "auto_map": {"AutoModel": "dspark.DSparkDraftModel"},
+    "hidden_size": 16, "vocab_size": 32, "num_hidden_layers": 1, "intermediate_size": 32,
+    "num_attention_heads": 2, "num_key_value_heads": 1, "head_dim": 8,
+    "block_size": 7, "num_target_layers": 2, "max_position_embeddings": 262144,
+    "markov_rank": 4, "markov_head_type": "vanilla",
+    "enable_confidence_head": True, "confidence_head_with_markov": True,
+    "layer_types": ["full_attention"], "sliding_window": None, "use_sliding_window": False,
+    "tie_word_embeddings": False,
+    "rope_parameters": {"beta_fast": 32.0, "beta_slow": 1.0, "factor": 32.0,
+                        "original_max_position_embeddings": 8192,
+                        "rope_theta": 10000000, "rope_type": "yarn"},
+    "dflash_config": {"attention_mode": "gqa", "confidence_head_alpha": 1.0,
+                      "confidence_head_with_markov": True, "enable_confidence_head": True,
+                      "markov_head_type": "vanilla", "markov_rank": 4,
+                      "mask_token_id": 3, "projector_type": "dspark",
+                      "target_layer_ids": [0, 1]},
+}
+
+
 def _cfg_path(tmp_path, cfg: dict) -> str:
     p = tmp_path / "config.json"
     p.write_text(json.dumps(cfg))
@@ -371,6 +399,89 @@ def test_speculators_dflash_lineage_causal_sliding_window(tmp_path):
     # regression: the bidirectional makora/mgoin heads (full_attention) stay unwindowed
     base = DSparkConfig.from_json(_cfg_path(tmp_path, SPECULATORS_FULL))
     assert base.causal_block is False and base.sliding_window is None
+
+
+def test_specforge_dspark_config_parses(tmp_path):
+    """SpecForge packaging: nested taps hoisted, anchor slot reserved, yarn rope carried."""
+    cfg = DSparkConfig.from_json(_cfg_path(tmp_path, RADIXARK_SPECFORGE))
+    assert cfg.family == "qwen3"
+    assert cfg.target_layer_ids == [0, 1] and cfg.mask_token_id == 3
+    # anchor-as-pos0 (measured: accept 3.42 vs 1.35 read as logits_start=1) -> 7 proposals
+    assert cfg.logits_start == 0 and cfg.block_size == 7
+    assert cfg.causal_block is False and cfg.sliding_window is None  # bidirectional full block
+    assert cfg.rope_yarn == {"factor": 32.0, "beta_fast": 32.0, "beta_slow": 1.0,
+                             "original_max_position_embeddings": 8192}
+    assert cfg.rope_parameters["rope_type"] == "yarn"
+    assert cfg.rope_theta == 10000000
+
+
+def test_specforge_without_nested_taps_still_refused(tmp_path):
+    """A projector_type tag with no target_layer_ids anywhere is underspecified, not a pass."""
+    cfg = {**RADIXARK_SPECFORGE,
+           "dflash_config": {k: v for k, v in RADIXARK_SPECFORGE["dflash_config"].items()
+                             if k != "target_layer_ids"}}
+    with pytest.raises(ValueError, match="target_layer_ids"):
+        DSparkConfig.from_json(_cfg_path(tmp_path, cfg))
+
+
+def test_yarn_rope_is_specforge_only(tmp_path):
+    """A yarn rope_parameters block on a NON-SpecForge head stays inert (deepcopy-noise
+    doctrine: a scaling field is only honored where the packaging's reference applies it —
+    DeepSpec's stock trainer deepcopies the TARGET config, so fields there describe the
+    target). The fork-labelled fixture carries a dflash_config but no projector_type tag,
+    so it must not hoist or yarn either."""
+    cfg = {**SATGEZE_QWEN36,
+           "rope_parameters": {**SATGEZE_QWEN36["rope_parameters"],
+                               "rope_type": "yarn", "factor": 32.0,
+                               "original_max_position_embeddings": 8192}}
+    parsed = DSparkConfig.from_json(_cfg_path(tmp_path, cfg))
+    assert parsed.rope_yarn is None
+    assert parsed.rope_parameters["rope_type"] == "default"
+    fork = DSparkConfig.from_json(_cfg_path(tmp_path, FORK_LABELLED_QWEN36))
+    assert fork.rope_yarn is None
+
+
+def test_specforge_yarn_rope_matches_transformers_reference(tmp_path):
+    """The drafter's YarnRoPE must reproduce transformers' _compute_yarn_parameters (what
+    Qwen3RotaryEmbedding used at training time): the interpolated inv_freq ramp between the
+    beta_fast/beta_slow correction dims, and the attention factor 0.1·ln(factor)+1 applied
+    to both q and k (mlx-vlm's YarnRoPE folds it in as an input mscale — same math, since
+    rope is linear in its input)."""
+    import math
+
+    cfg = DSparkConfig.from_json(_cfg_path(tmp_path, RADIXARK_SPECFORGE))
+    rope = DSparkDrafter(cfg).layers[0].self_attn.rope
+    dims, base, factor, orig = 8, 10000000.0, 32.0, 8192
+    # transformers reference inv_freq
+    import numpy as np
+    pos_freqs = base ** (np.arange(0, dims, 2, dtype=np.float64) / dims)
+    inv_extra, inv_inter = 1.0 / pos_freqs, 1.0 / (factor * pos_freqs)
+
+    def corr_dim(rot):
+        return dims * math.log(orig / (rot * 2 * math.pi)) / (2 * math.log(base))
+
+    low = max(math.floor(corr_dim(32.0)), 0)
+    high = min(math.ceil(corr_dim(1.0)), dims - 1)
+    ramp = np.clip((np.arange(dims // 2) - low) / max(high - low, 1e-3), 0, 1)
+    ext = 1 - ramp
+    ref_inv = inv_inter * (1 - ext) + inv_extra * ext
+    got_inv = 1.0 / np.array(rope._freqs, dtype=np.float64)
+    assert np.allclose(got_inv, ref_inv, rtol=1e-5)
+    assert abs(rope.mscale - (0.1 * math.log(factor) + 1.0)) < 1e-6
+
+
+def test_load_drafter_specforge_reuse_both_roundtrips(tmp_path):
+    """The RadixArk checkpoint ships neither embed_tokens nor lm_head (SpecForge's draft
+    model reuses the target's for both) — load must detect that from the weights and build
+    the bind-at-runtime drafter, same as the Muse-Glimmer speculators head."""
+    weights = _reference_weights(RADIXARK_SPECFORGE)
+    weights.pop("embed_tokens.weight", None)
+    weights.pop("lm_head.weight", None)
+    path = _write_drafter_ckpt(tmp_path, weights, RADIXARK_SPECFORGE)
+    drafter, cfg = load_drafter(path, quantize=False)
+    assert cfg.has_own_embed is False and cfg.has_own_lm_head is False
+    assert drafter.logits_start == 0 and drafter.max_draft == 7
+    assert drafter.draft_width(2) == cfg.block_size  # bidirectional: backbone stays full-width
 
 
 def test_load_drafter_reuses_target_embed_and_head_when_absent(tmp_path):
