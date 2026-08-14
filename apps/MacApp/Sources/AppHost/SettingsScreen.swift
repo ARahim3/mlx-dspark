@@ -114,8 +114,10 @@ struct DecodingControls: View {
     @State private var applying = false
 
     private var modes: [(id: String, label: String)] {
+        // availableDecodingModes, NOT availableRaceArms: applying reloads the pair, so the
+        // drafter mode stays selectable while Baseline/Lookup is running (it used to vanish).
         var options = [(id: "auto", label: "Auto")]
-        for arm in model.availableRaceArms {
+        for arm in model.availableDecodingModes {
             options.append((id: arm, label: arm == "dspark" ? "DSpark"
                             : arm == "dflash" ? "DFlash" : arm.capitalized))
         }

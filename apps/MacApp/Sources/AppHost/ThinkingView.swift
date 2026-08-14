@@ -45,6 +45,7 @@ struct ThinkingSplit {
 struct ThinkingCard: View {
     let reasoning: String
     let thinking: Bool
+    @Environment(\.textZoom) private var zoom
     @State private var expanded: Bool
     /// Once the user opens or closes it themselves, stop auto-collapsing on their behalf.
     @State private var userToggled = false
@@ -81,7 +82,7 @@ struct ThinkingCard: View {
 
             if expanded {
                 Text(reasoning)
-                    .font(.system(size: 11))
+                    .font(.system(size: 11 * zoom))
                     .foregroundStyle(.secondary)
                     .textSelection(.enabled)
                     .frame(maxWidth: .infinity, alignment: .leading)

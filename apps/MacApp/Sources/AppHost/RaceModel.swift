@@ -36,22 +36,24 @@ final class RaceModel: ObservableObject {
 
     @Published var prompt: String = RacePrompt.presets[0].text
     @Published var maxTokens: Int = 200
+    /// Off by default: a race is a speed demo, and thinking buries the answer both lanes
+    /// are producing. Sent explicitly either way so the toggle is always the truth.
+    @Published var thinking: Bool = false
     @Published var selectedArms: [RaceArm] = []
 
     private var task: Task<Void, Never>?
     private var replayTask: Task<Void, Never>?
 
-    /// Sensible arms for whatever is loaded: the drafter mode at the default cap, at the cap
-    /// the cost model likes, and the plain baseline for reference.
+    /// The default matchup: plain baseline on the LEFT, the drafter at cap 4 beside it —
+    /// baseline-vs-best is the comparison people understand at a glance; extra arms are a
+    /// chip-tap away. (The old default ran three arms, which read as clutter in a demo.)
     func defaultArms(available: [String]) -> [RaceArm] {
-        var arms: [RaceArm] = []
+        var arms: [RaceArm] = [RaceArm(mode: "baseline")]
         if let drafterMode = available.first(where: { $0 == "dspark" || $0 == "dflash" }) {
-            arms.append(RaceArm(mode: drafterMode, cap: 2))
             arms.append(RaceArm(mode: drafterMode, cap: 4))
         } else if available.contains("lookup") {
             arms.append(RaceArm(mode: "lookup"))
         }
-        arms.append(RaceArm(mode: "baseline"))
         return arms
     }
 
@@ -68,7 +70,8 @@ final class RaceModel: ObservableObject {
             guard let self else { return }
             do {
                 for try await event in client.streamRace(prompt: prompt, arms: selectedArms,
-                                                         maxTokens: maxTokens) {
+                                                         maxTokens: maxTokens,
+                                                         thinking: thinking) {
                     switch event {
                     case .started:
                         break

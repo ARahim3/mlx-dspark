@@ -106,10 +106,11 @@ enum MarkdownBlock {
 /// though it is Unicode translation rather than TeX typesetting (see `MathText`).
 struct MathBlock: View {
     let latex: String
+    @Environment(\.textZoom) private var zoom
 
     var body: some View {
         Text(MathText.unicode(latex))
-            .font(.system(size: 15, design: .serif))
+            .font(.system(size: 15 * zoom, design: .serif))
             .textSelection(.enabled)
             .frame(maxWidth: .infinity, alignment: .center)
             .padding(.vertical, 6)
@@ -118,6 +119,7 @@ struct MathBlock: View {
 
 struct ProseBlock: View {
     let lines: [String]
+    @Environment(\.textZoom) private var zoom
 
     var body: some View {
         VStack(alignment: .leading, spacing: 3) {
@@ -133,21 +135,26 @@ struct ProseBlock: View {
         if trimmed.isEmpty {
             Spacer().frame(height: 2)
         } else if let header = headerLevel(trimmed) {
+            // Explicit sizes rather than .title3/.headline so the zoom scales headers with
+            // the body; at zoom 1.0 these match the text styles they replace.
             Text(inline(String(trimmed.drop(while: { $0 == "#" || $0 == " " }))))
-                .font(header == 1 ? .title3.bold() : header == 2 ? .headline : .subheadline.bold())
+                .font(.system(size: (header == 1 ? 15 : header == 2 ? 13 : 12) * zoom).bold())
                 .padding(.top, 2)
         } else if let bullet = bulletBody(trimmed) {
             HStack(alignment: .firstTextBaseline, spacing: 6) {
                 Text("•").foregroundStyle(.secondary)
                 Text(inline(bullet)).frame(maxWidth: .infinity, alignment: .leading)
             }
+            .font(.system(size: 13 * zoom))
         } else if let (marker, body) = numberedBody(trimmed) {
             HStack(alignment: .firstTextBaseline, spacing: 6) {
                 Text(marker).foregroundStyle(.secondary).monospacedDigit()
                 Text(inline(body)).frame(maxWidth: .infinity, alignment: .leading)
             }
+            .font(.system(size: 13 * zoom))
         } else {
-            Text(inline(line)).frame(maxWidth: .infinity, alignment: .leading)
+            Text(inline(line)).font(.system(size: 13 * zoom))
+                .frame(maxWidth: .infinity, alignment: .leading)
         }
     }
 
@@ -190,6 +197,7 @@ struct ProseBlock: View {
 struct CodeCard: View {
     let language: String?
     let code: String
+    @Environment(\.textZoom) private var zoom
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -203,8 +211,8 @@ struct CodeCard: View {
             .background(.quaternary.opacity(0.4))
 
             ScrollView(.horizontal, showsIndicators: false) {
-                Text(SyntaxHighlight.highlight(code))
-                    .font(.system(size: 12, design: .monospaced))
+                Text(SyntaxHighlight.highlight(code, size: 12 * zoom))
+                    .font(.system(size: 12 * zoom, design: .monospaced))
                     .textSelection(.enabled)
                     .padding(10)
                     .frame(maxWidth: .infinity, alignment: .leading)

@@ -5,7 +5,8 @@ import SwiftUI
 /// *checked* rather than asserted.
 struct RaceTab: View {
     @EnvironmentObject private var model: AppModel
-    @StateObject private var race = RaceModel()
+    // App-owned (see MlxDsparkApp): the run survives switching tabs/screens.
+    @EnvironmentObject private var race: RaceModel
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
@@ -51,6 +52,19 @@ struct RaceControls: View {
     @EnvironmentObject private var model: AppModel
     @ObservedObject var race: RaceModel
 
+    /// Everything this pair could race: baseline first (the reference belongs on the left),
+    /// then the drafter at a few caps, then lookup. The user toggles which of these run.
+    private var candidateArms: [RaceArm] {
+        var arms: [RaceArm] = [RaceArm(mode: "baseline")]
+        if let drafterMode = model.availableRaceArms.first(where: { $0 == "dspark" || $0 == "dflash" }) {
+            arms.append(contentsOf: [2, 3, 4, 6].map { RaceArm(mode: drafterMode, cap: $0) })
+        }
+        if model.availableRaceArms.contains("lookup") {
+            arms.append(RaceArm(mode: "lookup"))
+        }
+        return arms
+    }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
             HStack(spacing: 8) {
@@ -61,6 +75,24 @@ struct RaceControls: View {
                         .disabled(race.phase == .running)
                 }
                 Spacer()
+                Toggle("Thinking", isOn: $race.thinking)
+                    .toggleStyle(.checkbox)
+                    .disabled(race.phase == .running)
+                    .help("Let the model reason before answering. Off keeps a race about "
+                          + "speed — thinking buries the answer both lanes are producing.")
+                HStack(spacing: 4) {
+                    Text("Max tokens").font(.callout).foregroundStyle(.secondary)
+                    TextField("200", value: $race.maxTokens, format: .number)
+                        .textFieldStyle(.roundedBorder)
+                        .frame(width: 64)
+                        .multilineTextAlignment(.trailing)
+                        .disabled(race.phase == .running)
+                        // Free-form entry, sane bounds: the server clamps to its cap anyway,
+                        // but a 0/negative value would silently fall back to the default.
+                        .onChange(of: race.maxTokens) { _, value in
+                            race.maxTokens = min(max(value, 16), 4096)
+                        }
+                }
             }
 
             TextField("Prompt", text: $race.prompt, axis: .vertical)
@@ -68,12 +100,15 @@ struct RaceControls: View {
                 .lineLimit(2...4)
                 .disabled(race.phase == .running)
 
-            HStack(spacing: 10) {
-                ForEach(race.selectedArms) { arm in
-                    Text(arm.label)
-                        .font(.caption.weight(.medium))
-                        .padding(.horizontal, 8).padding(.vertical, 3)
-                        .background(.quaternary.opacity(0.6), in: Capsule())
+            HStack(spacing: 8) {
+                // Toggle chips: pick the matchup. The server takes 2–4 arms; order is fixed
+                // to the candidate order so baseline always lands in the left lane.
+                ForEach(candidateArms) { arm in
+                    ArmChip(arm: arm,
+                            isOn: race.selectedArms.contains(arm),
+                            disabled: race.phase == .running
+                                || (!race.selectedArms.contains(arm) && race.selectedArms.count >= 4))
+                        { toggle(arm) }
                 }
                 Spacer()
                 if race.phase == .running {
@@ -95,7 +130,49 @@ struct RaceControls: View {
                     .disabled(!model.isServerReady || race.selectedArms.count < 2)
                 }
             }
+            if race.selectedArms.count < 2 {
+                Text("Pick at least two arms to race.")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
         }
+    }
+
+    private func toggle(_ arm: RaceArm) {
+        if let index = race.selectedArms.firstIndex(of: arm) {
+            race.selectedArms.remove(at: index)
+        } else {
+            race.selectedArms.append(arm)
+            let order = candidateArms
+            race.selectedArms.sort {
+                (order.firstIndex(of: $0) ?? .max) < (order.firstIndex(of: $1) ?? .max)
+            }
+        }
+    }
+}
+
+private struct ArmChip: View {
+    let arm: RaceArm
+    let isOn: Bool
+    let disabled: Bool
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            HStack(spacing: 4) {
+                Image(systemName: isOn ? "checkmark.circle.fill" : "circle")
+                    .imageScale(.small)
+                Text(arm.label)
+            }
+            .font(.caption.weight(.medium))
+            .padding(.horizontal, 8).padding(.vertical, 4)
+            .background(isOn ? AnyShapeStyle(.tint.opacity(0.18)) : AnyShapeStyle(.quaternary.opacity(0.6)),
+                        in: Capsule())
+            .overlay(Capsule().strokeBorder(isOn ? AnyShapeStyle(.tint.opacity(0.55))
+                                                 : AnyShapeStyle(.clear), lineWidth: 1))
+        }
+        .buttonStyle(.plain)
+        .disabled(disabled)
+        .opacity(disabled && !isOn ? 0.4 : 1)
     }
 }
 
@@ -188,25 +265,54 @@ struct RaceLanes: View {
     var body: some View {
         HStack(alignment: .top, spacing: 12) {
             ForEach(race.lanes) { lane in
-                VStack(alignment: .leading, spacing: 6) {
-                    HStack(spacing: 6) {
-                        Text(lane.label).font(.caption.weight(.semibold))
-                        if lane.isRunning { ProgressView().controlSize(.small) }
-                        Spacer()
-                        if let result = lane.result, !race.isReplaying {
-                            Text(String(format: "%.0f tok/s", result.tokensPerSec))
-                                .font(.caption.monospacedDigit()).foregroundStyle(.tint)
-                        }
+                RaceLaneColumn(race: race, laneIndex: lane.index)
+            }
+        }
+    }
+}
+
+/// One arm's output, rendered like a chat message (markdown, code blocks, math) and pinned
+/// to the bottom while tokens stream — live and during replay alike.
+struct RaceLaneColumn: View {
+    @ObservedObject var race: RaceModel
+    let laneIndex: Int
+
+    private var lane: RaceModel.Lane? {
+        race.lanes.indices.contains(laneIndex) ? race.lanes[laneIndex] : nil
+    }
+
+    private var displayText: String {
+        guard let lane else { return "" }
+        return race.isReplaying ? (race.replayText[laneIndex] ?? "") : lane.text
+    }
+
+    var body: some View {
+        if let lane {
+            VStack(alignment: .leading, spacing: 6) {
+                HStack(spacing: 6) {
+                    Text(lane.label).font(.caption.weight(.semibold))
+                    if lane.isRunning { ProgressView().controlSize(.small) }
+                    Spacer()
+                    // Shown during replay too — the replay is the shot people record.
+                    if let result = lane.result {
+                        Text(String(format: "%.0f tok/s", result.tokensPerSec))
+                            .font(.caption.monospacedDigit()).foregroundStyle(.tint)
                     }
+                }
+                ScrollViewReader { proxy in
                     ScrollView {
-                        Text(race.isReplaying ? (race.replayText[lane.index] ?? "") : lane.text)
-                            .font(.system(size: 11, design: .monospaced))
-                            .textSelection(.enabled)
+                        MarkdownText(text: displayText)
                             .frame(maxWidth: .infinity, alignment: .leading)
-                            .padding(8)
+                            .padding(10)
+                        Color.clear.frame(height: 1).id("lane-end")
                     }
-                    .frame(height: 240)
+                    .frame(height: 340)
                     .background(.quaternary.opacity(0.25), in: RoundedRectangle(cornerRadius: 8))
+                    // Follow the stream like a chat window: every appended token keeps the
+                    // tail in view. Replay resets the text, which naturally scrolls back up.
+                    .onChange(of: displayText) { _, _ in
+                        proxy.scrollTo("lane-end", anchor: .bottom)
+                    }
                 }
             }
         }

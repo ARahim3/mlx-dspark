@@ -5,11 +5,16 @@ import SwiftUI
 struct MlxDsparkApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var delegate
     @StateObject private var model = AppModel()
+    // Owned at app level, NOT by the Race tab: a race's lanes/results/replay must survive
+    // switching to Live/Curves or another screen entirely — a @StateObject inside the tab
+    // was destroyed with the view, silently discarding the run (user report).
+    @StateObject private var race = RaceModel()
 
     var body: some Scene {
         WindowGroup(id: "main") {
             RootView()
                 .environmentObject(model)
+                .environmentObject(race)
                 .tint(Theme.spark)
                 .onAppear { delegate.model = model }
         }
@@ -21,6 +26,19 @@ struct MlxDsparkApp: App {
             CommandGroup(replacing: .newItem) {
                 Button("New Chat") { model.newChat() }
                     .keyboardShortcut("n")
+            }
+            // Content text zoom — scales model output (chat, race lanes), not the chrome.
+            CommandGroup(after: .toolbar) {
+                Button("Bigger Text") { model.zoomText(+1) }
+                    .keyboardShortcut("+")
+                Button("Smaller Text") { model.zoomText(-1) }
+                    .keyboardShortcut("-")
+                Button("Actual Text Size") { model.textZoom = 1.0 }
+                    .keyboardShortcut("0")
+                Divider()
+                Picker("Appearance", selection: $model.appearance) {
+                    ForEach(Appearance.allCases) { Text($0.label).tag($0) }
+                }
             }
         }
 

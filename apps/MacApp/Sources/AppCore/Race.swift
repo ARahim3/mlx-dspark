@@ -99,11 +99,12 @@ public enum RaceEvent: Sendable {
 extension APIClient {
     /// Run the same prompt through several decode strategies, streamed.
     public func streamRace(prompt: String, arms: [RaceArm],
-                           maxTokens: Int = 200) -> AsyncThrowingStream<RaceEvent, Error> {
+                           maxTokens: Int = 200,
+                           thinking: Bool? = nil) -> AsyncThrowingStream<RaceEvent, Error> {
         AsyncThrowingStream { continuation in
             let task = Task {
                 do {
-                    let payload: [String: Any] = [
+                    var payload: [String: Any] = [
                         "prompt": prompt,
                         "max_tokens": maxTokens,
                         "arms": arms.map { arm -> [String: Any] in
@@ -112,6 +113,9 @@ extension APIClient {
                             return dict
                         },
                     ]
+                    // nil = the server's own default; the Lab toggle always sends a value so
+                    // the UI state and the race configuration can't drift apart.
+                    if let thinking { payload["thinking"] = thinking }
                     var request = URLRequest(url: baseURL.appendingPathComponent("admin/race"))
                     request.httpMethod = "POST"
                     request.setValue("application/json", forHTTPHeaderField: "Content-Type")

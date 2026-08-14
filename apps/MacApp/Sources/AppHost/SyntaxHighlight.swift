@@ -45,7 +45,7 @@ enum SyntaxHighlight {
             .joined(separator: "|"))
     }()
 
-    static func highlight(_ code: String) -> AttributedString {
+    static func highlight(_ code: String, size: Double = 12) -> AttributedString {
         var result = AttributedString(code)
         let ns = code as NSString
         for match in pattern.matches(in: code, range: NSRange(location: 0, length: ns.length)) {
@@ -62,7 +62,9 @@ enum SyntaxHighlight {
                 result[attrRange].foregroundColor = color
             } else if keywords.contains(String(code[range])) {
                 result[attrRange].foregroundColor = Theme.spark
-                result[attrRange].font = .system(size: 12, design: .monospaced).weight(.semibold)
+                // Same size as the surrounding CodeCard text (which zooms), or the semibold
+                // keywords would stay put while everything else scales.
+                result[attrRange].font = .system(size: size, design: .monospaced).weight(.semibold)
             }
         }
         return result

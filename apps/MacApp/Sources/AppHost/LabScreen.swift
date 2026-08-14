@@ -18,12 +18,44 @@ struct LabScreen: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            Picker("", selection: $tab) {
-                ForEach(Tab.allCases) { Text($0.rawValue).tag($0) }
+            ZStack {
+                Picker("", selection: $tab) {
+                    ForEach(Tab.allCases) { Text($0.rawValue).tag($0) }
+                }
+                .pickerStyle(.segmented)
+                .labelsHidden()
+                .frame(width: 280)
+
+                // Quick presentation controls, right where a recording happens: content text
+                // size (also Cmd+/Cmd−) and a light/dark pin (also the View menu). They act
+                // app-wide; living here just saves the trip while framing a shot.
+                HStack(spacing: 8) {
+                    Spacer()
+                    Button { model.zoomText(-1) } label: {
+                        Image(systemName: "textformat.size.smaller")
+                    }
+                    .help("Smaller text (⌘−)")
+                    Button { model.zoomText(+1) } label: {
+                        Image(systemName: "textformat.size.larger")
+                    }
+                    .help("Bigger text (⌘+)")
+                    Menu {
+                        Picker("Appearance", selection: $model.appearance) {
+                            ForEach(Appearance.allCases) { appearance in
+                                Label(appearance.label, systemImage: appearance.symbol)
+                                    .tag(appearance)
+                            }
+                        }
+                        .pickerStyle(.inline)
+                    } label: {
+                        Image(systemName: model.appearance.symbol)
+                    }
+                    .menuStyle(.borderlessButton)
+                    .fixedSize()
+                    .help("Light / dark / follow system")
+                }
+                .buttonStyle(.borderless)
             }
-            .pickerStyle(.segmented)
-            .labelsHidden()
-            .frame(width: 280)
             .padding(12)
 
             Divider()

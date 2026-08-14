@@ -150,6 +150,28 @@ final class AppModel: ObservableObject {
     /// One-time banner after onboarding: land in the Lab with the race ready to run.
     @Published var showLabWelcome = false
 
+    // MARK: Presentation
+    /// Content text scale (chat messages, race lanes). Persisted; Cmd+/Cmd−/Cmd0.
+    @Published var textZoom: Double = Defaults.textZoom {
+        didSet { Defaults.textZoom = textZoom }
+    }
+    /// System / pinned-light / pinned-dark. Persisted; the Lab has a quick toggle for
+    /// recording in a look that doesn't match the desktop.
+    @Published var appearance: Appearance = Appearance(rawValue: Defaults.appearance) ?? .system {
+        didSet { Defaults.appearance = appearance.rawValue }
+    }
+
+    /// Discrete steps rather than a free multiplier, so repeated Cmd+ lands on the same
+    /// sizes every time and Cmd0 has an exact home.
+    static let zoomSteps: [Double] = [0.8, 0.9, 1.0, 1.1, 1.25, 1.4, 1.6]
+
+    func zoomText(_ direction: Int) {
+        let steps = Self.zoomSteps
+        let index = steps.firstIndex(where: { abs($0 - textZoom) < 0.01 })
+            ?? steps.firstIndex(where: { $0 >= textZoom }) ?? steps.count - 1
+        textZoom = steps[max(0, min(steps.count - 1, index + direction))]
+    }
+
     enum Phase: Equatable {
         case launching, settingUp
         case onboarding            // first run only: choose a model before loading anything
@@ -665,6 +687,40 @@ final class AppModel: ObservableObject {
             ? [mode, "baseline", "lookup"] : ["baseline", "lookup"]
     }
 
+    /// Which modes the Decoding picker can APPLY — a different question from
+    /// `availableRaceArms`. Racing is bounded by what is in memory right now; applying goes
+    /// through `/admin/load`, which reloads the pair, so a registered model's drafter mode is
+    /// always one swap away. Deriving the picker from the race arms made "DSpark" vanish the
+    /// moment Baseline was applied, with no way back from the UI.
+    var availableDecodingModes: [String] {
+        var options: [String] = []
+        if let row = loadedModelRow {
+            if row.dsparkDrafter != nil { options.append("dspark") }
+            if row.dflashDrafter != nil { options.append("dflash") }
+        } else if let mode = health?.mode, mode == "dspark" || mode == "dflash" {
+            // Unregistered pair running with an explicit drafter: keep its mode on offer.
+            options.append(mode)
+        }
+        options.append(contentsOf: ["baseline", "lookup"])
+        return options
+    }
+
+    /// The registry row for the loaded target, matched the way the engine matches: by the
+    /// row id as a substring of the target's basename, quant-agnostic (dash-insensitive),
+    /// longest id first — so a local path like `…/models/Qwen3.8-27B-8bit` still finds its
+    /// row and the Decoding picker keeps offering the pair's drafter mode.
+    private var loadedModelRow: ModelRow? {
+        guard let target = health?.target else { return nil }
+        let base = (target as NSString).lastPathComponent.lowercased()
+        let baseNoDash = base.replacingOccurrences(of: "-", with: "")
+        return models
+            .sorted { $0.id.count > $1.id.count }
+            .first {
+                base.contains($0.id.lowercased())
+                    || baseNoDash.contains($0.id.lowercased().replacingOccurrences(of: "-", with: ""))
+            }
+    }
+
     var statusLine: String {
         switch serverState {
         case .idle:                 return "Idle"
@@ -727,6 +783,21 @@ enum Defaults {
     static var labTab: String {
         get { store.string(forKey: "labTab") ?? "Live" }
         set { store.set(newValue, forKey: "labTab") }
+    }
+
+    /// Content text scale (1.0 = default). 0 in the store means "never set".
+    static var textZoom: Double {
+        get {
+            let stored = store.double(forKey: "textZoom")
+            return stored == 0 ? 1.0 : stored
+        }
+        set { store.set(newValue, forKey: "textZoom") }
+    }
+
+    /// Appearance override: "system" | "light" | "dark".
+    static var appearance: String {
+        get { store.string(forKey: "appearance") ?? "system" }
+        set { store.set(newValue, forKey: "appearance") }
     }
 
     /// The target chosen during onboarding. `nil` means onboarding hasn't run — the signal

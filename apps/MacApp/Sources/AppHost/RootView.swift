@@ -19,7 +19,12 @@ struct RootView: View {
                 FailureView()
             }
         }
-        .frame(minWidth: 900, minHeight: 600)
+        // The floor is deliberately modest: 900x600 blocked half-screen tiling and narrow
+        // side-by-side recording layouts (user report). Below ~640 the sidebar can be
+        // collapsed with the toolbar button; screens scroll rather than clip.
+        .frame(minWidth: 640, minHeight: 440)
+        .environment(\.textZoom, model.textZoom)
+        .preferredColorScheme(model.appearance.colorScheme)
         .task { await model.boot() }
     }
 }

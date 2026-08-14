@@ -258,6 +258,7 @@ struct EmptyChat: View {
 struct MessageView: View {
     let message: ChatMessage
     let isStreaming: Bool
+    @Environment(\.textZoom) private var zoom
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
@@ -279,6 +280,7 @@ struct MessageView: View {
                     .frame(maxWidth: .infinity, alignment: .leading)
             } else {
                 Text(message.text)
+                    .font(.system(size: 13 * zoom))
                     .textSelection(.enabled)
                     .frame(maxWidth: .infinity, alignment: .leading)
             }

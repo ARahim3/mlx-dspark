@@ -155,7 +155,20 @@ enum MathText {
         while let open = rest.firstIndex(of: "$") {
             let afterOpen = rest.index(after: open)
             guard let close = rest[afterOpen...].firstIndex(of: "$"),
-                  close > afterOpen else { break }
+                  close > afterOpen else {
+                // Unclosed span — mid-stream, or output truncated mid-equation (a race that
+                // hits its token cap ends exactly here). Same rule as an unterminated code
+                // fence: render it as math to the end of what's arrived, but only on a STRONG
+                // math signal (a TeX command / ^ / _ / =) — the letter-adjacency heuristic
+                // below is too loose without a closing delimiter ("$5 total" must survive).
+                let span = String(rest[afterOpen...])
+                let strong = span.contains("\\") || span.contains("^")
+                    || span.contains("_") || span.contains("=")
+                result += rest[..<open]
+                result += strong ? unicode(span) : "$" + span
+                rest = Substring("")
+                break
+            }
             let span = String(rest[afterOpen..<close])
             result += rest[..<open]
             // Math, or money? "$120 in 1.5 hours" must not be eaten: require some math-y
