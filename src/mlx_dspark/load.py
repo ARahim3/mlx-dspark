@@ -53,6 +53,9 @@ DFLASH_PRESETS = {
 # **no user-facing nicknames** — `id` is only the substring we match against a target repo name.
 # `speedup` is the measured headline ratio from the README table (M4 Pro, mlx 0.32, warm,
 # vs greedy baseline) — a human string for pickers, not a promise; content and machine move it.
+# `lookup_drafts: False` marks pairs whose measured-best configuration runs with hybrid
+# n-gram lookup drafts OFF — the shipped default then reproduces the vouched-for numbers with
+# no flag (see lookup_drafts_default; an explicit --lookup-drafts/--no-lookup-drafts wins).
 REGISTRY = [
     {"id": "qwen3-4b",   "target": "mlx-community/Qwen3-4B-8bit",
      "dspark": "deepseek-ai/dspark_qwen3_4b_block7", "dflash": "z-lab/Qwen3-4B-DFlash-b16",
@@ -114,8 +117,31 @@ REGISTRY = [
     # step is only ~11.5 ms while the 1.53B DENSE drafter costs ~5.7 ms of it. See NOTES
     # "Qwen3.6-35B-A3B: the first MoE target".
     {"id": "qwen3.6-35b-a3b", "target": "mlx-community/Qwen3.6-35B-A3B-4bit",
-     "dspark": "Koopah/Qwen3.6-35B-A3B-NVFP4-DSPARK",
+     "dspark": "Koopah/Qwen3.6-35B-A3B-NVFP4-DSPARK", "lookup_drafts": False,
      "ram": "~23 GB", "speedup": "~1.3×"},
+    # Qwen3.8-27B (qwen3_5 hybrid — same 64-layer/5120-hidden 48-linear/16-full shape class as
+    # Qwen3.6-27B, new 248320-token vocab). Drafter by RadixArk: the first **SpecForge/SGLang**
+    # packaging here (trained with sgl-project/SpecForge) — a DFlash-backbone DSpark: 5-layer
+    # plain qwen3 GQA (40/8 heads, hd 128, bidirectional full-attention block), block_size 7
+    # sampled anchor-as-pos0 (logits_start 0 -> 7 proposals; NOT the shipped base-DFlash
+    # loop's convention — see config.py), YARN rope (factor 32 /
+    # orig 8192 — honored; the reference builds it from the head's own config), markov-256 +
+    # confidence head, and it reuses the target's embed_tokens AND lm_head (ships neither).
+    # Card reports accept 3.39 mean incl. bonus (SGLang, FP8 target, temp 0.6). Measured
+    # (M4 Pro, warm, 3-trial medians, 200 tok, lookup off = this row's default):
+    # **4-bit** (registry target, broad-RAM/absolute-speed pick): baseline ~14.6 tok/s;
+    # cap 2 = **1.74x mean** (code 1.87x / math 1.83x / chat 1.52x, accept 2.44; cap 3 tied)
+    # vs 1.56x with lookup ON — the first non-MoE target where lookup drafts measure a clear
+    # net loss (the 4-bit 27B verify slope prices extra rows like the MoE expert pull does).
+    # **8-bit** (best ratio; drafter was trained vs the FP8 verifier, so 8-bit is the matched
+    # precision): baseline 8.3; cap 4 (= static_cap's pick, curve flat to width 5) =
+    # **2.45x mean** (math 3.00x / code 2.38x / chat 1.96x, accept 3.43), 20.3 tok/s, ~29 GB;
+    # lookup on-vs-off is a wash there (flat curve absorbs the rows) so the off default
+    # stands for both quants. static_cap picks 2 (4-bit) / 4 (8-bit) unaided. Lossless
+    # both quants (fp ties only, margins 0.0/0.125).
+    {"id": "qwen3.8-27b", "target": "mlx-community/Qwen3.8-27B-4bit",
+     "dspark": "RadixArk/Qwen3.8-27B-DSpark", "lookup_drafts": False,
+     "ram": "~18 GB (4-bit) / ~29 GB (8-bit)", "speedup": "~1.7× (8-bit: ~2.5×)"},
     # NVIDIA Nemotron-3.5-Lightning-30B-A3B — a hybrid **Mamba-2 + MoE + attention** target
     # (model_type nemotron_h: 52 blocks, 128 experts top-6 + 1 shared, ~3B active, latent MoE),
     # the first non-attention recurrence here. NVIDIA's official DSpark head: a plain qwen3 GQA
@@ -130,6 +156,7 @@ REGISTRY = [
     {"id": "nemotron-3.5-lightning-30b-a3b",
      "target": "mlx-community/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-4bit",
      "dspark": "mlx-community/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-DSpark-bf16",
+     "lookup_drafts": False,
      "ram": "~20 GB", "speedup": "~1.25× code"},
     # Meta Muse-Glimmer-30B — the first **muse_glimmer** (multimodal, 3:1 sliding/full attention,
     # NoPE globals, ~30B DENSE) target, loaded via mlx-vlm >= 0.6.12. Unlike gemma4, its language
@@ -159,7 +186,7 @@ REGISTRY = [
     # match). See NOTES "Muse-Glimmer-30B: the first muse_glimmer target (and reuse-both
     # DFlash-lineage head)".
     {"id": "muse-glimmer-30b", "target": "mlx-community/Muse-Glimmer-30B-4bit",
-     "dspark": "DaoCloud/Muse-Glimmer-30B-DSpark",
+     "dspark": "DaoCloud/Muse-Glimmer-30B-DSpark", "lookup_drafts": False,
      "ram": "~26 GB (4-bit) / ~40 GB (8-bit)", "speedup": "~1.5× (8-bit: ~2.4×)"},
 ]
 
@@ -180,6 +207,25 @@ def _registry_entry(target: str) -> dict | None:
         if eid in key or eid.replace("-", "") in key_nodash:
             return entry
     return None
+
+
+def lookup_drafts_default(target: str | None) -> bool:
+    """Shipped default for hybrid n-gram lookup drafts in dspark mode, per pair.
+
+    Lookup drafts are only free where extra verify rows are cheap. On targets whose verify
+    curve rises steeply from narrow widths — every MoE measured (a low-acceptance free draft
+    pulls fresh routed experts per row) and the 4-bit 27B hybrids (Qwen3.8-27B: 1.74x off vs
+    1.56x on at cap 2) — the free draft costs more than the drafter round it replaces, so the
+    registry rows measured that way carry ``lookup_drafts: False`` and this returns it.
+    Unknown targets and rows without the key keep the global default True (dense cheap-verify
+    targets measure lookup as a clear win, +34% on copy content). An explicit CLI/request
+    setting always wins over this default — callers only consult it when the user said
+    nothing.
+    """
+    entry = _registry_entry(target) if target else None
+    if entry is None:
+        return True
+    return bool(entry.get("lookup_drafts", True))
 
 
 def resolve(model: str | None = None, *, mode: str = "dspark", drafter: str | None = None,

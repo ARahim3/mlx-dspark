@@ -137,3 +137,25 @@ def test_resolve_mode_passthrough_non_auto():
         "lookup", "mlx-community/Qwen3-8B-8bit", None)
     mode, _, drf = resolve_mode("mlx-community/Qwen3-8B-8bit", mode="dflash")
     assert mode == "dflash" and drf == "z-lab/Qwen3-8B-DFlash-b16"
+
+
+def test_lookup_drafts_default_follows_the_registry_row():
+    """Pairs whose stamped-best configuration ran with hybrid lookup drafts OFF carry
+    lookup_drafts: False in the registry — the shipped default must reproduce the vouched-for
+    numbers with no flag. Quant-agnostic like the drafter resolution itself."""
+    from mlx_dspark.load import lookup_drafts_default
+
+    # measured net-loss rows: every MoE and the 4-bit 27B hybrids (+ Muse's stamped config)
+    assert lookup_drafts_default("mlx-community/Qwen3.8-27B-4bit") is False
+    assert lookup_drafts_default("mlx-community/Qwen3.8-27B-8bit") is False
+    assert lookup_drafts_default("mlx-community/Qwen3.6-35B-A3B-4bit") is False
+    assert lookup_drafts_default(
+        "mlx-community/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-4bit") is False
+    assert lookup_drafts_default("mlx-community/Muse-Glimmer-30B-8bit") is False
+    # measured net-win rows keep the global default on
+    assert lookup_drafts_default("mlx-community/Qwen3-8B-8bit") is True
+    assert lookup_drafts_default("mlx-community/gemma-4-12B-it-8bit") is True
+    assert lookup_drafts_default("mlx-community/Qwen3.6-27B-8bit") is True
+    # unknown target / no target: global default
+    assert lookup_drafts_default("some-org/Weird-Model-3B") is True
+    assert lookup_drafts_default(None) is True
