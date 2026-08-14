@@ -4,7 +4,7 @@
 
 <p align="center">
   <b>DeepSeek's DSpark <i>and</i> z-lab's DFlash speculative decoding — native on Apple Silicon via <a href="https://github.com/ml-explore/mlx">MLX</a>.</b>
-  <br>Lossless drafters (same output, just faster) for <b>Gemma-4, Qwen3, Muse-Glimmer, Ornith-1.0, Qwen3.6, Nemotron, and Bonsai</b> targets —
+  <br>Lossless drafters (same output, just faster) for <b>Gemma-4, Qwen3, Muse-Glimmer, Ornith-1.0, Qwen3.6, Qwen3.8, Nemotron, and Bonsai</b> targets —
   <br>plus any matched DSpark / DFlash checkpoint. Run them at the CLI, from Python, serve an <b>OpenAI-compatible API</b> to LM Studio / any local tool,
   <br>or drive <b>Claude Code</b> with a model on your own Mac.
 </p>
@@ -44,6 +44,7 @@ chat/code/math), the Muse row per-content best (footnoted); full tables, baselin
 |---|---|---|
 | **Muse-Glimmer-30B** (8-bit, dense)[^muse] | **3.27×** math · **2.50×** code · **2.22×** chat | ~26 tok/s |
 | **Gemma-4 12B** (8-bit) | **3.09×** math · **2.63×** chat · **2.61×** code | ~49 tok/s |
+| **Qwen3.8-27B** (8-bit)[^q38] | **3.00×** math · **2.38×** code · 1.96× chat | ~20 tok/s |
 | **Qwen3.6-27B** (8-bit) | **2.67×** math · **2.26×** chat · 1.96× code | ~19 tok/s |
 | **Ornith-1.0-9B** (8-bit) | **2.53×** code · **2.48×** math · **2.21×** chat | ~64 tok/s |
 | **Qwen3-14B** (8-bit) | **2.36×** math · **2.11×** code · 1.62× chat | ~31 tok/s |
@@ -286,6 +287,7 @@ anything else, add `--drafter <repo>`. Run `mlx-dspark models` to print this tab
 | `mlx-community/gemma-4-12B-it-8bit`  | `deepseek-ai/dspark_gemma4_12b_block7` | `z-lab/gemma4-12B-it-DFlash` | ~15 GB |
 | `prism-ml/Ternary-Bonsai-27B-mlx-2bit` | `Rahim/Ternary-Bonsai-27B-dspark`    | — | ~12 GB |
 | `mlx-community/Qwen3.6-27B-8bit`     | `satgeze/Qwen3.6-27B-DSpark` (community) | — | ~32 GB |
+| `mlx-community/Qwen3.8-27B-4bit`     | `RadixArk/Qwen3.8-27B-DSpark` (community, SpecForge) | — | ~18 GB (4-bit) / ~29 GB (8-bit[^q38]) |
 | `mlx-community/Ornith-1.0-9B-8bit`   | `stanleyphoong/Ornith-1.0-9B-DSpark` (community) | — | ~13 GB |
 | `mlx-community/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-4bit` | `mlx-community/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-DSpark-bf16` (NVIDIA head, MLX) | — | ~20 GB |
 | `mlx-community/Muse-Glimmer-30B-4bit` | `DaoCloud/Muse-Glimmer-30B-DSpark` (community, DFlash-lineage) | — | ~26 GB (4-bit) / ~40 GB (8-bit[^muse]) |
@@ -445,11 +447,13 @@ which is why Bonsai still sits at 2 while the 8-bit rows moved to 4.
 |---|---|---|---|---|---|---|
 | **Gemma-4 12B** | 4 | 3.95 | 17.8 tok/s | 49.4 tok/s | **2.78×** | 2.63× / 2.61× / 3.09× |
 | **Muse-Glimmer-30B** (8-bit, dense)[^muse] | 4 | 3.31 | 8.2 tok/s | 20.2 tok/s | **2.47×** | 1.97× / 2.45× / 2.99× |
+| **Qwen3.8-27B** (8-bit, hybrid)[^community][^q38] | 4 | 3.43 | 8.3 tok/s | 20.3 tok/s | **2.45×** | 1.96× / 2.38× / 3.00× |
 | **Ornith-1.0-9B** (hybrid)[^community] | 4 | 3.64 | 26.7 tok/s | 64.2 tok/s | **2.40×** | 2.21× / 2.53× / 2.48× |
 | **Qwen3.6-27B** (8-bit, hybrid)[^community][^q27] | 4 | 3.15 | 8.4 tok/s | 19.2 tok/s | **2.29×** | 2.26× / 1.96× / 2.67× |
 | **Qwen3-8B** | 4 | 2.94 | 28.1 tok/s | 57.7 tok/s | **2.05×** | 1.81× / 2.06× / 2.29× |
 | **Qwen3-14B**[^qwen14b] | 4 | 2.87 | 15.3 tok/s | 31.0 tok/s | **2.03×** | 1.62× / 2.11× / 2.36× |
 | **Qwen3-4B** | 4 | 2.79 | 50.9 tok/s | 92.4 tok/s | **1.82×** | 1.77× / 1.70× / 1.98× |
+| **Qwen3.8-27B** (4-bit, hybrid)[^community][^q38] | 2 | 2.44 | 14.5 tok/s | 25.3 tok/s | **1.74×** | 1.52× / 1.87× / 1.83× |
 | **Qwen3.6-35B-A3B** (4-bit, MoE, hybrid)[^community][^moe] | conf | 4.72 | 86.9 tok/s | 114.5 tok/s | **1.32×** | 1.05× / 1.24× / 1.67× |
 | **Nemotron-3.5-Lightning-30B-A3B** (4-bit, MoE+Mamba, hybrid)[^nemotron] | 3 | 3.28 | 91.4 tok/s | 100.9 tok/s | **1.10×** | 0.95× / 1.23× / 1.13× |
 | **Ternary-Bonsai-27B** (2-bit, hybrid) | 2 | 2.60 | 25.4 tok/s | 27.2 tok/s | **1.07×** | 1.01× / 1.13× / 1.07× |
@@ -466,7 +470,8 @@ the same fact and are specific to this row:
 - **Hybrid lookup drafts are a net loss here** (1.27× → 1.21×), the only target where the
   shipped-on default should be turned off. A free n-gram draft still has to be *verified*, and
   on an MoE every extra verify row pulls in a fresh set of experts to read — so a
-  low-acceptance free draft is not free at all. Use `--no-lookup-drafts`.
+  low-acceptance free draft is not free at all. This is now the **shipped default** for the
+  pairs measured that way (the registry row carries it; `--lookup-drafts` forces it back on).
 - **The confidence head finally pays** (1.27× → 1.32×, and 1.50× → 1.67× on math), reversing
   this project's standing result that it reaches higher acceptance at *lower* throughput. That
   result was measured on dense targets with a flat verify region, where a fixed cap wastes
@@ -806,7 +811,8 @@ are bundled.
     the 15-wide 2.3B-param drafter backbone to the `cap` rows the head reads — bit-identical, worth
     **+10–13%** end-to-end on this pair (0.8.1). Both tables show the **8-bit** target
     (`mlx-community/Muse-Glimmer-30B-8bit`) at cap 4 (auto's pick — its verify curve is flat to
-    width 5, knees at 6) with `--no-lookup-drafts`. The **hook-table row is the best measured per
+    width 5, knees at 6) with lookup drafts off — now this pair's shipped default (registry
+    row). The **hook-table row is the best measured per
     content** — cap 4, each prompt paired against its *own* baseline, medians of 3 interleaved
     trials; per-content speedup tracks acceptance (math accepts 4.4 on that prompt), so it moves
     with content. The [Results at a glance](#results-at-a-glance) row is the fixed benchmark suite,
@@ -822,18 +828,33 @@ are bundled.
     sequential greedy at more positions than a typical dense model, every one a sub-ulp tie
     (cap 2 and cap 4 diverge at the *same* position).
 
-[^moe]: **Qwen3.6-35B-A3B** — the one row measured with non-default flags:
-    `--confidence-threshold 0.3 --no-lookup-drafts` (5 trials, median); its shipped-default cap
-    is 3, worth 1.27×. The only pure-MoE row, and the one where the *ratio* is the least
+[^moe]: **Qwen3.6-35B-A3B** — measured at `--confidence-threshold 0.3` (5 trials, median) with
+    lookup drafts off — the latter is now this pair's shipped default (registry row), the
+    confidence threshold still needs the flag; its shipped-default cap is 3, worth 1.27×. The only pure-MoE row, and the one where the *ratio* is the least
     interesting number — it is the fastest model in these tables in absolute terms, because only
     ~3.8B of its 35B parameters are active per token, and that same property is what caps the
     ratio (each extra verify row pulls in fresh routed experts). See the MoE discussion under
     [Results at a glance](#results-at-a-glance).
 
+[^q38]: **Qwen3.8-27B** — both tables show the **8-bit** target at cap 4 (the calibrated pick;
+    its verify curve is flat to width 5), 3-trial medians, hybrid lookup drafts **off** — this
+    pair's **shipped default** (the registry row carries it, no flag needed). The **4-bit**
+    target trades the ratio for absolute speed and RAM: cap 2, **1.74×** mean (1.87× code /
+    1.83× math / 1.52× chat, accept 2.44) but **25.3 tok/s** vs 8-bit's 20.3, in ~18 GB vs
+    ~29 GB — the registry auto-resolves the same drafter for both, and the 4-bit is where the
+    lookup-off default actually bites (1.74× off vs 1.56× on — the first **non-MoE** target
+    where lookup drafts are a clear net loss; the 4-bit 27B verify slope prices extra verify
+    rows the way MoE expert pulls do; on 8-bit's flat curve it's a wash). The drafter,
+    `RadixArk/Qwen3.8-27B-DSpark`, is the first **SpecForge/SGLang-packaged** head here
+    (DFlash backbone + DeepSpec markov/confidence heads, YaRN rope, reuses the target's embed
+    *and* lm_head; card: accept 3.39 at temp 0.6 vs the FP8 target). Trained against the FP8
+    verifier — which is why 8-bit lifts acceptance (2.44 → 3.43), the
+    Ornith/Qwen3.6-27B precision-matching pattern again.
+
 [^nemotron]: **Nemotron-3.5-Lightning-30B-A3B** — the first **Mamba-2 + MoE hybrid** target
     (`nemotron_h`, NVIDIA's official DSpark head), the project's first non-attention recurrence,
-    with an exact Mamba-2 spec rollback. `--no-lookup-drafts` everywhere (lookup drafts are a net
-    loss on it, as on every MoE). **This model's speedup is unusually content-sensitive**, so the
+    with an exact Mamba-2 spec rollback. Lookup drafts off everywhere (a net loss on it, as on
+    every MoE — now this pair's shipped default via its registry row). **This model's speedup is unusually content-sensitive**, so the
     two tables differ more than for other rows. The hook-table row is the best measured per
     content at `--max-draft 4`, each prompt paired against its own baseline: math **1.34×**
     (accept 4.41, 80 → 108 tok/s, medians of 3 on 0.8.1) and chat 1.07× are 0.8.1 measurements;
@@ -849,6 +870,9 @@ are bundled.
     bf16 target with DeepSpec's online mode and warm-started from z-lab's DFlash head for the
     same target. Rule of thumb: **match the target's precision to what the drafter was trained
     against** — Ornith's drafter (bf16-qualified) wants 8-bit, and so does this one.
+    Qwen3.8-27B runs `RadixArk/Qwen3.8-27B-DSpark`, the first **SpecForge/SGLang**-packaged head
+    here (see its own footnote); its row is the 4-bit target, a precision step below the FP8
+    verifier it was trained against.
     Ornith-1.0-9B (an agentic-coding qwen3_5 hybrid, drafter qualified against the bf16 verifier)
     runs the **8-bit** house sweet spot — the first target here with chat above 2× — and its
     acceptance is so high on code (p≈0.96/position) that auto-cap drives the cap to the full

@@ -4,6 +4,35 @@ All notable changes to `mlx-dspark`. Versions follow [SemVer](https://semver.org
 
 ## [Unreleased]
 
+## [0.10.0] — 2026-08-15 — Qwen3.8-27B (SpecForge drafters) + per-pair defaults
+
+First PyPI upload since 0.8.1 — it carries **0.9.0 below as well** (the server control plane +
+telemetry behind the Mac app, prepped 2026-08-13 but never uploaded on its own).
+
+### Added
+- **Qwen3.8-27B support** — `--model mlx-community/Qwen3.8-27B-8bit` (or `-4bit`) auto-resolves
+  `RadixArk/Qwen3.8-27B-DSpark`, the first **SpecForge/SGLang**-packaged head (a fourth checkpoint
+  format): DFlash-backbone DSpark with nested `dflash_config`, anchor-as-pos0 sampling (the shipped
+  base-class reference reads the wrong slot — measured accept 1.35 vs 3.42), a real **YaRN drafter
+  rope** (honored for this packaging only; mlx-vlm's YarnRoPE matches transformers' yarn exactly),
+  and target embed+lm_head reuse. Measured (M4 Pro, 3-trial medians, lossless): **8-bit cap 4 =
+  2.45×** mean (3.00× math / 2.38× code / 1.96× chat, accept 3.43, 8.3 → 20.3 tok/s); 4-bit cap 2 =
+  1.74× at 25.3 tok/s in ~18 GB. Both caps are the calibrated picks — no flags needed.
+- **Per-pair lookup-drafts defaults** — registry pairs whose measured best runs with hybrid n-gram
+  lookup drafts OFF (every MoE, the 4-bit 27B hybrids, Muse-Glimmer) now ship that default; the
+  shipped configuration reproduces the vouched-for numbers with no flag. CLI flags are three-state
+  (`--lookup-drafts` / `--no-lookup-drafts` / unset = pair default) on `generate`/`serve`/
+  `benchmark` (which prints the setting's provenance); `POST /admin/load` accepts a boolean
+  `lookup_drafts` override; a hot swap re-resolves the default for the incoming model; `/health`
+  and `/admin/models` report it. Library `speculative_generate` defaults are untouched.
+- **`POST /admin/race` takes an optional boolean `thinking`** — per-race chat-template override
+  (the Lab's toggle), echoed in the SSE start event.
+
+### Fixed
+- The vanished-mode trap in clients driving `/admin/load`: the Mac app's Decoding picker derived
+  its options from the *race* arms, so applying Baseline once removed DSpark with no way back
+  (app-side fix; the endpoint was always fine).
+
 ## [0.9.0] — 2026-08-13 — the server grows a control plane + live telemetry (and a native Mac app)
 
 The release that makes the server *observable and drivable*: everything the new Mac app renders
