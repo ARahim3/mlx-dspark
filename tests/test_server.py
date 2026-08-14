@@ -399,3 +399,30 @@ def test_generation_error_reports_type_and_logs_traceback(server, capfd):
     assert "IndexError" in err["message"]           # bare str(e) hid which exception it was
     assert "list index out of range" in err["message"]
     assert "Traceback" in capfd.readouterr().err    # the part that makes it diagnosable
+
+
+def test_race_thinking_param_validated_and_echoed(server):
+    """/admin/race takes an optional boolean `thinking` (the Lab's toggle): a non-boolean is
+    a 400 with the reason, a boolean rides into the chat-template kwargs and is echoed in the
+    SSE start event so a client can display the race's actual configuration."""
+    eng, base = server
+    eng.race_arms_available = lambda: ["dspark", "baseline"]
+    eng.race = lambda prompt_ids, arms, max_tokens, on_event: None
+
+    with pytest.raises(urllib.error.HTTPError) as e:
+        _post(base, "/admin/race",
+              {"prompt": "hi", "arms": ["dspark", "baseline"], "thinking": "yes"})
+    assert e.value.code == 400
+    assert "thinking" in json.loads(e.value.read())["error"]["message"]
+
+    out = _post(base, "/admin/race",
+                {"prompt": "hi", "arms": ["dspark", "baseline"], "thinking": False},
+                stream=True)
+    start = next(line for line in out.splitlines() if line.startswith("data:"))
+    assert json.loads(start[5:])["thinking"] is False
+
+    # omitted -> server default; the start event then carries no thinking key at all
+    out = _post(base, "/admin/race", {"prompt": "hi", "arms": ["dspark", "baseline"]},
+                stream=True)
+    start = next(line for line in out.splitlines() if line.startswith("data:"))
+    assert "thinking" not in json.loads(start[5:])

@@ -97,9 +97,11 @@ def cmd_generate(argv: list[str]) -> None:
     ap.add_argument("--kv-bits", type=int, default=0, choices=[0, 4, 8],
                     help="quantize the target KV cache (4/8 bits; 0 = off). Cuts the KV "
                          "bandwidth bill on long contexts; mlx-lm text targets only")
-    ap.add_argument("--no-lookup-drafts", action="store_true",
-                    help="disable hybrid n-gram drafting inside dspark mode (on by default; "
-                         "free extra speedup on copy-heavy spans, lossless either way)")
+    ap.add_argument("--lookup-drafts", action=argparse.BooleanOptionalAction, default=None,
+                    help="hybrid n-gram drafting inside dspark mode. Unset = the pair's "
+                         "measured default (ON for most targets — free extra speedup on "
+                         "copy-heavy spans; OFF where the registry stamped it a net loss: "
+                         "MoE targets and the 4-bit 27B hybrids). Lossless either way.")
     ap.add_argument("--wide-gemm-min", type=int, default=None, metavar="N",
                     help="prefill only: row count from which QuantizedLinear dequantizes the "
                          "weight once and runs a plain GEMM instead of quantized_matmul "
@@ -174,10 +176,21 @@ def cmd_generate(argv: list[str]) -> None:
             cap = static_cap(target, drafter, mode="dspark", target_repo=target_repo,
                              drafter_repo=drafter_repo)
             print(f"  cap {cap} (measured for this model+quant; override with --max-draft)")
+        # Unset --lookup-drafts = this pair's measured default (registry rows stamped with
+        # lookup off carry it; everything else stays on). Announce a registry OFF so the
+        # configuration is visible from the invocation.
+        lookup = args.lookup_drafts
+        if lookup is None:
+            from .load import lookup_drafts_default
+
+            lookup = lookup_drafts_default(target_repo)
+            if not lookup:
+                print("  lookup drafts off (measured default for this pair; "
+                      "--lookup-drafts forces on)")
         res = speculative_generate(
             target, tok, drafter, args.prompt,
             max_new_tokens=args.max_new_tokens, max_draft_tokens=cap,
-            cap_controller=cap_controller, lookup_drafts=not args.no_lookup_drafts,
+            cap_controller=cap_controller, lookup_drafts=lookup,
             lookup_long_draft=args.lookup_long_draft,
             confidence_threshold=args.confidence_threshold,
             temperature=args.temperature, top_p=args.top_p, top_k=args.top_k, seed=args.seed,
@@ -302,8 +315,10 @@ def cmd_serve(argv: list[str]) -> None:
     ap.add_argument("--prefix-cache-slots", type=int, default=2,
                     help="number of conversations kept in the prefix cache LRU (default 2, "
                          "so an agent and a chat don't evict each other every turn)")
-    ap.add_argument("--no-lookup-drafts", action="store_true",
-                    help="disable hybrid n-gram drafting inside dspark mode")
+    ap.add_argument("--lookup-drafts", action=argparse.BooleanOptionalAction, default=None,
+                    help="hybrid n-gram drafting inside dspark mode. Unset = each loaded "
+                         "pair's measured default (re-resolved on every /admin/load swap); "
+                         "an explicit value pins it for the whole server")
     ap.add_argument("--lookup-long-draft", type=int, default=32,
                     help="match-scaled long-draft ceiling for lookup drafts (default 32; "
                          "set to 6 to disable — see `mlx-dspark generate -h`)")
@@ -343,7 +358,7 @@ def cmd_serve(argv: list[str]) -> None:
         "default_top_p": args.default_top_p,
         "default_top_k": args.default_top_k,
         "prefix_cache_slots": args.prefix_cache_slots,
-        "lookup_drafts": not args.no_lookup_drafts,
+        "lookup_drafts": args.lookup_drafts,     # None = per-pair registry default
         "lookup_long_draft": args.lookup_long_draft,
         "wired_limit": args.wired_limit,
         "wide_gemm_min": args.wide_gemm_min,
@@ -530,19 +545,18 @@ def cmd_benchmark(argv: list[str]) -> None:
                          "where tested (<1%%). Only consider it if the model nearly fills "
                          "your RAM and you actually see paging stalls - and validate a long "
                          "run before trusting it.")
-    ap.add_argument("--no-lookup-drafts", action="store_true",
-                    help="dspark mode only: disable the 4-gram HYBRID lookup draft (on by "
-                         "default), where an n-gram hit supplies a free draft instead of "
-                         "running the drafter that round. Distinct from `--modes lookup`, "
-                         "which is the standalone drafter-free mode. Worth measuring on MoE "
-                         "targets: a free draft still costs verify rows, and each extra row "
-                         "pulls fresh routed experts (Qwen3.6-35B-A3B measured 1.27x -> "
-                         "1.21x with it ON).")
+    ap.add_argument("--lookup-drafts", action=argparse.BooleanOptionalAction, default=None,
+                    help="dspark mode only: the 4-gram HYBRID lookup draft, where an n-gram "
+                         "hit supplies a free draft instead of running the drafter that "
+                         "round. Unset = the pair's measured default (registry rows stamped "
+                         "with lookup off carry it — every MoE and the 4-bit 27B hybrids: a "
+                         "free draft still costs verify rows). Distinct from `--modes "
+                         "lookup`, the standalone drafter-free mode. Pass --lookup-drafts / "
+                         "--no-lookup-drafts to force an arm for A/B.")
     ap.add_argument("--json", default=None, help="also write results to this JSON file")
     args = ap.parse_args(argv)
 
     modes = [m.strip() for m in args.modes.split(",") if m.strip()]
-    lookup_drafts = not args.no_lookup_drafts
     caps = [c.strip() for c in args.caps.split(",") if c.strip()]
     if args.wired_limit:
         apply_wired_limit()
@@ -554,8 +568,18 @@ def cmd_benchmark(argv: list[str]) -> None:
     _, target_repo, _ = resolve_mode(args.model, mode="auto", drafter=args.drafter)
     # State the hybrid-lookup setting explicitly: it materially moves dspark numbers and used
     # to be invisible from the invocation, which makes results non-comparable after the fact.
+    # Unset = the pair's measured default from the registry, and the provenance is printed so
+    # a forced arm and a default arm can't be conflated after the fact.
+    if args.lookup_drafts is None:
+        from .load import lookup_drafts_default
+
+        lookup_drafts = lookup_drafts_default(target_repo)
+        lk_note = f"{'on' if lookup_drafts else 'OFF'} (pair default)"
+    else:
+        lookup_drafts = args.lookup_drafts
+        lk_note = f"{'on' if lookup_drafts else 'OFF'} (forced)"
     print(f"target: {target_repo}\n"
-          f"hybrid lookup drafts: {'on (default)' if lookup_drafts else 'OFF'}\n"
+          f"hybrid lookup drafts: {lk_note}\n"
           f"loading + warming up…")
     target, tok = load_target(
         target_repo, require_tap=any(m in ("dspark", "dflash") for m in modes))

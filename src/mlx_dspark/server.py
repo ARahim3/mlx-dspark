@@ -228,7 +228,7 @@ class Engine:
         default_top_p: float | None = None,
         default_top_k: int | None = None,
         prefix_cache_slots: int = 2,
-        lookup_drafts: bool = True,
+        lookup_drafts: bool | None = None,       # None = this pair's registry default
         lookup_long_draft: int = 32,
         wired_limit: bool = False,
         batch_widths: list[int] | None = None,   # e.g. [2, max_batch]: calibrate (B,cap) grid
@@ -242,6 +242,15 @@ class Engine:
         # drafter-free lookup), so any model repo serves without extra flags.
         mode, target_repo, drafter_repo = resolve_mode(model, mode=mode, drafter=drafter,
                                                        family=family, target=target)
+        # Hybrid lookup drafts: unset means "this pair's measured-best configuration" — the
+        # registry rows whose stamped numbers were taken with lookup off (every MoE, the
+        # 4-bit 27B hybrids, Muse) carry lookup_drafts: False, so serving them needs no flag
+        # to reproduce the vouched-for speedup. Re-resolved on every /admin/load hot swap
+        # (the server kwargs keep None), so the default follows the model, not the process.
+        if lookup_drafts is None:
+            from .load import lookup_drafts_default
+
+            lookup_drafts = lookup_drafts_default(target_repo)
 
         # Load (and calibrate) on the SAME single thread that will generate: MLX ops/arrays
         # are thread/stream-affine, and mlx-vlm's gemma load switches the loading thread's
@@ -1035,7 +1044,8 @@ class EngineHolder:
                 "error": self._load_error}
 
     def swap(self, *, model: str, mode: str | None = None,
-             max_draft: int | str | None = None) -> dict:
+             max_draft: int | str | None = None,
+             lookup_drafts: bool | None = None) -> dict:
         """Release the current model and load ``model`` in its place. Returns the new status.
 
         Serialized by ``_swap_lock`` so two concurrent loads can't race. Raises ``ValueError``
@@ -1061,6 +1071,8 @@ class EngineHolder:
                     kwargs["mode"] = mode
                 if max_draft is not None:
                     kwargs["max_draft_tokens"] = max_draft
+                if lookup_drafts is not None:
+                    kwargs["lookup_drafts"] = lookup_drafts
                 engine = Engine.load(**kwargs)
                 engine = maybe_batch_engine(engine, self._max_batch)
                 self._engine = engine
@@ -1263,6 +1275,9 @@ def make_handler(engine: Engine, api_key: str | None):
                     "status": "ok", "model": engine.model_id, "mode": engine.mode,
                     "target": engine.target_repo, "drafter": engine.drafter_repo,
                     "max_draft": max_draft,
+                    # resolved per pair at load (registry rows measured with lookup off carry
+                    # it) — reported so a client shows the actual configuration, like max_draft
+                    "lookup_drafts": bool(getattr(engine, "lookup_drafts", True)),
                     "context_window": getattr(engine, "context_window", None),
                     "max_output_tokens": engine.max_tokens_cap,
                 })
@@ -1336,8 +1351,13 @@ def make_handler(engine: Engine, api_key: str | None):
                 return self._send_error(400, "load needs a 'model' (repo or path)")
             mode = req.get("mode")
             max_draft = req.get("max_draft")
+            lookup_drafts = req.get("lookup_drafts")
+            if lookup_drafts is not None and not isinstance(lookup_drafts, bool):
+                return self._send_error(400, "'lookup_drafts' must be a boolean (omit it to "
+                                             "use the pair's measured default)")
             try:
-                status = engine.swap(model=model, mode=mode, max_draft=max_draft)
+                status = engine.swap(model=model, mode=mode, max_draft=max_draft,
+                                     lookup_drafts=lookup_drafts)
             except ValueError as e:                 # unknown model / unresolvable drafter
                 return self._send_error(400, str(e))
             except Exception as e:  # noqa: BLE001 — load failed; report, server stays up
@@ -1374,16 +1394,29 @@ def make_handler(engine: Engine, api_key: str | None):
                 return self._send_error(400, "race takes between 2 and 4 arms")
 
             max_tokens = _clamp_tokens(req.get("max_tokens"), 200, engine.max_tokens_cap)
+            # Optional per-race thinking override (the Lab's toggle). Omitted = the server's
+            # own default, same as every other endpoint; templates that don't know the kwarg
+            # ignore it (encode_messages retries without unknown kwargs).
+            thinking = req.get("thinking")
+            if thinking is not None and not isinstance(thinking, bool):
+                return self._send_error(400, "'thinking' must be a boolean (omit it to use "
+                                             "the server's default)")
+            template_kwargs = dict(engine.template_defaults)
+            if thinking is not None:
+                template_kwargs["enable_thinking"] = thinking
             try:
                 prompt_ids = encode_messages(engine.tokenizer,
                                              [{"role": "user", "content": prompt}],
-                                             **engine.template_defaults)
+                                             **template_kwargs)
             except Exception as e:  # noqa: BLE001
                 return self._send_error(400, f"could not apply chat template: {e}")
 
             self._sse_start()
-            self._sse({"arms": arms, "max_tokens": max_tokens,
-                       "model": engine.model_id}, "start")
+            start_payload = {"arms": arms, "max_tokens": max_tokens,
+                             "model": engine.model_id}
+            if thinking is not None:
+                start_payload["thinking"] = thinking
+            self._sse(start_payload, "start")
             try:
                 engine.race(prompt_ids, arms, max_tokens,
                             lambda name, payload: self._sse(payload, name))

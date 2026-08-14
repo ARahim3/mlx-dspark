@@ -277,6 +277,9 @@ def model_inventory(ram_gb: float | None = _DETECT) -> list[dict]:  # type: igno
             "dflash_drafter": entry.get("dflash"),
             "ram": entry.get("ram"),
             "speedup": entry.get("speedup"),
+            # The pair's measured-best hybrid-lookup setting (False where the stamped numbers
+            # were taken with lookup off); the engine applies it as the shipped default.
+            "lookup_drafts": bool(entry.get("lookup_drafts", True)),
             "ram_gb": need,
             "fits": (None if (need is None or ram_gb is None) else need <= ram_gb * 0.8),
             "target_installed": _is_local(entry["target"]),

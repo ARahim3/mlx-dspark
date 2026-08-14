@@ -114,6 +114,28 @@ class TestSwap:
         assert captured["max_draft_tokens"] == 4
         assert captured["prefix_cache"] is True      # base kwarg preserved
 
+    def test_swap_lookup_drafts_override_and_per_pair_default(self, monkeypatch):
+        """An explicit lookup_drafts rides the swap; absent, the server's stored kwargs
+        pass through unchanged — a serve started without the flag stores None, so each
+        swapped-in pair re-resolves its own registry default inside Engine.load."""
+        h = EngineHolder(FakeEngine("old"), load_kwargs={"lookup_drafts": None})
+        captured = {}
+
+        import mlx_dspark.server as server
+
+        def capture(**kw):
+            captured.update(kw)
+            return FakeEngine("new")
+
+        monkeypatch.setattr(server.Engine, "load", staticmethod(capture))
+        monkeypatch.setattr(server, "maybe_batch_engine", lambda e, b: e)
+
+        h.swap(model="repo", lookup_drafts=False)
+        assert captured["lookup_drafts"] is False    # request override wins
+        captured.clear()
+        h.swap(model="repo2")
+        assert captured["lookup_drafts"] is None     # unset -> Engine.load resolves per pair
+
     def test_batch_engine_inner_is_also_closed(self, monkeypatch):
         inner = FakeEngine("old-inner")
 
