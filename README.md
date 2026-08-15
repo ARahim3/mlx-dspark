@@ -163,8 +163,9 @@ multi-turn), `POST /v1/completions`, `GET /v1/models`, `GET /health`, `GET /metr
 (`enable_thinking`). Each response carries an `x_mlx_dspark` block (accept length + tok/s) so the
 spec-decode gain is visible. **Continuous batching** (`--max-batch N`) serves concurrent requests in one
 batched forward for ~2.5× aggregate throughput (see [Concurrent throughput](#concurrent-throughput));
-**prefix caching** (on by default) reuses the conversation prefix so multi-turn chat doesn't re-prefill
-each turn (~13× faster follow-up turns on a long shared context — see [Prefix caching](#prefix-caching)).
+**prefix caching** (on by default) reuses the conversation prefix so multi-turn chat and agents don't
+re-prefill each turn — measured on an ~8k-token context: first token in ~62 s cold vs **0.2–1 s** on
+cached turns, hybrid targets included (see [Prefix caching](#prefix-caching)).
 
 ### Use it from Claude Code
 
@@ -212,8 +213,10 @@ the win on re-prefilling. Choose for prefix-cache compatibility first, drafter q
 
 <sub>That table was measured on 0.6.0. **0.7.0 changes its premise for the hybrid row**: checkpoint
 prefix caching (see [Prefix caching](#prefix-caching)) gives Ornith reuse under `--no-thinking`,
-which is the setting this table used — so its ~4:10 should improve. Not yet re-measured, so the
-numbers above stand as recorded rather than being quietly restated.</sub>
+which is the setting this table used — and **0.10.1 drops that condition**: stable-boundary
+snapshots make checkpoint reuse fire with thinking on and on Qwen3.6/3.8-class templates too, so
+every hybrid row's wall clock should improve. Not yet re-measured, so the numbers above stand as
+recorded rather than being quietly restated.</sub>
 
 ### Other agent clients
 
@@ -243,7 +246,7 @@ Practical notes for a local model:
 | **Use a tool-calling model** | These are tool-use agents first. Qwen3-8B and up handle it; smaller models flail. |
 | **Agent choice moves the clock more than model choice** | The client's prompt size is the dominant cost on a local model — a lean agent like pi is an order of magnitude faster on the same hardware and the same task. |
 | **`--no-thinking` is a speed knob, not a requirement** | Leaving it off works fine — reasoning is streamed as proper `thinking` blocks either way. It just costs: on Qwen3-8B the same Claude Code task ran 3:17 and 2762 output tokens with thinking vs ~2:20 and 169 without, since the model thinks before *every* tool call. A client sending `thinking: {"type": "disabled"}` gets the same effect per-request. Note it's a no-op on Gemma-4, whose template doesn't think by default. |
-| **Leave prefix caching on** | It is doing most of the work (see the table). Expect the first request of a session to be the slow one regardless. |
+| **Leave prefix caching on** | It is doing most of the work (see the table). The first request of a *cold server* is the slow one; since 0.10.1 a fresh session over a system prompt the server has already seen partially reuses it (rungs — see [Prefix caching](#prefix-caching)). |
 | **Context** | An over-long request is refused with the wording Claude Code recognises as a context limit, so it compacts and retries instead of dying. `--context-window N` lowers the bar deliberately (e.g. to keep the KV cache inside your RAM budget). |
 
 ### One-shot generation (CLI)
@@ -383,7 +386,10 @@ plain step is very fast — so chat-level acceptance hovers at break-even instea
 picks the cap from this machine's measured curves + live acceptance and can still *park*
 speculation (plain pipelined steps + probe rounds) on content where it would lose. And it
 requires **mlx ≥ 0.32.0** (older mlx lacks the multi-row 2-bit matmul path that makes
-verification affordable at all). Prefix caching and batching remain dense-target-only.
+verification affordable at all). Prefix caching works here too via checkpoint mode — the
+recurrent state can't trim, so it's snapshotted at boundaries instead (see
+[Prefix caching](#prefix-caching)) — and baseline batching handles hybrids since 0.7.0;
+only batched *speculative* decoding stays dense-only.
 Baseline/`--mode lookup` also work for any other `qwen3_5` (Qwen3.5/3.6-family) checkpoint.
 
 The **1-bit** `Bonsai-27B-mlx-1bit` pack runs on stock MLX as of mlx-vlm **0.6.5** (which
@@ -493,9 +499,11 @@ Drafter quantization was swept for this pair and **4-bit remains right** — 3-b
 are both slower. Prefill's wide-GEMM lever gives only **1.03×** here (905 → 931 tok/s,
 bit-identical) rather than the usual 1.07–1.15×, because the MoE expert weights are
 `SwitchLinear` rather than `QuantizedLinear` and the optimization never sees them. Turn-2 prefix
-reuse does **not** fire: the Qwen3.6 chat template prefills a `<think>` opener, so the next
-turn's prompt misses the checkpoint boundary by 2 tokens (4 with `--no-thinking`) — the same
-per-chat-template contract documented for Qwen3.6-27B, and a miss costs nothing.
+reuse used to miss here: the Qwen3.6 chat template prefills a `<think>` opener, so the next
+turn's prompt landed 2 tokens short of the checkpoint boundary (4 with `--no-thinking`).
+**0.10.1's stable-boundary snapshots fix exactly this** — the server measures each template's
+re-render-unstable tail and snapshots below it, so turn-2 reuse now fires (see
+[Prefix caching](#prefix-caching)).
 
 Every 8-bit row peaks at **cap 4** and falls off sharply at cap 5 — the cliff sits exactly where
 the measured verify curve leaves its cheap region (width 5 → 6). Bonsai is the counter-example
@@ -546,8 +554,14 @@ worth only **1.035×** (928 → 960 tok/s): the optimization hooks `nn.Quantized
 keeps most of its weight in `SwitchLinear` experts that it never sees. Extending it to the
 gather path is open work. Prefill runs at ~85% of this machine's measured
 bf16 GEMM peak (and so does attention), so that is close to all there is to take: the remaining
-lever is not prefilling at all, which is what [prefix caching](#prefix-caching) does — a follow-up
-turn that extends the previous one skips straight to decoding.
+lever is not prefilling at all, which is what [prefix caching](#prefix-caching) does.
+
+That makes the table's "20k-token prompt" column a **first-request cost, not a per-request one**:
+in multi-turn chat or an agent loop, every turn after the first reuses the cached prefix and
+skips straight to decoding. Measured on Qwen3.8-27B (a hybrid, ~8k-token system prompt): first
+token in **~62 s cold → 0.21 s on a retry, ~1 s on the next conversation turn** — and since
+0.10.1 that includes hybrid GDN/Mamba targets on thinking templates, plus *partial* reuse when
+a new session shares only the system prompt.
 
 ## Concurrent throughput
 
