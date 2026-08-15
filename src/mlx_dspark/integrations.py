@@ -120,9 +120,11 @@ def integrations(base_url: str, model: str, api_key: str | None) -> list[dict]:
         },
         {
             "id": "openai-compatible",
-            "name": "Cline · Continue · Zed · Open WebUI",
+            "name": "Any OpenAI-compatible app",
             "protocol": "openai",
-            "summary": "Anything that takes an OpenAI base URL. Paste these into its settings.",
+            "summary": "Cline, Continue, Zed, Open WebUI, SillyTavern — every tool that "
+                       "connects to llama.cpp or Ollama also connects here. Paste these "
+                       "into its provider settings.",
             "setup": [
                 {"kind": "fields",
                  "label": "Provider settings",

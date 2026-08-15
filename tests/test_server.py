@@ -480,3 +480,178 @@ def test_unstable_suffix_defaults_to_one_without_a_template():
     eng = _probe_engine(_FakeTok())                 # no chat_template attribute
     assert eng._boundary_probes() == []
     assert eng._unstable_suffix([1, 2, 3, 4]) == 1
+
+
+# --- reasoning effort (Qwen3.8-class chat-template kwarg) --------------------------------
+
+
+class _EffortTok(_FakeTok):
+    """Kwarg-capturing template double for the reasoning-effort passthrough tests."""
+
+    chat_template = "{% if reasoning_effort %}hint{% endif %}"
+
+    def __init__(self):
+        self.template_kwargs = []
+
+    def apply_chat_template(self, messages, add_generation_prompt=True, **kw):
+        self.template_kwargs.append(kw)
+        return [1, 2, 3]
+
+
+def test_reasoning_effort_normalization():
+    assert S._reasoning_effort("XHigh") == "xhigh"
+    for bad in ("extreme", 3, None, ""):
+        with pytest.raises(ValueError):
+            S._reasoning_effort(bad)
+
+
+def test_reasoning_effort_reaches_the_template(server):
+    eng, base = server
+    tok = _EffortTok()
+    eng.tokenizer = tok
+    _post(base, "/v1/chat/completions",
+          {"messages": [{"role": "user", "content": "hi"}], "reasoning_effort": "LOW"})
+    assert tok.template_kwargs[-1]["reasoning_effort"] == "low"     # normalized
+    # The top-level field wins over chat_template_kwargs, like enable_thinking's shortcut.
+    _post(base, "/v1/chat/completions",
+          {"messages": [{"role": "user", "content": "hi"}],
+           "chat_template_kwargs": {"reasoning_effort": "medium"},
+           "reasoning_effort": "xhigh"})
+    assert tok.template_kwargs[-1]["reasoning_effort"] == "xhigh"
+    # Omitted -> not injected at all; the model's own default applies.
+    _post(base, "/v1/chat/completions", {"messages": [{"role": "user", "content": "hi"}]})
+    assert "reasoning_effort" not in tok.template_kwargs[-1]
+
+
+def test_reasoning_effort_invalid_is_400(server):
+    """A typo is a clear boundary 400, not a Jinja raise_exception buried in a template error."""
+    eng, base = server
+    eng.tokenizer = _EffortTok()
+    with pytest.raises(urllib.error.HTTPError) as e:
+        _post(base, "/v1/chat/completions",
+              {"messages": [{"role": "user", "content": "hi"}], "reasoning_effort": "extreme"})
+    assert e.value.code == 400
+    assert "reasoning_effort" in json.loads(e.value.read())["error"]["message"]
+
+
+def test_health_reports_reasoning_effort_support(server):
+    _eng, base = server
+    h = _get(base, "/health")
+    assert h["supports_reasoning_effort"] is False
+    assert h["reasoning_effort"] is None
+
+
+def test_supports_reasoning_effort_tracks_the_template():
+    # _ThinkTok's template string doesn't mention the kwarg; a template that does flips it.
+    assert _probe_engine(_ThinkTok()).supports_reasoning_effort is False
+    tok = _ThinkTok()
+    tok.chat_template = "{% if reasoning_effort == 'low' %}brief{% endif %}"
+    assert _probe_engine(tok).supports_reasoning_effort is True
+
+
+def test_race_reasoning_effort_param_validated_and_echoed(server):
+    eng, base = server
+    eng.race_arms_available = lambda: ["dspark", "baseline"]
+    eng.race = lambda prompt_ids, arms, max_tokens, on_event: None
+
+    with pytest.raises(urllib.error.HTTPError) as e:
+        _post(base, "/admin/race",
+              {"prompt": "hi", "arms": ["dspark", "baseline"], "reasoning_effort": "max"})
+    assert e.value.code == 400
+
+    out = _post(base, "/admin/race",
+                {"prompt": "hi", "arms": ["dspark", "baseline"], "reasoning_effort": "Low"},
+                stream=True)
+    start = next(line for line in out.splitlines() if line.startswith("data:"))
+    assert json.loads(start[5:])["reasoning_effort"] == "low"
+
+
+# --- no-model server state (`serve --no-model`, /admin/unload) ---------------------------
+
+
+class _CloseableEngine(_FakeEngine):
+    def __init__(self):
+        super().__init__()
+        self.closed = False
+
+    def close(self):
+        self.closed = True
+
+
+@pytest.fixture
+def holder_server():
+    holder = S.EngineHolder(_CloseableEngine(), load_kwargs={})
+    httpd = ThreadingHTTPServer(("127.0.0.1", 0), S.make_handler(holder, api_key=None))
+    port = httpd.server_address[1]
+    t = threading.Thread(target=httpd.serve_forever, daemon=True)
+    t.start()
+    yield holder, f"http://127.0.0.1:{port}"
+    httpd.shutdown()
+
+
+def test_no_model_health_and_503_wording(holder_server):
+    """A model-less server reports `no_model` (distinct from `loading` — a client waits
+    through one and shows a picker on the other), and generation 503s with the reason."""
+    holder, base = holder_server
+    holder._engine = None
+    h = _get(base, "/health")
+    assert h["status"] == "no_model" and h["loading"] is False
+
+    with pytest.raises(urllib.error.HTTPError) as e:
+        _post(base, "/v1/chat/completions", {"messages": [{"role": "user", "content": "hi"}]})
+    assert e.value.code == 503
+    assert "no model is loaded" in json.loads(e.value.read())["error"]["message"]
+
+
+def test_admin_unload_frees_the_engine(holder_server):
+    holder, base = holder_server
+    eng = holder.current
+    s = _post(base, "/admin/unload", {})
+    assert s["ready"] is False and s["model"] is None
+    assert eng.closed is True
+    assert _get(base, "/health")["status"] == "no_model"
+    # A second unload is a no-op, not an error.
+    assert _post(base, "/admin/unload", {})["ready"] is False
+
+
+def test_inventory_routes_answer_without_a_model(holder_server):
+    """/doctor and /admin/models are model-free by design — a picker must work from the
+    no-model state. /admin/models reports loaded=None there."""
+    holder, base = holder_server
+    holder._engine = None
+    assert "ok" in _get(base, "/doctor")
+    inv = _get(base, "/admin/models")
+    assert inv["loaded"] is None
+    assert "models" in inv and "installed" in inv
+
+
+# --- streaming reasoning split (OpenAI chat SSE) -----------------------------------------
+
+
+def _stream_fields(sse):
+    chunks = [json.loads(l[6:]) for l in sse.split("\n\n")
+              if l.startswith("data: ") and l != "data: [DONE]"]
+    reasoning = "".join(c["choices"][0]["delta"].get("reasoning_content", "") for c in chunks)
+    content = "".join(c["choices"][0]["delta"].get("content", "") for c in chunks)
+    return reasoning.strip(), content.strip()
+
+
+def test_stream_splits_self_opened_thinking(server):
+    """Inline `<think>…</think>` rides in `reasoning_content` when streaming, matching the
+    non-streaming path — clients otherwise render reasoning as answer text."""
+    eng, base = server
+    eng.response_text = "<think>plan deeply</think>Sure thing"
+    sse = _post(base, "/v1/chat/completions",
+                {"messages": [{"role": "user", "content": "hi"}], "stream": True}, stream=True)
+    assert _stream_fields(sse) == ("plan deeply", "Sure thing")
+
+
+def test_stream_splits_prefilled_thinking(server):
+    """Prefilled-opener templates (the prompt tail ends in `<think>`) generate only the
+    closer; the split keys off the decoded prompt tail, not the output."""
+    eng, base = server
+    eng.response_text = "I reason here</think>The answer"
+    sse = _post(base, "/v1/chat/completions",
+                {"messages": [{"role": "user", "content": "hi<think>"}], "stream": True},
+                stream=True)
+    assert _stream_fields(sse) == ("I reason here", "The answer")

@@ -4,6 +4,44 @@ All notable changes to `mlx-dspark`. Versions follow [SemVer](https://semver.org
 
 ## [Unreleased]
 
+## [0.11.0] — 2026-08-15 — reasoning effort, instant server start, streaming reasoning split
+
+### Added
+- **Reasoning-effort control** for models whose chat template supports it (Qwen3.8-class
+  `reasoning_effort`, values `low`/`medium`/`xhigh` — the hint is a system-block instruction,
+  ignored whenever thinking is off): serve takes `--reasoning-effort` as the server default, the
+  OpenAI endpoint takes a top-level `reasoning_effort` per request (`chat_template_kwargs`
+  passthrough worked before and still does), `/admin/race` takes it as a race knob, and
+  `/health` reports `supports_reasoning_effort` (detected from the loaded template) plus the
+  configured default so clients only show the control where it does something. Invalid values
+  are a clear 400 at the boundary; templates that don't know the kwarg ignore it. Note the hint
+  lands at the *head* of the prompt, so changing effort mid-conversation is a full prefix-cache
+  miss — treat it as per-conversation.
+- **Model-less server state** — `mlx-dspark serve --no-model` starts in ~2 s with nothing
+  resident (the Mac app's fast-launch path): generation routes answer 503 with a clear "no
+  model is loaded" reason until `POST /admin/load` brings one up on the same port; `/health`
+  reports the new `no_model` status (distinct from `loading`: a client waits through one and
+  offers a picker on the other). New **`POST /admin/unload`** releases the loaded model and
+  frees its memory while the server and port survive (idempotent; `/admin/load` reverses it).
+  `/doctor` and `/admin/models` now answer without a loaded model — a model picker has to work
+  from exactly that state.
+- **Streaming responses split reasoning into `reasoning_content`** on the OpenAI chat endpoint,
+  matching the non-streaming path (which already did) and the DeepSeek-style convention clients
+  expect. Covers both self-opened `<think>…</think>` and the prefilled-opener templates
+  (Qwen3-2507 / Qwen3.8-class prefill the opener in the prompt, so the raw stream carries only
+  a dangling `</think>` mid-text — every streaming client rendered the reasoning as answer
+  text). `/v1/completions` streaming stays raw by design.
+
+- **Qwen3.8-27B-8bit registered as its own measured pair** — model pickers (`mlx-dspark
+  models`, the app) now list both quants; auto-resolution sends `…-8bit` to the new row
+  (2.45× at cap 4, ~29 GB) and every other Qwen3.8 spelling to the 4-bit row (1.74× at cap 2
+  but 25.3 tok/s absolute, ~18 GB); both carry the measured lookup-drafts-off default.
+
+### Changed
+- The catch-all integrations row is now "Any OpenAI-compatible app" and says the quiet part
+  out loud: every tool that connects to llama.cpp's `llama-server` or Ollama connects here
+  with the same base-URL setting.
+
 ## [0.10.1] — 2026-08-15 — the prefix cache actually hits: stable boundaries + hybrid partial reuse
 
 ### Fixed

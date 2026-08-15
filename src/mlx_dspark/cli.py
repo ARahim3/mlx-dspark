@@ -254,6 +254,11 @@ def cmd_serve(argv: list[str]) -> None:
                     help="target model: an HF repo or local path (e.g. mlx-community/Qwen3-8B-8bit). "
                          "Matched drafter auto-resolves for known targets; else pass --drafter. "
                          "See `mlx-dspark models`.")
+    ap.add_argument("--no-model", action="store_true",
+                    help="start without loading any model: the server comes up instantly, "
+                         "generation routes answer 503 until a client loads one via "
+                         "POST /admin/load (model pickers still work — /doctor and "
+                         "/admin/models answer model-free)")
     ap.add_argument("--drafter", default=None, help="drafter repo/path (overrides auto-resolve)")
     ap.add_argument("--family", choices=["gemma4", "qwen3"], default=None,
                     help=argparse.SUPPRESS)          # deprecated alias for --model
@@ -297,6 +302,12 @@ def cmd_serve(argv: list[str]) -> None:
     ap.add_argument("--no-thinking", action="store_true",
                     help="default responses to non-thinking mode (Qwen3 enable_thinking=False); "
                          "clients can still override per-request")
+    ap.add_argument("--reasoning-effort", choices=["low", "medium", "high", "xhigh"],
+                    default=None,
+                    help="default reasoning depth for models whose chat template supports it "
+                         "(Qwen3.8-class reasoning_effort; templates that don't know the kwarg "
+                         "ignore it). Clients can override per-request; /health reports whether "
+                         "the loaded model supports it")
     ap.add_argument("--no-prefix-cache", action="store_true",
                     help="disable multi-turn prefix caching (reuse the shared conversation "
                          "prefix's KV; on by default for dspark/lookup/baseline on dense or "
@@ -346,7 +357,8 @@ def cmd_serve(argv: list[str]) -> None:
     else:
         max_draft = max(1, md)
 
-    print(f"loading {args.mode} engine — first run downloads weights…")
+    if not args.no_model:
+        print(f"loading {args.mode} engine — first run downloads weights…")
     # Captured so a `/admin/load` model swap re-loads with the same server flags, changing only
     # the model — an in-place swap that keeps the port instead of a full restart.
     load_kwargs = {
@@ -355,6 +367,7 @@ def cmd_serve(argv: list[str]) -> None:
         "drafter_bits": args.drafter_bits, "max_draft_tokens": max_draft,
         "confidence_threshold": args.confidence_threshold,
         "enable_thinking": False if args.no_thinking else None,
+        "reasoning_effort": args.reasoning_effort,
         "prefix_cache": not args.no_prefix_cache,
         "prefix_cache_dir": args.prefix_cache_dir,
         "prefix_cache_max_ram_mb": args.prefix_cache_max_ram_mb,
@@ -373,12 +386,17 @@ def cmd_serve(argv: list[str]) -> None:
         "kv_bits": args.kv_bits or None,
         "context_window": args.context_window,
     }
-    try:
-        engine = Engine.load(**load_kwargs)
-    except ValueError as e:
-        ap.error(str(e))
-    holder = EngineHolder(maybe_batch_engine(engine, args.max_batch),
-                          load_kwargs, max_batch=args.max_batch)
+    if args.no_model:
+        # Fast start with nothing resident: the first /admin/load brings a model up on the
+        # same port (the Mac app's instant-launch path).
+        holder = EngineHolder(None, load_kwargs, max_batch=args.max_batch)
+    else:
+        try:
+            engine = Engine.load(**load_kwargs)
+        except ValueError as e:
+            ap.error(str(e))
+        holder = EngineHolder(maybe_batch_engine(engine, args.max_batch),
+                              load_kwargs, max_batch=args.max_batch)
     run_server(holder, host=args.host, port=args.port, api_key=args.api_key)
 
 

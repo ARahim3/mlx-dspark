@@ -157,3 +157,45 @@ class TestSwap:
         h.swap(model="repo")
         assert batch.closed is True          # scheduler stopped
         assert inner.closed is True          # AND the wrapped models freed
+
+
+class TestUnload:
+    def test_unload_releases_and_reports_no_model(self):
+        eng = FakeEngine("m")
+        h = holder(eng)
+        s = h.unload()
+        assert eng.closed is True
+        assert h.ready is False
+        assert s == {"ready": False, "loading": False, "model": None, "error": None}
+
+    def test_unload_twice_is_a_noop(self):
+        h = holder()
+        h.unload()
+        assert h.unload()["ready"] is False   # no raise on the empty holder
+
+    def test_unload_closes_a_batch_engine_inner(self):
+        inner = FakeEngine("inner")
+
+        class FakeBatch:
+            def __init__(self, e):
+                self.engine = e
+                self.closed = False
+
+            def close(self):
+                self.closed = True
+
+        batch = FakeBatch(inner)
+        h = EngineHolder(batch, load_kwargs={})
+        h.unload()
+        assert batch.closed is True and inner.closed is True
+
+    def test_load_after_unload_works(self, monkeypatch):
+        h = holder()
+        h.unload()
+
+        import mlx_dspark.server as server
+        monkeypatch.setattr(server.Engine, "load", staticmethod(lambda **kw: FakeEngine("new")))
+        monkeypatch.setattr(server, "maybe_batch_engine", lambda e, b: e)
+
+        status = h.swap(model="repo")
+        assert status["ready"] is True and status["model"] == "new"

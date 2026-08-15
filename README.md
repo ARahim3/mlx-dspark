@@ -50,6 +50,7 @@ chat/code/math), the Muse row per-content best (footnoted); full tables, baselin
 | **Qwen3-14B** (8-bit) | **2.36×** math · **2.11×** code · 1.62× chat | ~31 tok/s |
 | **Qwen3-8B** (8-bit) | **2.29×** math · **2.06×** code · 1.81× chat | ~58 tok/s |
 | **Qwen3-4B** (8-bit) | **1.98×** math · 1.77× chat · 1.70× code | ~92 tok/s |
+| **Qwen3.8-27B** (4-bit)[^q38] | **1.87×** code · **1.83×** math · 1.52× chat | ~25 tok/s |
 | **Qwen3.6-35B-A3B** (4-bit, MoE)[^moe] | **1.67×** math · 1.24× code · 1.05× chat | **~115 tok/s** |
 | **Nemotron-3.5-Lightning-30B-A3B** (4-bit, MoE+Mamba)[^nemotron] | **1.34×** math · **1.27×** code · 1.07× chat | **~117 tok/s** |
 | **Ternary-Bonsai-27B** (2-bit) | **1.13×** code | ~27 tok/s |
@@ -123,11 +124,31 @@ library.
 
 ## Quickstart
 
-You name the **target model** (`--model`, an HF repo or local path, exactly like `mlx-lm`); the matching
-drafter is resolved automatically for known targets (see [Models](#models)), or pass `--drafter`. There
-are no speed knobs you need to set: the draft cap **auto-calibrates to your machine** on first run
-(~5 s, cached — see [Tuning](#tuning)), and registered pairs ship their measured-best configuration
-as the default.
+```bash
+mlx-dspark generate --model mlx-community/Qwen3-8B-8bit --prompt "Explain rainbows."
+mlx-dspark serve    --model mlx-community/Qwen3-8B-8bit   # OpenAI + Anthropic API on :8080
+```
+
+That's the whole setup — swap in any target from the [table above](#supported-models). Three
+things worth knowing, then you can stop reading:
+
+- **Pick a model, not a configuration.** `--model` takes any HF repo or local path (exactly like
+  `mlx-lm`); the matching drafter *and* that pair's measured-best settings resolve automatically.
+  A model that isn't in the table still gets drafter-free speculation via `--mode auto`, or pass
+  `--drafter <repo>` yourself.
+- **Don't set the draft cap.** The speedups above were measured on one M4 Pro — your machine's
+  optimum is different, so mlx-dspark **measures your Mac** on a pair's first run (~5 s, cached)
+  and derives its own cap from those curves. An M1 and an M5 each get their own answer.
+  `--max-draft auto` additionally adapts per round while generating (the safest choice if you
+  only remember one flag); `--max-draft N` pins a value only if you've measured a better one.
+- **It's lossless by construction.** The target verifies every drafted token, so the output is
+  identical to running the target alone — every mode, every cap, only the speed changes. Want
+  proof and your own numbers? `mlx-dspark benchmark --model <repo> --trials 3` is the same
+  reproducible sweep this README's tables come from (the Mac app's **Race** shows it live, with
+  a token-by-token identical-output verdict).
+
+Prefer clicking to typing? [The Mac app](#the-mac-app) wraps all of this — including the
+calibration and the model picker with "will it fit my Mac?" answered up front.
 
 ### Serve an API (OpenAI **and** Anthropic on one port)
 
@@ -138,6 +159,10 @@ mlx-dspark serve --model mlx-community/Qwen3-8B-8bit        # → http://127.0.0
 #                   admits the next one mid-flight)
 #   --kv-bits 8     quantized KV cache (long-context bandwidth saver)
 #   --mode auto|dspark|dflash|lookup|baseline   ·   --no-thinking   ·   --api-key KEY
+#   --reasoning-effort low|medium|xhigh   default reasoning depth on models that support it
+#                   (Qwen3.8-class; /health reports support, requests can override)
+#   --no-model      start instantly with nothing loaded; POST /admin/load loads later,
+#                   POST /admin/unload frees the model again (port survives both)
 ```
 
 `--mode auto` picks the best available speculation for any target (a known DSpark drafter → else
@@ -154,13 +179,19 @@ print(client.chat.completions.create(
 ).choices[0].message.content)
 ```
 
-**For LM Studio / other tools:** set the OpenAI base URL to `http://127.0.0.1:8080/v1`.
+**Works with any OpenAI-compatible client** — the same frontends people point at llama.cpp's
+`llama-server` or Ollama work here by switching one setting: set the OpenAI base URL to
+`http://127.0.0.1:8080/v1` (API key: anything). That covers Open WebUI, SillyTavern,
+Continue/Cline, LibreChat, Raycast AI, and the rest of that ecosystem. (There is no GGUF
+interop — mlx-dspark runs MLX weights natively — but the HTTP surface is shared, which is the
+part those tools actually talk to.)
 
 The server speaks the OpenAI API: `POST /v1/chat/completions` (streaming **and** non-streaming,
 multi-turn), `POST /v1/completions`, `GET /v1/models`, `GET /health`, `GET /metrics`. It supports
 `temperature`, `top_p`, `top_k`, `max_tokens`, `stop`, `seed`, `presence_penalty` / `frequency_penalty`,
-`logprobs` / `top_logprobs`, **tool calling** (`tools` / `tool_calls`), and a per-request thinking toggle
-(`enable_thinking`). Each response carries an `x_mlx_dspark` block (accept length + tok/s) so the
+`logprobs` / `top_logprobs`, **tool calling** (`tools` / `tool_calls`), a per-request thinking toggle
+(`enable_thinking`), and per-request `reasoning_effort` on models whose template supports it (Qwen3.8-class;
+`GET /health` reports `supports_reasoning_effort`). Each response carries an `x_mlx_dspark` block (accept length + tok/s) so the
 spec-decode gain is visible. **Continuous batching** (`--max-batch N`) serves concurrent requests in one
 batched forward for ~2.5× aggregate throughput (see [Concurrent throughput](#concurrent-throughput));
 **prefix caching** (on by default) reuses the conversation prefix so multi-turn chat and agents don't
@@ -299,7 +330,7 @@ anything else, add `--drafter <repo>`. Run `mlx-dspark models` to print this tab
 | `mlx-community/gemma-4-12B-it-8bit`  | `deepseek-ai/dspark_gemma4_12b_block7` | `z-lab/gemma4-12B-it-DFlash` | ~15 GB |
 | `prism-ml/Ternary-Bonsai-27B-mlx-2bit` | `Rahim/Ternary-Bonsai-27B-dspark`    | — | ~12 GB |
 | `mlx-community/Qwen3.6-27B-8bit`     | `satgeze/Qwen3.6-27B-DSpark` (community) | — | ~32 GB |
-| `mlx-community/Qwen3.8-27B-4bit`     | `RadixArk/Qwen3.8-27B-DSpark` (community, SpecForge) | — | ~18 GB (4-bit) / ~29 GB (8-bit[^q38]) |
+| `mlx-community/Qwen3.8-27B-4bit` / `-8bit`[^q38] | `RadixArk/Qwen3.8-27B-DSpark` (community, SpecForge) | — | ~18 GB (4-bit) / ~29 GB (8-bit) |
 | `mlx-community/Ornith-1.0-9B-8bit`   | `stanleyphoong/Ornith-1.0-9B-DSpark` (community) | — | ~13 GB |
 | `mlx-community/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-4bit` | `mlx-community/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-DSpark-bf16` (NVIDIA head, MLX) | — | ~20 GB |
 | `mlx-community/Muse-Glimmer-30B-4bit` | `DaoCloud/Muse-Glimmer-30B-DSpark` (community, DFlash-lineage) | — | ~26 GB (4-bit) / ~40 GB (8-bit[^muse]) |
@@ -875,9 +906,9 @@ are bundled.
     ratio (each extra verify row pulls in fresh routed experts). See the MoE discussion under
     [Results at a glance](#results-at-a-glance).
 
-[^q38]: **Qwen3.8-27B** — both tables show the **8-bit** target at cap 4 (the calibrated pick;
-    its verify curve is flat to width 5), 3-trial medians, hybrid lookup drafts **off** — this
-    pair's **shipped default** (the registry row carries it, no flag needed). The **4-bit**
+[^q38]: **Qwen3.8-27B** — the **8-bit** rows are cap 4 (the calibrated pick; its verify curve
+    is flat to width 5), 3-trial medians, hybrid lookup drafts **off** — this
+    pair's **shipped default** (the registry rows carry it, no flag needed). The **4-bit**
     target trades the ratio for absolute speed and RAM: cap 2, **1.74×** mean (1.87× code /
     1.83× math / 1.52× chat, accept 2.44) but **25.3 tok/s** vs 8-bit's 20.3, in ~18 GB vs
     ~29 GB — the registry auto-resolves the same drafter for both, and the 4-bit is where the

@@ -51,6 +51,20 @@ from .tools import normalize_tool_messages, parse_tool_calls, schema_types
 
 MODES = ("dspark", "dflash", "lookup", "baseline")
 
+# The union of effort vocabularies across template lineages (Qwen3.8 knows low/medium/xhigh,
+# harmony-style templates low/medium/high). Values outside a given template's own vocabulary
+# still fail there — its raise_exception carries the model-specific list — but this boundary
+# check turns typos into a clear 400 before any template runs.
+REASONING_EFFORTS = ("low", "medium", "high", "xhigh")
+
+
+def _reasoning_effort(value) -> str:
+    """Normalize a reasoning-effort value, raising ValueError for anything unknown."""
+    if not isinstance(value, str) or value.lower() not in REASONING_EFFORTS:
+        raise ValueError(
+            f"reasoning_effort must be one of {', '.join(REASONING_EFFORTS)}, got {value!r}")
+    return value.lower()
+
 
 def _context_window(target_repo: str) -> int | None:
     """The target's trained context length, from its ``config.json``.
@@ -255,6 +269,16 @@ class Engine:
         return 1
 
     @property
+    def supports_reasoning_effort(self) -> bool:
+        """True when the loaded chat template reads ``reasoning_effort`` (Qwen3.8-class).
+
+        Reported in ``/health`` so a client can decide whether to show an effort control at
+        all — sending the kwarg to a template that ignores it is harmless but misleading UI.
+        """
+        template = getattr(self.tokenizer, "chat_template", None)
+        return bool(template) and "reasoning_effort" in str(template)
+
+    @property
     def is_muse(self) -> bool:
         """True for muse_glimmer targets, whose "Onyx ATEM" harmony output needs the recipient-
         channel parser (analysis `to=self` -> thinking, `to=user` -> answer, `<atem:invoke>` ->
@@ -276,6 +300,7 @@ class Engine:
         max_draft_tokens: int | str | None = None,   # int, None (mode default) or "auto"
         confidence_threshold: float = 0.0,
         enable_thinking: bool | None = None,
+        reasoning_effort: str | None = None,
         prefix_cache: bool = True,
         prefix_cache_dir: str | None = None,
         prefix_cache_max_ram_mb: int = 0,
@@ -360,6 +385,10 @@ class Engine:
                 max_draft_tokens = 6
         model_id = target_repo.rstrip("/").split("/")[-1]
         template_defaults = {} if enable_thinking is None else {"enable_thinking": enable_thinking}
+        if reasoning_effort is not None:
+            # Reasoning depth for templates that support it (Qwen3.8-class `reasoning_effort`).
+            # Harmless on templates that don't know the kwarg — they simply ignore it.
+            template_defaults["reasoning_effort"] = _reasoning_effort(reasoning_effort)
         # sampling defaults: model's generation_config.json, then explicit server flags on top
         # (many mlx-community conversions ship no generation_config — e.g. the Qwen3 repos —
         # so the flags are the way to serve sampled-by-default there)
@@ -1124,6 +1153,23 @@ class EngineHolder:
                 "model": self._engine.model_id if self._engine is not None else None,
                 "error": self._load_error}
 
+    def unload(self) -> dict:
+        """Release the loaded model without loading another — frees its memory.
+
+        The server stays up: generation routes 503 (with a "no model" reason) and
+        ``/admin/load`` brings a model back on the same port. Unloading twice is a no-op.
+        """
+        with self._swap_lock:
+            old = self._engine
+            self._engine = None
+            self._load_error = None
+            if old is not None:
+                old.close()
+                inner = getattr(old, "engine", None)
+                if inner is not None and inner is not old and hasattr(inner, "close"):
+                    inner.close()
+            return self.status()
+
     def swap(self, *, model: str, mode: str | None = None,
              max_draft: int | str | None = None,
              lookup_drafts: bool | None = None) -> dict:
@@ -1332,11 +1378,15 @@ def make_handler(engine: Engine, api_key: str | None):
             self.end_headers()
 
         def _require_ready(self) -> bool:
-            """503 while a model swap is in flight. Everything but /health and the admin status
-            routes needs a loaded model, so they gate on this."""
+            """503 while a model swap is in flight, or while no model is loaded at all
+            (``--no-model`` start, ``/admin/unload``). Everything but /health, the admin
+            status/inventory routes and /doctor needs a loaded model, so they gate on this."""
             if isinstance(engine, EngineHolder) and not engine.ready:
-                self._send_error(503, "a model is loading — try again in a moment",
-                                 "service_unavailable")
+                self._send_error(
+                    503,
+                    "a model is loading — try again in a moment" if engine.status()["loading"]
+                    else "no model is loaded — load one with POST /admin/load",
+                    "service_unavailable")
                 return False
             return True
 
@@ -1344,10 +1394,14 @@ def make_handler(engine: Engine, api_key: str | None):
             route = self._route()
             if route == "/health":
                 # Answers even mid-swap so a client can poll the status through a model change.
+                # "loading" and "no_model" are distinct states: a client should wait through
+                # the first and offer a model picker on the second.
                 if isinstance(engine, EngineHolder) and not engine.ready:
                     status = engine.status()
-                    return self._send_json(200, {"status": "loading", "model": status["model"],
-                                                 "loading": True, "error": status["error"]})
+                    return self._send_json(200, {
+                        "status": "loading" if status["loading"] else "no_model",
+                        "model": status["model"], "loading": status["loading"],
+                        "error": status["error"]})
                 # max_draft as a string ("auto" or the pinned/derived cap) so a client can
                 # show the configured knob, not just infer it from round telemetry.
                 max_draft = ("auto" if getattr(engine, "cap_controller", None) is not None
@@ -1361,12 +1415,35 @@ def make_handler(engine: Engine, api_key: str | None):
                     "lookup_drafts": bool(getattr(engine, "lookup_drafts", True)),
                     "context_window": getattr(engine, "context_window", None),
                     "max_output_tokens": engine.max_tokens_cap,
+                    # Whether the loaded template reads `reasoning_effort`, and the server's
+                    # default when one was configured — so a client only offers the control
+                    # for models where it does something.
+                    "supports_reasoning_effort": bool(
+                        getattr(engine, "supports_reasoning_effort", False)),
+                    "reasoning_effort": getattr(engine, "template_defaults", {}).get(
+                        "reasoning_effort"),
                 })
             if route == "/admin/status":
                 if isinstance(engine, EngineHolder):
                     return self._send_json(200, engine.status())
                 return self._send_json(200, {"ready": True, "loading": False,
                                              "model": engine.model_id, "error": None})
+            # Model-free inventory routes answer without a loaded model — a client's model
+            # picker must work from the no-model state (that state's whole point is picking).
+            if route == "/doctor":
+                from .diagnostics import doctor
+
+                return self._send_json(200, doctor())
+            if route == "/admin/models":
+                from .diagnostics import disk_usage, installed_models, model_inventory
+
+                installed = installed_models()
+                loaded = (engine.target_repo
+                          if not isinstance(engine, EngineHolder) or engine.ready else None)
+                return self._send_json(200, {"models": model_inventory(),
+                                             "installed": installed,
+                                             "disk": disk_usage(installed),
+                                             "loaded": loaded})
             if not self._require_ready():
                 return
             if route in ("/v1/models", "/models"):
@@ -1382,18 +1459,6 @@ def make_handler(engine: Engine, api_key: str | None):
                 return self._send_json(200, payload)
             if route == "/calibration":
                 return self._send_json(200, engine.calibration())
-            if route == "/doctor":
-                from .diagnostics import doctor
-
-                return self._send_json(200, doctor())
-            if route == "/admin/models":
-                from .diagnostics import disk_usage, installed_models, model_inventory
-
-                installed = installed_models()
-                return self._send_json(200, {"models": model_inventory(),
-                                             "installed": installed,
-                                             "disk": disk_usage(installed),
-                                             "loaded": engine.target_repo})
             if route == "/admin/integrations":
                 from .integrations import integrations
 
@@ -1485,6 +1550,12 @@ def make_handler(engine: Engine, api_key: str | None):
             template_kwargs = dict(engine.template_defaults)
             if thinking is not None:
                 template_kwargs["enable_thinking"] = thinking
+            effort = req.get("reasoning_effort")
+            if effort is not None:
+                try:
+                    template_kwargs["reasoning_effort"] = _reasoning_effort(effort)
+                except ValueError as e:
+                    return self._send_error(400, str(e))
             try:
                 prompt_ids = encode_messages(engine.tokenizer,
                                              [{"role": "user", "content": prompt}],
@@ -1497,6 +1568,8 @@ def make_handler(engine: Engine, api_key: str | None):
                              "model": engine.model_id}
             if thinking is not None:
                 start_payload["thinking"] = thinking
+            if effort is not None:
+                start_payload["reasoning_effort"] = template_kwargs["reasoning_effort"]
             self._sse(start_payload, "start")
             try:
                 engine.race(prompt_ids, arms, max_tokens,
@@ -1585,9 +1658,15 @@ def make_handler(engine: Engine, api_key: str | None):
                 return self._send_error(400, f"invalid JSON body: {e}")
 
             try:
-                # /admin/load runs the swap itself, so it must NOT be gated on readiness.
+                # /admin/load runs the swap itself, so it must NOT be gated on readiness —
+                # and /admin/unload's whole job is to *leave* the ready state.
                 if route == "/admin/load":
                     return self._load(req)
+                if route == "/admin/unload":
+                    if not isinstance(engine, EngineHolder):
+                        return self._send_error(
+                            501, "this server was not started with hot-swap support")
+                    return self._send_json(200, engine.unload())
                 if not self._require_ready():
                     return
                 if route in ("/v1/chat/completions", "/chat/completions"):
@@ -1641,6 +1720,16 @@ def make_handler(engine: Engine, api_key: str | None):
             tkw = {**engine.template_defaults, **(req.get("chat_template_kwargs") or {})}
             if "enable_thinking" in req:
                 tkw["enable_thinking"] = bool(req["enable_thinking"])
+            if req.get("reasoning_effort") is not None:
+                # Top-level shortcut (the OpenAI field name); validated here so a typo is a
+                # clear 400 rather than a Jinja raise_exception message. Templates that don't
+                # know the kwarg ignore it. NOTE: the effort hint lands at the head of the
+                # prompt (a system-block instruction), so changing it mid-conversation is a
+                # full prefix-cache miss — clients should treat it as per-conversation.
+                try:
+                    tkw["reasoning_effort"] = _reasoning_effort(req["reasoning_effort"])
+                except ValueError as e:
+                    return self._send_error(400, str(e))
             if req.get("tools"):                      # let the template render the tool schemas
                 tkw["tools"] = req["tools"]
             try:
@@ -1914,14 +2003,39 @@ def make_handler(engine: Engine, api_key: str | None):
                 res = engine.generate(prompt_ids, on_text=on_text, **params)
                 _emit_muse(muse.feed("", final=True))   # flush the held-back tail
                 finish = res.finish_reason
-            else:
+            elif chat:
+                # Split reasoning into `reasoning_content` incrementally (the streaming twin
+                # of the non-streaming path's split_thinking). Covers both the self-opened
+                # `<think>` and the prefilled-opener templates (Qwen3-2507 / qwen3_5 / Qwen3.8
+                # prefill the opener in the prompt, so the output holds only the closer —
+                # streamed raw, clients render the reasoning as answer text with a stray
+                # `</think>` in the middle).
+                splitter = A.ThinkingStreamSplitter(
+                    in_thinking=self._prompt_opens_thinking(prompt_ids))
+
+                def _emit_split(chunks):
+                    for kind, text in chunks:
+                        if not text:
+                            continue
+                        field = "reasoning_content" if kind == "reasoning" else "content"
+                        self._sse(base({field: text}, None))
+
                 def on_text(piece: str):
                     try:
-                        self._sse(base({"content": piece} if chat else piece, None))
+                        _emit_split(splitter.feed(piece))
                     except (BrokenPipeError, ConnectionResetError) as e:
                         # client hung up mid-stream: end generation gracefully at the next
                         # round so the engine can still store the prefix cache (raising
                         # anything else would invalidate it)
+                        raise StopStreaming() from e
+                res = engine.generate(prompt_ids, on_text=on_text, **params)
+                _emit_split(splitter.feed("", final=True))   # flush the held-back tail
+                finish = res.finish_reason
+            else:
+                def on_text(piece: str):
+                    try:
+                        self._sse(base(piece, None))
+                    except (BrokenPipeError, ConnectionResetError) as e:
                         raise StopStreaming() from e
                 res = engine.generate(prompt_ids, on_text=on_text, **params)
                 finish = res.finish_reason
@@ -1954,33 +2068,43 @@ def run_server(engine, *, host: str = "127.0.0.1", port: int = 8080,
     httpd = ThreadingHTTPServer((host, port), handler)
     httpd.daemon_threads = True
     base = f"http://{host}:{port}"
+    # A --no-model start hands over a model-less EngineHolder; the banner can't dereference
+    # engine attributes then (the holder raises a clear "no model" through __getattr__).
+    loaded = not isinstance(engine, EngineHolder) or engine.ready
     print("=" * 64)
-    print(f"  mlx-dspark server  ·  mode={engine.mode}  ·  model={engine.model_id}")
-    print(f"  target : {engine.target_repo}")
-    if engine.drafter_repo:
-        print(f"  drafter: {engine.drafter_repo}")
-    if engine.prefix is not None:
-        print(f"  prefix cache: on{'  (+SSD spill)' if engine.prefix.l2_dir else ''}")
+    if loaded:
+        print(f"  mlx-dspark server  ·  mode={engine.mode}  ·  model={engine.model_id}")
+        print(f"  target : {engine.target_repo}")
+        if engine.drafter_repo:
+            print(f"  drafter: {engine.drafter_repo}")
+        if engine.prefix is not None:
+            print(f"  prefix cache: on{'  (+SSD spill)' if engine.prefix.l2_dir else ''}")
+        else:
+            print("  prefix cache: off (not reusable for this mode/target)")
+        if isinstance(engine, BatchEngine):
+            print(f"  batching: micro-batch up to {engine.max_batch} concurrent "
+                  f"({engine.mode}; serial fallback for temp>0 dspark / lone requests)")
+        if engine.cap_controller is not None:
+            print(f"  max-draft: auto (calibrated for this machine; starting cap "
+                  f"{engine.cap_controller.cap})")
+        if engine.sampling_defaults:
+            print(f"  sampling defaults (model generation_config; requests override): "
+                  f"{engine.sampling_defaults}")
     else:
-        print("  prefix cache: off (not reusable for this mode/target)")
-    if isinstance(engine, BatchEngine):
-        print(f"  batching: micro-batch up to {engine.max_batch} concurrent "
-              f"({engine.mode}; serial fallback for temp>0 dspark / lone requests)")
-    if engine.cap_controller is not None:
-        print(f"  max-draft: auto (calibrated for this machine; starting cap "
-              f"{engine.cap_controller.cap})")
-    if engine.sampling_defaults:
-        print(f"  sampling defaults (model generation_config; requests override): "
-              f"{engine.sampling_defaults}")
+        print("  mlx-dspark server  ·  no model loaded")
+        print(f"  load one:  curl {base}/admin/load -d '{{\"model\":\"<repo>\"}}'")
     print(f"  listening on {base}   (OpenAI base_url: {base}/v1)")
     print(f"  claude code : ANTHROPIC_BASE_URL={base}   (or run `mlx-dspark claude`)")
     if api_key:
         print("  auth   : Bearer <api-key> required")
     print("=" * 64)
-    print(f"  curl {base}/v1/chat/completions -H 'Content-Type: application/json' \\")
-    print(f"    -d '{{\"model\":\"{engine.model_id}\",\"messages\":"
-          "[{\"role\":\"user\",\"content\":\"Hi\"}],\"stream\":true}'")
-    print("=" * 64, flush=True)
+    if loaded:
+        print(f"  curl {base}/v1/chat/completions -H 'Content-Type: application/json' \\")
+        print(f"    -d '{{\"model\":\"{engine.model_id}\",\"messages\":"
+              "[{\"role\":\"user\",\"content\":\"Hi\"}],\"stream\":true}'")
+        print("=" * 64, flush=True)
+    else:
+        print(flush=True)
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:

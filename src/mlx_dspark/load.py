@@ -141,7 +141,15 @@ REGISTRY = [
     # both quants (fp ties only, margins 0.0/0.125).
     {"id": "qwen3.8-27b", "target": "mlx-community/Qwen3.8-27B-4bit",
      "dspark": "RadixArk/Qwen3.8-27B-DSpark", "lookup_drafts": False,
-     "ram": "~18 GB (4-bit) / ~29 GB (8-bit)", "speedup": "~1.7× (8-bit: ~2.5×)"},
+     "ram": "~18 GB", "speedup": "~1.7×"},
+    # Same pair at 8-bit — the measured-best quant (the drafter was trained vs an FP8
+    # verifier, so 8-bit is the matched precision: accept 2.44 -> 3.43, 2.45x at cap 4).
+    # Listed as its own row so pickers offer both; the 4-bit row keeps the absolute-speed
+    # crown (25.3 vs 20.3 tok/s) in ~18 GB. Resolution: the longest-id-first match sends
+    # "*-8bit" here and everything else Qwen3.8 to the row above.
+    {"id": "qwen3.8-27b-8bit", "target": "mlx-community/Qwen3.8-27B-8bit",
+     "dspark": "RadixArk/Qwen3.8-27B-DSpark", "lookup_drafts": False,
+     "ram": "~29 GB", "speedup": "~2.5×"},
     # NVIDIA Nemotron-3.5-Lightning-30B-A3B — a hybrid **Mamba-2 + MoE + attention** target
     # (model_type nemotron_h: 52 blocks, 128 experts top-6 + 1 shared, ~3B active, latent MoE),
     # the first non-attention recurrence here. NVIDIA's official DSpark head: a plain qwen3 GQA

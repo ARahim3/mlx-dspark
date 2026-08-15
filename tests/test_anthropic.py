@@ -1130,3 +1130,46 @@ def test_openai_nonstream_muse_puts_reasoning_in_reasoning_content():
     msg = r["choices"][0]["message"]
     assert msg["reasoning_content"] == "17*23 = 391. Provide answer."
     assert msg["content"] == "17 × 23 = **391**."
+
+
+# --- ThinkingStreamSplitter (OpenAI streaming twin of split_thinking) --------------------
+
+
+def _split_stream(pieces, in_thinking=None):
+    sp = A.ThinkingStreamSplitter(in_thinking=in_thinking)
+    out = []
+    for piece in pieces:
+        out += sp.feed(piece)
+    out += sp.feed("", final=True)
+    reasoning = "".join(t for k, t in out if k == "reasoning")
+    answer = "".join(t for k, t in out if k == "answer")
+    return reasoning, answer
+
+
+def test_stream_splitter_prefilled_opener():
+    """Prefilled templates generate only the closer — the marker can be split across pieces."""
+    reasoning, answer = _split_stream(
+        ["I rea", "son</th", "ink>\n\nAns", "wer"], in_thinking="</think>")
+    assert reasoning == "I reason"
+    assert answer == "Answer"
+
+
+def test_stream_splitter_self_opened():
+    reasoning, answer = _split_stream(["<thi", "nk>plan", "</think>", "  done"])
+    assert reasoning == "plan"
+    assert answer == "done"          # post-closer whitespace stripped, like split_thinking
+
+
+def test_stream_splitter_plain_text_passes_through():
+    reasoning, answer = _split_stream(["Hello ", "world"])
+    assert reasoning == ""
+    assert answer == "Hello world"
+    # A '<' that never becomes an opener is released once it can't match one.
+    reasoning, answer = _split_stream(["<t", "his is text"])
+    assert (reasoning, answer) == ("", "<this is text")
+
+
+def test_stream_splitter_unterminated_thinking():
+    """Token cap mid-thought: everything is reasoning, nothing lost at the final flush."""
+    reasoning, answer = _split_stream(["<think>cut ", "off mid"])
+    assert (reasoning, answer) == ("cut off mid", "")

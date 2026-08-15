@@ -217,6 +217,70 @@ def split_thinking(text: str) -> tuple[str, str]:
     return "", text
 
 
+class ThinkingStreamSplitter:
+    """Incrementally splits ``<think>…</think>``-style reasoning out of a raw text stream into
+    ``('reasoning' | 'answer', text)`` chunks — the streaming counterpart of
+    :func:`split_thinking`, for the OpenAI chat SSE path (the Anthropic path has
+    :class:`MessageStream`, muse has :class:`MuseChannelParser`).
+
+    ``in_thinking`` is the closing marker to expect when the chat template *prefilled* the
+    opener (see :func:`prompt_opens_thinking`) — the stream then starts inside the block and no
+    opener will ever appear. Otherwise the splitter starts in ``pending``: it holds text back
+    until the first non-whitespace characters either match an opener (→ thinking) or rule every
+    opener out (→ answer), so a marker split across stream pieces is still recognised.
+    """
+
+    def __init__(self, in_thinking: str | None = None):
+        self.buf = ""
+        self.state = "thinking" if in_thinking else "pending"
+        self.close = in_thinking or _THINK_CLOSE
+        self._strip_lead = False        # drop whitespace between </think> and the answer,
+        #                                 mirroring split_thinking's lstrip on the answer half
+
+    def feed(self, piece: str, final: bool = False) -> list[tuple[str, str]]:
+        self.buf += piece
+        out: list[tuple[str, str]] = []
+        while True:
+            if self.state == "pending":
+                s = self.buf.lstrip()
+                opened = next(((o, c) for o, c in _THINK_PAIRS if s.startswith(o)), None)
+                if opened:
+                    self.buf = s[len(opened[0]):]
+                    self.state, self.close = "thinking", opened[1]
+                    continue
+                # Could a longer feed still complete an opener? Then wait. (Also waits while
+                # the stream is still all-whitespace.)
+                if not final and (not s or any(o.startswith(s) for o, _ in _THINK_PAIRS)):
+                    return out
+                self.state = "answer"
+                continue
+
+            if self.state == "thinking":
+                idx = self.buf.find(self.close)
+                if idx == -1:                       # no closer yet: emit, holding a straddle tail
+                    hold = 0 if final else len(self.close) - 1
+                    upto = max(0, len(self.buf) - hold)
+                    if upto:
+                        out.append(("reasoning", self.buf[:upto]))
+                        self.buf = self.buf[upto:]
+                    return out
+                if idx:
+                    out.append(("reasoning", self.buf[:idx]))
+                self.buf = self.buf[idx + len(self.close):]
+                self.state, self._strip_lead = "answer", True
+                continue
+
+            # answer: pass through (minus the one-time post-closer whitespace strip)
+            text, self.buf = self.buf, ""
+            if self._strip_lead:
+                text = text.lstrip()
+                if text:
+                    self._strip_lead = False
+            if text:
+                out.append(("answer", text))
+            return out
+
+
 # --------------------------------------------------------------------------- request -> ours
 
 
