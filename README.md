@@ -541,11 +541,13 @@ Measured on an M4 Pro, ~3.2–3.7k-token prompt, median of 3, default settings:
 | **Qwen3-4B** (8-bit) | **761 tok/s** | ~26 s |
 | **Qwen3-8B** (8-bit) | **438 tok/s** | ~46 s |
 | **Gemma-4 12B** (8-bit) | **264 tok/s** | ~76 s |
+| **Qwen3.8-27B** (8-bit) | **133 tok/s** | ~151 s |
 | **Qwen3.6-27B** (8-bit) | **126 tok/s** | ~159 s |
 
 The MoE tops this table despite being the largest model in it: prefill is compute-bound, and an
 A3B model does only ~3.8B parameters' worth of arithmetic per token no matter how many experts
-it stores.
+it stores. The same fact shows up on Qwen3.8-27B the other way: its 4-bit quant prefills at the
+same 135 tok/s as the 8-bit — weight bits change decode speed (bandwidth-bound), not prefill.
 
 Since 0.7.0 mlx-dspark skips the prefill logits every caller discards and dequantizes wide weights
 once instead of per output tile, which is worth **1.07–1.15×** here — **bit-identical**, no extra
