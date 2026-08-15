@@ -61,6 +61,10 @@ struct ChatSettings: Codable, Equatable {
     var maxTokens: Int?
     /// Reasoning models spend real tokens thinking; agentic/plain use often wants it off.
     var thinking: Bool = true
+    /// Reasoning depth ("low"/"medium"/"xhigh") for models whose template supports it
+    /// (Qwen3.8-class `reasoning_effort`). `nil` = the model's own default. Only sent when
+    /// the server reports support, and only while thinking is on.
+    var reasoningEffort: String?
 }
 
 /// A log line with a stable identity, so trimming the buffer never reshuffles SwiftUI ids.
@@ -143,10 +147,17 @@ final class AppModel: ObservableObject {
     /// A newer app release on GitHub, if any. Informational — updating is `brew upgrade`.
     @Published var appUpdate: AppUpdate.Available?
 
+    /// A newer engine release on PyPI, found by the post-launch background check. It installs
+    /// itself on the next launch (in place, no venv rebuild) — this only *tells* the user.
+    @Published var engineUpdateAvailable: String?
+
     /// What the loading screen should say this load *is* — a first download, a hot swap, a
     /// settings reload. Without it every load claims "downloading", which reads as broken
     /// when the model is already on disk.
     @Published var loadingDetail: String?
+    /// A model load/swap in flight (`/admin/load`). The window stays up; screens show
+    /// progress inline and generation controls stay disabled via `isServerReady`.
+    @Published var isModelLoading = false
     /// One-time banner after onboarding: land in the Lab with the race ready to run.
     @Published var showLabWelcome = false
 
@@ -242,6 +253,15 @@ final class AppModel: ObservableObject {
         }
         engineURL = engine
 
+        // Engine updates are discovered here, off the launch path, and applied by the next
+        // launch's in-place upgrade — the old blocking launch-time PyPI check made every
+        // cached start look like an install.
+        Task { [weak self] in
+            if let newer = await bootstrapper.checkForEngineUpdate() {
+                await MainActor.run { self?.engineUpdateAvailable = newer }
+            }
+        }
+
         // First run: choose a model before loading anything heavy. The machine check is
         // model-free, so it runs without a server and without committing to a multi-GB
         // download the user might not have meant.
@@ -260,44 +280,107 @@ final class AppModel: ObservableObject {
         await startServer(model: model)
     }
 
-    /// Load a target and go. Called from onboarding's pick, or straight from boot on a return
-    /// visit. The first-ever load of a model downloads it, which is why the "starting" state is
-    /// worded for minutes, not seconds.
+    /// Spawn the server and load a target. Called from onboarding's pick, or straight from
+    /// boot on a return visit. The server itself starts model-less (`--no-model`, seconds) and
+    /// the window opens immediately; the model then loads *inside* the running window with
+    /// inline progress, instead of gating the whole app behind a loading screen.
     func startServer(model: String) async {
-        guard let engine = engineURL else { return }
         self.model = model
         Defaults.selectedModel = model
-        phase = .startingServer
+        guard await spawnServer() else { return }
+        phase = .ready
+        await refreshDiagnostics()               // model pickers work before anything loads
+        let loaded: Bool
+        if currentHealth?.isLoaded == true {
+            // The compatibility fallback in spawnServer already loaded it during spawn.
+            startTelemetry()
+            startMemoryPolling()
+            loaded = true
+        } else {
+            loaded = await loadModel(model)
+        }
+        if loaded, isFirstRun {
+            // The plan's "hooked" moment: straight from onboarding into a race the user
+            // can run — not a blank chat that hides why this app exists.
+            isFirstRun = false
+            if detail.showsLab {
+                Defaults.labTab = "Race"
+                screen = .lab
+                showLabWelcome = true
+            }
+        }
+    }
 
+    /// Spawn `mlx-dspark serve --no-model` and wait for `/health` — up in seconds (python
+    /// import, no weights). Returns false after calling `fail()` when even that can't start.
+    private func spawnServer() async -> Bool {
+        guard let engine = engineURL else { return false }
+        phase = .startingServer
         let supervisor = ServerSupervisor(engine: engine, logStore: logStore)
         self.supervisor = supervisor
         await supervisor.observeState { [weak self] state in
             Task { @MainActor in self?.serverState = state }
         }
-
         do {
             let port = try await supervisor.start(
-                config: ServerConfig(model: model, mode: "auto", maxDraft: "auto"))
-            let client = APIClient(baseURL: URL(string: "http://127.0.0.1:\(port)")!)
-            self.apiClient = client
-            currentHealth = try? await client.health()
+                config: ServerConfig(model: nil, mode: "auto", maxDraft: "auto"))
+            return await connect(port: port)
+        } catch {
+            // An engine below this app's floor doesn't know `--no-model`, and an offline
+            // machine can't be force-upgraded to one that does — fall back to the classic
+            // blocking start with the model loaded at spawn.
+            logStore.note("model-less start failed — retrying with the model inline "
+                          + "(older engine?)")
+            do {
+                let port = try await supervisor.start(
+                    config: ServerConfig(model: model, mode: "auto", maxDraft: "auto"))
+                return await connect(port: port)
+            } catch {
+                fail(error)
+                return false
+            }
+        }
+    }
+
+    private func connect(port: Int) async -> Bool {
+        let client = APIClient(baseURL: URL(string: "http://127.0.0.1:\(port)")!)
+        self.apiClient = client
+        currentHealth = try? await client.health()
+        return true
+    }
+
+    /// Load `target` into the running server (`/admin/load`) with inline progress — the
+    /// window, the port, and every other screen stay up throughout. Returns whether it loaded.
+    @discardableResult
+    func loadModel(_ target: String) async -> Bool {
+        guard let client = apiClient else { return false }
+        generationTask?.cancel()
+        modelSwitchError = nil
+        isModelLoading = true
+        self.model = target
+        Defaults.selectedModel = target
+        rounds = []
+        stats = nil
+        calibration = nil
+        logStore.note("loading model → \(target)")
+        defer {
+            isModelLoading = false
             loadingDetail = nil
-            phase = .ready
+        }
+        do {
+            _ = try await client.loadModel(target)
+            // Re-point health at the new model and restart the telemetry stream (the old one
+            // ended when the engine it was streaming from was torn down).
+            currentHealth = try? await client.health()
             startTelemetry()
             startMemoryPolling()
             await refreshDiagnostics()
-            if isFirstRun {
-                // The plan's "hooked" moment: straight from onboarding into a race the user
-                // can run — not a blank chat that hides why this app exists.
-                isFirstRun = false
-                if detail.showsLab {
-                    Defaults.labTab = "Race"
-                    screen = .lab
-                    showLabWelcome = true
-                }
-            }
+            return true
         } catch {
-            fail(error)
+            modelSwitchError = error.localizedDescription
+            logStore.note("model load failed: \(error.localizedDescription)")
+            currentHealth = try? await client.health()   // reflects the no-model state
+            return false
         }
     }
 
@@ -312,49 +395,46 @@ final class AppModel: ObservableObject {
     /// declaring the whole app failed.
     func switchModel(to target: String) async {
         let target = target.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !target.isEmpty, target != model, let client = apiClient else { return }
-        generationTask?.cancel()
+        // Re-picking the loaded model is a no-op — but the *same name in the no-model state*
+        // (a failed load, an unload) is a legitimate retry, so only bounce when it's serving.
+        guard !target.isEmpty, !(target == model && isServerReady), apiClient != nil
+        else { return }
         let previous = model
-        modelSwitchError = nil
-        self.model = target
-        Defaults.selectedModel = target
+        let hadModel = isServerReady
+        loadingDetail = "Swapping models in place — the server and its port stay up, so "
+            + "connected agents keep working. A model that isn't downloaded yet downloads first."
+        logStore.note("switching model → \(target)")
+        if await loadModel(target) { return }
+        // Release-then-load means the old model is already gone, so restore it — the app
+        // (and anything on the port) should keep working on what it had. Keep the *new*
+        // model's error visible through the restore (loadModel clears it on entry).
+        let failure = modelSwitchError
+        screen = .models                         // the inline error lives there
+        if hadModel, previous != target {
+            self.model = previous
+            Defaults.selectedModel = previous
+            loadingDetail = "Restoring \(previous.components(separatedBy: "/").last ?? previous)…"
+            await loadModel(previous)
+        }
+        // Restore failing too is no longer fatal: the server survives model-less, the picker
+        // still works, and the user just chooses again.
+        modelSwitchError = failure
+    }
+
+    /// Release the loaded model without loading another — frees its memory; the server, the
+    /// port, and connected clients' base URLs all survive. `/admin/load` brings one back.
+    func unloadModel() async {
+        guard let client = apiClient, isServerReady else { return }
+        generationTask?.cancel()
         rounds = []
         stats = nil
         calibration = nil
-        loadingDetail = "Swapping models in place — the server and its port stay up, so "
-            + "connected agents keep working. A model that isn't downloaded yet downloads first."
-        phase = .startingServer
-        logStore.note("switching model → \(target)")
-        do {
-            _ = try await client.loadModel(target)
-            // Re-point health at the new model and restart the telemetry stream (the old one
-            // ended when the engine it was streaming from was torn down).
-            currentHealth = try? await client.health()
-            loadingDetail = nil
-            phase = .ready
-            startTelemetry()
-            startMemoryPolling()
-            await refreshDiagnostics()
-        } catch {
-            modelSwitchError = error.localizedDescription
-            logStore.note("model swap failed: \(error.localizedDescription)")
-            screen = .models                     // the inline error lives there
-            // Release-then-load means the old model is already gone, so restore it — the
-            // app (and anything on the port) should keep working on what it had.
-            self.model = previous
-            Defaults.selectedModel = previous
-            do {
-                _ = try await client.loadModel(previous)
-                currentHealth = try? await client.health()
-                loadingDetail = nil
-            phase = .ready
-                startTelemetry()
-                startMemoryPolling()
-                await refreshDiagnostics()
-            } catch {
-                fail(error)                      // even the old model won't load — real failure
-            }
-        }
+        memory = nil
+        liveTokensPerSec = 0
+        logStore.note("unloading model")
+        _ = try? await client.unloadModel()
+        currentHealth = try? await client.health()
+        await refreshDiagnostics()
     }
 
     /// Reload the *current* model with a different decode mode and/or draft cap — the
@@ -371,29 +451,26 @@ final class AppModel: ObservableObject {
         loadingDetail = "Applying mode \(mode ?? "auto") · cap \(cap ?? "auto") — reloading "
             + "the model in place. Weights are already on disk; this takes seconds to a "
             + "minute, and the server's port stays up."
-        phase = .startingServer
+        isModelLoading = true
         logStore.note("reloading \(model) — mode \(mode ?? "auto") · cap \(cap ?? "auto")")
+        defer {
+            isModelLoading = false
+            loadingDetail = nil
+        }
         do {
             _ = try await client.loadModel(model, mode: mode, maxDraft: cap)
             currentHealth = try? await client.health()
-            loadingDetail = nil
-            phase = .ready
             startTelemetry()
             startMemoryPolling()
             await refreshDiagnostics()
         } catch {
             modelSwitchError = error.localizedDescription
             // The engine is modelless after a failed load — restore with default settings.
-            do {
-                _ = try await client.loadModel(model)
-                currentHealth = try? await client.health()
-                loadingDetail = nil
-            phase = .ready
-                startTelemetry()
-                startMemoryPolling()
-            } catch {
-                fail(error)
-            }
+            // If even that fails, the server survives model-less; the picker still works.
+            _ = try? await client.loadModel(model)
+            currentHealth = try? await client.health()
+            startTelemetry()
+            startMemoryPolling()
         }
     }
 
@@ -420,7 +497,9 @@ final class AppModel: ObservableObject {
     /// so the Lab keeps updating even when the tokens are being generated for Claude Code or
     /// any other client pointed at this server.
     private func startTelemetry() {
-        guard let client else { return }
+        // No model → /events answers 503; don't spin against it. The next successful load
+        // calls this again.
+        guard let client, isServerReady else { return }
         telemetryTask?.cancel()
         telemetryTask = Task { [weak self] in
             while !Task.isCancelled {
@@ -486,7 +565,7 @@ final class AppModel: ObservableObject {
     /// Poll the allocator numbers behind the memory gauge. Cheap on the server side (it reads
     /// the allocator, never the GPU), so a relaxed cadence is plenty.
     private func startMemoryPolling() {
-        guard let client else { return }
+        guard let client, isServerReady else { return }    // /metrics 503s with no model
         memoryTask?.cancel()
         memoryTask = Task { [weak self] in
             while !Task.isCancelled {
@@ -551,7 +630,10 @@ final class AppModel: ObservableObject {
                     messages: history,
                     temperature: self.chatSettings.temperature,
                     maxTokens: self.chatSettings.maxTokens,
-                    enableThinking: self.chatSettings.thinking ? nil : false
+                    enableThinking: self.chatSettings.thinking ? nil : false,
+                    // The template ignores effort when thinking is off, so don't send it then.
+                    reasoningEffort: self.chatSettings.thinking && self.supportsReasoningEffort
+                        ? self.chatSettings.reasoningEffort : nil
                 ) {
                     switch event {
                     case .delta(let piece):
@@ -676,7 +758,14 @@ final class AppModel: ObservableObject {
         return nil
     }
 
-    var isServerReady: Bool { health != nil }
+    /// A model is loaded and serving. (The server being *up* is a weaker state — it answers
+    /// `/health` with `no_model` from the fast-launch or unloaded state, where generation
+    /// controls must stay disabled but model pickers work.)
+    var isServerReady: Bool { health?.isLoaded ?? false }
+
+    /// Whether the loaded model's chat template reads `reasoning_effort` (`/health` reports
+    /// it), so the chat settings only show an effort picker where it does something.
+    var supportsReasoningEffort: Bool { health?.supportsReasoningEffort ?? false }
 
     /// Which strategies can be raced with the currently loaded pair. `baseline` and `lookup`
     /// need only the target; a drafter mode needs the drafter this engine was loaded with, so
@@ -726,7 +815,10 @@ final class AppModel: ObservableObject {
         case .idle:                 return "Idle"
         case .starting(let detail): return detail
         case .ready(let port, let health):
-            return "\(health.model) · \(health.mode) · :\(port)"
+            guard let name = health.model, let mode = health.mode else {
+                return "No model loaded · :\(port)"
+            }
+            return "\(name) · \(mode) · :\(port)"
         case .failed(let message):  return message
         case .stopped:              return "Stopped"
         }
@@ -742,9 +834,10 @@ final class AppModel: ObservableObject {
     /// "target ← drafter" — the pairing that makes speculative decoding work. Naming both is
     /// something no other local-LLM app has to do, so it belongs in the chrome, not a submenu.
     var pairingLine: String? {
-        guard let health, let drafter = health.drafter else { return nil }
+        guard let health, let drafter = health.drafter,
+              let name = health.target ?? health.model else { return nil }
         let short = { (repo: String) in repo.components(separatedBy: "/").last ?? repo }
-        return "\(short(health.target ?? health.model))  ←  \(short(drafter))"
+        return "\(short(name))  ←  \(short(drafter))"
     }
 
     /// The loaded model's resident footprint, ready for the chrome. Peak is deliberately not

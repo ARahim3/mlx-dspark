@@ -51,6 +51,10 @@ struct RaceTab: View {
 struct RaceControls: View {
     @EnvironmentObject private var model: AppModel
     @ObservedObject var race: RaceModel
+    // String mirror of race.maxTokens, parsed on change and clamped only on commit. Binding
+    // the field to the Int directly (value:format:) re-parses every keystroke, so a live
+    // clamp rewrites the text under the cursor mid-entry ("500" passes through "5" -> 16).
+    @State private var maxTokensText: String = ""
 
     /// Everything this pair could race: baseline first (the reference belongs on the left),
     /// then the drafter at a few caps, then lookup. The user toggles which of these run.
@@ -82,16 +86,15 @@ struct RaceControls: View {
                           + "speed — thinking buries the answer both lanes are producing.")
                 HStack(spacing: 4) {
                     Text("Max tokens").font(.callout).foregroundStyle(.secondary)
-                    TextField("200", value: $race.maxTokens, format: .number)
+                    TextField("200", text: $maxTokensText)
                         .textFieldStyle(.roundedBorder)
                         .frame(width: 64)
                         .multilineTextAlignment(.trailing)
                         .disabled(race.phase == .running)
-                        // Free-form entry, sane bounds: the server clamps to its cap anyway,
-                        // but a 0/negative value would silently fall back to the default.
-                        .onChange(of: race.maxTokens) { _, value in
-                            race.maxTokens = min(max(value, 16), 4096)
+                        .onChange(of: maxTokensText) { _, text in
+                            if let value = Int(text) { race.maxTokens = value }
                         }
+                        .onSubmit(commitMaxTokens)
                 }
             }
 
@@ -124,6 +127,7 @@ struct RaceControls: View {
                               + "The arms have to run one at a time, but the timings are real.")
                     }
                     Button("Run race") {
+                        commitMaxTokens()
                         if let client = model.apiClient { race.run(client: client) }
                     }
                     .buttonStyle(.borderedProminent)
@@ -135,6 +139,16 @@ struct RaceControls: View {
                     .font(.caption).foregroundStyle(.secondary)
             }
         }
+        .onAppear { maxTokensText = String(race.maxTokens) }
+    }
+
+    /// Free-form entry, sane bounds: the server clamps to its cap anyway, but a 0/negative
+    /// value would silently fall back to the default. Applied on Enter and on Run, never
+    /// per keystroke.
+    private func commitMaxTokens() {
+        let clamped = min(max(Int(maxTokensText) ?? race.maxTokens, 16), 4096)
+        race.maxTokens = clamped
+        maxTokensText = String(clamped)
     }
 
     private func toggle(_ arm: RaceArm) {

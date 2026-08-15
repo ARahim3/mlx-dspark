@@ -43,11 +43,11 @@ struct MenuBarPanel: View {
 
             if let health = model.health {
                 VStack(alignment: .leading, spacing: 6) {
-                    row("Model", health.model)
+                    row("Model", health.model ?? "none loaded")
                     if let drafter = health.drafter {
                         row("Drafter", drafter.components(separatedBy: "/").last ?? drafter)
                     }
-                    row("Mode", health.mode)
+                    if let mode = health.mode { row("Mode", mode) }
                     if let memory = model.memoryLine {
                         row("Memory", memory)
                     }

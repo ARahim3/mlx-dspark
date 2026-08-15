@@ -7,11 +7,15 @@ import Foundation
 // (accept length, cap, lookup rounds), so it is a first-class type here, not an afterthought.
 
 public struct HealthInfo: Decodable, Sendable, Equatable {
+    /// `ok` (model loaded) · `loading` (swap in flight) · `no_model` (server up, nothing
+    /// loaded — the fast-launch/unloaded state). Older engines only ever report `ok` here;
+    /// their loading state was undecodable and surfaced as a failed request instead.
     public let status: String
     /// Short display id, e.g. `Qwen3-4B-8bit`. Also the id `/v1/models` lists.
-    public let model: String
+    /// `nil` while loading or with no model loaded.
+    public let model: String?
     /// Resolved mode — `auto` is decided server-side, so this may differ from what was asked.
-    public let mode: String
+    public let mode: String?
     /// The full target repo and the drafter that auto-resolved for it. Showing the *pair* is
     /// this app's domain language; no other local-LLM app has a second model to name.
     public let target: String?
@@ -20,13 +24,20 @@ public struct HealthInfo: Decodable, Sendable, Equatable {
     public let maxDraft: String?
     public let contextWindow: Int?
     public let maxOutputTokens: Int?
+    /// Whether the loaded model's chat template reads `reasoning_effort` (Qwen3.8-class).
+    /// Optional so the app keeps decoding health from older engines that don't report it.
+    public let supportsReasoningEffort: Bool?
 
     enum CodingKeys: String, CodingKey {
         case status, model, mode, target, drafter
         case maxDraft = "max_draft"
         case contextWindow = "context_window"
         case maxOutputTokens = "max_output_tokens"
+        case supportsReasoningEffort = "supports_reasoning_effort"
     }
+
+    /// True when a model is loaded and serving (`status == "ok"`).
+    public var isLoaded: Bool { status == "ok" }
 }
 
 public struct SpecInfo: Codable, Sendable, Equatable {
@@ -176,6 +187,17 @@ public struct APIClient: Sendable {
         return try JSONDecoder().decode(LoadStatus.self, from: data)
     }
 
+    /// Release the loaded model without loading another (`/admin/unload`) — frees its memory;
+    /// the server and its port stay up and `/admin/load` brings a model back.
+    @discardableResult
+    public func unloadModel() async throws -> LoadStatus {
+        let body = try JSONSerialization.data(withJSONObject: [String: Any]())
+        let req = request("admin/unload", method: "POST", body: body)
+        let (data, response) = try await session.data(for: req)
+        try Self.check(response, data)
+        return try JSONDecoder().decode(LoadStatus.self, from: data)
+    }
+
     /// This machine's measured verify/drafter cost curves (Lab → Curves).
     public func calibration() async throws -> Calibration {
         let (data, response) = try await session.data(for: request("calibration"))
@@ -257,7 +279,8 @@ public struct APIClient: Sendable {
         messages: [[String: String]],
         temperature: Double? = nil,
         maxTokens: Int? = nil,
-        enableThinking: Bool? = nil
+        enableThinking: Bool? = nil,
+        reasoningEffort: String? = nil
     ) -> AsyncThrowingStream<ChatEvent, Error> {
         var payload: [String: Any] = [
             "model": model,
@@ -267,6 +290,7 @@ public struct APIClient: Sendable {
         if let temperature { payload["temperature"] = temperature }
         if let maxTokens { payload["max_tokens"] = maxTokens }
         if let enableThinking { payload["enable_thinking"] = enableThinking }
+        if let reasoningEffort { payload["reasoning_effort"] = reasoningEffort }
 
         return AsyncThrowingStream { continuation in
             let task = Task {

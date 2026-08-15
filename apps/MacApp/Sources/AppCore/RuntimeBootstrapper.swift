@@ -130,11 +130,32 @@ public actor RuntimeBootstrapper {
         return payload.info.version
     }
 
+    /// A newer release discovered by the background check, recorded to install on the next
+    /// launch. Stored rather than acted on immediately: upgrading the venv while the running
+    /// server lazily imports from it risks mixing module versions inside one process.
+    public static var pendingEngineUpdate: String? {
+        get { UserDefaults.standard.string(forKey: "pendingEngineUpdate") }
+        set { UserDefaults.standard.set(newValue, forKey: "pendingEngineUpdate") }
+    }
+
+    /// Background update check — run after the app is up, never on the launch path. Records a
+    /// newer PyPI release for the next launch's in-place upgrade and returns it for the UI.
+    public func checkForEngineUpdate(source: EngineSource = .fromEnvironment()) async -> String? {
+        guard source == .pypi,
+              let latest = await Self.latestReleasedVersion(),
+              let current = currentFingerprint(),
+              latest != current.engineVersion
+        else { return nil }
+        Self.pendingEngineUpdate = latest
+        return latest
+    }
+
     /// Ensure a working runtime exists, reinstalling if the fingerprint doesn't match.
     ///
-    /// For the PyPI source this is also the auto-update path: the newest release is resolved
-    /// on every launch, and a runtime built from an older release is rebuilt. Offline, an
-    /// existing runtime is used as-is — a network check must never brick a working install.
+    /// For the PyPI source this is also the auto-update path: a newer release found by the
+    /// *background* check (`checkForEngineUpdate`) is applied here as an in-place upgrade.
+    /// Offline, an existing runtime is used as-is — a network check must never brick (or
+    /// delay) a working install.
     /// - Returns: the engine executable to drive.
     @discardableResult
     public func ensureRuntime(
@@ -143,17 +164,37 @@ public actor RuntimeBootstrapper {
     ) async throws -> URL {
         try Paths.ensureDirectories()
 
-        let latest: String? = source == .pypi ? await Self.latestReleasedVersion() : nil
+        // Fast path FIRST and network-free: a fingerprint-matching runtime boots instantly.
+        // (This used to sit behind a blocking PyPI query, so every launch spent up to 5 s
+        // showing the install checklist over a fully-cached runtime.)
         if let current = currentFingerprint(),
            current.source == source.fingerprint,
            current.pythonVersion == AppIdentity.pythonVersion,
-           FileManager.default.isExecutableFile(atPath: Paths.engineExecutable.path),
-           source != .pypi || latest == nil || latest == current.engineVersion {
-            // Already current (or offline with a working install) — mark every row done so
-            // onboarding can skip past instantly.
+           FileManager.default.isExecutableFile(atPath: Paths.engineExecutable.path) {
+            let pending = source == .pypi ? Self.pendingEngineUpdate : nil
+            if let pending, pending != current.engineVersion {
+                if let upgraded = await upgradeInPlace(to: pending, onProgress: onProgress) {
+                    return upgraded
+                }
+                // Upgrade failed (offline, resolver churn): keep the working runtime and
+                // retry on a later launch — an update must never brick a working install.
+                logStore?.note("engine update to \(pending) didn't complete; "
+                               + "keeping \(current.engineVersion)")
+            } else if pending != nil {
+                Self.pendingEngineUpdate = nil     // already on it (e.g. a manual rebuild)
+            }
             steps = SetupStepID.allCases.map { SetupStep(id: $0, state: .done, detail: "Ready") }
             onProgress?(steps)
             return Paths.engineExecutable
+        }
+
+        // Full (re)install: first run, a python bump, a source switch, or a broken venv.
+        // Only here — where a rebuild happens regardless — is a blocking version query
+        // acceptable.
+        var latest: String?
+        if source == .pypi {
+            latest = Self.pendingEngineUpdate
+            if latest == nil { latest = await Self.latestReleasedVersion() }
         }
 
         // --- uv ------------------------------------------------------------------
@@ -240,9 +281,47 @@ public actor RuntimeBootstrapper {
         try writeFingerprint(RuntimeFingerprint(engineVersion: installed,
                                                 pythonVersion: AppIdentity.pythonVersion,
                                                 source: source.fingerprint))
+        if source == .pypi { Self.pendingEngineUpdate = nil }
         set(.verify, .done, "Engine \(installed)")
         onProgress?(steps)
 
+        return Paths.engineExecutable
+    }
+
+    /// Upgrade the engine inside the existing venv (`uv pip install pkg==version`) — no venv
+    /// rebuild, nothing deleted, so any failure leaves the working install untouched.
+    private func upgradeInPlace(to version: String, onProgress: ProgressHandler?) async -> URL? {
+        guard let uv = Paths.uvExecutable(bundle: bundle) else { return nil }
+        let requirement = "\(AppIdentity.enginePackage)==\(version)"
+        let env = childEnvironment()
+        set(.uv, .done, "Ready")
+        set(.python, .done, "Python \(AppIdentity.pythonVersion)")
+        set(.engine, .running, "Updating to \(requirement)")
+        onProgress?(steps)
+        do {
+            try await Shell.check(uv, ["pip", "install", "--python", venvPython().path,
+                                       requirement],
+                                  environment: env) { [logStore] line in
+                logStore?.append(line)
+            }
+        } catch {
+            return nil
+        }
+        set(.engine, .done, requirement)
+        set(.verify, .running, "Checking the engine")
+        onProgress?(steps)
+        let probe = await Shell.capture(
+            venvPython(),
+            ["-c", "import mlx_dspark; print(mlx_dspark.__version__)"],
+            environment: env)
+        let installed = probe.output.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard probe.code == 0, !installed.isEmpty else { return nil }
+        try? writeFingerprint(RuntimeFingerprint(engineVersion: installed,
+                                                 pythonVersion: AppIdentity.pythonVersion,
+                                                 source: EngineSource.pypi.fingerprint))
+        Self.pendingEngineUpdate = nil
+        set(.verify, .done, "Engine \(installed)")
+        onProgress?(steps)
         return Paths.engineExecutable
     }
 

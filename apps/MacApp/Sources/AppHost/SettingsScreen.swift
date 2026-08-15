@@ -51,6 +51,11 @@ struct AboutCard: View {
                          + "are checked at launch.")
                         .font(.caption).foregroundStyle(.secondary)
                 }
+                if let engineUpdate = model.engineUpdateAvailable {
+                    Label("Engine \(engineUpdate) is available — it installs on the next launch.",
+                          systemImage: "arrow.triangle.2.circlepath")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
             }
         }
     }
@@ -108,6 +113,11 @@ struct DecodingCard: View {
 /// Mode + cap pickers with Apply. Shared between Settings → Decoding and the chat toolbar's
 /// settings popover, so the knobs live where the user already is.
 struct DecodingControls: View {
+    /// The popover is 340pt wide; both pickers are `.fixedSize()`, so the single-row layout
+    /// designed for the Settings card pushes Apply past the popover's edge. Compact stacks
+    /// the button on its own row instead.
+    var compact = false
+
     @EnvironmentObject private var model: AppModel
     @State private var mode: String = "auto"
     @State private var cap: String = "auto"
@@ -125,25 +135,29 @@ struct DecodingControls: View {
     }
 
     var body: some View {
-        HStack(spacing: 14) {
-            Picker("Mode", selection: $mode) {
-                ForEach(modes, id: \.id) { Text($0.label).tag($0.id) }
-            }
-            .fixedSize()
-
-            Picker("Cap", selection: $cap) {
-                Text("Auto").tag("auto")
-                ForEach(1...8, id: \.self) { Text("\($0)").tag("\($0)") }
-            }
-            .fixedSize()
-
-            if applying {
-                ProgressView().controlSize(.small)
+        Group {
+            if compact {
+                VStack(alignment: .leading, spacing: 8) {
+                    HStack(spacing: 14) {
+                        pickers
+                        Spacer(minLength: 0)
+                    }
+                    HStack(spacing: 8) {
+                        applyControl
+                        if !applying, isDirty {
+                            Text("Reloads the model in place.")
+                                .font(.caption2).foregroundStyle(.tertiary)
+                        }
+                        Spacer(minLength: 0)
+                    }
+                }
             } else {
-                Button("Apply") { apply() }
-                    .disabled(!model.isServerReady || !isDirty)
+                HStack(spacing: 14) {
+                    pickers
+                    applyControl
+                    Spacer(minLength: 0)
+                }
             }
-            Spacer(minLength: 0)
         }
         // The pickers show what the engine is actually running, not a stale default — the
         // server reports both (`/health` mode + max_draft), so a reopened popover agrees
@@ -151,6 +165,28 @@ struct DecodingControls: View {
         .onAppear {
             mode = model.health?.mode ?? "auto"
             cap = model.health?.maxDraft ?? "auto"
+        }
+    }
+
+    @ViewBuilder private var pickers: some View {
+        Picker("Mode", selection: $mode) {
+            ForEach(modes, id: \.id) { Text($0.label).tag($0.id) }
+        }
+        .fixedSize()
+
+        Picker("Cap", selection: $cap) {
+            Text("Auto").tag("auto")
+            ForEach(1...8, id: \.self) { Text("\($0)").tag("\($0)") }
+        }
+        .fixedSize()
+    }
+
+    @ViewBuilder private var applyControl: some View {
+        if applying {
+            ProgressView().controlSize(.small)
+        } else {
+            Button("Apply") { apply() }
+                .disabled(!model.isServerReady || !isDirty)
         }
     }
 

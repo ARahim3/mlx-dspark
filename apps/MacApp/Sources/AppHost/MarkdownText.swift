@@ -25,6 +25,8 @@ struct MarkdownText: View {
                     CodeCard(language: language, code: code)
                 case .math(let latex):
                     MathBlock(latex: latex)
+                case .table(let header, let rows):
+                    TableBlock(header: header, rows: rows)
                 }
             }
         }
@@ -35,43 +37,69 @@ enum MarkdownBlock {
     case prose([String])
     case code(language: String?, code: String)
     case math(String)
+    case table(header: [String]?, rows: [[String]])
 
-    /// Split on ``` fences and `$$` display-math blocks. An unclosed fence (mid-stream) runs
-    /// to the end.
+    /// Split on ``` fences, `$$`/`\[ … \]` display-math blocks, and `|`-row tables. An
+    /// unclosed fence or math block (mid-stream) runs to the end.
     static func parse(_ text: String) -> [MarkdownBlock] {
         var blocks: [MarkdownBlock] = []
         var prose: [String] = []
         var inCode = false
         var inMath = false
+        var mathCloser = "$$"
         var codeLines: [String] = []
         var mathLines: [String] = []
+        var tableLines: [String] = []
         var language: String?
 
         func flushProse() {
             if !prose.isEmpty { blocks.append(.prose(prose)); prose = [] }
         }
+        func flushTable() {
+            if !tableLines.isEmpty { blocks.append(makeTable(tableLines)); tableLines = [] }
+        }
+        func openMath(body: String, closer: String) {
+            flushProse()
+            // One-line `$$ x $$` / `\[ x \]`, or an opener whose block spans several lines.
+            if body.hasSuffix(closer), body.count >= closer.count {
+                blocks.append(.math(String(body.dropLast(closer.count))))
+            } else {
+                inMath = true
+                mathCloser = closer
+                if !body.isEmpty { mathLines.append(body) }
+            }
+        }
 
         for line in text.components(separatedBy: "\n") {
             let trimmed = line.trimmingCharacters(in: .whitespaces)
-            if !inCode, trimmed.hasPrefix("$$") {
-                // `$$ … $$` on one line, or a `$$` toggle spanning several.
-                let body = trimmed.dropFirst(2)
-                if inMath {
+            if inMath {
+                if trimmed.hasSuffix(mathCloser) {
+                    let body = trimmed.dropLast(mathCloser.count)
+                        .trimmingCharacters(in: .whitespaces)
+                    if !body.isEmpty { mathLines.append(body) }
                     blocks.append(.math(mathLines.joined(separator: " ")))
                     mathLines = []
                     inMath = false
-                } else if body.hasSuffix("$$"), body.count >= 2 {
-                    flushProse()
-                    blocks.append(.math(String(body.dropLast(2))))
                 } else {
-                    flushProse()
-                    inMath = true
-                    if !body.isEmpty { mathLines.append(String(body)) }
+                    mathLines.append(line)
                 }
                 continue
             }
-            if inMath {
-                mathLines.append(line)
+            if !inCode, trimmed.hasPrefix("|") {
+                // Consecutive pipe rows form a table (separator row detected in makeTable).
+                if tableLines.isEmpty { flushProse() }
+                tableLines.append(trimmed)
+                continue
+            }
+            flushTable()
+            if !inCode, trimmed.hasPrefix("$$") {
+                openMath(body: String(trimmed.dropFirst(2)), closer: "$$")
+                continue
+            }
+            if !inCode, trimmed.hasPrefix("\\[") {
+                // LaTeX display math — models emit this form as often as `$$`.
+                openMath(body: String(trimmed.dropFirst(2))
+                    .trimmingCharacters(in: .whitespaces), closer: "\\]")
                 continue
             }
             if trimmed.hasPrefix("```") {
@@ -97,8 +125,29 @@ enum MarkdownBlock {
         // Mid-stream: an open fence/block renders up to whatever has arrived.
         if inCode { blocks.append(.code(language: language, code: codeLines.joined(separator: "\n"))) }
         if inMath { blocks.append(.math(mathLines.joined(separator: " "))) }
+        flushTable()
         flushProse()
         return blocks
+    }
+
+    /// `| a | b |` rows → a table block. A `|---|:--:|` second row marks row 1 as the header.
+    static func makeTable(_ lines: [String]) -> MarkdownBlock {
+        func cells(_ line: String) -> [String] {
+            var l = line
+            if l.hasPrefix("|") { l.removeFirst() }
+            if l.hasSuffix("|") { l.removeLast() }
+            return l.components(separatedBy: "|")
+                .map { $0.trimmingCharacters(in: .whitespaces) }
+        }
+        var rows = lines.map(cells)
+        var header: [String]?
+        if rows.count >= 2, !rows[1].isEmpty, rows[1].allSatisfy({ cell in
+            !cell.isEmpty && cell.allSatisfy { "-: ".contains($0) }
+        }) {
+            header = rows[0]
+            rows.removeSubrange(0...1)
+        }
+        return .table(header: header, rows: rows)
     }
 }
 
@@ -182,15 +231,66 @@ struct ProseBlock: View {
         return ("\(digits)\(punct)", String(rest.dropFirst(2)))
     }
 
-    /// Inline markdown via AttributedString, falling back to plain text if it can't parse
-    /// (a stray unbalanced `*` mid-stream, say — better plain than an exception).
-    /// `$…$` math spans are translated to Unicode first (see `MathText`).
-    private func inline(_ s: String) -> AttributedString {
-        let text = s.contains("$") || s.contains("\\(") ? MathText.inlineReplaced(s) : s
-        return (try? AttributedString(
-            markdown: text,
-            options: .init(interpretedSyntax: .inlineOnlyPreservingWhitespace)))
-            ?? AttributedString(text)
+    private func inline(_ s: String) -> AttributedString { inlineMarkdown(s) }
+}
+
+/// Inline markdown via AttributedString, falling back to plain text if it can't parse
+/// (a stray unbalanced `*` mid-stream, say — better plain than an exception).
+/// `$…$` / `\(…\)` math spans are translated to Unicode first (see `MathText`).
+func inlineMarkdown(_ s: String) -> AttributedString {
+    let text = s.contains("$") || s.contains("\\(") ? MathText.inlineReplaced(s) : s
+    return (try? AttributedString(
+        markdown: text,
+        options: .init(interpretedSyntax: .inlineOnlyPreservingWhitespace)))
+        ?? AttributedString(text)
+}
+
+/// A markdown table, rendered as a real grid: header row shaded, zebra rows, cells taking
+/// inline markdown + math, the whole thing horizontally scrollable when it outgrows the
+/// bubble. Missing trailing cells (a common model slip) render empty rather than crashing
+/// the row.
+struct TableBlock: View {
+    let header: [String]?
+    let rows: [[String]]
+    @Environment(\.textZoom) private var zoom
+
+    var body: some View {
+        let columns = max(header?.count ?? 0, rows.map(\.count).max() ?? 0)
+        if columns > 0 {
+            ScrollView(.horizontal, showsIndicators: false) {
+                Grid(alignment: .topLeading, horizontalSpacing: 0, verticalSpacing: 0) {
+                    if let header {
+                        GridRow {
+                            ForEach(0..<columns, id: \.self) { i in
+                                cell(i < header.count ? header[i] : "", header: true)
+                                    .background(.quaternary.opacity(0.4))
+                            }
+                        }
+                    }
+                    ForEach(Array(rows.enumerated()), id: \.offset) { index, row in
+                        GridRow {
+                            ForEach(0..<columns, id: \.self) { i in
+                                cell(i < row.count ? row[i] : "", header: false)
+                                    .background(index.isMultiple(of: 2)
+                                                ? Color.clear
+                                                : Color.secondary.opacity(0.06))
+                            }
+                        }
+                    }
+                }
+            }
+            .clipShape(RoundedRectangle(cornerRadius: 8))
+            .overlay(RoundedRectangle(cornerRadius: 8).strokeBorder(.quaternary.opacity(0.5)))
+        }
+    }
+
+    private func cell(_ text: String, header: Bool) -> some View {
+        Text(inlineMarkdown(text))
+            .font(.system(size: 12 * zoom).weight(header ? .semibold : .regular))
+            .textSelection(.enabled)
+            .padding(.horizontal, 9)
+            .padding(.vertical, 5)
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
     }
 }
 

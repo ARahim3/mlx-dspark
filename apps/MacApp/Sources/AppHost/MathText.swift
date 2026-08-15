@@ -151,7 +151,7 @@ enum MathText {
     /// same line and doesn't look like `$5` followed by prose.
     static func inlineReplaced(_ line: String) -> String {
         var result = ""
-        var rest = Substring(line)
+        var rest = Substring(replacedParenSpans(line))
         while let open = rest.firstIndex(of: "$") {
             let afterOpen = rest.index(after: open)
             guard let close = rest[afterOpen...].firstIndex(of: "$"),
@@ -181,7 +181,27 @@ enum MathText {
         }
         result += rest
         return result
-            .replacingOccurrences(of: "\\(", with: "")
-            .replacingOccurrences(of: "\\)", with: "")
+    }
+
+    /// Translate `\( … \)` spans (LaTeX's inline delimiters — models emit them as often as
+    /// `$…$`). The old behavior stripped the delimiters but left the LaTeX inside raw.
+    private static func replacedParenSpans(_ line: String) -> String {
+        var result = ""
+        var rest = Substring(line)
+        while let open = rest.range(of: "\\(") {
+            result += rest[..<open.lowerBound]
+            let after = rest[open.upperBound...]
+            if let close = after.range(of: "\\)") {
+                result += unicode(String(after[..<close.lowerBound]))
+                rest = after[close.upperBound...]
+            } else {
+                // Unclosed mid-stream / truncated output: the opener itself is the strong
+                // math signal, so translate to end of line (the unterminated-fence rule).
+                result += unicode(String(after))
+                rest = Substring("")
+            }
+        }
+        result += rest
+        return result
     }
 }

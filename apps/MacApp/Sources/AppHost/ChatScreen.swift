@@ -139,10 +139,10 @@ struct ChatSettingsPanel: View {
                         Text("· \(model.decodingLine.lowercased()) · applies to every chat")
                             .font(.caption2).foregroundStyle(.tertiary)
                     }
-                    DecodingControls()
-                    Text("Speed only — output is identical in every mode. Applying reloads "
-                         + "the model in place.")
+                    DecodingControls(compact: true)
+                    Text("Speed only — output is identical in every mode.")
                         .font(.caption2).foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
                 }
                 Divider()
             }
@@ -201,6 +201,28 @@ struct ChatSettingsPanel: View {
                         .font(.caption2).foregroundStyle(.secondary)
                 }
             }
+
+            // Only for models whose template actually reads it (the server reports support
+            // in /health) — a control that silently does nothing is worse than none.
+            if model.supportsReasoningEffort {
+                VStack(alignment: .leading, spacing: 4) {
+                    Picker("Reasoning effort", selection: Binding(
+                        get: { model.chatSettings.reasoningEffort ?? "default" },
+                        set: { model.chatSettings.reasoningEffort = $0 == "default" ? nil : $0 }
+                    )) {
+                        Text("Model default").tag("default")
+                        Text("Low").tag("low")
+                        Text("Medium").tag("medium")
+                        Text("XHigh").tag("xhigh")
+                    }
+                    .disabled(!model.chatSettings.thinking)
+                    Text("How deeply the model thinks before answering. Changing it "
+                         + "restarts the conversation's prompt cache, so the next reply "
+                         + "prefills from scratch once.")
+                        .font(.caption2).foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
         }
         .padding(16)
         .frame(width: 340)
@@ -239,16 +261,38 @@ struct EmptyChat: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
-            Text("Ask anything.").font(.title3.weight(.medium))
-            if let pairing = model.pairingLine {
-                Text("\(pairing) — the drafter guesses ahead, the target verifies every "
-                     + "token, so this is faster with identical output.")
+            if model.isModelLoading {
+                // The window is up while the model loads; this is where the wait shows.
+                HStack(spacing: 10) {
+                    ProgressView().controlSize(.small)
+                    Text("Loading \(model.model.components(separatedBy: "/").last ?? model.model)")
+                        .font(.title3.weight(.medium))
+                }
+                Text(model.loadingDetail
+                     ?? "The first time a model runs, it downloads first — this can take a "
+                        + "few minutes. After that it's cached and starts in seconds.")
                     .foregroundStyle(.secondary)
-            }
-            if model.detail.showsLab {
-                Text("Open the Lab to watch acceptance live, or race the decoders on the "
-                     + "same prompt.")
+                EngineLogTail()
+            } else if !model.isServerReady {
+                Text("No model loaded.").font(.title3.weight(.medium))
+                Text("Pick one from the model menu in the toolbar, or browse everything "
+                     + "on the Models screen.")
                     .foregroundStyle(.secondary)
+                Button("Choose a model") { model.screen = .models }
+                    .buttonStyle(.borderedProminent)
+                    .padding(.top, 4)
+            } else {
+                Text("Ask anything.").font(.title3.weight(.medium))
+                if let pairing = model.pairingLine {
+                    Text("\(pairing) — the drafter guesses ahead, the target verifies every "
+                         + "token, so this is faster with identical output.")
+                        .foregroundStyle(.secondary)
+                }
+                if model.detail.showsLab {
+                    Text("Open the Lab to watch acceptance live, or race the decoders on the "
+                         + "same prompt.")
+                        .foregroundStyle(.secondary)
+                }
             }
         }
         .padding(.vertical, 40)

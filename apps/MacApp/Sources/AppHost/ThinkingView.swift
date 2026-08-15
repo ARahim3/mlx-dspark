@@ -17,6 +17,15 @@ struct ThinkingSplit {
 
     static func parse(_ text: String) -> ThinkingSplit {
         guard let open = text.range(of: "<think>") else {
+            // Prefilled-opener templates (Qwen3-2507 / Qwen3.8-class) generate only the
+            // closer — the opener sits in the prompt. The engine splits that into the
+            // reasoning channel now, but an older engine (or a saved session) streams it
+            // raw: everything before a dangling </think> is reasoning.
+            if let close = text.range(of: "</think>") {
+                return ThinkingSplit(reasoning: trimmed(String(text[..<close.lowerBound])),
+                                     answer: leadingTrimmed(String(text[close.upperBound...])),
+                                     thinking: false)
+            }
             return ThinkingSplit(reasoning: nil, answer: text, thinking: false)
         }
         let afterOpen = text[open.upperBound...]

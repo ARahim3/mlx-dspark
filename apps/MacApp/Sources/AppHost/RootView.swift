@@ -108,19 +108,33 @@ struct ModelPill: View {
                 }
             }
             Divider()
+            if model.isServerReady {
+                Button("Unload model") { Task { await model.unloadModel() } }
+            }
             Button("All models…") { model.screen = .models }
         } label: {
             HStack(spacing: 6) {
-                Circle()
-                    .fill(model.isServerReady ? Theme.verified : Theme.warning)
-                    .frame(width: 7, height: 7)
-                Text(model.health?.model ?? "starting…")
+                if model.isModelLoading {
+                    ProgressView().controlSize(.mini)
+                } else {
+                    Circle()
+                        .fill(model.isServerReady ? Theme.verified : Theme.warning)
+                        .frame(width: 7, height: 7)
+                }
+                Text(title)
                     .font(.callout.weight(.medium))
                     .lineLimit(1)
             }
         }
         .menuIndicator(.visible)
         .help("Switch model — the server and its port stay up")
+    }
+
+    private var title: String {
+        if model.isModelLoading {
+            return "Loading \(model.model.components(separatedBy: "/").last ?? model.model)…"
+        }
+        return model.health?.model ?? "No model — choose"
     }
 }
 
@@ -135,10 +149,16 @@ struct SidebarFooter: View {
         VStack(alignment: .leading, spacing: 6) {
             Divider()
             HStack(spacing: 6) {
-                Circle()
-                    .fill(model.isServerReady ? Theme.verified : Theme.warning)
-                    .frame(width: 6, height: 6)
-                Text(model.health?.model ?? "starting…")
+                if model.isModelLoading {
+                    ProgressView().controlSize(.mini)
+                } else {
+                    Circle()
+                        .fill(model.isServerReady ? Theme.verified : Theme.warning)
+                        .frame(width: 6, height: 6)
+                }
+                Text(model.isModelLoading
+                     ? "Loading \(model.model.components(separatedBy: "/").last ?? model.model)…"
+                     : model.health?.model ?? "No model")
                     .font(.caption).lineLimit(1).truncationMode(.middle)
             }
             if model.liveTokensPerSec > 0 {
@@ -304,48 +324,52 @@ struct LogPane: View {
     }
 }
 
-/// Shown while the chosen model loads. On a first download this is minutes, so it surfaces the
-/// engine's own log tail — honest progress beats a spinner that looks stuck. The download
-/// progress genuinely lands in that log (huggingface_hub writes it to stderr, which the
-/// supervisor captures).
+/// Shown only while the server process itself spawns (`--no-model`, a few seconds) — model
+/// loading happens *inside* the main window with inline progress, so a launch never parks the
+/// whole app behind a full-screen wait anymore.
 struct LoadingView: View {
     @EnvironmentObject private var model: AppModel
-
-    private var recentLog: [LogRow] {
-        Array(model.logLines.suffix(8))
-    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 18) {
             VStack(alignment: .leading, spacing: 6) {
                 HStack(spacing: 10) {
                     ProgressView().controlSize(.small)
-                    Text("Loading \(model.model.components(separatedBy: "/").last ?? model.model)")
+                    Text("Starting the engine")
                         .font(.system(size: 20, weight: .semibold))
                 }
-                Text(model.loadingDetail
-                     ?? "The first time a model runs, it downloads first — this can take a "
-                        + "few minutes. After that it's cached and starts in seconds.")
+                Text("A few seconds — the window opens before any model loads.")
                     .foregroundStyle(.secondary).font(.callout)
             }
-
-            if !recentLog.isEmpty {
-                VStack(alignment: .leading, spacing: 2) {
-                    ForEach(recentLog) { line in
-                        Text(line.text)
-                            .font(.system(size: 10, design: .monospaced))
-                            .foregroundStyle(.tertiary)
-                            .lineLimit(1).truncationMode(.middle)
-                    }
-                }
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .padding(10)
-                .background(.quaternary.opacity(0.25), in: RoundedRectangle(cornerRadius: 8))
-            }
+            EngineLogTail()
             Spacer()
         }
         .padding(28)
         .frame(maxWidth: .infinity, alignment: .leading)
+    }
+}
+
+/// The engine's own recent log lines. On a first model download the honest progress lives
+/// here (huggingface_hub writes it to stderr, which the supervisor captures) — a spinner
+/// alone looks stuck for minutes.
+struct EngineLogTail: View {
+    @EnvironmentObject private var model: AppModel
+
+    var body: some View {
+        let recent = Array(model.logLines.suffix(8))
+        if !recent.isEmpty {
+            VStack(alignment: .leading, spacing: 2) {
+                ForEach(recent) { line in
+                    Text(line.text)
+                        .font(.system(size: 10, design: .monospaced))
+                        .foregroundStyle(.tertiary)
+                        .lineLimit(1).truncationMode(.middle)
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(10)
+            .background(.quaternary.opacity(0.25), in: RoundedRectangle(cornerRadius: 8))
+        }
     }
 }
 

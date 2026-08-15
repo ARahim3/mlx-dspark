@@ -61,7 +61,11 @@ public actor ServerSupervisor {
 
         var args = ["serve", "--host", config.host, "--port", String(chosenPort),
                     "--mode", config.mode]
+        // No model = a deliberate fast start (`--no-model`): the server is up in seconds and
+        // a model loads later via /admin/load. Omitting the flag entirely would silently load
+        // the engine's default target instead.
         if let model = config.model { args.append(contentsOf: ["--model", model]) }
+        else { args.append("--no-model") }
         if let maxDraft = config.maxDraft { args.append(contentsOf: ["--max-draft", maxDraft]) }
         if let key = config.apiKey, !key.isEmpty { args.append(contentsOf: ["--api-key", key]) }
 
