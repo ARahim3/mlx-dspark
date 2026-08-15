@@ -45,7 +45,7 @@ from .generate import (
 )
 from .load import apply_wired_limit, load_dflash, load_drafter, load_target, resolve_mode
 from .lookup import lookup_generate
-from .prefix_cache import PrefixCache, target_cache_reusable
+from .prefix_cache import PrefixCache, _lcp, target_cache_reusable
 from .telemetry import RoundLog, RoundRecorder
 from .tools import normalize_tool_messages, parse_tool_calls, schema_types
 
@@ -127,6 +127,7 @@ class Engine:
         default_max_tokens: int = 2048,
         max_tokens_cap: int = 32768,
         prefix_cache_slots: int = 2,
+        prefix_cache_rungs: int = 8192,
         lookup_drafts: bool = True,
         lookup_long_draft: int = 32,
         wired_limit: bool = False,
@@ -147,6 +148,9 @@ class Engine:
         self.default_max_tokens = default_max_tokens
         self.max_tokens_cap = max_tokens_cap
         self.prefix_cache_slots = max(1, prefix_cache_slots)
+        self.prefix_cache_rungs = max(0, prefix_cache_rungs)  # interior-snapshot spacing
+        #   (tokens) for checkpoint-mode prefix caching; 0 disables rungs (see prefix_cache)
+        self._boundary_probes_cache = None                 # [(gen-suffix tail ids, unstable)]
         self.lookup_drafts = lookup_drafts                 # hybrid n-gram drafts in dspark mode
         self.lookup_long_draft = lookup_long_draft         # match-scaled long-draft ceiling
         self.context_window = context_window               # target's trained positions, if known
@@ -197,6 +201,59 @@ class Engine:
                            l2_dir=l2_dir, max_ram_bytes=max(0, max_ram_mb) * 1024 * 1024,
                            slots=self.prefix_cache_slots, checkpoint=checkpoint)
 
+    def _boundary_probes(self) -> list[tuple[list[int], int]]:
+        """Per-chat-template measurement of the *stable prompt boundary* for checkpoint-mode
+        prefix caching: how many trailing tokens of a rendered prompt do NOT survive into the
+        next turn's re-rendered transcript. Qwen3.6-class templates prefill a ``<think>``
+        opener whose tail the completed turn renders differently, so a snapshot taken at the
+        full prompt boundary can never be hit by turn N+1 — it misses by exactly these 2-4
+        tokens (the CLAUDE.md "lever 3 does not fire on Qwen3.6" finding, now healed at
+        runtime instead of documented).
+
+        Probed empirically from the template itself — render a tiny turn with the generation
+        prompt, then re-render it completed plus a next user turn, and diff the tails — once
+        per thinking-flag variant, since ``enable_thinking`` changes the suffix. Returns
+        ``[(generation-suffix tail ids, unstable count)]``, longest tail first; a request is
+        matched to its variant by comparing its prompt tail against the probes' tails."""
+        if self._boundary_probes_cache is not None:
+            return self._boundary_probes_cache
+        probes: dict[tuple, int] = {}
+        if getattr(self.tokenizer, "chat_template", None):
+            msgs = [{"role": "user", "content": "a"}]
+            # both reply shapes: some templates re-render a thinking reply differently
+            replies = ["b", "T</think>\n\nA"]
+            for kw in ({}, {"enable_thinking": True}, {"enable_thinking": False}):
+                try:
+                    kw = {**self.template_defaults, **kw}
+                    p = encode_messages(self.tokenizer, msgs, **kw)
+                    ng = encode_messages(self.tokenizer, msgs,
+                                         add_generation_prompt=False, **kw)
+                    g = len(p) - _lcp(p, ng)          # generation-prompt suffix length
+                    u = 0
+                    for reply in replies:
+                        nxt = encode_messages(
+                            self.tokenizer,
+                            msgs + [{"role": "assistant", "content": reply},
+                                    {"role": "user", "content": "c"}], **kw)
+                        u = max(u, len(p) - _lcp(p, nxt))
+                    if 0 < g <= 64 and u <= 64:       # sane template; tail is matchable
+                        tail = tuple(p[len(p) - g:])
+                        probes[tail] = max(probes.get(tail, 0), u)
+                except Exception:  # noqa: BLE001 — a probe failure just means fallback u=1
+                    continue
+        self._boundary_probes_cache = sorted(
+            ([list(t), u] for t, u in probes.items()), key=lambda x: -len(x[0]))
+        return self._boundary_probes_cache
+
+    def _unstable_suffix(self, prompt_ids: list[int]) -> int:
+        """Trailing tokens of THIS prompt that won't survive re-rendering (>= 1 — snapshotting
+        at least one token below the boundary is also what makes a byte-identical repeat a
+        hit: the loop re-forwards the tail and gets the logits a boundary snapshot can't)."""
+        for tail, u in self._boundary_probes():
+            if len(prompt_ids) > len(tail) and prompt_ids[-len(tail):] == tail:
+                return max(1, u)
+        return 1
+
     @property
     def is_muse(self) -> bool:
         """True for muse_glimmer targets, whose "Onyx ATEM" harmony output needs the recipient-
@@ -228,6 +285,7 @@ class Engine:
         default_top_p: float | None = None,
         default_top_k: int | None = None,
         prefix_cache_slots: int = 2,
+        prefix_cache_rungs: int = 8192,
         lookup_drafts: bool | None = None,       # None = this pair's registry default
         lookup_long_draft: int = 32,
         wired_limit: bool = False,
@@ -318,7 +376,8 @@ class Engine:
                    cap_controller=cap_controller,
                    sampling_defaults=sampling_defaults,
                    default_max_tokens=default_max_tokens, max_tokens_cap=max_tokens_cap,
-                   prefix_cache_slots=prefix_cache_slots, lookup_drafts=lookup_drafts,
+                   prefix_cache_slots=prefix_cache_slots,
+                   prefix_cache_rungs=prefix_cache_rungs, lookup_drafts=lookup_drafts,
                    lookup_long_draft=lookup_long_draft,
                    wired_limit=wired_limit,
                    context_window=context_window or _context_window(target_repo),
@@ -354,13 +413,35 @@ class Engine:
         cache = ctx = None
         reuse_len = 0
         on_prefill = None
+        prefill_marks = None
         if self.prefix is not None:
             cache, ctx, reuse_len = self.prefix.acquire(prompt_ids)
             if self.prefix.wants_checkpoint():
-                # snapshot at the prompt boundary (the only moment the caches hold exactly
-                # the prompt) — the reuse path for caches that cannot be trimmed back
-                def on_prefill(c, x, n, _ids=prompt_ids):
-                    self.prefix.checkpoint(c, x, n, _ids)
+                # Snapshot at the STABLE prompt boundary (prompt minus the template's
+                # re-render-unstable tail — see _boundary_probes; also >= 1 below the
+                # boundary so an identical repeat hits), plus interior rungs every
+                # `prefix_cache_rungs` tokens and at the anchor acquire() suggested, so
+                # requests that diverge mid-prompt (new session on the same system prompt,
+                # compacted history) can partially reuse instead of missing outright.
+                n = len(prompt_ids)
+                stable = n - self._unstable_suffix(prompt_ids)
+                marks = set()
+                if self.prefix_cache_rungs:
+                    marks.update(range(self.prefix_cache_rungs, stable,
+                                       self.prefix_cache_rungs))
+                anchor = self.prefix.take_anchor()
+                if anchor:
+                    marks.add(anchor)
+                marks = {m for m in marks if reuse_len < m < stable}
+                if stable > reuse_len and stable >= self.prefix.min_reuse:
+                    marks.add(stable)
+                prefill_marks = sorted(marks)
+
+                def on_prefill(c, x, pos, _ids=prompt_ids, _stable=stable):
+                    if pos == _stable:
+                        self.prefix.checkpoint(c, x, pos, _ids)
+                    elif pos < _stable:
+                        self.prefix.rung(c, pos)
         try:
             if self.mode == "dspark":
                 res = speculative_generate(
@@ -373,7 +454,7 @@ class Engine:
                     temperature=temperature, top_p=top_p, top_k=top_k,
                     presence_penalty=presence_penalty, frequency_penalty=frequency_penalty,
                     logprobs=logprobs, seed=seed, stop=stop, on_text=on_text,
-                    on_round=on_round, on_prefill=on_prefill,
+                    on_round=on_round, on_prefill=on_prefill, prefill_marks=prefill_marks,
                 )
             elif self.mode == "dflash":
                 res = dflash_generate(
@@ -391,7 +472,7 @@ class Engine:
                     long_draft_tokens=max(self.max_draft_tokens or 6, self.lookup_long_draft),
                     temperature=temperature, top_p=top_p, top_k=top_k,
                     seed=seed, stop=stop, on_text=on_text, on_round=on_round,
-                    on_prefill=on_prefill,
+                    on_prefill=on_prefill, prefill_marks=prefill_marks,
                 )
             else:
                 res = greedy_generate(
@@ -401,7 +482,7 @@ class Engine:
                     top_k=top_k, presence_penalty=presence_penalty,
                     frequency_penalty=frequency_penalty, logprobs=logprobs, seed=seed,
                     stop=stop, on_text=on_text, on_round=on_round,
-                    on_prefill=on_prefill,
+                    on_prefill=on_prefill, prefill_marks=prefill_marks,
                 )
         except BaseException:                     # never leave a desynced cache behind
             if self.prefix is not None:

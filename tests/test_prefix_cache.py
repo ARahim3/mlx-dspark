@@ -346,3 +346,194 @@ def test_checkpoint_restores_ctx_caches_too():
     _, got_ctx, reuse = pc.acquire(prompt + [7])
     assert reuse == len(prompt)
     assert got_ctx is not None and len(got_ctx) == len(ctx)
+
+
+# --- stable boundary, rungs, anchors: partial checkpoint reuse ---------------------------
+
+
+class TrimStateCache:
+    """A trimmable layer with real state (a hybrid target's attention KVCache stand-in)."""
+
+    def __init__(self):
+        self.offset = 0
+
+    def feed(self, n):
+        self.offset += n
+
+    def is_trimmable(self):
+        return True
+
+    def trim(self, n):
+        n = min(n, self.offset)
+        self.offset -= n
+        return n
+
+    @property
+    def state(self):
+        return [f"kv@{self.offset}"]
+
+    @state.setter
+    def state(self, v):
+        self.offset = int(str(v[0]).split("@")[1])
+
+    @property
+    def meta_state(self):
+        return ""
+
+    @meta_state.setter
+    def meta_state(self, v):
+        pass
+
+
+def _mk_mixed():
+    return [TrimStateCache(), LinearStateCache()]
+
+
+def _feed(cache, n):
+    for c in cache:
+        c.feed(n)
+
+
+def test_checkpoint_below_boundary_makes_identical_repeat_hit():
+    """The server snapshots at the STABLE boundary (>= 1 token below the prompt); a
+    byte-identical repeat then reuses it and re-forwards the tail — the issue-#7 turn 2."""
+    pc = PrefixCache(_mk_hybrid, None, min_reuse=4, checkpoint=True)
+    prompt = list(range(20))
+    cache, _, reuse = pc.acquire(prompt)
+    assert reuse == 0
+    _feed(cache, 19)
+    pc.checkpoint(cache, None, 19, prompt)          # stable boundary = n - 1
+    got, _, reuse = pc.acquire(list(prompt))        # byte-identical request
+    assert reuse == 19
+    assert got[0].state == ["state@19", "conv@19"]
+
+
+def test_rung_partial_reuse_restores_captured_state_and_trims_the_rest():
+    pc = PrefixCache(_mk_mixed, None, min_reuse=4, checkpoint=True)
+    prompt = list(range(21))
+    cache, _, _ = pc.acquire(prompt)
+    _feed(cache, 8)
+    pc.rung(cache, 8)                               # interior mark mid-prefill
+    _feed(cache, 12)                                # ... prefill continues to 20
+    pc.checkpoint(cache, None, 20, prompt)
+    # a request that diverges at position 10 reuses the deepest rung under the divergence
+    fan_out = prompt[:10] + [777] * 15
+    got, _, reuse = pc.acquire(fan_out)
+    assert reuse == 8
+    assert pc.partial_hits == 1
+    assert got[1].state == ["state@8", "conv@8"]    # recurrent layer: from the rung
+    assert got[0].offset == 8                       # trimmable layer: boundary snapshot trimmed
+    # the boundary itself still works for a proper extension
+    _, _, reuse = pc.acquire(prompt + [9, 9])
+    assert reuse == 20
+
+
+def test_rung_is_refused_when_an_uncaptured_layer_cannot_trim():
+    """A rotating layer that was linear (not captured) at rung time but wrapped by the
+    boundary snapshot can't be rolled back to the rung — must miss, not corrupt."""
+
+    class RotStateCache(RealRotatingKVCache):
+        @property
+        def state(self):
+            return [f"rot@{self.offset}"]
+
+        @state.setter
+        def state(self, v):
+            self.offset = int(str(v[0]).split("@")[1])
+
+        @property
+        def meta_state(self):
+            return ""
+
+        @meta_state.setter
+        def meta_state(self, v):
+            pass
+
+        def feed(self, n):
+            self.offset += n
+
+    def mk():
+        return [RotStateCache(max_size=15), LinearStateCache()]
+
+    pc = PrefixCache(mk, None, min_reuse=4, checkpoint=True)
+    prompt = list(range(21))
+    cache, _, _ = pc.acquire(prompt)
+    _feed(cache, 8)
+    pc.rung(cache, 8)                               # rotating still linear -> not captured
+    _feed(cache, 12)                                # by 20 it has wrapped (max_size 15)
+    pc.checkpoint(cache, None, 20, prompt)
+    _, _, reuse = pc.acquire(prompt[:10] + [777] * 15)
+    assert reuse == 0                               # refused, fresh caches
+    _, _, reuse = pc.acquire(prompt + [9])          # boundary reuse is unaffected
+    assert reuse == 20
+
+
+def test_new_boundary_supersedes_old_slot_into_a_rung():
+    """Turn N+1's checkpoint collapses turn N's slot into a rung of the new slot: one slot
+    per conversation carrying a ladder of past boundaries."""
+    pc = PrefixCache(_mk_mixed, None, min_reuse=4, checkpoint=True)
+    t1 = list(range(20))
+    cache, _, _ = pc.acquire(t1)
+    _feed(cache, 19)
+    pc.checkpoint(cache, None, 19, t1)
+    t2 = t1 + list(range(100, 120))                 # turn 2 extends turn 1
+    cache, _, reuse = pc.acquire(t2)
+    assert reuse == 19
+    _feed(cache, len(t2) - 1 - reuse)
+    pc.checkpoint(cache, None, len(t2) - 1, t2)
+    info = pc.info()
+    assert len(info["slots"]) == 1                  # old slot collapsed, not evicted
+    assert info["slots"][0]["rungs"] == [19]
+    # a new session sharing only turn 1's prompt partially reuses at the old boundary
+    _, _, reuse = pc.acquire(t1 + [555] * 30)
+    assert reuse == 19
+    assert pc.partial_hits == 1
+
+
+def test_anchor_suggested_on_miss_and_heals_the_fan_out():
+    pc = PrefixCache(_mk_mixed, None, min_reuse=4, checkpoint=True)
+    sys_prefix = list(range(30))
+    a = sys_prefix + [100] * 10
+    cache, _, _ = pc.acquire(a)
+    assert pc.take_anchor() == 0                    # nothing cached yet
+    _feed(cache, len(a) - 1)
+    pc.checkpoint(cache, None, len(a) - 1, a)
+    b = sys_prefix + [200] * 10                     # same system prompt, new user turn
+    cache, _, reuse = pc.acquire(b)
+    assert reuse == 0                               # miss: no rung at the divergence yet
+    anchor = pc.take_anchor()
+    assert anchor == len(sys_prefix)                # ...but acquire noticed the shared prefix
+    assert pc.take_anchor() == 0                    # one-shot
+    _feed(cache, anchor)
+    pc.rung(cache, anchor)                          # server marks the anchor during prefill
+    _feed(cache, len(b) - 1 - anchor)
+    pc.checkpoint(cache, None, len(b) - 1, b)
+    c = sys_prefix + [300] * 10                     # third fan-out request now hits the rung
+    _, _, reuse = pc.acquire(c)
+    assert reuse == len(sys_prefix)
+    assert pc.partial_hits == 1
+
+
+def test_rung_ladder_is_capped():
+    pc = PrefixCache(_mk_mixed, None, min_reuse=1, checkpoint=True, max_rungs=3)
+    prompt = list(range(50))
+    cache, _, _ = pc.acquire(prompt)
+    for pos in range(5, 45, 5):
+        _feed(cache, pos - (pos - 5))
+        pc.rung(cache, pos)
+    pc.checkpoint(cache, None, 49, prompt)
+    rungs = pc.info()["slots"][0]["rungs"]
+    assert len(rungs) == 3
+    assert 40 in rungs                              # the spread survives, not just the newest
+
+
+def test_failed_generation_drops_pending_rungs():
+    pc = PrefixCache(_mk_mixed, None, min_reuse=4, checkpoint=True)
+    prompt = list(range(20))
+    cache, _, _ = pc.acquire(prompt)
+    _feed(cache, 8)
+    pc.rung(cache, 8)                               # generation dies before checkpoint()
+    cache2, _, _ = pc.acquire(list(range(300, 320)))  # next acquire clears the stale rungs
+    _feed(cache2, 19)
+    pc.checkpoint(cache2, None, 19, list(range(300, 320)))
+    assert "rungs" not in pc.info()["slots"][0]

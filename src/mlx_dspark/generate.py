@@ -406,6 +406,7 @@ def greedy_generate(
     on_text=None,
     on_round=None,
     on_prefill=None,
+    prefill_marks=None,
 ) -> GenResult:
     """Plain decoding of the target (no drafter, no hidden-state capture) — the fair
     'run the model normally' baseline. ``temperature`` 0 = greedy, > 0 = sampling (matches
@@ -426,7 +427,9 @@ def greedy_generate(
 
     t0 = time.time()
     suffix = ids[reuse_len:] if reuse_len else ids      # only prefill past the reused prefix
-    logits = _prefill_plain(target_model, suffix, cache)
+    logits = _prefill_plain(
+        target_model, suffix, cache, base=reuse_len, marks=prefill_marks,
+        on_mark=(lambda p: on_prefill(cache, None, p)) if on_prefill else None)
     if on_prefill is not None:
         on_prefill(cache, None, len(ids))   # caches hold exactly `ids` right now
     out_ids: list[int] = []
@@ -671,38 +674,62 @@ def _cache_arrays(cache) -> list:
     return [v for _, v in tree_flatten(states) if isinstance(v, mx.array)]
 
 
-def _prefill_plain(target, ids: list[int], cache, chunk: int | None = None):
-    """Chunked no-tap prefill; returns the last chunk's logits [1, 1, V]."""
+def _mark_stops(marks, base: int, n: int) -> list[int]:
+    """Suffix-relative positions the chunked prefill must break at so the caches hold
+    exactly ``base + stop`` tokens there (``marks`` are absolute prompt positions; the
+    prompt boundary itself is not a stop — the loop's final on_prefill covers it)."""
+    return sorted({m - base for m in (marks or ()) if 0 < m - base < n})
+
+
+def _prefill_plain(target, ids: list[int], cache, chunk: int | None = None,
+                   base: int = 0, marks=None, on_mark=None):
+    """Chunked no-tap prefill; returns the last chunk's logits [1, 1, V]. ``marks``
+    (absolute positions, with ``base`` = tokens already in the caches) split chunks so
+    ``on_mark(pos)`` runs while the caches hold exactly the first ``pos`` tokens — the
+    prefix cache snapshots its interior boundaries there."""
     chunk = chunk or PREFILL_CHUNK      # read the module knob at call time
+    stops = _mark_stops(marks, base, len(ids))
     logits = None
-    many = len(ids) > chunk
+    many = len(ids) > chunk or bool(stops)
     with wide_matmul(WIDE_GEMM_MIN_ROWS, WIDE_GEMM_SHAPES):
-        for i in range(0, len(ids), chunk):
-            last = i + chunk >= len(ids)
-            logits, _ = target.prefill(mx.array([ids[i:i + chunk]]), cache,
+        i = 0
+        while i < len(ids):
+            end = min(i + chunk, len(ids))
+            end = min([end] + [s for s in stops if i < s < end])
+            last = end == len(ids)
+            logits, _ = target.prefill(mx.array([ids[i:end]]), cache,
                                        want_logits=last,
                                        head_last_row=PREFILL_LAST_ROW_HEAD)
             if many and not last:
                 mx.eval(_cache_arrays(cache))
                 mx.clear_cache()
+            if on_mark is not None and end in stops:
+                on_mark(base + end)
+            i = end
     return logits
 
 
 def _prefill_tapped(target, ids: list[int], cache, tap, drafter=None, ctx_caches=None,
-                    ctx_offset: int = 0, chunk: int | None = None):
+                    ctx_offset: int = 0, chunk: int | None = None,
+                    marks=None, on_mark=None):
     """Chunked prefill with the hidden-state tap. When ``drafter`` is given, each chunk's
     fused states feed the drafter context immediately (so a long prompt's fused activations
     never all materialize at once); returns (last logits, last chunk's fused). Without a
-    drafter the fused chunks are concatenated (DFlash needs the whole prompt's fused)."""
+    drafter the fused chunks are concatenated (DFlash needs the whole prompt's fused).
+    ``marks``/``on_mark``: see :func:`_prefill_plain` (``ctx_offset`` is the base)."""
     chunk = chunk or PREFILL_CHUNK      # read the module knob at call time
+    stops = _mark_stops(marks, ctx_offset, len(ids))
     logits = fused = None
     parts = []
     pos = ctx_offset
-    many = len(ids) > chunk
+    many = len(ids) > chunk or bool(stops)
     with wide_matmul(WIDE_GEMM_MIN_ROWS, WIDE_GEMM_SHAPES):
-        for i in range(0, len(ids), chunk):
-            piece = ids[i:i + chunk]
-            last = i + chunk >= len(ids)
+        i = 0
+        while i < len(ids):
+            end = min(i + chunk, len(ids))
+            end = min([end] + [s for s in stops if i < s < end])
+            piece = ids[i:end]
+            last = end == len(ids)
             logits, fused = target.prefill(mx.array([piece]), cache, tap,
                                            want_logits=last,
                                            head_last_row=PREFILL_LAST_ROW_HEAD)
@@ -717,6 +744,9 @@ def _prefill_tapped(target, ids: list[int], cache, tap, drafter=None, ctx_caches
                 mx.eval(_cache_arrays(cache),
                         [c.k for c in ctx_caches] if ctx_caches else fused)
                 mx.clear_cache()
+            if on_mark is not None and end in stops:
+                on_mark(ctx_offset + end)
+            i = end
     if drafter is None:
         fused = parts[0] if len(parts) == 1 else mx.concatenate(parts, axis=1)
     return logits, fused
@@ -783,6 +813,7 @@ def speculative_generate(
     on_text=None,
     on_round=None,
     on_prefill=None,
+    prefill_marks=None,
     verbose: bool = False,
 ) -> GenResult:
     """Speculative decoding (batch=1).
@@ -861,8 +892,10 @@ def speculative_generate(
     # --- prefill (only the suffix past any reused prefix; chunked, feeding the drafter
     # context per chunk so long prompts never materialize all fused states at once) ---
     suffix = ids[reuse_len:] if reuse_len else ids
-    logits, _ = _prefill_tapped(target_model, suffix, cache, tap,
-                                drafter=drafter, ctx_caches=ctx_caches, ctx_offset=reuse_len)
+    logits, _ = _prefill_tapped(
+        target_model, suffix, cache, tap,
+        drafter=drafter, ctx_caches=ctx_caches, ctx_offset=reuse_len, marks=prefill_marks,
+        on_mark=(lambda p: on_prefill(cache, ctx_caches, p)) if on_prefill else None)
     if on_prefill is not None:
         on_prefill(cache, ctx_caches, len(ids))   # caches hold exactly `ids` right now
     n_cached = len(ids)

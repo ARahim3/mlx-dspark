@@ -213,3 +213,48 @@ def test_eos_filters_unknown_markers_to_unk():
     ids = eos_token_ids(_MarkerTok({"<|im_end|>": 151645}))
     assert 151645 in ids
     assert 3 not in ids              # everything else resolves to unk and is dropped
+
+
+# --- prefill marks: mid-prefill snapshot positions for checkpoint prefix caching ---------
+
+
+def test_mark_stops_are_suffix_relative_and_interior():
+    from mlx_dspark.generate import _mark_stops
+
+    assert _mark_stops([8, 16, 24], base=5, n=15) == [3, 11]   # 24-5=19 > 15 excluded...
+    assert _mark_stops(None, base=0, n=10) == []
+    assert _mark_stops([5], base=5, n=10) == []                # at the base: nothing to split
+    assert _mark_stops([15], base=5, n=10) == []               # the end is not a mark stop
+
+
+def test_prefill_plain_splits_chunks_at_marks_and_reports_positions():
+    import mlx.core as mx
+
+    from mlx_dspark.generate import _prefill_plain
+
+    class Layer:
+        def __init__(self):
+            self.offset = 0
+
+    class Tgt:
+        def __init__(self):
+            self.chunks = []
+
+        def prefill(self, ids, cache, tap=None, want_logits=True, head_last_row=True):
+            n = ids.shape[1]
+            self.chunks.append(n)
+            for c in cache:
+                c.offset += n
+            return (mx.zeros((1, 1, 4)) if want_logits else None), None
+
+    tgt = Tgt()
+    cache = [Layer()]
+    seen = []
+    ids = list(range(100, 112))                     # 12 suffix tokens after base 5
+    _prefill_plain(tgt, ids, cache, chunk=8, base=5, marks=[8, 14],
+                   on_mark=lambda p: seen.append((p, cache[0].offset)))
+    # chunks split at the marks (8-5=3, 14-5=9); chunk is a max piece size, not a grid
+    assert tgt.chunks == [3, 6, 3]
+    # on_mark fires with the caches holding exactly the first `pos` tokens (offset is
+    # suffix-relative here: 3 and 9 of the 12)
+    assert seen == [(8, 3), (14, 9)]

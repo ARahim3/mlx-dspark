@@ -426,3 +426,57 @@ def test_race_thinking_param_validated_and_echoed(server):
                 stream=True)
     start = next(line for line in out.splitlines() if line.startswith("data:"))
     assert "thinking" not in json.loads(start[5:])
+
+
+# --- checkpoint-mode boundary probes (stable prompt boundary per chat template) ----------
+
+
+class _ThinkTok:
+    """Qwen3.6-shaped template double: the generation prompt appends a `<think>` opener
+    (tokens 91, 92) that a completed turn re-renders WITHOUT — the stable boundary sits
+    2 tokens below the prompt boundary."""
+
+    chat_template = "fake"
+
+    def apply_chat_template(self, messages, add_generation_prompt=True, **kw):
+        role = {"system": 1, "user": 2, "assistant": 3}
+        out = []
+        for m in messages:
+            out += [10, role.get(m.get("role"), 4)]
+            out += [ord(c) % 40 + 100 for c in str(m.get("content", ""))]
+            out += [11]
+        if add_generation_prompt:
+            out += [10, 3, 91, 92]
+        return out
+
+    def encode(self, text):
+        return [ord(c) % 40 + 100 for c in text]
+
+    def decode(self, ids):
+        return "".join(chr(int(i)) for i in ids)
+
+
+class _NullTarget:
+    def make_cache(self):
+        return []
+
+
+def _probe_engine(tok):
+    return S.Engine(_NullTarget(), tok, None, mode="baseline", model_id="m",
+                    target_repo="t", drafter_repo=None, max_draft_tokens=None,
+                    prefix_cache=False)
+
+
+def test_unstable_suffix_probed_from_the_template():
+    eng = _probe_engine(_ThinkTok())
+    prompt = eng.tokenizer.apply_chat_template([{"role": "user", "content": "hello"}])
+    assert prompt[-2:] == [91, 92]
+    assert eng._unstable_suffix(prompt) == 2        # the <think> opener doesn't survive
+    # a prompt that doesn't end in this template's generation suffix: conservative 1
+    assert eng._unstable_suffix(prompt[:-2] + [55, 56]) == 1
+
+
+def test_unstable_suffix_defaults_to_one_without_a_template():
+    eng = _probe_engine(_FakeTok())                 # no chat_template attribute
+    assert eng._boundary_probes() == []
+    assert eng._unstable_suffix([1, 2, 3, 4]) == 1

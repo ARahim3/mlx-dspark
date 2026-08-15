@@ -315,6 +315,12 @@ def cmd_serve(argv: list[str]) -> None:
     ap.add_argument("--prefix-cache-slots", type=int, default=2,
                     help="number of conversations kept in the prefix cache LRU (default 2, "
                          "so an agent and a chat don't evict each other every turn)")
+    ap.add_argument("--prefix-cache-rungs", type=int, default=8192, metavar="N",
+                    help="checkpoint-mode prefix caching (hybrid/recurrent targets, wrapped "
+                         "gemma-4): also snapshot the recurrent state every N prompt tokens, "
+                         "so a request that diverges mid-prompt (new session on the same "
+                         "system prompt, compacted history) partially reuses the cache "
+                         "instead of missing outright (default 8192; 0 disables)")
     ap.add_argument("--lookup-drafts", action=argparse.BooleanOptionalAction, default=None,
                     help="hybrid n-gram drafting inside dspark mode. Unset = each loaded "
                          "pair's measured default (re-resolved on every /admin/load swap); "
@@ -358,6 +364,7 @@ def cmd_serve(argv: list[str]) -> None:
         "default_top_p": args.default_top_p,
         "default_top_k": args.default_top_k,
         "prefix_cache_slots": args.prefix_cache_slots,
+        "prefix_cache_rungs": args.prefix_cache_rungs,
         "lookup_drafts": args.lookup_drafts,     # None = per-pair registry default
         "lookup_long_draft": args.lookup_long_draft,
         "wired_limit": args.wired_limit,
