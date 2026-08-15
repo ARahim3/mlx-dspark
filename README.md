@@ -69,6 +69,12 @@ methodology live in the numbered footnotes at the end of this page — click a m
 unquantized matmul pays a ~2× cost cliff at verify width 2). Details in
 [Results at a glance](#results-at-a-glance).</sub>
 
+<sub>Nothing in this table is hand-tuned per model, and none of it is pinned to this M4 Pro:
+with no `--max-draft`, mlx-dspark measures **your** machine's verify/drafter cost curves once
+(~5 s, cached per model + quant + mlx version) and derives the draft cap from them — an M1 or
+an M5 gets *its own* optimum, not the one these rows were measured at. `--max-draft auto`
+additionally adapts the cap per round while generating. See [Tuning](#tuning).</sub>
+
 **Copy-heavy code editing goes further:** when the model re-emits or refactors code already in its
 context (the daily agent/assistant workload), match-scaled lookup drafts reach **4.5× on Gemma-12B**
 (75 tok/s) and **3.6× on Ornith-9B** (93 tok/s). Any model *not* listed still gets drafter-free
@@ -118,7 +124,10 @@ library.
 ## Quickstart
 
 You name the **target model** (`--model`, an HF repo or local path, exactly like `mlx-lm`); the matching
-drafter is resolved automatically for known targets (see [Models](#models)), or pass `--drafter`.
+drafter is resolved automatically for known targets (see [Models](#models)), or pass `--drafter`. There
+are no speed knobs you need to set: the draft cap **auto-calibrates to your machine** on first run
+(~5 s, cached — see [Tuning](#tuning)), and registered pairs ship their measured-best configuration
+as the default.
 
 ### Serve an API (OpenAI **and** Anthropic on one port)
 
@@ -621,21 +630,35 @@ picked automatically — you don't choose:
 
 - **Trim** (dense targets, e.g. Qwen3): the cache is trimmed back to the shared prefix and the rest
   re-prefilled. For **Gemma-4** (rotating KV cache) this is exact only until the window first wraps.
-- **Checkpoint** (since 0.7.0): the cache is snapshotted at the prompt boundary and reused *whole*
-  when a later prompt extends it. Because it never trims, it works where trim mode structurally
-  cannot — **hybrid targets** (Ornith, Bonsai, Qwen3.6-27B), whose recurrent state can't be rolled
-  back, and gemma-4 after its window wraps. Measured **5.5× on turn 2** (Ornith-1.0-9B: 1.15 s vs
-  6.30 s, 2420 of 2483 tokens reused), output token-identical to a cold run.
+- **Checkpoint** (since 0.7.0, reworked in 0.10.1): the cache is snapshotted at boundaries and
+  reused when a later prompt reaches one. Because it never trims the recurrent state, it works
+  where trim mode structurally cannot — **hybrid targets** (Ornith, Bonsai, Qwen3.6/3.8-27B),
+  whose recurrent state can't be rolled back, and gemma-4 after its window wraps. Measured
+  **5.5× on turn 2** (Ornith-1.0-9B: 1.15 s vs 6.30 s, 2420 of 2483 tokens reused), output
+  token-identical to a cold run.
 
-**Checkpoint reuse is all-or-nothing**, so the next prompt has to extend the previous one *exactly*.
-That makes it a property of the model's **chat template**, not just its cache type: templates that
-prefill a `<think>` opener into the generation prompt don't reproduce it when re-rendering the
-finished turn, and miss by those few tokens. Measured — Ornith-1.0-9B reuses under `--no-thinking`;
-Qwen3.6-27B misses either way (by 2 tokens with thinking on, 4 with `--no-thinking`). A miss costs
-nothing: it falls back to a normal prefill (measured 1.00×, identical output).
+Checkpoint reuse used to be all-or-nothing at the exact prompt boundary, which in practice meant
+it almost never fired (issue #7): thinking-style chat templates re-render the `<think>` opener so
+turn N+1 misses the boundary by 2–4 tokens, and a byte-identical retry couldn't hit at all. The
+server now measures each **chat template's** stable boundary at runtime and snapshots there, and
+adds two partial-reuse mechanisms for hybrid recurrent targets:
+
+- **Rungs** — every `--prefix-cache-rungs` tokens (default 8192) the *recurrent* state (small
+  and fixed-size) is also snapshotted mid-prefill; the attention KV and drafter context are
+  trimmable, so a request that diverges mid-prompt (a new session on the same system prompt,
+  compacted history) reuses the cache up to the nearest rung instead of missing outright.
+- **Anchors** — a miss that shared a long prefix with a cached conversation plants a rung at the
+  exact divergence point, so the next request of that shape hits it.
+
+Measured (Qwen3.8-27B-4bit, ~8k-token system prompt, M4 Pro): time-to-first-token 62 s cold →
+**0.21 s** on an identical retry, **1.05 s** on the next conversation turn, **0.53 s** for a
+"same system prompt, new user" request after its anchor is planted — with outputs byte-identical
+to the uncached server. Restores are bit-exact (validated array-for-array on device); a miss
+still costs nothing.
 
 Flags: `--no-prefix-cache`, `--prefix-cache-slots N` (LRU slots so a chat and
-an agent don't evict each other, default 2), and `--prefix-cache-dir DIR` + `--prefix-cache-max-ram-mb N`
+an agent don't evict each other, default 2), `--prefix-cache-rungs N` (partial-reuse spacing,
+0 disables), and `--prefix-cache-dir DIR` + `--prefix-cache-max-ram-mb N`
 for the optional SSD spill tier on very long contexts.
 
 ---

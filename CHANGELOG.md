@@ -4,6 +4,28 @@ All notable changes to `mlx-dspark`. Versions follow [SemVer](https://semver.org
 
 ## [Unreleased]
 
+## [0.10.1] — 2026-08-15 — the prefix cache actually hits: stable boundaries + hybrid partial reuse
+
+### Fixed
+- **Checkpoint-mode prefix caching (hybrid/recurrent targets, wrapped gemma-4) never hit in
+  practice** (#7): the snapshot sat at the exact prompt boundary, so a byte-identical repeat
+  could not hit (no token left to forward), and Qwen3.6/3.8-class chat templates re-render the
+  `<think>` generation tail so real multi-turn requests missed by 1–4 tokens. The server now
+  probes each template's *stable* boundary at runtime and snapshots there. Measured
+  (Qwen3.8-27B-4bit, ~8k-token system prompt): TTFT 62 s → **0.21 s** on an identical repeat,
+  **1.05 s** on a multi-turn extension; outputs byte-identical to the uncached run.
+
+### Added
+- **Partial prefix reuse for hybrid GDN/Mamba targets** — interior "rungs" snapshot only the
+  recurrent layer state every `--prefix-cache-rungs` tokens (default 8192; the attention KV and
+  drafter ctx are trimmed from the boundary snapshot), so a request that diverges mid-prompt
+  (new session on the same system prompt, compacted history) partially reuses the cache instead
+  of missing outright. Misses with a long shared prefix stage an **anchor** rung at the exact
+  divergence point, so the next request from that fan-out hits (measured 0.53 s TTFT vs 60 s).
+  Restore is bit-exact (validated array-for-array on Qwen3.8-27B). A conversation now collapses
+  into one slot carrying a ladder of past boundaries instead of a chain of slots. `/metrics`
+  reports `partial_hits` and per-slot `rungs`.
+
 ## [0.10.0] — 2026-08-15 — Qwen3.8-27B (SpecForge drafters) + per-pair defaults
 
 First PyPI upload since 0.8.1 — it carries **0.9.0 below as well** (the server control plane +
