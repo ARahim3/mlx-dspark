@@ -20,7 +20,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 APP_NAME="mlx-dspark"
-VERSION="${APP_VERSION:-0.4.0}"
+VERSION="${APP_VERSION:-0.4.1}"
 APP="build/${APP_NAME}.app"
 DMG="build/${APP_NAME}-${VERSION}.dmg"
 VOLNAME="${APP_NAME} ${VERSION}"
