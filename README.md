@@ -174,7 +174,11 @@ mlx-dspark serve --model mlx-community/Qwen3-8B-8bit        # → http://127.0.0
 #   --reasoning-effort low|medium|xhigh   default reasoning depth on models that support it
 #                   (Qwen3.8-class; /health reports support, requests can override)
 #   --no-model      start instantly with nothing loaded; POST /admin/load loads later,
-#                   POST /admin/unload frees the model again (port survives both)
+#                   POST /admin/unload frees the model again (port survives both).
+#                   A first-time load reports download progress in /health and is
+#                   cancellable (POST /admin/load/cancel — partials resume by default);
+#                   /admin/load also takes per-swap mode / max_draft / lookup_drafts /
+#                   confidence_threshold / context_window overrides
 ```
 
 `--mode auto` picks the best available speculation for any target (a known DSpark drafter → else
@@ -469,29 +473,33 @@ pointer saying so. The ternary 2-bit variant remains the speculative-decoding op
 The drafter loads 1:1 from the HF checkpoint and is **4-bit quantized** by default (cheap to run each round;
 quantization doesn't change acceptance — that's set by the drafter↔target match).
 
-## Which target & drafter should I use?
+## Which target should I use?
 
-Short answer on current mlx (≥ 0.32): **DSpark, everywhere** (`--mode auto` picks it for you). Measured on
-an M4 Pro, warm (code prompt unless marked chat):
+**Mode first, because it's the short one: DSpark, everywhere** — `--mode auto` picks it for you.
+On current mlx (≥ 0.32) DSpark beats DFlash on every pair measured here (the receipts are in
+[DSpark vs DFlash](#dspark-vs-dflash-head-to-head)). That verdict is *version-dependent* and worth
+knowing about: on mlx 0.31, verify cost rose steeply with the number of tokens verified, which made
+DFlash's full 16-block the winner on Gemma-12B code/math; 0.32's kernels made narrow multi-row
+verify disproportionately cheaper and flipped it. If your mlx/hardware differs, `--max-draft auto`
+re-measures the curves on your machine, and `mlx-dspark benchmark` settles it empirically.
 
-| target | DSpark (`--mode dspark`, measured cap) | DFlash (`--mode dflash --max-draft 0`) | pick |
-|---|---|---|---|
-| **Gemma-4 12B** | **2.61×** code, 2.63× chat *(cap 4)* | 1.63× code, ~0.7× chat | **DSpark** |
-| **Qwen3-8B** | **2.06×** code *(cap 4)* | 0.86× full block (1.47× at cap 2) | **DSpark** |
-| **Qwen3-4B** | **1.70×** code *(cap 4)* | modest | **DSpark** |
-| **Ternary-Bonsai-27B** | **1.13×** code *(cap 2)* | — | **DSpark** |
-| **Qwen3.6-27B** (8-bit, hybrid) | **1.86×** code · **2.48×** math · **2.29×** chat *(cap 4)* | — | **DSpark** |
-| **Ornith-1.0-9B** (8-bit, hybrid) | **2.53×** code · **2.48×** math · **2.21×** chat *(cap 4)* | — | **DSpark** |
+**Target, by the Mac you have** (all numbers from [the table above](#supported-models); speedups
+and caps are this M4 Pro's — yours are derived fresh on first run):
 
-<sub>DSpark column regenerated 2026-07-22 at each model's measured cap; the DFlash column is the
-older cap-2-era sweep and was **not** re-measured, so the real DSpark margin is now wider than
-the rows suggest — the verdict does not change.</sub>
-
-This is a *version-dependent* verdict worth knowing about: on mlx 0.31, verify cost rose steeply with the
-number of tokens verified, which made DFlash's full 16-block the winner on Gemma-12B code/math (~2.1× vs
-DSpark's ~1.9× then). mlx 0.32's quantized-matmul kernels made *narrow* multi-row verify disproportionately
-cheaper, and DSpark's short block now wins across the board here. If your mlx/hardware differs,
-`--max-draft auto` re-measures the curves on your machine, and `mlx-dspark benchmark` settles it empirically.
+- **~48 GB** — `Qwen3.8-27B-8bit` (best ratio in the project: 2.72×, 3.37× on math) or
+  `Muse-Glimmer-30B-8bit` (the strongest chat ratio, 2.2×+). Both ~29–40 GB resident.
+- **~24–36 GB** — `gemma-4-12B-it-8bit` (big ratio *and* real speed: ~46–55 tok/s),
+  `Qwen3.6-27B-8bit`, or `Qwen3.8-27B-4bit` (27B quality in ~18 GB at ~23–31 tok/s — use
+  `--max-draft 7 --confidence-threshold 0.3`, its measured best).
+- **~16 GB** — `Ornith-1.0-9B-8bit` (2.4× at ~59–68 tok/s, the mid-size sweet spot),
+  `Qwen3-8B-8bit`, or `Qwen3-4B-8bit` (~87–101 tok/s, fits ~8 GB).
+- **Raw tokens per second above all** — the MoEs: `Qwen3.6-35B-A3B-4bit` (~91–145 tok/s).
+  Their *speedup ratio* is modest for a structural reason (sparse targets are already fast —
+  see the MoE note under [Results](#results-at-a-glance)), but nothing here decodes faster.
+- **Agents (Claude Code, pi, …)** — prefill dominates agent turns, so **prefix-cache reuse
+  matters more than acceptance**: `Qwen3-8B-8bit` wins wall-clock in the
+  [Claude Code comparison](#use-it-from-claude-code), and since v0.10.1 the hybrid targets
+  (Qwen3.8/Qwen3.6/Ornith) cache too. Use `--no-thinking` and an 8B+ tool-calling model.
 
 For target *precision*: **8-bit** is the sweet spot (best acceptance + quality); **4-bit** gives the highest
 absolute throughput and fits smaller Macs but a smaller speedup ratio; bf16 is *slower* on M-series (verify
@@ -508,11 +516,15 @@ every number
 is a median of 3 runs over the harness's three prompts, and the tok/s columns are the mean across
 them. Reproduce any row with that command.
 
-The cap column is the headline change. mlx 0.32's quantized-matmul kernels widened the cheap
-verify region to width 5 for 8-bit weights, moving the knee from 4 to 6 — so the old hard-coded
-`cap=2` was leaving **10–35%** on the table for every 8-bit target. The cap is now derived from
-each machine+model+quant's measured cost curves rather than hard-coded (see [Tuning](#tuning)),
-which is why Bonsai still sits at 2 while the 8-bit rows moved to 4.
+The cap column is the headline change, twice over. mlx 0.32's quantized-matmul kernels widened
+the cheap verify region to width 5 for 8-bit weights — so the old hard-coded `cap=2` was leaving
+**10–35%** on the table for every 8-bit target. Then v0.12.0's **small-M verify kernel** removed
+the cliff that sat *after* that region (stock `quantized_matmul` re-pays the whole weight read
+per row at 2–8 rows — see [the ceiling section](#the-apple-silicon-speedup-ceiling)), which is
+how the Qwen3.8-27B rows reach cap 7. The cap is never hard-coded: it is derived from each
+machine+model+quant's measured cost curves (see [Tuning](#tuning)), which is why Bonsai sits at
+2, most 8-bit rows at 4, and the kernel-flattened rows at 7 — same code, different measured
+curves.
 
 | target | cap | accept len | baseline | mlx-dspark | speedup | chat / code / math |
 |---|---|---|---|---|---|---|
@@ -538,17 +550,23 @@ step *costs*, and here a step is only ~11.5 ms while the drafter — 1.53B **den
 against a target with 3.8B active — costs ~5.7 ms of every round. Two other things follow from
 the same fact and are specific to this row:
 
-- **Hybrid lookup drafts are a net loss here** (1.27× → 1.21×), the only target where the
-  shipped-on default should be turned off. A free n-gram draft still has to be *verified*, and
+- **Hybrid lookup drafts are a net loss here** (1.27× → 1.21×), the first target where the
+  shipped-on default had to be turned off. A free n-gram draft still has to be *verified*, and
   on an MoE every extra verify row pulls in a fresh set of experts to read — so a
-  low-acceptance free draft is not free at all. This is now the **shipped default** for the
-  pairs measured that way (the registry row carries it; `--lookup-drafts` forces it back on).
+  low-acceptance free draft is not free at all. Every pair measured that way ships with lookup
+  off as its **registry default** (all the MoEs, the 4-bit 27B hybrids, Muse — re-measured and
+  confirmed for Qwen3.8 even after the small-M kernel flattened its curve); `--lookup-drafts`
+  forces it back on.
 - **The confidence head finally pays** (1.27× → 1.32×, and 1.50× → 1.67× on math), reversing
   this project's standing result that it reaches higher acceptance at *lower* throughput. That
   result was measured on dense targets with a flat verify region, where a fixed cap wastes
   nothing. Here the verify curve rises from the very first extra row **and** acceptance swings
   from 2.8 (chat) to 7.0 (math), so deciding per round how far to draft is worth real time.
   `--confidence-threshold 0.3` (0.5 is within noise of it; 0.7 over-throttles, back to 1.21×).
+  The rule this generalized to (and the Qwen3.8-27B-4bit row confirms): **confidence pays iff
+  the verify curve still rises inside the cap's window** — 4-bit Qwen3.8 (rising to width 5)
+  gains from cap 7 + 0.3, while its 8-bit sibling (flat 1–8 under the kernel) measures *worse*
+  with it and ships it off.
 
 Drafter quantization was swept for this pair and **4-bit remains right** — 3-bit is no cheaper
 (the drafter's cost is dominated by a 248K-vocab head, not by weight bytes) and 2-bit and 8-bit
@@ -561,10 +579,13 @@ turn's prompt landed 2 tokens short of the checkpoint boundary (4 with `--no-thi
 re-render-unstable tail and snapshots below it, so turn-2 reuse now fires (see
 [Prefix caching](#prefix-caching)).
 
-Every 8-bit row peaks at **cap 4** and falls off sharply at cap 5 — the cliff sits exactly where
-the measured verify curve leaves its cheap region (width 5 → 6). Bonsai is the counter-example
-that shows why the cap is not a constant: its 2-bit verify cost climbs from width 2, so it peaks
-at cap 2 (cap 1 = 1.00×, cap 3 = 1.06×) and there is no wide-draft regime to reach.
+Most 8-bit rows peak at **cap 4** and fall off sharply at cap 5 — the cliff sits exactly where
+the measured verify curve leaves its cheap region (width 5 → 6). The Qwen3.8-27B rows are the
+exception that proves the mechanism: v0.12.0's small-M kernel removes that cliff for 4/8-bit
+group-64 weights, the re-measured curve comes back flat through width 8, and the derived cap
+moves to 7 on its own (the other 8-bit rows predate the kernel and will be re-measured with
+it). Bonsai is the counter-example at the other end: its 2-bit verify cost climbs from width 2,
+so it peaks at cap 2 (cap 1 = 1.00×, cap 3 = 1.06×) and there is no wide-draft regime to reach.
 
 Baselines are this harness's pipelined greedy loop, which measures at parity with `mlx_lm.generate`
 (the Qwen3-4B baseline is the same 51–52 tok/s either way). All paths produce **identical** output to
@@ -750,7 +771,18 @@ length). On an M-series chip it's weaker — **verify cost grows with the number
 property of (quantization × mlx version × chip), which is why `--max-draft auto` measures it on your
 machine instead of trusting a constant. On mlx 0.31.2 we measured ≈ +14 ms/token for Gemma-4 12B (a
 ~2.2× ceiling even with a perfect drafter); mlx 0.32's kernels flattened the curve enough that Gemma-4
-now measures 2.11× at cap 2 — past what the old curve allowed. The binding limiter remains acceptance
+now measures 2.11× at cap 2 — past what the old curve allowed.
+
+**v0.12.0 moved the wall itself.** The rising verify cost was never hardware: MLX's stock
+`quantized_matmul` re-reads (and re-dequantizes) the whole weight matrix *per row* for 2–8 rows —
+exactly the verify window — and only amortizes it from ~13 rows up
+([ml-explore/mlx#4265](https://github.com/ml-explore/mlx/issues/4265)). mlx-dspark now ships a small
+`simdgroup_matrix` kernel (vendored MIT from [avlp12's fork](https://github.com/avlp12/mlx-lm), see
+NOTICE) that reads each 4/8-bit weight group once and reuses it across all rows: verify widths 6–8
+drop to ~width-5 cost (measured 1.3–1.7× per matmul, flat in width). That is what pushed
+Qwen3.8-27B-8bit to **2.72×** at a derived cap of 7 and its 4-bit sibling past 2× on code — and per
+project doctrine it is gated per shape by a one-time on-device probe, so on a machine or mlx version
+where it doesn't win, it silently stays off. The binding limiter remains acceptance
 length (set by the drafter↔target match) — **not** drafter quantization (4-bit / 8-bit / bf16 give
 identical acceptance; 4-bit is simply fastest).
 
@@ -766,6 +798,13 @@ Two things do still grow with a longer prompt, for **every** decoder (baseline, 
 speculative speedup: **time-to-first-token** (reading an *L*-token prompt is inherent work) and **per-token
 decode** (attention reads a longer KV cache). Soften both with prefix caching (reuse the conversation prefix
 across turns, on by default) and `--kv-bits 8` (quantized KV cache — the long-context bandwidth lever).
+
+The third thing that grows is **RAM**: the KV cache is linear in context. Measured on Qwen3.8-27B it costs
+**0.086 GB per 1k tokens of context** (identical for both quants — the cache is bf16 regardless of weight
+bits), i.e. ~11 GB on top of the weights at 128k — the "[+ cache at 128k ctx](#models)" column in the
+models table. When RAM is the constraint, cap it with `--context-window N` (also a per-swap
+`context_window` override on `/admin/load`): requests past the cap get the "prompt is too long" error that
+agent clients like Claude Code auto-compact on, instead of a swap-storm.
 
 ### DSpark vs DFlash (head-to-head)
 
@@ -858,8 +897,18 @@ is unchanged):
   with no `--max-draft`, mlx-dspark benchmarks this pair's verify/drafter cost curves once (~5 s, cached
   on disk) and picks the best fixed cap. It has to be measured, because the answer moves a lot — on one
   M4 Pro under mlx 0.32 the optimum spans cap 2 to 7, and the *same model* wants cap 2 at 4-bit, 4 at
-  8-bit and 6 at bf16. Pass `--max-draft N` to pin it. `--confidence-threshold 0.6` truncates the block
-  adaptively via the confidence head instead. For **Bonsai-27B** use `--max-draft auto` (see its section).
+  8-bit and 6 at bf16. Pass `--max-draft N` to pin it. `--confidence-threshold 0.3` truncates the block
+  adaptively via the confidence head — it pays exactly where the verify curve still rises inside the
+  cap's window (Qwen3.8-27B-4bit at cap 7, the MoE), and measures worse where the curve is flat (most
+  8-bit targets). For **Bonsai-27B** use `--max-draft auto` (see its section).
+- **Small-M verify kernel** (v0.12.0, on by default) — stock `quantized_matmul` re-pays the whole weight
+  read per row at verify widths 2–8; a vendored `simdgroup_matrix` kernel dequantizes each 4/8-bit
+  weight group once and reuses it across rows, making widths 6–8 cost ~width-5. It is enabled per shape
+  only after a one-time cached probe proves it faster *and* numerically sane **on your machine**
+  (the wide-GEMM doctrine); everything else stays on the stock kernel. `--no-small-m` forces it off
+  for A/B runs. Output stays greedy-correct (the target verifies every token); ids can differ from the
+  stock kernel at floating-point ties, same class as the batched path. This is what moved
+  Qwen3.8-27B-8bit's derived cap to 7.
 - **`--wired-limit`** — off by default, and you almost certainly want to leave it that way. It raises MLX's
   wired-memory ceiling to the recommended working set (~75% of RAM) so weights can't be paged out. Wired
   pages can't be reclaimed by the OS, so on a machine already holding a large working set this can **hang
@@ -885,9 +934,9 @@ is unchanged):
   rename-edit **2.8×→3.6×** (93 tok/s); chat unchanged. An acceptance gate parks the scaling on
   insertion-heavy edits (measured neutral there).
 - **DFlash** — `--max-draft 0` (full 16-block) is its native point and reaches ~6 accepted tokens on
-  code/math; on current mlx that still measures below DSpark cap-2 on this M4 Pro (see the pick table),
-  so treat DFlash as the head-to-head benchmark option rather than the speed pick. Short caps on open
-  chat; the full block never fills there.
+  code/math; on current mlx that still measures below DSpark on this M4 Pro (see
+  [DSpark vs DFlash](#dspark-vs-dflash-head-to-head)), so treat DFlash as the head-to-head benchmark
+  option rather than the speed pick. Short caps on open chat; the full block never fills there.
 - **Sampling** — `--temperature > 0` (+ `--top-p` / `--top-k`) is lossless w.r.t. the target at temperature T
   (the paper's §2.1 method). On M-series it's ≈ greedy speed (the extra acceptance lives in a tail a short
   cap never reaches) — it's a *sampled-output* feature, not a speed lever.
