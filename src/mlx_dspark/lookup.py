@@ -36,6 +36,7 @@ from .generate import (
     _prefill_plain,
     _spec_sample_accept,
     _Streamer,
+    _with_small_m,
     encode_prompt,
     eos_token_ids,
 )
@@ -137,6 +138,7 @@ class LongDraftGate:
         self.rounds_since = 0
 
 
+@_with_small_m
 def lookup_generate(
     target_model,
     tokenizer,

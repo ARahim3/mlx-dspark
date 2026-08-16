@@ -37,10 +37,13 @@ import mlx.core as mx
 
 CACHE_DIR = os.path.expanduser("~/.cache/mlx_dspark")
 CACHE_FILE = "calibration.json"
-SCHEMA = 3   # 2: verify curve includes width 1; adds the measured per-round overhead
+SCHEMA = 4   # 2: verify curve includes width 1; adds the measured per-round overhead
 # 3: causal-block (DFlash-lineage) drafter curves are measured at draft_width(cap) — the
 # truncated backbone the loop now runs — so cached full-width curves must re-measure
 # (they priced Muse's drafter ~2.5x too high at small caps and flat in cap).
+# 4: curves are measured inside the small-M MMA kernel context when it is enabled
+# (small_m_qmm.py flattens 4-bit verify at widths 6-8), and the cache key carries an
+# "|smm" tag so kernel-on and kernel-off curves never masquerade as each other.
 CTX_LEN = 512          # curve shape is nearly ctx-independent (SDPA is flat in width)
 TOKEN_ID = 7           # arbitrary; timings are content-independent
 
@@ -599,6 +602,58 @@ def apply_wide_gemm(target, drafter=None, *, target_repo: str,
     return _gen.WIDE_GEMM_MIN_ROWS
 
 
+def small_m_qmm_shapes(target, drafter=None, *, target_repo: str,
+                       drafter_repo: str | None = None,
+                       cache_dir: str | None = None,
+                       verbose: bool = True) -> list[str]:
+    """Weight shapes whose verify-window forwards should run on the small-M MMA kernel
+    (see :mod:`.small_m_qmm`), or ``[]`` when it never pays on this machine.
+
+    Same doctrine as the cap and the wide-GEMM crossover: the win is a property of
+    (chip x mlx version x shape), so each shape is raced and numerics-checked once
+    (~2-4 s total) and the verdict cached under a device+mlx key."""
+    from .small_m_qmm import measure_shapes
+
+    key = _cache_key("smallm", target_repo, drafter_repo)
+    entry = load_cached(key, cache_dir)
+    if entry is None:
+        if verbose:
+            print("calibrating small-M qmm kernel (one-time, cached)…", flush=True)
+        shapes = measure_shapes(getattr(target, "model", target), drafter,
+                                verbose=verbose)
+        entry = {"shapes": shapes}
+        save_cached(key, entry, cache_dir)
+        if verbose:
+            state = (f"on for {len(shapes)} weight shapes"
+                     if shapes else "off (no gain, or numerics reject, on this machine)")
+            print(f"  small-M qmm: {state}", flush=True)
+    return entry.get("shapes") or []
+
+
+def apply_small_m(target, drafter=None, *, target_repo: str,
+                  drafter_repo: str | None = None,
+                  enabled: bool | None = None, verbose: bool = True):
+    """Turn the small-M MMA verify kernel on for this process (``generate.SMALL_M_IDS``)
+    and return the instance allowlist used, or ``None`` when off.
+
+    ``enabled=None`` calibrates (and caches) the per-shape gate; ``False`` disables.
+    Call BEFORE :func:`calibrate` — the cap controller's curves must be measured with
+    the same kernel dispatch generation will use. Sets a process-wide global rather
+    than a library default for the same reason as wide-GEMM: a plain
+    ``speculative_generate`` call must not silently change numerics class."""
+    from . import generate as _gen
+    from .small_m_qmm import ids_for_shapes
+
+    if enabled is False:
+        _gen.SMALL_M_IDS = None
+        return None
+    shapes = small_m_qmm_shapes(target, drafter, target_repo=target_repo,
+                                drafter_repo=drafter_repo, verbose=verbose)
+    ids = ids_for_shapes(shapes, getattr(target, "model", target), drafter)
+    _gen.SMALL_M_IDS = ids or None
+    return _gen.SMALL_M_IDS
+
+
 # --------------------------------------------------------------------------- entry point
 
 
@@ -628,20 +683,30 @@ def calibrate(target, drafter, *, mode: str, target_repo: str, drafter_repo: str
     else:
         raise ValueError(f"auto cap supports dspark/dflash, not {mode!r}")
 
+    # Cost curves must describe what generation will actually run: with the small-M MMA
+    # kernel enabled (apply_small_m, before this), 4-bit verify is flat at widths 6-8 —
+    # measured outside the context the controller would price wide caps ~1.5x too high.
+    from . import generate as _gen
+    from .small_m_qmm import small_m_matmul
+    smm_ids = _gen.SMALL_M_IDS
+
     key = _cache_key(mode, target_repo, drafter_repo,
                      kv_bits=getattr(target, "kv_bits", None))
+    if smm_ids:
+        key += "|smm"
     entry = load_cached(key, cache_dir)
     if entry is None:
         if verbose:
             print(f"calibrating {mode} cap for this machine (one-time, cached)…", flush=True)
         tap = list(cfg.target_layer_ids)
-        verify = measure_verify_curve(target, tap, widths)
-        if mode == "dspark":
-            drafter_ms: dict | float = measure_dspark_drafter_curve(drafter, caps)
-            overhead = measure_dspark_round_overhead(target, drafter, verify, drafter_ms)
-        else:
-            drafter_ms = measure_dflash_drafter_cost(drafter)
-            overhead = 0.0
+        with small_m_matmul(smm_ids):
+            verify = measure_verify_curve(target, tap, widths)
+            if mode == "dspark":
+                drafter_ms: dict | float = measure_dspark_drafter_curve(drafter, caps)
+                overhead = measure_dspark_round_overhead(target, drafter, verify, drafter_ms)
+            else:
+                drafter_ms = measure_dflash_drafter_cost(drafter)
+                overhead = 0.0
         entry = {"verify": {str(k): v for k, v in verify.items()},
                  "drafter": ({str(k): v for k, v in drafter_ms.items()}
                              if isinstance(drafter_ms, dict) else drafter_ms),
@@ -662,7 +727,8 @@ def calibrate(target, drafter, *, mode: str, target_repo: str, drafter_repo: str
         if verbose:
             print(f"calibrating batched verify grid (B={want_bs}, one-time, cached)…",
                   flush=True)
-        grid = measure_batch_verify_grid(target, list(cfg.target_layer_ids), want_bs, widths)
+        with small_m_matmul(smm_ids):
+            grid = measure_batch_verify_grid(target, list(cfg.target_layer_ids), want_bs, widths)
         vg = entry.setdefault("verify_grid", {})
         for B, row in grid.items():
             vg[str(B)] = {str(k): v for k, v in row.items()}

@@ -13,6 +13,7 @@ acceptance length (tokens committed per target forward).
 
 from __future__ import annotations
 
+import functools
 import json
 import time
 from dataclasses import dataclass
@@ -21,9 +22,27 @@ import mlx.core as mx
 from mlx.utils import tree_flatten
 
 from .sampling import sample_probs, truncate_probs
+from .small_m_qmm import small_m_matmul
 from .wide_gemm import wide_matmul
 
 TAP = None  # set from drafter config at call time
+
+SMALL_M_IDS = None  # QuantizedLinear instances (by id) routed through the small-M MMA
+# kernel for verify-window forwards of 6-8 rows (see small_m_qmm.py). None disables.
+# Same doctrine as WIDE_GEMM_*: the library default stays off — a plain generate call
+# must not silently change numerics class — and the CLI/server set it from
+# calibrate.apply_small_m()'s measured per-shape gate.
+
+
+def _with_small_m(fn):
+    """Run a generation loop inside :func:`small_m_matmul` (a no-op when SMALL_M_IDS is
+    unset). A decorator rather than an inline ``with`` so the loop bodies stay
+    untouched; the global is read at call time, so hot swaps re-resolve naturally."""
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        with small_m_matmul(SMALL_M_IDS):
+            return fn(*args, **kwargs)
+    return wrapper
 
 
 @dataclass
@@ -494,6 +513,7 @@ def greedy_generate(
     )
 
 
+@_with_small_m
 def dflash_generate(
     target_model,
     tokenizer,
@@ -784,6 +804,7 @@ def _spec_sample_accept(v_logits, draft, q_probs, temperature, top_p=1.0, top_k=
     return n, repl
 
 
+@_with_small_m
 def speculative_generate(
     target_model,
     tokenizer,

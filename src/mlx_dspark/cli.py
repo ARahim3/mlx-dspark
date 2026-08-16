@@ -108,6 +108,15 @@ def cmd_generate(argv: list[str]) -> None:
                          "(mlx re-dequantizes per output tile, which is redundant at prefill "
                          "widths). Default: calibrate the crossover for this machine+model "
                          "once and cache it; 0 disables. Bit-identical, ~1.09x prefill")
+    ap.add_argument("--small-m", action=argparse.BooleanOptionalAction, default=None,
+                    help="small-M MMA verify kernel: dequantize each weight group once "
+                         "and reuse it across verify rows 6-8, where stock "
+                         "quantized_matmul re-pays the weight read per row (4-bit) or "
+                         "cliffs at width 6 (8-bit). Unset = on for shapes a one-time "
+                         "cached probe proves faster on this machine (4/8-bit gs64); "
+                         "--no-small-m disables. Output stays greedy-correct "
+                         "(verify-checked); ids can differ from the stock kernel at fp "
+                         "ties, like the batched path")
     ap.add_argument("--lookup-long-draft", type=int, default=32,
                     help="match-scaled long-draft ceiling for lookup drafts (dspark hybrid "
                          "+ lookup mode): a deep context match (real copy run) earns drafts "
@@ -142,6 +151,14 @@ def cmd_generate(argv: list[str]) -> None:
         drafter, _ = load_dflash(drafter_repo, quantize=args.drafter_bits > 0,
                                  bits=max(args.drafter_bits, 2))
         drafter.bind(target.model)
+
+    # small-M MMA verify kernel: amortize the 4-bit weight read across verify rows 6-8
+    # (see small_m_qmm.py). Must run BEFORE calibrate()/static_cap below — the cap
+    # curves have to be measured with the same kernel dispatch generation will use.
+    from .calibrate import apply_small_m
+
+    apply_small_m(target, drafter, target_repo=target_repo, drafter_repo=drafter_repo,
+                  enabled=False if args.small_m is False else None)
 
     max_draft = _parse_max_draft(args.max_draft, ap)
     cap_controller = None
@@ -578,6 +595,11 @@ def cmd_benchmark(argv: list[str]) -> None:
                          "free draft still costs verify rows). Distinct from `--modes "
                          "lookup`, the standalone drafter-free mode. Pass --lookup-drafts / "
                          "--no-lookup-drafts to force an arm for A/B.")
+    ap.add_argument("--small-m", action=argparse.BooleanOptionalAction, default=None,
+                    help="small-M MMA verify kernel (see `mlx-dspark generate --help`). "
+                         "Unset = on where the cached probe proves it faster; "
+                         "--no-small-m forces the stock kernel for A/B. The setting "
+                         "prints in the header so arms can't be conflated.")
     ap.add_argument("--json", default=None, help="also write results to this JSON file")
     args = ap.parse_args(argv)
 
@@ -603,8 +625,11 @@ def cmd_benchmark(argv: list[str]) -> None:
     else:
         lookup_drafts = args.lookup_drafts
         lk_note = f"{'on' if lookup_drafts else 'OFF'} (forced)"
+    smm_note = ("OFF (forced)" if args.small_m is False
+                else "on where probe-verified (default)")
     print(f"target: {target_repo}\n"
           f"hybrid lookup drafts: {lk_note}\n"
+          f"small-M qmm kernel: {smm_note}\n"
           f"loading + warming up…")
     target, tok = load_target(
         target_repo, require_tap=any(m in ("dspark", "dflash") for m in modes))
@@ -663,6 +688,12 @@ def cmd_benchmark(argv: list[str]) -> None:
         else:
             drafter, _ = load_dflash(drafter_repo)
             drafter.bind(target.model)
+        # small-M MMA verify kernel (see small_m_qmm.py) — before calibrate() so any
+        # auto-cap arm prices caps against the curve generation will actually run
+        from .calibrate import apply_small_m
+
+        apply_small_m(target, drafter, target_repo=target_repo, drafter_repo=drafter_repo,
+                      enabled=False if args.small_m is False else None, verbose=False)
         for cap in caps:
             ctrl = None
             md: int | None = None

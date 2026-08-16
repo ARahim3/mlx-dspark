@@ -31,6 +31,7 @@ from .generate import (
     GenResult,
     _prefill_plain,
     _Streamer,
+    _with_small_m,
     eos_token_ids,
 )
 
@@ -403,6 +404,7 @@ class _RowTracker:
 # --------------------------------------------------------------------------- baseline (M1)
 
 
+@_with_small_m
 def batch_generate_baseline(
     target,
     tokenizer,
@@ -697,6 +699,7 @@ class SpecSlots:
         return finished
 
 
+@_with_small_m
 def batch_spec_generate(
     target,
     tokenizer,

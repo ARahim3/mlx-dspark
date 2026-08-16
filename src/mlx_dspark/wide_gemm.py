@@ -106,11 +106,14 @@ def wide_matmul(min_rows: int | None, shapes=None):
         return
     _min_rows = max(int(min_rows), SAFE_MIN_ROWS)
     _shapes = None if shapes is None else frozenset(shapes)
+    prev = nn.QuantizedLinear.__call__   # restore to ENTRY value, not the import-time
+    # original — this context nests inside small_m_matmul (prefill inside a decode
+    # loop), and restoring _orig_call would silently strip that patch mid-generation.
     nn.QuantizedLinear.__call__ = _wide_call
     try:
         yield
     finally:
-        nn.QuantizedLinear.__call__ = _orig_call
+        nn.QuantizedLinear.__call__ = prev
         _min_rows = 0
         _shapes = None
 

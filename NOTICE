@@ -38,6 +38,21 @@ checkpoints (e.g. `z-lab/gemma4-12B-it-DFlash`) are downloaded at runtime from z
 
 ---
 
+Small-M quantized-matmul kernel (avlp12)
+----------------------------------------
+
+The Metal kernel in `src/mlx_dspark/small_m_qmm.py` (an 8x8 simdgroup-matrix MMA
+tile that amortizes the 4-bit weight read across 6-8 verify rows) is vendored from
+avlp12's mlx-lm fork under the MIT License; copyright the fast_qmm.py authors:
+
+  - https://github.com/avlp12/mlx-lm  (`mlx_lm/fast_qmm.py`, MIT License)
+  - Context: https://github.com/ml-explore/mlx/issues/4265
+
+The dispatch, per-shape runtime verification gate, and calibration integration
+around it are mlx-dspark's own.
+
+---
+
 Target models (Gemma-4, Qwen3) are downloaded at runtime from their respective
 publishers and are subject to their own licenses (e.g. the Gemma Terms of Use and the
 Qwen license).
