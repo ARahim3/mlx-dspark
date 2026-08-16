@@ -37,6 +37,7 @@ class GenResult:
     seconds: float
     finish_reason: str = "stop"  # "stop" (eos/stop-string) | "length" (hit max_new_tokens)
     lookup_rounds: int = 0       # rounds whose draft came from the free n-gram lookup
+    reused_tokens: int = 0       # prompt tokens served from the prefix cache (0 = full prefill)
     logprobs: list | None = None  # per-token [{token_id, logprob, top:[(id, logprob), …]}], if requested
 
     @property

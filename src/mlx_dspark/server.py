@@ -519,6 +519,9 @@ class Engine:
             raise
         if self.prefix is not None and cache is not None:
             self.prefix.store(cache, ctx, prompt_ids, res.token_ids)
+        # The generate loops take `reuse_len` but don't report it back; the engine is
+        # where the number is known, so it's stamped once here for all three paths.
+        res.reused_tokens = reuse_len
         self.stats["requests"] += 1
         self.stats["prompt_tokens"] += len(prompt_ids)
         self.stats["completion_tokens"] += res.num_tokens
@@ -1918,6 +1921,9 @@ def make_handler(engine: Engine, api_key: str | None):
                 "prompt_tokens": len(prompt_ids),
                 "completion_tokens": gen_tokens,
                 "total_tokens": len(prompt_ids) + gen_tokens,
+                # n-best runs share one prefix lookup, so the reuse is the same for
+                # every row — report the first rather than summing it n times.
+                "prompt_tokens_details": {"cached_tokens": res_list[0].reused_tokens},
             }
             choices = []
             for i, res in enumerate(res_list):
@@ -2048,6 +2054,7 @@ def make_handler(engine: Engine, api_key: str | None):
                     "prompt_tokens": len(prompt_ids),
                     "completion_tokens": res.num_tokens,
                     "total_tokens": len(prompt_ids) + res.num_tokens,
+                    "prompt_tokens_details": {"cached_tokens": res.reused_tokens},
                 }
             final["x_mlx_dspark"] = engine.spec_info(res)
             self._sse(final)

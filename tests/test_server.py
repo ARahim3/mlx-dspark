@@ -44,6 +44,7 @@ class _FakeEngine:
         self.tokenizer = _FakeTok()
         self.calls = []
         self.response_text = "Hello world from mlx dspark"
+        self.reused_tokens = 0        # prompt tokens a prefix-cache hit would serve
 
     def generate(self, prompt_ids, *, max_tokens, temperature, top_p=1.0, top_k=0,
                  presence_penalty=0.0, frequency_penalty=0.0, logprobs=None,
@@ -63,7 +64,8 @@ class _FakeEngine:
                    "top": [(t, -0.5)] if logprobs else []} for t in [1, 2, 3, 4, 5]]
         return GenResult(text=text, token_ids=[1, 2, 3, 4, 5], num_tokens=5, num_rounds=2,
                          accept_lengths=[2, 3], target_forwards=2, seconds=0.1,
-                         finish_reason="stop", logprobs=lp)
+                         finish_reason="stop", logprobs=lp,
+                         reused_tokens=self.reused_tokens)
 
     def spec_info(self, res):
         return {"mode": self.mode, "accept_len": res.mean_accept_len,
@@ -137,6 +139,45 @@ def test_chat_stream_sse(server):
     assert content == "Hello world from mlx dspark "
     assert chunks[-1]["choices"][0]["finish_reason"] == "stop"
     assert chunks[-1]["usage"]["completion_tokens"] == 5
+
+
+def test_usage_reports_cached_tokens(server):
+    """A prefix-cache hit is visible to the client, in the OpenAI shape.
+
+    Without it a caller can see that a request was fast but not whether it was
+    fast *because* the cache held — which is the difference between measuring
+    the cache and guessing at it.
+    """
+    eng, base = server
+    eng.reused_tokens = 0
+    c = _post(base, "/v1/chat/completions",
+              {"model": "x", "messages": [{"role": "user", "content": "hi"}]})
+    assert c["usage"]["prompt_tokens_details"]["cached_tokens"] == 0
+
+    eng.reused_tokens = 7
+    c = _post(base, "/v1/chat/completions",
+              {"model": "x", "messages": [{"role": "user", "content": "hi"}]})
+    assert c["usage"]["prompt_tokens_details"]["cached_tokens"] == 7
+
+
+def test_stream_usage_reports_cached_tokens(server):
+    """Same field on the streamed final chunk, where clients actually read it."""
+    eng, base = server
+    eng.reused_tokens = 5
+    sse = _post(base, "/v1/chat/completions",
+                {"messages": [{"role": "user", "content": "hi"}], "stream": True,
+                 "stream_options": {"include_usage": True}}, stream=True)
+    chunks = [json.loads(l[6:]) for l in sse.split("\n\n")
+              if l.startswith("data: ") and l != "data: [DONE]"]
+    assert chunks[-1]["usage"]["prompt_tokens_details"]["cached_tokens"] == 5
+
+
+def test_completions_usage_reports_cached_tokens(server):
+    """/v1/completions shares the usage builder, so it reports it too."""
+    eng, base = server
+    eng.reused_tokens = 3
+    c = _post(base, "/v1/completions", {"model": "x", "prompt": "hi"})
+    assert c["usage"]["prompt_tokens_details"]["cached_tokens"] == 3
 
 
 def test_stop_forwarded(server):
