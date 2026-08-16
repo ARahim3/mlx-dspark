@@ -4,6 +4,65 @@ All notable changes to `mlx-dspark`. Versions follow [SemVer](https://semver.org
 
 ## [Unreleased]
 
+## [0.12.0] — 2026-08-16 — small-M verify kernel, cancellable downloads, long-context controls
+
+### Added
+- **Cancellable model downloads with live progress** (`download.py`): a first-time load now
+  pre-fetches every hub repo in a killable child process before the loaders run, so the long
+  phase of `/admin/load` — the download — can be stopped: **`POST /admin/load/cancel`**
+  (optional `cleanup: true` also removes the partial files; the default keeps them so a
+  retried load resumes instead of restarting a multi-gigabyte fetch). While fetching,
+  `/health` reports `download: {repo, bytes_done, bytes_total}` for a real progress bar.
+  A cancelled load unwinds like any failed load (server up, model-less), and a dying server
+  takes its download child with it — no orphan quietly fetching gigabytes after quit.
+- **Race arms take `cap: "auto"` and any cap 1–64** on `/admin/race`: an auto arm runs the
+  per-round adaptive cap from this machine's cached cost curves (a fresh controller per arm,
+  so no run biases another), raceable head-to-head against fixed caps; custom integer caps
+  are validated instead of silently crashing on garbage.
+- **`confidence_threshold` as an `/admin/load` override** (number in [0, 1]; 0 = off) and a
+  matching `/health` report — so a client can apply a pair's measured cap+confidence bundle
+  (Qwen3.8-27B-4bit's best is `cap 7 + 0.3`) without restarting the server.
+- **`context_window` as an `/admin/load` override** (was serve-time-only via
+  `--context-window`): a per-swap cap below the model's own maximum — the KV-cache RAM
+  lever for long agent sessions; requests past it get the "prompt is too long" wording
+  agent clients auto-compact on. Validated (integer ≥ 1024); `/health` already reported the
+  effective window.
+
+### Changed
+- Registry `speedup` strings (what `/admin/models` badges show) refreshed to the current
+  measured table — several predated the 2026-07-22 cap re-measure (Qwen3-8B 1.6→2.1×,
+  gemma-4-12B 2.1→2.8×, Ornith 2.2→2.4×) and the small-M kernel results (Qwen3.8-27B
+  1.5→1.9× / 8-bit 2.5→2.7×, Muse 1.5→1.7×).
+- **Small-M MMA verify kernel** (`small_m_qmm.py`, vendored MIT from avlp12's mlx-lm fork —
+  see NOTICE): `mx.quantized_matmul` re-pays the whole weight read per row for M in 2..8
+  (upstream ml-explore/mlx#4265), which is exactly the speculative verify window — the reason
+  4-bit verify curves "rise steeply from width 3". An 8x8 `simdgroup_matrix` split-K kernel
+  dequantizes each 4-bit weight group once and reuses it across all rows, making verify widths
+  6-8 cost the same as width 5 (measured M4 Pro: 1.3-1.7x per-matmul at M=6-8, flat in M).
+  Dispatched only for M in [6, 8] on shapes a one-time cached probe proves faster AND
+  numerically sane on this machine (4-bit gs64, N≥4096 — the wide-GEMM doctrine); everything
+  else stays on the stock kernel, at stock speed and stock numerics. On by default in the CLI
+  and server (`--no-small-m` disables; library API stays off unless `calibrate.apply_small_m`
+  is called). Cap calibration now measures its curves under the same kernel dispatch
+  generation uses (cache schema 4, keys tagged `|smm`), so `static_cap`/auto re-derive caps.
+  Output stays greedy-correct (the target verifies every token); ids can differ from the stock
+  kernel at fp ties, like the batched path. Measured end-to-end (Qwen3.8-27B-4bit, M4 Pro,
+  3-trial medians): **`--max-draft 7 --confidence-threshold 0.3` = 2.12x code / 1.97x math /
+  1.55x chat (~1.88x mean, 27.5 tok/s)** vs the old shipped best 1.74x mean at cap 2 — the
+  confidence head pays on a dense target for the first time (the wide acceptance spread the
+  flat verify curve exposes is exactly its regime), plain cap 7 = 1.78x mean, `--max-draft
+  auto` = 1.77x (the first hybrid pair where auto matches static — the flat curve fixed the
+  controller's economics), and the no-flags default (static cap 2) keeps its old numbers plus
+  2-4% from the drafter's width-8 block backbone riding the kernel. Lookup drafts re-measured
+  at the flat curve: still a net loss on this pair (1.69x on vs 1.78x off at cap 7) — the
+  registry's off default stands. An **8-bit unpack variant** covers 8-bit gs64 targets, where
+  qmm is flat to M=5 but cliffs at 6: the kernel removes the cliff (1.20-1.62x at M=6-8), and
+  on Qwen3.8-27B-8bit **static_cap moves 4 -> 7 unaided**, making the new best the zero-flag
+  default: **2.72x mean (3.37x math / 2.84x code / 1.95x chat, accept 4.05) at 22.6 tok/s**
+  vs the old 2.45x at cap 4 — and math acceptance reaches 5.15, the pair's highest measured.
+  The confidence head does NOT pay at 8-bit (curve now flat 1-8, so truncation only costs
+  acceptance) — the inverse of the 4-bit case, same mechanism.
+
 ## [0.11.0] — 2026-08-15 — reasoning effort, instant server start, streaming reasoning split
 
 ### Added

@@ -40,22 +40,27 @@ chat/code/math), the Muse row per-content best (footnoted); full tables, baselin
 
 <div align="center">
 
-| target | best measured speedup | speed |
+| target | best measured speedup | speed (chat → best) |
 |---|---|---|
-| **Muse-Glimmer-30B** (8-bit, dense)[^muse] | **3.27×** math · **2.50×** code · **2.22×** chat | ~26 tok/s |
-| **Gemma-4 12B** (8-bit) | **3.09×** math · **2.63×** chat · **2.61×** code | ~49 tok/s |
-| **Qwen3.8-27B** (8-bit)[^q38] | **3.00×** math · **2.38×** code · 1.96× chat | ~20 tok/s |
-| **Qwen3.6-27B** (8-bit) | **2.67×** math · **2.26×** chat · 1.96× code | ~19 tok/s |
-| **Ornith-1.0-9B** (8-bit) | **2.53×** code · **2.48×** math · **2.21×** chat | ~64 tok/s |
-| **Qwen3-14B** (8-bit) | **2.36×** math · **2.11×** code · 1.62× chat | ~31 tok/s |
-| **Qwen3-8B** (8-bit) | **2.29×** math · **2.06×** code · 1.81× chat | ~58 tok/s |
-| **Qwen3-4B** (8-bit) | **1.98×** math · 1.77× chat · 1.70× code | ~92 tok/s |
-| **Qwen3.8-27B** (4-bit)[^q38] | **1.87×** code · **1.83×** math · 1.52× chat | ~25 tok/s |
-| **Qwen3.6-35B-A3B** (4-bit, MoE)[^moe] | **1.67×** math · 1.24× code · 1.05× chat | **~115 tok/s** |
-| **Nemotron-3.5-Lightning-30B-A3B** (4-bit, MoE+Mamba)[^nemotron] | **1.34×** math · **1.27×** code · 1.07× chat | **~117 tok/s** |
-| **Ternary-Bonsai-27B** (2-bit) | **1.13×** code | ~27 tok/s |
+| **Qwen3.8-27B** (8-bit)[^q38] | **3.37×** math · **2.84×** code · 1.95× chat | ~17–28 tok/s |
+| **Muse-Glimmer-30B** (8-bit, dense)[^muse] | **3.27×** math · **2.50×** code · **2.22×** chat | ~18–26 tok/s |
+| **Gemma-4 12B** (8-bit) | **3.09×** math · **2.63×** chat · **2.61×** code | ~46–55 tok/s |
+| **Qwen3.6-27B** (8-bit) | **2.67×** math · **2.26×** chat · 1.96× code | ~16–22 tok/s |
+| **Ornith-1.0-9B** (8-bit) | **2.53×** code · **2.48×** math · **2.21×** chat | ~59–68 tok/s |
+| **Qwen3-14B** (8-bit) | **2.36×** math · **2.11×** code · 1.62× chat | ~25–36 tok/s |
+| **Qwen3-8B** (8-bit) | **2.29×** math · **2.06×** code · 1.81× chat | ~51–64 tok/s |
+| **Qwen3.8-27B** (4-bit)[^q38] | **2.12×** code · **1.97×** math · 1.55× chat | ~23–31 tok/s |
+| **Qwen3-4B** (8-bit) | **1.98×** math · 1.77× chat · 1.70× code | ~87–101 tok/s |
+| **Qwen3.6-35B-A3B** (4-bit, MoE)[^moe] | **1.67×** math · 1.24× code · 1.05× chat | **~91–145 tok/s** |
+| **Nemotron-3.5-Lightning-30B-A3B** (4-bit, MoE+Mamba)[^nemotron] | **1.34×** math · **1.27×** code · 1.07× chat | **~87–112 tok/s** |
+| **Ternary-Bonsai-27B** (2-bit) | **1.13×** code | ~26–29 tok/s |
 
 </div>
+
+<sub>The speed column is the measured range across the three benchmark contents at the row's
+best configuration — chat at the low end, code/math at the high end (decoding speed depends on
+what is being generated: copy- and structure-heavy content accepts longer drafts). Baselines and
+per-content splits are in [Results at a glance](#results-at-a-glance).</sub>
 
 <sub>This table is the set of pairs we have **measured and vouch for**, which is also exactly the
 auto-resolve registry — that is the only thing the registry is for. It is *not* the set of models
@@ -323,19 +328,30 @@ Pass **any** target repo/path to `--model`; the matched drafter auto-resolves fo
 (quantization-agnostic — a `-4bit` / `-8bit` / `-bf16` of the same model resolves the same drafter). For
 anything else, add `--drafter <repo>`. Run `mlx-dspark models` to print this table.
 
-| target (`--model`) | DSpark drafter (`--mode dspark`) | DFlash drafter (`--mode dflash`) | peak RAM |
-|---|---|---|---|
-| `mlx-community/Qwen3-4B-8bit`        | `deepseek-ai/dspark_qwen3_4b_block7`   | `z-lab/Qwen3-4B-DFlash-b16`  | ~8 GB  |
-| `mlx-community/Qwen3-8B-8bit`        | `deepseek-ai/dspark_qwen3_8b_block7`   | `z-lab/Qwen3-8B-DFlash-b16`  | ~11 GB |
-| `mlx-community/gemma-4-12B-it-8bit`  | `deepseek-ai/dspark_gemma4_12b_block7` | `z-lab/gemma4-12B-it-DFlash` | ~15 GB |
-| `prism-ml/Ternary-Bonsai-27B-mlx-2bit` | `Rahim/Ternary-Bonsai-27B-dspark`    | — | ~12 GB |
-| `mlx-community/Qwen3.6-27B-8bit`     | `satgeze/Qwen3.6-27B-DSpark` (community) | — | ~32 GB |
-| `mlx-community/Qwen3.8-27B-4bit` / `-8bit`[^q38] | `RadixArk/Qwen3.8-27B-DSpark` (community, SpecForge) | — | ~18 GB (4-bit) / ~29 GB (8-bit) |
-| `mlx-community/Ornith-1.0-9B-8bit`   | `stanleyphoong/Ornith-1.0-9B-DSpark` (community) | — | ~13 GB |
-| `mlx-community/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-4bit` | `mlx-community/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-DSpark-bf16` (NVIDIA head, MLX) | — | ~20 GB |
-| `mlx-community/Muse-Glimmer-30B-4bit` | `DaoCloud/Muse-Glimmer-30B-DSpark` (community, DFlash-lineage) | — | ~26 GB (4-bit) / ~40 GB (8-bit[^muse]) |
+| target (`--model`) | DSpark drafter (`--mode dspark`) | DFlash drafter (`--mode dflash`) | peak RAM | + cache at 128k ctx |
+|---|---|---|---|---|
+| `mlx-community/Qwen3-4B-8bit`        | `deepseek-ai/dspark_qwen3_4b_block7`   | `z-lab/Qwen3-4B-DFlash-b16`  | ~8 GB  | not measured yet |
+| `mlx-community/Qwen3-8B-8bit`        | `deepseek-ai/dspark_qwen3_8b_block7`   | `z-lab/Qwen3-8B-DFlash-b16`  | ~11 GB | not measured yet |
+| `mlx-community/gemma-4-12B-it-8bit`  | `deepseek-ai/dspark_gemma4_12b_block7` | `z-lab/gemma4-12B-it-DFlash` | ~15 GB | not measured (partly window-bounded) |
+| `prism-ml/Ternary-Bonsai-27B-mlx-2bit` | `Rahim/Ternary-Bonsai-27B-dspark`    | — | ~12 GB | not measured yet |
+| `mlx-community/Qwen3.6-27B-8bit`     | `satgeze/Qwen3.6-27B-DSpark` (community) | — | ~32 GB | ~11 GB (est., same arch as Qwen3.8) |
+| `mlx-community/Qwen3.8-27B-4bit` / `-8bit`[^q38] | `RadixArk/Qwen3.8-27B-DSpark` (community, SpecForge) | — | ~18 GB (4-bit) / ~29 GB (8-bit) | **~11 GB measured** (~23 GB at full 256k) |
+| `mlx-community/Ornith-1.0-9B-8bit`   | `stanleyphoong/Ornith-1.0-9B-DSpark` (community) | — | ~13 GB | not measured yet |
+| `mlx-community/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-4bit` | `mlx-community/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-DSpark-bf16` (NVIDIA head, MLX) | — | ~20 GB | not measured yet |
+| `mlx-community/Muse-Glimmer-30B-4bit` | `DaoCloud/Muse-Glimmer-30B-DSpark` (community, DFlash-lineage) | — | ~26 GB (4-bit) / ~40 GB (8-bit[^muse]) | not measured yet |
 
-*Peak RAM* is measured on an M4 Pro (8-bit target + 4-bit drafter + KV cache); add headroom for macOS.
+*Peak RAM* is measured on an M4 Pro (8-bit target + 4-bit drafter + KV cache) at chat-length
+context; add headroom for macOS. *Cache at 128k ctx* is what a long-context session **adds on
+top**: the target's attention KV plus the drafter's context cache grow linearly with every
+token of context. The Qwen3.8-27B figure is measured on-device (**0.086 GB per 1k tokens** —
+64 KB/token target KV + 20 KB/token drafter ctx, matching the architecture math exactly:
+16 full-attention layers × 4 KV heads × 256 head-dim in bf16; the 48 linear-attention layers
+hold fixed-size state, which is why a 27B "256k-context" model is usable at long context on
+a Mac at all) and is the same for both quants — the cache is bf16 regardless of weight bits.
+So Qwen3.8-27B-4bit at 128k needs ~26 GB total, the 8-bit ~40 GB; `--kv-bits 8` roughly
+halves the attention-KV share. Cap it with `--context-window` (or the `context_window`
+override on `/admin/load`) when RAM is the constraint — requests past the cap get the
+"prompt is too long" error agent clients auto-compact on.
 Rows marked *(community)* use drafters published by the community, not by DeepSeek — quality varies more
 than with the official checkpoints, and it shows up directly as acceptance length (= your speedup).
 The **Ornith** drafter is the strong case: rigorously qualified by its author (17/17 gates, 95% of the
@@ -479,7 +495,9 @@ dominates). The drafter stays 4-bit either way. Full numbers and the reasoning a
 
 **DSpark** vs plain greedy decoding of the same model, each at **its own measured cap** (M4 Pro 48 GB,
 warm, 8-bit instruct target, 4-bit drafter, **mlx 0.32.0**). Regenerated 2026-07-22 with
-`mlx-dspark benchmark --trials 3` (Muse row 2026-08-12, post-0.8.1 drafter truncation): every number
+`mlx-dspark benchmark --trials 3` (Muse row 2026-08-12, post-0.8.1 drafter truncation; Qwen3.8
+4-bit row 2026-08-16 with the small-M verify kernel, `--max-draft 7 --confidence-threshold 0.3`):
+every number
 is a median of 3 runs over the harness's three prompts, and the tok/s columns are the mean across
 them. Reproduce any row with that command.
 
@@ -492,14 +510,14 @@ which is why Bonsai still sits at 2 while the 8-bit rows moved to 4.
 | target | cap | accept len | baseline | mlx-dspark | speedup | chat / code / math |
 |---|---|---|---|---|---|---|
 | **Gemma-4 12B** | 4 | 3.95 | 17.8 tok/s | 49.4 tok/s | **2.78×** | 2.63× / 2.61× / 3.09× |
+| **Qwen3.8-27B** (8-bit, hybrid)[^community][^q38] | 7 | 4.05 | 8.3 tok/s | 22.6 tok/s | **2.72×** | 1.95× / 2.84× / 3.37× |
 | **Muse-Glimmer-30B** (8-bit, dense)[^muse] | 4 | 3.31 | 8.2 tok/s | 20.2 tok/s | **2.47×** | 1.97× / 2.45× / 2.99× |
-| **Qwen3.8-27B** (8-bit, hybrid)[^community][^q38] | 4 | 3.43 | 8.3 tok/s | 20.3 tok/s | **2.45×** | 1.96× / 2.38× / 3.00× |
 | **Ornith-1.0-9B** (hybrid)[^community] | 4 | 3.64 | 26.7 tok/s | 64.2 tok/s | **2.40×** | 2.21× / 2.53× / 2.48× |
 | **Qwen3.6-27B** (8-bit, hybrid)[^community][^q27] | 4 | 3.15 | 8.4 tok/s | 19.2 tok/s | **2.29×** | 2.26× / 1.96× / 2.67× |
 | **Qwen3-8B** | 4 | 2.94 | 28.1 tok/s | 57.7 tok/s | **2.05×** | 1.81× / 2.06× / 2.29× |
 | **Qwen3-14B**[^qwen14b] | 4 | 2.87 | 15.3 tok/s | 31.0 tok/s | **2.03×** | 1.62× / 2.11× / 2.36× |
+| **Qwen3.8-27B** (4-bit, hybrid)[^community][^q38] | 7+conf | 3.17 | 14.6 tok/s | 27.5 tok/s | **1.88×** | 1.55× / 2.12× / 1.97× |
 | **Qwen3-4B** | 4 | 2.79 | 50.9 tok/s | 92.4 tok/s | **1.82×** | 1.77× / 1.70× / 1.98× |
-| **Qwen3.8-27B** (4-bit, hybrid)[^community][^q38] | 2 | 2.44 | 14.5 tok/s | 25.3 tok/s | **1.74×** | 1.52× / 1.87× / 1.83× |
 | **Qwen3.6-35B-A3B** (4-bit, MoE, hybrid)[^community][^moe] | conf | 4.72 | 86.9 tok/s | 114.5 tok/s | **1.32×** | 1.05× / 1.24× / 1.67× |
 | **Nemotron-3.5-Lightning-30B-A3B** (4-bit, MoE+Mamba, hybrid)[^nemotron] | 3 | 3.28 | 91.4 tok/s | 100.9 tok/s | **1.10×** | 0.95× / 1.23× / 1.13× |
 | **Ternary-Bonsai-27B** (2-bit, hybrid) | 2 | 2.60 | 25.4 tok/s | 27.2 tok/s | **1.07×** | 1.01× / 1.13× / 1.07× |
@@ -906,15 +924,20 @@ are bundled.
     ratio (each extra verify row pulls in fresh routed experts). See the MoE discussion under
     [Results at a glance](#results-at-a-glance).
 
-[^q38]: **Qwen3.8-27B** — the **8-bit** rows are cap 4 (the calibrated pick; its verify curve
-    is flat to width 5), 3-trial medians, hybrid lookup drafts **off** — this
+[^q38]: **Qwen3.8-27B** — the **8-bit** rows are cap 7 (the calibrated pick with the small-M
+    verify kernel: 8-bit qmm is flat to width 5 but cliffed at 6, and the kernel removes the
+    cliff, so the derived cap moved 4 → 7 with **no flag needed** — math acceptance reaches
+    5.15, this pair's highest), 3-trial medians, hybrid lookup drafts **off** — this
     pair's **shipped default** (the registry rows carry it, no flag needed). The **4-bit**
-    target trades the ratio for absolute speed and RAM: cap 2, **1.74×** mean (1.87× code /
-    1.83× math / 1.52× chat, accept 2.44) but **25.3 tok/s** vs 8-bit's 20.3, in ~18 GB vs
-    ~29 GB — the registry auto-resolves the same drafter for both, and the 4-bit is where the
-    lookup-off default actually bites (1.74× off vs 1.56× on — the first **non-MoE** target
-    where lookup drafts are a clear net loss; the 4-bit 27B verify slope prices extra verify
-    rows the way MoE expert pulls do; on 8-bit's flat curve it's a wash). The drafter,
+    row is `--max-draft 7 --confidence-threshold 0.3` with the **small-M MMA verify kernel**
+    (on by default where a one-time probe verifies it; it makes verify widths 6–8 cost
+    ~width-5 by dequantizing each 4-bit weight group once per row-block instead of per row):
+    **1.88×** mean (2.12× code / 1.97× math / 1.55× chat) at ~28 tok/s in ~18 GB — both
+    faster *and* a better ratio than the pre-kernel cap-2 optimum (1.74× mean, 25.3 tok/s);
+    plain defaults (no flags) still land 1.71×, `--max-draft auto` 1.77×. The registry
+    auto-resolves the same drafter for both quants, and the 4-bit keeps the
+    lookup-off default (re-measured at the flat curve: 1.78× off vs 1.69× on at cap 7 —
+    long lookup drafts land outside the kernel window; on 8-bit it's a wash). The drafter,
     `RadixArk/Qwen3.8-27B-DSpark`, is the first **SpecForge/SGLang-packaged** head here
     (DFlash backbone + DeepSpec markov/confidence heads, YaRN rope, reuses the target's embed
     *and* lm_head; card: accept 3.39 at temp 0.6 vs the FP8 target). Trained against the FP8
