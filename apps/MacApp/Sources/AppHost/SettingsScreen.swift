@@ -121,7 +121,37 @@ struct DecodingControls: View {
     @EnvironmentObject private var model: AppModel
     @State private var mode: String = "auto"
     @State private var cap: String = "auto"
+    @State private var confidence: String = "off"
+    @State private var contextWindow: String = "default"
     @State private var applying = false
+
+    /// Context presets as (tag, label, tokens). "default" = the model's own maximum.
+    private static let contextPresets: [(tag: String, label: String, tokens: Int?)] = [
+        ("default", "Model max", nil),
+        ("8192", "8k", 8192), ("16384", "16k", 16384), ("32768", "32k", 32768),
+        ("65536", "64k", 65536), ("131072", "128k", 131072), ("262144", "256k", 262144),
+    ]
+
+    private static func contextTag(_ value: Int?) -> String {
+        guard let value, contextPresets.contains(where: { $0.tokens == value })
+        else { return "default" }
+        return String(value)
+    }
+
+    /// Health's 0.0/0.2/0.3/0.5 as picker tags ("off"/"0.2"/…). Values outside the preset
+    /// list (a server started with an unusual --confidence-threshold) round to one decimal
+    /// and appear as their own tag so the picker never lies about the running state.
+    private static func confTag(_ value: Double?) -> String {
+        guard let value, value > 0 else { return "off" }
+        return String(format: "%.1f", value)
+    }
+
+    private var confOptions: [String] {
+        var options = ["off", "0.2", "0.3", "0.5"]
+        let current = Self.confTag(model.health?.confidenceThreshold)
+        if !options.contains(current) { options.append(current) }
+        return options
+    }
 
     private var modes: [(id: String, label: String)] {
         // availableDecodingModes, NOT availableRaceArms: applying reloads the pair, so the
@@ -137,9 +167,20 @@ struct DecodingControls: View {
     var body: some View {
         Group {
             if compact {
+                // Three pickers no longer fit one 340pt popover row (the clipped-Apply
+                // lesson, relearned the day Confidence landed): mode+cap on one row,
+                // confidence on its own, Apply last.
                 VStack(alignment: .leading, spacing: 8) {
                     HStack(spacing: 14) {
-                        pickers
+                        modeCapPickers
+                        Spacer(minLength: 0)
+                    }
+                    HStack(spacing: 14) {
+                        confidencePicker
+                        Spacer(minLength: 0)
+                    }
+                    HStack(spacing: 14) {
+                        contextPicker
                         Spacer(minLength: 0)
                     }
                     HStack(spacing: 8) {
@@ -152,10 +193,17 @@ struct DecodingControls: View {
                     }
                 }
             } else {
-                HStack(spacing: 14) {
-                    pickers
-                    applyControl
-                    Spacer(minLength: 0)
+                VStack(alignment: .leading, spacing: 8) {
+                    HStack(spacing: 14) {
+                        modeCapPickers
+                        confidencePicker
+                        Spacer(minLength: 0)
+                    }
+                    HStack(spacing: 14) {
+                        contextPicker
+                        applyControl
+                        Spacer(minLength: 0)
+                    }
                 }
             }
         }
@@ -165,10 +213,12 @@ struct DecodingControls: View {
         .onAppear {
             mode = model.health?.mode ?? "auto"
             cap = model.health?.maxDraft ?? "auto"
+            confidence = Self.confTag(model.health?.confidenceThreshold)
+            contextWindow = Self.contextTag(model.health?.contextWindow)
         }
     }
 
-    @ViewBuilder private var pickers: some View {
+    @ViewBuilder private var modeCapPickers: some View {
         Picker("Mode", selection: $mode) {
             ForEach(modes, id: \.id) { Text($0.label).tag($0.id) }
         }
@@ -179,6 +229,29 @@ struct DecodingControls: View {
             ForEach(1...8, id: \.self) { Text("\($0)").tag("\($0)") }
         }
         .fixedSize()
+    }
+
+    @ViewBuilder private var confidencePicker: some View {
+        Picker("Confidence", selection: $confidence) {
+            ForEach(confOptions, id: \.self) { Text($0 == "off" ? "Off" : $0).tag($0) }
+        }
+        .fixedSize()
+        .help("Confidence-head early stop: the drafter truncates its own block when it "
+              + "stops believing in it. Pays where the verify curve still rises inside "
+              + "the cap — the measured best for Qwen3.8-27B-4bit is cap 7 + 0.3. Off is "
+              + "right where the curve is flat (its 8-bit sibling).")
+    }
+
+    @ViewBuilder private var contextPicker: some View {
+        Picker("Context", selection: $contextWindow) {
+            ForEach(Self.contextPresets, id: \.tag) { Text($0.label).tag($0.tag) }
+        }
+        .fixedSize()
+        .help("Cap the context window below the model's own maximum — a RAM lever: the "
+              + "KV cache grows with every token of context (~84 KB/token on the "
+              + "Qwen3.8-27B pair), so a long agent session at full context can add "
+              + "many GB. Requests past the cap get a clear \"prompt is too long\", "
+              + "which agent clients like Claude Code auto-compact on.")
     }
 
     @ViewBuilder private var applyControl: some View {
@@ -192,12 +265,17 @@ struct DecodingControls: View {
 
     private var isDirty: Bool {
         mode != (model.health?.mode ?? "auto") || cap != (model.health?.maxDraft ?? "auto")
+            || confidence != Self.confTag(model.health?.confidenceThreshold)
+            || contextWindow != Self.contextTag(model.health?.contextWindow)
     }
 
     private func apply() {
         applying = true
         Task {
-            await model.applyEngineSettings(mode: mode, cap: cap)
+            await model.applyEngineSettings(
+                mode: mode, cap: cap,
+                confidence: confidence == "off" ? 0.0 : Double(confidence),
+                contextWindow: contextWindow == "default" ? nil : Int(contextWindow))
             applying = false
         }
     }

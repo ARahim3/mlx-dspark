@@ -1,18 +1,50 @@
 import Foundation
 
-/// One competitor in a race.
+/// One competitor in a race. `autoCap` is the server's cap `"auto"` — the per-round
+/// adaptive cap driven by this machine's measured cost curves, raceable against any
+/// fixed cap since the engine grew it on `/admin/race`.
 public struct RaceArm: Codable, Sendable, Hashable, Identifiable {
     public let mode: String
     public let cap: Int?
+    public let autoCap: Bool
 
-    public var id: String { cap.map { "\(mode)-\($0)" } ?? mode }
+    public var id: String { autoCap ? "\(mode)-auto" : cap.map { "\(mode)-\($0)" } ?? mode }
 
-    public init(mode: String, cap: Int? = nil) {
+    public init(mode: String, cap: Int? = nil, autoCap: Bool = false) {
         self.mode = mode
-        self.cap = cap
+        self.cap = autoCap ? nil : cap
+        self.autoCap = autoCap
     }
 
-    public var label: String { cap.map { "\(mode) cap \($0)" } ?? mode }
+    public var label: String {
+        autoCap ? "\(mode) cap auto" : cap.map { "\(mode) cap \($0)" } ?? mode
+    }
+
+    enum CodingKeys: String, CodingKey { case mode, cap }
+
+    // The wire value for cap is an Int OR the string "auto" (the server echoes whichever
+    // was asked in the SSE start event), so decoding must accept both.
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        mode = try c.decode(String.self, forKey: .mode)
+        if let n = try? c.decodeIfPresent(Int.self, forKey: .cap) {
+            cap = n
+            autoCap = false
+        } else {
+            cap = nil
+            autoCap = (try? c.decodeIfPresent(String.self, forKey: .cap)) == "auto"
+        }
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(mode, forKey: .mode)
+        if autoCap {
+            try c.encode("auto", forKey: .cap)
+        } else {
+            try c.encodeIfPresent(cap, forKey: .cap)
+        }
+    }
 }
 
 /// How one arm finished.
@@ -36,6 +68,22 @@ public struct RaceResult: Decodable, Sendable, Identifiable {
         case acceptLen = "accept_len"
         case targetForwards = "target_forwards"
         case lookupRounds = "lookup_rounds"
+    }
+
+    // An auto-cap arm reports cap "auto" (a string); the label already names it, so a
+    // non-integer cap simply decodes as nil rather than failing the whole result.
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        index = try c.decode(Int.self, forKey: .index)
+        label = try c.decode(String.self, forKey: .label)
+        mode = try c.decode(String.self, forKey: .mode)
+        cap = try? c.decodeIfPresent(Int.self, forKey: .cap)
+        tokens = try c.decode(Int.self, forKey: .tokens)
+        seconds = try c.decode(Double.self, forKey: .seconds)
+        tokensPerSec = try c.decode(Double.self, forKey: .tokensPerSec)
+        acceptLen = try c.decode(Double.self, forKey: .acceptLen)
+        targetForwards = try c.decode(Int.self, forKey: .targetForwards)
+        lookupRounds = try c.decode(Int.self, forKey: .lookupRounds)
     }
 }
 
@@ -109,7 +157,11 @@ extension APIClient {
                         "max_tokens": maxTokens,
                         "arms": arms.map { arm -> [String: Any] in
                             var dict: [String: Any] = ["mode": arm.mode]
-                            if let cap = arm.cap { dict["cap"] = cap }
+                            if arm.autoCap {
+                                dict["cap"] = "auto"
+                            } else if let cap = arm.cap {
+                                dict["cap"] = cap
+                            }
                             return dict
                         },
                     ]

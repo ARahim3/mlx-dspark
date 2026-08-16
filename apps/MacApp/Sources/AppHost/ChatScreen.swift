@@ -272,6 +272,9 @@ struct EmptyChat: View {
                      ?? "The first time a model runs, it downloads first — this can take a "
                         + "few minutes. After that it's cached and starts in seconds.")
                     .foregroundStyle(.secondary)
+                if let dl = model.downloadProgress {
+                    DownloadProgressRow(progress: dl)
+                }
                 EngineLogTail()
             } else if !model.isServerReady {
                 Text("No model loaded.").font(.title3.weight(.medium))
@@ -296,6 +299,54 @@ struct EmptyChat: View {
             }
         }
         .padding(.vertical, 40)
+    }
+}
+
+/// A first-time weight download, with a real progress bar (when the hub reports a total)
+/// and a Cancel that offers both flavors: keep the partial (a retry resumes) or remove it.
+/// Rendered wherever the loading state shows — the download used to be unstoppable short
+/// of killing the whole server.
+struct DownloadProgressRow: View {
+    @EnvironmentObject private var model: AppModel
+    let progress: DownloadProgress
+
+    private static let bytes: ByteCountFormatter = {
+        let f = ByteCountFormatter()
+        f.countStyle = .file
+        return f
+    }()
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 10) {
+                if let fraction = progress.fraction {
+                    ProgressView(value: fraction).frame(maxWidth: 260)
+                    Text("\(Int(fraction * 100))%").monospacedDigit()
+                        .foregroundStyle(.secondary)
+                } else {
+                    ProgressView().controlSize(.small)
+                }
+                Text(sizeLine).monospacedDigit().foregroundStyle(.secondary)
+                Menu("Cancel") {
+                    Button("Cancel — keep partial (resumes later)") {
+                        model.cancelModelLoad(removePartial: false)
+                    }
+                    Button("Cancel and remove partial files", role: .destructive) {
+                        model.cancelModelLoad(removePartial: true)
+                    }
+                }
+                .fixedSize()
+                .disabled(model.isCancellingLoad)
+            }
+            Text("Downloading \(progress.repo)")
+                .font(.caption).foregroundStyle(.secondary)
+        }
+    }
+
+    private var sizeLine: String {
+        let done = Self.bytes.string(fromByteCount: progress.bytesDone)
+        guard let total = progress.bytesTotal else { return done }
+        return "\(done) of \(Self.bytes.string(fromByteCount: total))"
     }
 }
 

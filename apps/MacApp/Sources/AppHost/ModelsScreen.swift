@@ -19,6 +19,24 @@ struct ModelsScreen: View {
                     SwapErrorBanner(message: error) { model.modelSwitchError = nil }
                 }
 
+                if model.isModelLoading {
+                    // The screen most downloads start from is also where they should be
+                    // stoppable — the same progress + Cancel the empty chat shows.
+                    VStack(alignment: .leading, spacing: 8) {
+                        HStack(spacing: 8) {
+                            ProgressView().controlSize(.small)
+                            Text("Loading \(model.model.components(separatedBy: "/").last ?? model.model)…")
+                                .font(.callout.weight(.medium))
+                        }
+                        if let dl = model.downloadProgress {
+                            DownloadProgressRow(progress: dl)
+                        }
+                    }
+                    .padding(10)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .background(RoundedRectangle(cornerRadius: 8).fill(.quaternary.opacity(0.5)))
+                }
+
                 header
 
                 AnyModelField()

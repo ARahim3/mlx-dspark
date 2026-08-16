@@ -158,6 +158,12 @@ final class AppModel: ObservableObject {
     /// A model load/swap in flight (`/admin/load`). The window stays up; screens show
     /// progress inline and generation controls stay disabled via `isServerReady`.
     @Published var isModelLoading = false
+    /// Live weight-download progress while a first-time load fetches from the hub
+    /// (`/health.download`, polled during the load). Nil for cached models and old engines.
+    @Published var downloadProgress: DownloadProgress?
+    /// A cancel has been requested and the load is unwinding — disables the cancel buttons
+    /// so a slow unwind can't collect duplicate requests.
+    @Published var isCancellingLoad = false
     /// One-time banner after onboarding: land in the Lab with the race ready to run.
     @Published var showLabWelcome = false
 
@@ -363,9 +369,23 @@ final class AppModel: ObservableObject {
         stats = nil
         calibration = nil
         logStore.note("loading model → \(target)")
+        // Poll /health while /admin/load blocks: it reports live download progress for a
+        // first-time fetch (`download: {repo, bytes_done, bytes_total}`), which is what the
+        // progress bar and the Cancel button key off. Cached loads report nothing and the
+        // UI stays as it was.
+        let poll = Task { [weak self] in
+            while !Task.isCancelled {
+                let health = try? await client.health()
+                await MainActor.run { self?.downloadProgress = health?.download }
+                try? await Task.sleep(nanoseconds: 1_000_000_000)
+            }
+        }
         defer {
+            poll.cancel()
             isModelLoading = false
             loadingDetail = nil
+            downloadProgress = nil
+            isCancellingLoad = false
         }
         do {
             _ = try await client.loadModel(target)
@@ -377,11 +397,32 @@ final class AppModel: ObservableObject {
             await refreshDiagnostics()
             return true
         } catch {
-            modelSwitchError = error.localizedDescription
-            logStore.note("model load failed: \(error.localizedDescription)")
+            // A user-cancelled download is not a failure — don't leave a scary error
+            // banner behind it (the engine's message contains "cancelled" either way).
+            let cancelled = error.localizedDescription
+                .localizedCaseInsensitiveContains("cancelled")
+            modelSwitchError = cancelled ? nil : error.localizedDescription
+            logStore.note(cancelled ? "download cancelled"
+                          : "model load failed: \(error.localizedDescription)")
             currentHealth = try? await client.health()   // reflects the no-model state
             return false
         }
+    }
+
+    /// Cancel the in-flight first-time download (`/admin/load/cancel`). The blocked
+    /// `/admin/load` then unwinds cleanly and — via `switchModel`'s restore path — the
+    /// previously loaded model comes back if there was one. `removePartial` also deletes
+    /// the partial files; keeping them (the default) means loading this model again later
+    /// resumes where it stopped instead of restarting a multi-gigabyte fetch.
+    func cancelModelLoad(removePartial: Bool) {
+        guard let client = apiClient, isModelLoading, !isCancellingLoad else { return }
+        isCancellingLoad = true
+        loadingDetail = removePartial
+            ? "Cancelling download and removing the partial files…"
+            : "Cancelling download — the partial files are kept, so loading this model "
+              + "again later resumes where it stopped."
+        logStore.note("cancelling download\(removePartial ? " (removing partial files)" : "")")
+        Task { _ = try? await client.cancelLoad(cleanup: removePartial) }
     }
 
     /// Switch to a different target — an in-place hot swap via `/admin/load`, not a restart.
@@ -441,7 +482,8 @@ final class AppModel: ObservableObject {
     /// engine-level knobs. Same in-place swap as a model change (`/admin/load` takes the
     /// overrides), so the port survives and output stays byte-identical either way; only
     /// speed changes.
-    func applyEngineSettings(mode: String?, cap: String?) async {
+    func applyEngineSettings(mode: String?, cap: String?, confidence: Double? = nil,
+                             contextWindow: Int? = nil) async {
         guard let client = apiClient else { return }
         generationTask?.cancel()
         modelSwitchError = nil
@@ -452,13 +494,16 @@ final class AppModel: ObservableObject {
             + "the model in place. Weights are already on disk; this takes seconds to a "
             + "minute, and the server's port stays up."
         isModelLoading = true
-        logStore.note("reloading \(model) — mode \(mode ?? "auto") · cap \(cap ?? "auto")")
+        logStore.note("reloading \(model) — mode \(mode ?? "auto") · cap \(cap ?? "auto")"
+                      + (confidence.map { " · conf \($0)" } ?? ""))
         defer {
             isModelLoading = false
             loadingDetail = nil
         }
         do {
-            _ = try await client.loadModel(model, mode: mode, maxDraft: cap)
+            _ = try await client.loadModel(model, mode: mode, maxDraft: cap,
+                                           confidence: confidence,
+                                           contextWindow: contextWindow)
             currentHealth = try? await client.health()
             startTelemetry()
             startMemoryPolling()

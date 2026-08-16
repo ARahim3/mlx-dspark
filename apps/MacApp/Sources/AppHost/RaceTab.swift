@@ -56,12 +56,26 @@ struct RaceControls: View {
     // clamp rewrites the text under the cursor mid-entry ("500" passes through "5" -> 16).
     @State private var maxTokensText: String = ""
 
+    /// Custom draft caps the user typed this session — they render as chips next to the
+    /// presets, so they can be toggled off like any other arm.
+    @State private var customCaps: [Int] = []
+    @State private var customCapText = ""
+
+    private var drafterMode: String? {
+        model.availableRaceArms.first(where: { $0 == "dspark" || $0 == "dflash" })
+    }
+
     /// Everything this pair could race: baseline first (the reference belongs on the left),
-    /// then the drafter at a few caps, then lookup. The user toggles which of these run.
+    /// then the drafter at preset + user-typed caps and its cap-auto (the adaptive cap the
+    /// engine derives from this machine's measured curves), then lookup.
     private var candidateArms: [RaceArm] {
         var arms: [RaceArm] = [RaceArm(mode: "baseline")]
-        if let drafterMode = model.availableRaceArms.first(where: { $0 == "dspark" || $0 == "dflash" }) {
-            arms.append(contentsOf: [2, 3, 4, 6].map { RaceArm(mode: drafterMode, cap: $0) })
+        if let drafterMode {
+            let presets = [2, 3, 4, 6]
+            arms.append(contentsOf: presets.map { RaceArm(mode: drafterMode, cap: $0) })
+            arms.append(contentsOf: customCaps.filter { !presets.contains($0) }
+                .map { RaceArm(mode: drafterMode, cap: $0) })
+            arms.append(RaceArm(mode: drafterMode, autoCap: true))
         }
         if model.availableRaceArms.contains("lookup") {
             arms.append(RaceArm(mode: "lookup"))
@@ -113,6 +127,17 @@ struct RaceControls: View {
                                 || (!race.selectedArms.contains(arm) && race.selectedArms.count >= 4))
                         { toggle(arm) }
                 }
+                if drafterMode != nil {
+                    // Any cap 1–64, not just the preset chips — typed caps become chips.
+                    TextField("cap", text: $customCapText)
+                        .textFieldStyle(.roundedBorder)
+                        .frame(width: 40)
+                        .multilineTextAlignment(.center)
+                        .disabled(race.phase == .running)
+                        .onSubmit(addCustomCap)
+                        .help("Race any draft cap (1–64): type it and press Return. "
+                              + "The presets are just common picks.")
+                }
                 Spacer()
                 if race.phase == .running {
                     ProgressView().controlSize(.small)
@@ -149,6 +174,18 @@ struct RaceControls: View {
         let clamped = min(max(Int(maxTokensText) ?? race.maxTokens, 16), 4096)
         race.maxTokens = clamped
         maxTokensText = String(clamped)
+    }
+
+    private func addCustomCap() {
+        guard let drafterMode, let cap = Int(customCapText), (1...64).contains(cap)
+        else { return }
+        customCapText = ""
+        if !customCaps.contains(cap) {
+            customCaps.append(cap)
+            customCaps.sort()
+        }
+        let arm = RaceArm(mode: drafterMode, cap: cap)
+        if !race.selectedArms.contains(arm), race.selectedArms.count < 4 { toggle(arm) }
     }
 
     private func toggle(_ arm: RaceArm) {

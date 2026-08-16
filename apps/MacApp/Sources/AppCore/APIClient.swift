@@ -27,17 +27,45 @@ public struct HealthInfo: Decodable, Sendable, Equatable {
     /// Whether the loaded model's chat template reads `reasoning_effort` (Qwen3.8-class).
     /// Optional so the app keeps decoding health from older engines that don't report it.
     public let supportsReasoningEffort: Bool?
+    /// Confidence-head early-stop threshold (0 = off). Part of a pair's measured-best
+    /// bundle where the verify curve still rises inside the cap window (Qwen3.8-27B-4bit:
+    /// cap 7 + 0.3). Optional: older engines don't report it.
+    public let confidenceThreshold: Double?
+    /// While `status == "loading"` and the engine is fetching weights: live download
+    /// progress (`/health.download`). Nil once the fetch is done, on hot swaps of cached
+    /// models, and on older engines.
+    public let download: DownloadProgress?
 
     enum CodingKeys: String, CodingKey {
-        case status, model, mode, target, drafter
+        case status, model, mode, target, drafter, download
         case maxDraft = "max_draft"
         case contextWindow = "context_window"
         case maxOutputTokens = "max_output_tokens"
         case supportsReasoningEffort = "supports_reasoning_effort"
+        case confidenceThreshold = "confidence_threshold"
     }
 
     /// True when a model is loaded and serving (`status == "ok"`).
     public var isLoaded: Bool { status == "ok" }
+}
+
+/// A first-time model download in flight, as `/health` reports it while loading.
+/// `bytesTotal` is best-effort (hub metadata) and may be nil for the first seconds.
+public struct DownloadProgress: Decodable, Sendable, Equatable {
+    public let repo: String
+    public let bytesDone: Int64
+    public let bytesTotal: Int64?
+
+    enum CodingKeys: String, CodingKey {
+        case repo
+        case bytesDone = "bytes_done"
+        case bytesTotal = "bytes_total"
+    }
+
+    public var fraction: Double? {
+        guard let total = bytesTotal, total > 0 else { return nil }
+        return min(1.0, Double(bytesDone) / Double(total))
+    }
 }
 
 public struct SpecInfo: Codable, Sendable, Equatable {
@@ -167,18 +195,38 @@ public struct APIClient: Sendable {
     /// the server's startup flags for this load only — how the app turns speculation on/off
     /// or pins a measured cap without touching the model.
     public func loadModel(_ target: String, mode: String? = nil,
-                          maxDraft: String? = nil) async throws -> LoadStatus {
+                          maxDraft: String? = nil,
+                          confidence: Double? = nil,
+                          contextWindow: Int? = nil) async throws -> LoadStatus {
         var payload: [String: Any] = ["model": target]
         if let mode { payload["mode"] = mode }
         if let maxDraft {
             payload["max_draft"] = Int(maxDraft).map { $0 as Any } ?? maxDraft
         }
+        // 0 = explicitly off; nil = keep the server default. Older engines ignore the key.
+        if let confidence { payload["confidence_threshold"] = confidence }
+        // A limit below the model's own max — the KV-cache RAM lever. nil = model max.
+        if let contextWindow { payload["context_window"] = contextWindow }
         let body = try JSONSerialization.data(withJSONObject: payload)
         var req = request("admin/load", method: "POST", body: body)
         req.timeoutInterval = 1800        // a first-time load downloads weights
         let (data, response) = try await session.data(for: req)
         try Self.check(response, data)
         return try JSONDecoder().decode(LoadStatus.self, from: data)
+    }
+
+    /// Cancel an in-flight first-time download (`/admin/load/cancel`). The blocked
+    /// `/admin/load` then fails cleanly and the server stays up, model-less. `cleanup`
+    /// also removes the partial files; the default keeps them so loading the same model
+    /// again resumes where it stopped instead of restarting a multi-gigabyte fetch.
+    @discardableResult
+    public func cancelLoad(cleanup: Bool = false) async throws -> Bool {
+        let body = try JSONSerialization.data(withJSONObject: ["cleanup": cleanup])
+        let req = request("admin/load/cancel", method: "POST", body: body)
+        let (data, response) = try await session.data(for: req)
+        try Self.check(response, data)
+        let obj = try JSONSerialization.jsonObject(with: data) as? [String: Any]
+        return obj?["cancelled"] as? Bool ?? false
     }
 
     public func loadStatus() async throws -> LoadStatus {
