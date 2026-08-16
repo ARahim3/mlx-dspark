@@ -626,8 +626,12 @@ class Engine:
         for index, arm in enumerate(arms):
             mode = arm.get("mode", "baseline")
             cap = arm.get("cap")
+            conf = arm.get("confidence")
             label = mode if cap is None else f"{mode} cap {cap}"
-            on_event("arm_start", {"index": index, "mode": mode, "cap": cap, "label": label})
+            if conf is not None:
+                label += f" conf {conf:g}"
+            on_event("arm_start", {"index": index, "mode": mode, "cap": cap,
+                                   "confidence": conf, "label": label})
 
             started = time.time()
 
@@ -635,7 +639,7 @@ class Engine:
                 on_event("token", {"index": _index, "text": piece,
                                    "t_ms": round((time.time() - _t0) * 1e3, 1)})
 
-            res = self._executor.submit(self._race_arm, prompt_ids, mode, cap,
+            res = self._executor.submit(self._race_arm, prompt_ids, mode, cap, conf,
                                         max_tokens, emit).result()
             summary = {
                 "index": index, "label": label, "mode": mode, "cap": cap,
@@ -733,8 +737,10 @@ class Engine:
                 f"differences accumulate and eventually flip a near-tie. Every token any arm "
                 f"emitted was its target's own top choice.")
 
-    def _race_arm(self, prompt_ids, mode, cap, max_tokens, on_text) -> GenResult:
-        """One arm, on the generation thread, with a cache of its own."""
+    def _race_arm(self, prompt_ids, mode, cap, confidence, max_tokens, on_text) -> GenResult:
+        """One arm, on the generation thread, with a cache of its own. ``confidence`` is a
+        per-arm confidence-head threshold (None = the server's loaded setting) — what lets a
+        measured bundle like Qwen3.8-27B-4bit's cap 7 + 0.3 race its plain-cap siblings."""
         ctrl = None
         if cap == "auto" and mode in ("dspark", "dflash"):
             # A FRESH controller per arm: the curves come from the disk cache (measured at
@@ -754,7 +760,9 @@ class Engine:
                 max_draft_tokens=(None if ctrl is not None else (cap or 2)),
                 cap_controller=ctrl,
                 lookup_drafts=self.lookup_drafts, lookup_long_draft=self.lookup_long_draft,
-                confidence_threshold=self.confidence_threshold, on_text=on_text)
+                confidence_threshold=(self.confidence_threshold if confidence is None
+                                      else confidence),
+                on_text=on_text)
         if mode == "dflash":
             return dflash_generate(
                 self.target, self.tokenizer, self.drafter, prompt_ids=prompt_ids,
@@ -1464,6 +1472,10 @@ def make_handler(engine: Engine, api_key: str | None):
                     # best is cap 7 + 0.3)
                     "confidence_threshold": float(
                         getattr(engine, "confidence_threshold", 0.0)),
+                    # capability flag: /admin/race arms accept a per-arm "confidence".
+                    # A client must gate its conf-bundle arm on this — an engine without
+                    # it would silently DROP the field and the lane label would lie.
+                    "race_arm_confidence": True,
                     "context_window": getattr(engine, "context_window", None),
                     "max_output_tokens": engine.max_tokens_cap,
                     # Whether the loaded template reads `reasoning_effort`, and the server's
@@ -1621,7 +1633,21 @@ def make_handler(engine: Engine, api_key: str | None):
                             400, f"arm cap must be an integer or 'auto', got {cap!r}")
                     if not 1 <= cap <= 64:
                         return self._send_error(400, "arm cap must be in 1..64")
-                arms.append({"mode": mode, "cap": cap})
+                conf = arm.get("confidence")
+                if conf is not None:
+                    # per-arm confidence-head threshold — races a measured cap+confidence
+                    # bundle (e.g. Qwen3.8-27B-4bit's cap 7 + 0.3) against plain caps.
+                    # None = the server's loaded setting, so old clients change nothing.
+                    if mode != "dspark":
+                        return self._send_error(
+                            400, "arm 'confidence' needs a dspark arm (only the DSpark "
+                                 "drafter has a confidence head)")
+                    if (isinstance(conf, bool) or not isinstance(conf, (int, float))
+                            or not 0.0 <= conf <= 1.0):
+                        return self._send_error(
+                            400, "arm 'confidence' must be a number in [0, 1]")
+                    conf = float(conf)
+                arms.append({"mode": mode, "cap": cap, "confidence": conf})
             if not 2 <= len(arms) <= 4:
                 return self._send_error(400, "race takes between 2 and 4 arms")
 

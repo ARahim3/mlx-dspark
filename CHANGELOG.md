@@ -4,6 +4,13 @@ All notable changes to `mlx-dspark`. Versions follow [SemVer](https://semver.org
 
 ## [Unreleased]
 
+### Added
+- **Per-arm `confidence` on `/admin/race`** (dspark arms; None = the server's loaded setting),
+  so a measured cap+confidence bundle — Qwen3.8-27B-4bit's best is cap 7 + 0.3 — can race its
+  plain-cap siblings head-to-head. `/health` advertises `race_arm_confidence: true` as the
+  capability gate: clients must show a bundle arm only when it's present, because an older
+  engine silently drops the field and the lane label would lie.
+
 ## [0.12.0] — 2026-08-16 — small-M verify kernel, cancellable downloads, long-context controls
 
 ### Added

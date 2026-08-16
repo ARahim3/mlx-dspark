@@ -670,7 +670,7 @@ def test_race_cap_auto_and_validation(server):
                 {"prompt": "hi", "arms": [{"mode": "dspark", "cap": "auto"},
                                           {"mode": "baseline"}]},
                 stream=True)
-    assert captured["arms"][0] == {"mode": "dspark", "cap": "auto"}
+    assert captured["arms"][0] == {"mode": "dspark", "cap": "auto", "confidence": None}
     start = next(line for line in out.splitlines() if line.startswith("data:"))
     assert json.loads(start[5:])["arms"][0]["cap"] == "auto"   # echoed for the client
 
@@ -704,4 +704,34 @@ def test_race_custom_int_cap_passes_through(server):
     _post(base, "/admin/race",
           {"prompt": "hi", "arms": [{"mode": "dspark", "cap": 13}, {"mode": "baseline"}]},
           stream=True)
-    assert captured["arms"][0] == {"mode": "dspark", "cap": 13}
+    assert captured["arms"][0] == {"mode": "dspark", "cap": 13, "confidence": None}
+
+
+def test_race_arm_confidence_validated_and_passed(server):
+    """A per-arm confidence threshold rides through for dspark arms (the cap+conf bundle
+    race), is a clear 400 on non-drafter arms and out-of-range values, and its presence is
+    advertised via /health's race_arm_confidence capability flag — a client must gate on
+    that, or an older engine would silently drop the field and the lane label would lie."""
+    eng, base = server
+    eng.race_arms_available = lambda: ["dspark", "baseline", "lookup"]
+    captured = {}
+    eng.race = lambda prompt_ids, arms, max_tokens, on_event: captured.update(arms=arms)
+
+    out = _post(base, "/admin/race",
+                {"prompt": "hi", "arms": [{"mode": "dspark", "cap": 7, "confidence": 0.3},
+                                          {"mode": "baseline"}]},
+                stream=True)
+    assert captured["arms"][0] == {"mode": "dspark", "cap": 7, "confidence": 0.3}
+    start = next(line for line in out.splitlines() if line.startswith("data:"))
+    assert json.loads(start[5:])["arms"][0]["confidence"] == 0.3
+
+    for bad_arm in ({"mode": "baseline", "confidence": 0.3},
+                    {"mode": "lookup", "confidence": 0.3},
+                    {"mode": "dspark", "confidence": 1.5},
+                    {"mode": "dspark", "confidence": True}):
+        with pytest.raises(urllib.error.HTTPError) as e:
+            _post(base, "/admin/race",
+                  {"prompt": "hi", "arms": [bad_arm, {"mode": "dspark"}]})
+        assert e.value.code == 400, bad_arm
+
+    assert _get(base, "/health")["race_arm_confidence"] is True

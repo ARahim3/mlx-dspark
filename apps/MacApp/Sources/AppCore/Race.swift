@@ -2,25 +2,35 @@ import Foundation
 
 /// One competitor in a race. `autoCap` is the server's cap `"auto"` — the per-round
 /// adaptive cap driven by this machine's measured cost curves, raceable against any
-/// fixed cap since the engine grew it on `/admin/race`.
+/// fixed cap since the engine grew it on `/admin/race`. `confidence` is a per-arm
+/// confidence-head threshold (engines with `/health.race_arm_confidence` only) — what
+/// lets a measured bundle like Qwen3.8-27B-4bit's cap 7 + 0.3 race its plain siblings.
 public struct RaceArm: Codable, Sendable, Hashable, Identifiable {
     public let mode: String
     public let cap: Int?
     public let autoCap: Bool
+    public let confidence: Double?
 
-    public var id: String { autoCap ? "\(mode)-auto" : cap.map { "\(mode)-\($0)" } ?? mode }
+    public var id: String {
+        let base = autoCap ? "\(mode)-auto" : cap.map { "\(mode)-\($0)" } ?? mode
+        return confidence.map { "\(base)-c\($0)" } ?? base
+    }
 
-    public init(mode: String, cap: Int? = nil, autoCap: Bool = false) {
+    public init(mode: String, cap: Int? = nil, autoCap: Bool = false,
+                confidence: Double? = nil) {
         self.mode = mode
         self.cap = autoCap ? nil : cap
         self.autoCap = autoCap
+        self.confidence = confidence
     }
 
     public var label: String {
-        autoCap ? "\(mode) cap auto" : cap.map { "\(mode) cap \($0)" } ?? mode
+        var out = autoCap ? "\(mode) cap auto" : cap.map { "\(mode) cap \($0)" } ?? mode
+        if let confidence { out += " conf \(confidence.formatted())" }
+        return out
     }
 
-    enum CodingKeys: String, CodingKey { case mode, cap }
+    enum CodingKeys: String, CodingKey { case mode, cap, confidence }
 
     // The wire value for cap is an Int OR the string "auto" (the server echoes whichever
     // was asked in the SSE start event), so decoding must accept both.
@@ -34,6 +44,7 @@ public struct RaceArm: Codable, Sendable, Hashable, Identifiable {
             cap = nil
             autoCap = (try? c.decodeIfPresent(String.self, forKey: .cap)) == "auto"
         }
+        confidence = try? c.decodeIfPresent(Double.self, forKey: .confidence)
     }
 
     public func encode(to encoder: Encoder) throws {
@@ -44,6 +55,7 @@ public struct RaceArm: Codable, Sendable, Hashable, Identifiable {
         } else {
             try c.encodeIfPresent(cap, forKey: .cap)
         }
+        try c.encodeIfPresent(confidence, forKey: .confidence)
     }
 }
 
@@ -162,6 +174,7 @@ extension APIClient {
                             } else if let cap = arm.cap {
                                 dict["cap"] = cap
                             }
+                            if let conf = arm.confidence { dict["confidence"] = conf }
                             return dict
                         },
                     ]

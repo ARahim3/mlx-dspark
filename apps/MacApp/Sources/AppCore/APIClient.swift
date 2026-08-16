@@ -31,6 +31,10 @@ public struct HealthInfo: Decodable, Sendable, Equatable {
     /// bundle where the verify curve still rises inside the cap window (Qwen3.8-27B-4bit:
     /// cap 7 + 0.3). Optional: older engines don't report it.
     public let confidenceThreshold: Double?
+    /// Whether `/admin/race` arms accept a per-arm `confidence` — the capability gate for
+    /// the Lab's cap+conf bundle chip. An engine without it would silently drop the field
+    /// and the lane label would lie, so the chip only shows when this is true.
+    public let raceArmConfidence: Bool?
     /// While `status == "loading"` and the engine is fetching weights: live download
     /// progress (`/health.download`). Nil once the fetch is done, on hot swaps of cached
     /// models, and on older engines.
@@ -43,6 +47,7 @@ public struct HealthInfo: Decodable, Sendable, Equatable {
         case maxOutputTokens = "max_output_tokens"
         case supportsReasoningEffort = "supports_reasoning_effort"
         case confidenceThreshold = "confidence_threshold"
+        case raceArmConfidence = "race_arm_confidence"
     }
 
     /// True when a model is loaded and serving (`status == "ok"`).

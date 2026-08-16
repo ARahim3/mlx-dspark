@@ -76,6 +76,11 @@ struct RaceControls: View {
             arms.append(contentsOf: customCaps.filter { !presets.contains($0) }
                 .map { RaceArm(mode: drafterMode, cap: $0) })
             arms.append(RaceArm(mode: drafterMode, autoCap: true))
+            if drafterMode == "dspark", model.health?.raceArmConfidence == true {
+                // The cap+confidence bundle (measured best for 4-bit 27B pairs) as its own
+                // arm — gated on the engine capability so the lane label never lies.
+                arms.append(RaceArm(mode: drafterMode, cap: 7, confidence: 0.3))
+            }
         }
         if model.availableRaceArms.contains("lookup") {
             arms.append(RaceArm(mode: "lookup"))
