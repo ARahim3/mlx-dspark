@@ -4,6 +4,8 @@ All notable changes to `mlx-dspark`. Versions follow [SemVer](https://semver.org
 
 ## [Unreleased]
 
+## [0.12.1] — 2026-08-16 — race the confidence bundle
+
 ### Added
 - **Per-arm `confidence` on `/admin/race`** (dspark arms; None = the server's loaded setting),
   so a measured cap+confidence bundle — Qwen3.8-27B-4bit's best is cap 7 + 0.3 — can race its
