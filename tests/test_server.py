@@ -655,3 +655,53 @@ def test_stream_splits_prefilled_thinking(server):
                 {"messages": [{"role": "user", "content": "hi<think>"}], "stream": True},
                 stream=True)
     assert _stream_fields(sse) == ("I reason here", "The answer")
+
+
+def test_race_cap_auto_and_validation(server):
+    """Race arms accept cap 'auto' for drafter modes (per-round adaptive cap from the
+    cached curves), reject it for modes with no controller to drive, and reject garbage
+    caps — each with the reason, not a silent int() crash."""
+    eng, base = server
+    eng.race_arms_available = lambda: ["dspark", "baseline", "lookup"]
+    captured = {}
+    eng.race = lambda prompt_ids, arms, max_tokens, on_event: captured.update(arms=arms)
+
+    out = _post(base, "/admin/race",
+                {"prompt": "hi", "arms": [{"mode": "dspark", "cap": "auto"},
+                                          {"mode": "baseline"}]},
+                stream=True)
+    assert captured["arms"][0] == {"mode": "dspark", "cap": "auto"}
+    start = next(line for line in out.splitlines() if line.startswith("data:"))
+    assert json.loads(start[5:])["arms"][0]["cap"] == "auto"   # echoed for the client
+
+    with pytest.raises(urllib.error.HTTPError) as e:
+        _post(base, "/admin/race",
+              {"prompt": "hi", "arms": [{"mode": "baseline", "cap": "auto"},
+                                        {"mode": "dspark"}]})
+    assert e.value.code == 400
+    assert "auto" in json.loads(e.value.read())["error"]["message"]
+
+    with pytest.raises(urllib.error.HTTPError) as e:
+        _post(base, "/admin/race",
+              {"prompt": "hi", "arms": [{"mode": "dspark", "cap": "seven"},
+                                        {"mode": "baseline"}]})
+    assert e.value.code == 400
+
+    with pytest.raises(urllib.error.HTTPError) as e:
+        _post(base, "/admin/race",
+              {"prompt": "hi", "arms": [{"mode": "dspark", "cap": 0},
+                                        {"mode": "baseline"}]})
+    assert e.value.code == 400
+
+
+def test_race_custom_int_cap_passes_through(server):
+    """Any cap in 1..64 rides through to the arm — the Lab's custom-cap field depends on
+    the server not silently clamping to its chip presets."""
+    eng, base = server
+    eng.race_arms_available = lambda: ["dspark", "baseline"]
+    captured = {}
+    eng.race = lambda prompt_ids, arms, max_tokens, on_event: captured.update(arms=arms)
+    _post(base, "/admin/race",
+          {"prompt": "hi", "arms": [{"mode": "dspark", "cap": 13}, {"mode": "baseline"}]},
+          stream=True)
+    assert captured["arms"][0] == {"mode": "dspark", "cap": 13}

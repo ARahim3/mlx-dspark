@@ -199,3 +199,62 @@ class TestUnload:
 
         status = h.swap(model="repo")
         assert status["ready"] is True and status["model"] == "new"
+
+
+class TestSwapConfidence:
+    def test_swap_confidence_override_and_default_passthrough(self, monkeypatch):
+        """An explicit confidence_threshold rides the swap (the cap+confidence bundle a
+        client applies for pairs whose measured best needs it — Qwen3.8-27B-4bit's is
+        cap 7 + 0.3); absent, the server's stored kwargs pass through untouched."""
+        h = EngineHolder(FakeEngine("old"), load_kwargs={"confidence_threshold": 0.0})
+        captured = {}
+
+        import mlx_dspark.server as server
+
+        def capture(**kw):
+            captured.update(kw)
+            return FakeEngine("new")
+
+        monkeypatch.setattr(server.Engine, "load", staticmethod(capture))
+        monkeypatch.setattr(server, "maybe_batch_engine", lambda e, b: e)
+
+        h.swap(model="repo", confidence_threshold=0.3)
+        assert captured["confidence_threshold"] == 0.3
+        captured.clear()
+        h.swap(model="repo2")
+        assert captured["confidence_threshold"] == 0.0   # unset -> server default kept
+
+    def test_status_reports_download_progress_while_loading(self, monkeypatch):
+        """While a swap is fetching weights, status() carries the download progress so
+        /health can show a real bar and the client can offer Cancel."""
+        import mlx_dspark.download as download
+
+        h = EngineHolder(FakeEngine(), load_kwargs={})
+        h._loading = True
+        monkeypatch.setattr(download, "progress", lambda: {
+            "repo": "org/model", "bytes_done": 5, "bytes_total": 10})
+        s = h.status()
+        assert s["download"]["repo"] == "org/model"
+        h._loading = False
+        assert "download" not in h.status()
+
+    def test_swap_context_window_override(self, monkeypatch):
+        """context_window rides the swap as a per-load override (the KV-RAM lever);
+        absent, the server's stored kwargs pass through untouched."""
+        h = EngineHolder(FakeEngine("old"), load_kwargs={"context_window": None})
+        captured = {}
+
+        import mlx_dspark.server as server
+
+        def capture(**kw):
+            captured.update(kw)
+            return FakeEngine("new")
+
+        monkeypatch.setattr(server.Engine, "load", staticmethod(capture))
+        monkeypatch.setattr(server, "maybe_batch_engine", lambda e, b: e)
+
+        h.swap(model="repo", context_window=32768)
+        assert captured["context_window"] == 32768
+        captured.clear()
+        h.swap(model="repo2")
+        assert captured["context_window"] is None

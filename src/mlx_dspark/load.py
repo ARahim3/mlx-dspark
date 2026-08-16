@@ -62,7 +62,7 @@ REGISTRY = [
      "ram": "~8 GB", "speedup": "~1.8×"},
     {"id": "qwen3-8b",   "target": "mlx-community/Qwen3-8B-8bit",
      "dspark": "deepseek-ai/dspark_qwen3_8b_block7", "dflash": "z-lab/Qwen3-8B-DFlash-b16",
-     "ram": "~11 GB", "speedup": "~1.6×"},
+     "ram": "~11 GB", "speedup": "~2.1×"},
     # Same official DeepSeek drop and recipe as the 4B/8B entries above; registered
     # 2026-07-22 once it was actually benchmarked (2.03x at cap 4: 2.36x math / 2.11x code /
     # 1.62x chat, baseline 15.3 tok/s). No z-lab DFlash adapter published at this size.
@@ -71,7 +71,7 @@ REGISTRY = [
      "ram": "~19 GB", "speedup": "~2.0×"},
     {"id": "gemma-4-12b", "target": "mlx-community/gemma-4-12B-it-8bit",
      "dspark": "deepseek-ai/dspark_gemma4_12b_block7", "dflash": "z-lab/gemma4-12B-it-DFlash",
-     "ram": "~15 GB", "speedup": "~2.1×"},
+     "ram": "~15 GB", "speedup": "~2.8×"},
     # PrismML Ternary-Bonsai 27B (ternary rebuild of Qwen3.6-27B, hybrid linear attention).
     # PrismML ships the DSpark drafter GGUF-only (no safetensors export exists); the repo
     # below is our 1:1 bf16 repack into the DeepSpec layout (converted with gguf_convert.py —
@@ -104,7 +104,7 @@ REGISTRY = [
     # on the 4-bit target — 4-bit trades those ratios for ~10-15% more absolute tok/s.
     {"id": "ornith-1.0-9b", "target": "mlx-community/Ornith-1.0-9B-8bit",
      "dspark": "stanleyphoong/Ornith-1.0-9B-DSpark",
-     "ram": "~13 GB", "speedup": "~2.2×"},
+     "ram": "~13 GB", "speedup": "~2.4×"},
     # Qwen3.6-35B-A3B — the first **MoE** target here (qwen3_5_moe: 40 layers, 30 linear +
     # 10 full attention, 256 experts top-8, ~3.8B active). Community drafter by Koopah:
     # DeepSpec-standalone, block_size 8, 8 taps, plain dense-qwen3 backbone; loaded with zero
@@ -141,7 +141,7 @@ REGISTRY = [
     # both quants (fp ties only, margins 0.0/0.125).
     {"id": "qwen3.8-27b", "target": "mlx-community/Qwen3.8-27B-4bit",
      "dspark": "RadixArk/Qwen3.8-27B-DSpark", "lookup_drafts": False,
-     "ram": "~18 GB", "speedup": "~1.7×"},
+     "ram": "~18 GB", "speedup": "~1.9×"},
     # Same pair at 8-bit — the measured-best quant (the drafter was trained vs an FP8
     # verifier, so 8-bit is the matched precision: accept 2.44 -> 3.43, 2.45x at cap 4).
     # Listed as its own row so pickers offer both; the 4-bit row keeps the absolute-speed
@@ -149,7 +149,7 @@ REGISTRY = [
     # "*-8bit" here and everything else Qwen3.8 to the row above.
     {"id": "qwen3.8-27b-8bit", "target": "mlx-community/Qwen3.8-27B-8bit",
      "dspark": "RadixArk/Qwen3.8-27B-DSpark", "lookup_drafts": False,
-     "ram": "~29 GB", "speedup": "~2.5×"},
+     "ram": "~29 GB", "speedup": "~2.7×"},
     # NVIDIA Nemotron-3.5-Lightning-30B-A3B — a hybrid **Mamba-2 + MoE + attention** target
     # (model_type nemotron_h: 52 blocks, 128 experts top-6 + 1 shared, ~3B active, latent MoE),
     # the first non-attention recurrence here. NVIDIA's official DSpark head: a plain qwen3 GQA
@@ -195,7 +195,7 @@ REGISTRY = [
     # DFlash-lineage head)".
     {"id": "muse-glimmer-30b", "target": "mlx-community/Muse-Glimmer-30B-4bit",
      "dspark": "DaoCloud/Muse-Glimmer-30B-DSpark", "lookup_drafts": False,
-     "ram": "~26 GB (4-bit) / ~40 GB (8-bit)", "speedup": "~1.5× (8-bit: ~2.4×)"},
+     "ram": "~26 GB (4-bit) / ~40 GB (8-bit)", "speedup": "~1.7× (8-bit: ~2.5×)"},
 ]
 
 # legacy `--family` / load_pair("qwen3") values -> a concrete target repo (deprecated).

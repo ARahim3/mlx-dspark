@@ -335,6 +335,15 @@ class Engine:
 
             lookup_drafts = lookup_drafts_default(target_repo)
 
+        # Pre-fetch hub repos cancellably (download.py) so the loaders below hit a complete
+        # cache and never touch the network: the long phase of a first-time load — the one
+        # worth cancelling and showing progress for — all happens here, where
+        # /admin/load/cancel and /health's download progress can reach it.
+        from .download import ensure_local
+
+        ensure_local(target_repo)
+        ensure_local(drafter_repo)
+
         # Load (and calibrate) on the SAME single thread that will generate: MLX ops/arrays
         # are thread/stream-affine, and mlx-vlm's gemma load switches the loading thread's
         # default stream — anything left lazy would then be unevaluatable from another thread.
@@ -351,6 +360,12 @@ class Engine:
                 draft, _ = load_dflash(drafter_repo, quantize=drafter_bits > 0,
                                        bits=max(drafter_bits, 2))
                 draft.bind(tgt.model)
+            # small-M MMA verify kernel (see small_m_qmm.py): on for shapes the cached
+            # probe proves faster on this machine. MUST precede calibrate()/static_cap —
+            # cap curves are measured under the same kernel dispatch generation uses.
+            from .calibrate import apply_small_m
+
+            apply_small_m(tgt, draft, target_repo=target_repo, drafter_repo=drafter_repo)
             # --max-draft auto: measure this machine+pair's cost curves once (disk-cached)
             # and let a CapController pick the cap per round. Only meaningful with a drafter.
             ctrl = None
@@ -720,16 +735,31 @@ class Engine:
 
     def _race_arm(self, prompt_ids, mode, cap, max_tokens, on_text) -> GenResult:
         """One arm, on the generation thread, with a cache of its own."""
+        ctrl = None
+        if cap == "auto" and mode in ("dspark", "dflash"):
+            # A FRESH controller per arm: the curves come from the disk cache (measured at
+            # load time for static_cap, so this is instant), but the acceptance EWMA is
+            # runtime state — sharing one across arms/races would let an earlier run bias
+            # a later one's caps, which is exactly what a race must not do.
+            from .calibrate import calibrate
+
+            ctrl = calibrate(self.target, self.drafter, mode=mode,
+                             target_repo=self.target_repo, drafter_repo=self.drafter_repo,
+                             verbose=False)
+            cap = None
         if mode == "dspark":
             return speculative_generate(
                 self.target, self.tokenizer, self.drafter, prompt_ids=prompt_ids,
-                max_new_tokens=max_tokens, max_draft_tokens=cap or 2,
+                max_new_tokens=max_tokens,
+                max_draft_tokens=(None if ctrl is not None else (cap or 2)),
+                cap_controller=ctrl,
                 lookup_drafts=self.lookup_drafts, lookup_long_draft=self.lookup_long_draft,
                 confidence_threshold=self.confidence_threshold, on_text=on_text)
         if mode == "dflash":
             return dflash_generate(
                 self.target, self.tokenizer, self.drafter, prompt_ids=prompt_ids,
-                max_new_tokens=max_tokens, max_draft_tokens=cap, on_text=on_text)
+                max_new_tokens=max_tokens, max_draft_tokens=cap, cap_controller=ctrl,
+                on_text=on_text)
         if mode == "lookup":
             return lookup_generate(
                 self.target, self.tokenizer, prompt_ids=prompt_ids,
@@ -1149,9 +1179,16 @@ class EngineHolder:
         return self._engine
 
     def status(self) -> dict:
-        return {"ready": self.ready, "loading": self._loading,
-                "model": self._engine.model_id if self._engine is not None else None,
-                "error": self._load_error}
+        out = {"ready": self.ready, "loading": self._loading,
+               "model": self._engine.model_id if self._engine is not None else None,
+               "error": self._load_error}
+        if self._loading:
+            # Live download progress while a first-time load fetches weights — lets a
+            # client draw a real progress bar and offer Cancel (POST /admin/load/cancel).
+            from .download import progress
+
+            out["download"] = progress()
+        return out
 
     def unload(self) -> dict:
         """Release the loaded model without loading another — frees its memory.
@@ -1172,7 +1209,9 @@ class EngineHolder:
 
     def swap(self, *, model: str, mode: str | None = None,
              max_draft: int | str | None = None,
-             lookup_drafts: bool | None = None) -> dict:
+             lookup_drafts: bool | None = None,
+             confidence_threshold: float | None = None,
+             context_window: int | None = None) -> dict:
         """Release the current model and load ``model`` in its place. Returns the new status.
 
         Serialized by ``_swap_lock`` so two concurrent loads can't race. Raises ``ValueError``
@@ -1200,6 +1239,10 @@ class EngineHolder:
                     kwargs["max_draft_tokens"] = max_draft
                 if lookup_drafts is not None:
                     kwargs["lookup_drafts"] = lookup_drafts
+                if confidence_threshold is not None:
+                    kwargs["confidence_threshold"] = confidence_threshold
+                if context_window is not None:
+                    kwargs["context_window"] = context_window
                 engine = Engine.load(**kwargs)
                 engine = maybe_batch_engine(engine, self._max_batch)
                 self._engine = engine
@@ -1401,6 +1444,9 @@ def make_handler(engine: Engine, api_key: str | None):
                     return self._send_json(200, {
                         "status": "loading" if status["loading"] else "no_model",
                         "model": status["model"], "loading": status["loading"],
+                        # non-null while a first-time load is fetching weights:
+                        # {repo, bytes_done, bytes_total} — cancel with /admin/load/cancel
+                        "download": status.get("download"),
                         "error": status["error"]})
                 # max_draft as a string ("auto" or the pinned/derived cap) so a client can
                 # show the configured knob, not just infer it from round telemetry.
@@ -1413,6 +1459,11 @@ def make_handler(engine: Engine, api_key: str | None):
                     # resolved per pair at load (registry rows measured with lookup off carry
                     # it) — reported so a client shows the actual configuration, like max_draft
                     "lookup_drafts": bool(getattr(engine, "lookup_drafts", True)),
+                    # 0.0 = off; settable per swap via /admin/load so a client can serve a
+                    # pair at a measured cap+confidence bundle (e.g. Qwen3.8-27B-4bit's
+                    # best is cap 7 + 0.3)
+                    "confidence_threshold": float(
+                        getattr(engine, "confidence_threshold", 0.0)),
                     "context_window": getattr(engine, "context_window", None),
                     "max_output_tokens": engine.max_tokens_cap,
                     # Whether the loaded template reads `reasoning_effort`, and the server's
@@ -1501,9 +1552,29 @@ def make_handler(engine: Engine, api_key: str | None):
             if lookup_drafts is not None and not isinstance(lookup_drafts, bool):
                 return self._send_error(400, "'lookup_drafts' must be a boolean (omit it to "
                                              "use the pair's measured default)")
+            confidence = req.get("confidence_threshold")
+            if confidence is not None:
+                if not isinstance(confidence, (int, float)) or not 0.0 <= confidence <= 1.0:
+                    return self._send_error(400, "'confidence_threshold' must be a number in "
+                                                 "[0, 1] (0 disables; omit to keep the "
+                                                 "server default)")
+                confidence = float(confidence)
+            # A LIMIT below the model's own maximum, mainly a RAM lever: the KV cache grows
+            # linearly with context, and this caps it — requests past it get the "prompt is
+            # too long" wording agent clients auto-compact on. It cannot extend a model past
+            # its trained max_position_embeddings.
+            context_window = req.get("context_window")
+            if context_window is not None and (
+                    isinstance(context_window, bool) or not isinstance(context_window, int)
+                    or not 1024 <= context_window <= 10_000_000):
+                return self._send_error(400, "'context_window' must be an integer token "
+                                             "count >= 1024 (omit it to use the model's "
+                                             "own maximum)")
             try:
                 status = engine.swap(model=model, mode=mode, max_draft=max_draft,
-                                     lookup_drafts=lookup_drafts)
+                                     lookup_drafts=lookup_drafts,
+                                     confidence_threshold=confidence,
+                                     context_window=context_window)
             except ValueError as e:                 # unknown model / unresolvable drafter
                 return self._send_error(400, str(e))
             except Exception as e:  # noqa: BLE001 — load failed; report, server stays up
@@ -1535,7 +1606,22 @@ def make_handler(engine: Engine, api_key: str | None):
                         400, f"mode {mode!r} is not available with the loaded model "
                              f"(have: {', '.join(available)})")
                 cap = arm.get("cap")
-                arms.append({"mode": mode, "cap": int(cap) if cap else None})
+                if cap == "auto":
+                    # per-round adaptive cap from this machine's cached cost curves —
+                    # only meaningful for the drafter modes (lookup/baseline have no
+                    # controller to drive)
+                    if mode not in ("dspark", "dflash"):
+                        return self._send_error(
+                            400, f"cap 'auto' needs a drafter mode, not {mode!r}")
+                elif cap is not None:
+                    try:
+                        cap = int(cap)
+                    except (TypeError, ValueError):
+                        return self._send_error(
+                            400, f"arm cap must be an integer or 'auto', got {cap!r}")
+                    if not 1 <= cap <= 64:
+                        return self._send_error(400, "arm cap must be in 1..64")
+                arms.append({"mode": mode, "cap": cap})
             if not 2 <= len(arms) <= 4:
                 return self._send_error(400, "race takes between 2 and 4 arms")
 
@@ -1662,6 +1748,17 @@ def make_handler(engine: Engine, api_key: str | None):
                 # and /admin/unload's whole job is to *leave* the ready state.
                 if route == "/admin/load":
                     return self._load(req)
+                if route == "/admin/load/cancel":
+                    # Cancel an in-flight first-time download (the load then fails cleanly
+                    # and the holder's failed-load semantics apply: server up, model-less).
+                    # `cleanup` also removes the partial files; default keeps them so a
+                    # retried load resumes instead of restarting a 15 GB fetch.
+                    from .download import cancel_current
+
+                    cleanup = req.get("cleanup")
+                    if cleanup is not None and not isinstance(cleanup, bool):
+                        return self._send_error(400, "'cleanup' must be a boolean")
+                    return self._send_json(200, cancel_current(cleanup=bool(cleanup)))
                 if route == "/admin/unload":
                     if not isinstance(engine, EngineHolder):
                         return self._send_error(
