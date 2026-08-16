@@ -1,13 +1,21 @@
 # Homebrew cask for the mlx-dspark Mac app.
 #
-# Install:
+# Install (Homebrew 6+):
 #   brew tap ARahim3/mlx-dspark https://github.com/ARahim3/mlx-dspark
-#   brew install --cask --no-quarantine mlx-dspark
+#   brew trust arahim3/mlx-dspark
+#   brew install --cask mlx-dspark
+#   xattr -dr com.apple.quarantine /Applications/mlx-dspark.app
 #
-# The `--no-quarantine` flag is what makes this pleasant. The app is ad-hoc signed but NOT
-# notarized (that needs a paid Apple Developer ID), so without it macOS 15 blocks the first
-# launch behind System Settings › Privacy & Security › "Open Anyway". `--no-quarantine` skips
-# the quarantine attribute entirely, so the app just opens. Drop it once the app is notarized.
+# Homebrew 6 (verified 2026-08-16) removed `--no-quarantine` entirely (brew/#20755 — "invalid
+# option") and requires `brew trust` for third-party taps; installed casks now KEEP the
+# quarantine attribute. The app is ad-hoc signed but NOT notarized (that needs a paid Apple
+# Developer ID), so a quarantined copy fails Gatekeeper (`spctl: rejected`) and macOS 15 blocks
+# the first launch behind System Settings › Privacy & Security › "Open Anyway". The `xattr`
+# line clears the attribute once — the exact thing `--no-quarantine` used to do — and the
+# caveats below tell the user so at install time. On Homebrew ≤ 5 the old
+# `brew install --cask --no-quarantine mlx-dspark` still works. All of this retires when the
+# app is notarized (also note Homebrew intends to require Gatekeeper-passing casks from
+# Sep 2026 — notarization is the real fix, not a nicety).
 #
 # Per release, two lines change: `version` and `sha256`. `make_dmg.sh` prints both.
 cask "mlx-dspark" do
@@ -50,8 +58,12 @@ cask "mlx-dspark" do
 
     Requires Apple Silicon (M1 or newer).
 
-    The app is not notarized yet, so it was installed with --no-quarantine. If you
-    installed without that flag and macOS blocks it, either reinstall with
-    `--no-quarantine` or allow it under System Settings › Privacy & Security.
+    The app is not notarized yet, so macOS will block the first launch. Either run
+
+        xattr -dr com.apple.quarantine /Applications/mlx-dspark.app
+
+    once, or allow it under System Settings › Privacy & Security › "Open Anyway"
+    after the first launch attempt. (Homebrew 6 removed the old --no-quarantine
+    flag; on Homebrew 5 and older it still works at install time.)
   EOS
 end

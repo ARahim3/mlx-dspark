@@ -46,18 +46,25 @@ Install, from a user's side:
 
 ```bash
 brew tap ARahim3/mlx-dspark https://github.com/ARahim3/mlx-dspark
-brew install --cask --no-quarantine mlx-dspark
+brew trust arahim3/mlx-dspark          # Homebrew 6+: third-party taps need explicit trust
+brew install --cask mlx-dspark
+xattr -dr com.apple.quarantine /Applications/mlx-dspark.app
 ```
 
-## Why `--no-quarantine`
+## Why the `xattr` step (né `--no-quarantine`)
 
 The app is **ad-hoc signed but not notarized** — notarization needs a paid Apple Developer
 Program membership. On macOS 15 a downloaded, un-notarized app no longer opens with a Finder
 right-click → Open; the user has to go to System Settings › Privacy & Security › "Open Anyway".
 
-`brew install --cask --no-quarantine` skips the quarantine attribute, so the app just opens.
-This is the reason the cask is the recommended install over a raw DMG download. The `caveats`
-block in the cask explains it to anyone who installs without the flag.
+Until Homebrew 5, `brew install --cask --no-quarantine` skipped the quarantine attribute so the
+app just opened. **Homebrew 6 removed that flag** (Homebrew/brew#20755 — "invalid option") and
+also requires `brew trust` for third-party taps; installed casks keep the quarantine attribute,
+and a quarantined ad-hoc-signed app fails Gatekeeper (`spctl: rejected`, verified 2026-08-16).
+The one-time `xattr -dr com.apple.quarantine` does exactly what the flag used to. The cask's
+`caveats` block prints this at install time. On Homebrew ≤ 5 the old flag still works.
+Note Homebrew intends to require Gatekeeper-passing casks from Sep 2026 — notarization is
+where this ends up regardless.
 
 Keeping the Python runtime **outside** the bundle (it installs to Application Support at first
 launch) is what keeps signing to just "the Swift binary + one vendored `uv`" — a full embedded
@@ -80,8 +87,9 @@ the DMG) and that the repo is <30 days old — both expected pre-release, not ca
 
 ## If a Developer ID is ever bought
 
-Notarization drops the `--no-quarantine` requirement entirely. The steps would be, after
-`make_app.sh`:
+Notarization drops the `xattr` step (and the Gatekeeper friction) entirely — and Homebrew's
+planned Sep-2026 Gatekeeper requirement for casks makes it the endgame anyway. The steps would
+be, after `make_app.sh`:
 
 ```bash
 codesign --force --deep --options runtime --sign "Developer ID Application: <name> (<team>)" build/mlx-dspark.app
@@ -90,7 +98,7 @@ xcrun notarytool submit build/mlx-dspark-<v>.dmg --keychain-profile <profile> --
 xcrun stapler staple build/mlx-dspark-<v>.dmg
 ```
 
-At that point drop `--no-quarantine` from the install instructions and the cask caveats.
+At that point drop the `xattr` step from the install instructions and the cask caveats.
 
 ## Not done here (deliberately)
 

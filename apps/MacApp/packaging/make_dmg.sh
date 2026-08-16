@@ -11,8 +11,9 @@
 # NOTE ON SIGNING: make_app.sh ad-hoc signs the bundle, which is enough to *run*, but the DMG is
 # NOT notarized (that needs a paid Apple Developer ID). On macOS 15 a downloaded, un-notarized
 # app can't be opened from Finder with a right-click any more — the user must go to System
-# Settings › Privacy & Security › "Open Anyway". The Homebrew cask sidesteps this entirely with
-# `--no-quarantine` (see Casks/mlx-dspark.rb), which is why the cask is the recommended install.
+# Settings › Privacy & Security › "Open Anyway", or clear the quarantine attribute once with
+# `xattr -dr com.apple.quarantine`. (Homebrew 6 removed the `--no-quarantine` flag that used to
+# automate this — see Casks/mlx-dspark.rb for the current install flow and caveats.)
 
 set -euo pipefail
 

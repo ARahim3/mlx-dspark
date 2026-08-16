@@ -96,8 +96,15 @@ model memory.
 
 ```bash
 brew tap ARahim3/mlx-dspark https://github.com/ARahim3/mlx-dspark
-brew install --cask --no-quarantine mlx-dspark    # --no-quarantine: signed but not notarized yet
+brew trust arahim3/mlx-dspark          # Homebrew 6+: third-party taps need explicit trust
+brew install --cask mlx-dspark
+xattr -dr com.apple.quarantine /Applications/mlx-dspark.app   # not notarized yet: clear
+                                       # quarantine once, or use System Settings › Privacy &
+                                       # Security › "Open Anyway" after the first launch
 ```
+
+(On Homebrew ≤ 5, `brew install --cask --no-quarantine mlx-dspark` still works and replaces
+the `trust`/`xattr` steps — Homebrew 6 removed that flag.)
 
 Or download the DMG from [Releases](https://github.com/ARahim3/mlx-dspark/releases) (`app-v*`
 tags) and drag it to Applications. First launch sets up its own private engine runtime (no
