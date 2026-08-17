@@ -20,6 +20,25 @@ from contextlib import contextmanager
 
 import mlx.core as mx
 
+#: ``tap`` sentinel: capture the **post-norm final hidden** instead of a set of
+#: intermediate residual-stream layers. This is the tensor the target already feeds its
+#: own lm_head, and it is what a native MTP head consumes (``base_hidden_variant =
+#: "post_norm"``). Every body below computes it anyway, so passing this only stops it
+#: being discarded — the MTP draft path costs the target no extra work.
+POST_NORM = "post_norm"
+
+
+def _tapset(tap):
+    """Layer indices to capture. The POST_NORM sentinel captures none of them."""
+    return set(tap) if isinstance(tap, (list, tuple, set)) else ()
+
+
+def _captured(tap, captured, hn):
+    """What ``run``/``verify`` hand back as ``fused``, per tap kind."""
+    if tap is POST_NORM:
+        return hn
+    return mx.concatenate(captured, axis=-1) if tap is not None else None
+
 
 class Target:
     def __init__(self, model, tokenizer, *, kv_bits: int | None = None,
@@ -100,6 +119,14 @@ class Target:
         if self._muse:
             return self._run_muse_glimmer(ids, cache, tap)
         if self.is_vlm:
+            if tap is POST_NORM:
+                # The mlx-vlm capture hook returns tapped residual-stream layers, not the
+                # post-norm hidden, and there is no hook for the latter. Refuse rather than
+                # hand an MTP head the wrong tensor — it would draft plausibly and accept
+                # badly, which reads as "MTP is not worth it" instead of as a bug.
+                raise ValueError(
+                    "POST_NORM capture is not available on mlx-vlm targets; native-MTP "
+                    "drafting currently supports the mlx-lm dense and hybrid paths.")
             out = self.model.language_model(inputs=ids, cache=cache, capture_layer_ids=tap)
             return out.logits, mx.concatenate(out.hidden_states, axis=-1)
         if self._recurrence == "mamba2":
@@ -116,7 +143,7 @@ class Target:
         from mlx_lm.models.base import create_attention_mask
 
         mm = self._inner.model
-        tapset = set(tap) if tap is not None else ()
+        tapset = _tapset(tap)
         h = mm.embed_tokens(ids)
         mask = create_attention_mask(h, cache[0])
         captured = []
@@ -124,7 +151,8 @@ class Target:
             h = layer(h, mask, c)
             if i in tapset:
                 captured.append(h)
-        return mm.norm(h), (mx.concatenate(captured, axis=-1) if tap is not None else None)
+        hn = mm.norm(h)
+        return hn, _captured(tap, captured, hn)
 
     def _body_hybrid(self, ids, cache, tap):
         """Replicates mlx-lm's hybrid text forward (qwen3_5-style: per-layer fa/ssm mask
@@ -133,7 +161,7 @@ class Target:
         from mlx_lm.models.base import create_attention_mask, create_ssm_mask
 
         mm = self._inner.model
-        tapset = set(tap) if tap is not None else ()
+        tapset = _tapset(tap)
         h = mm.embed_tokens(ids)
         fa_mask = create_attention_mask(h, cache[mm.fa_idx])
         ssm_mask = create_ssm_mask(h, cache[mm.ssm_idx])
@@ -142,7 +170,8 @@ class Target:
             h = layer(h, mask=(ssm_mask if layer.is_linear else fa_mask), cache=c)
             if i in tapset:
                 captured.append(h)
-        return mm.norm(h), (mx.concatenate(captured, axis=-1) if tap is not None else None)
+        hn = mm.norm(h)
+        return hn, _captured(tap, captured, hn)
 
     def _body_nemotron(self, ids, cache, tap):
         """Replicates mlx-lm's Nemotron-H forward (hybrid Mamba-2 / attention / MoE / MLP)
@@ -154,7 +183,7 @@ class Target:
         from mlx_lm.models.base import create_attention_mask, create_ssm_mask
 
         bb = self._inner.backbone
-        tapset = set(tap) if tap is not None else ()
+        tapset = _tapset(tap)
         h = bb.embeddings(ids)
         attn_mask = create_attention_mask(h, cache[bb.fa_idx])
         ssm_mask = create_ssm_mask(h, cache[bb.ssm_idx])
@@ -170,7 +199,8 @@ class Target:
             h = layer(h, mask=mask, cache=c)
             if i in tapset:
                 captured.append(h)
-        return bb.norm_f(h), (mx.concatenate(captured, axis=-1) if tap is not None else None)
+        hn = bb.norm_f(h)
+        return hn, _captured(tap, captured, hn)
 
     def _run_nemotron(self, ids, cache, tap):
         hn, fused = self._body_nemotron(ids, cache, tap)
@@ -200,7 +230,7 @@ class Target:
         from mlx_vlm.models.base import create_attention_mask
 
         tm = self.model.language_model.model   # muse_glimmer TextModel
-        tapset = set(tap) if tap is not None else ()
+        tapset = _tapset(tap)
         h = tm.embed_norm(tm.embed_tokens(ids))
         full_mask = create_attention_mask(h, cache[tm.full_attention_idx])
         sliding_mask = (create_attention_mask(h, cache[tm.sliding_attention_idx],
@@ -212,7 +242,8 @@ class Target:
             h = layer(h, mask=mask, cache=c)
             if i in tapset:
                 captured.append(h)
-        return tm.norm(h), (mx.concatenate(captured, axis=-1) if tap is not None else None)
+        hn = tm.norm(h)
+        return hn, _captured(tap, captured, hn)
 
     def _head_muse_glimmer(self, hn):
         """Project post-norm hidden -> logits with muse_glimmer's head: lm_head, scaled by

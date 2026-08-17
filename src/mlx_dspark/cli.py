@@ -57,7 +57,7 @@ def cmd_generate(argv: list[str]) -> None:
     from .lookup import lookup_generate
 
     ap = argparse.ArgumentParser(prog="mlx-dspark generate")
-    ap.add_argument("--mode", choices=["auto", "dspark", "dflash", "lookup", "baseline"],
+    ap.add_argument("--mode", choices=["auto", "dspark", "dflash", "mtp", "lookup", "baseline"],
                     default="dspark",
                     help="dspark = DSpark spec decoding; dflash = z-lab DFlash (block diffusion); "
                          "lookup = drafter-free prompt-lookup spec decoding (any target); "
@@ -246,7 +246,7 @@ def cmd_serve(argv: list[str]) -> None:
 
     ap = argparse.ArgumentParser(prog="mlx-dspark serve",
                                  description="OpenAI-compatible API server.")
-    ap.add_argument("--mode", choices=["auto", "dspark", "dflash", "lookup", "baseline"],
+    ap.add_argument("--mode", choices=["auto", "dspark", "dflash", "mtp", "lookup", "baseline"],
                     default="dspark",
                     help="'auto' picks the best available speculation for the target "
                          "(dspark -> dflash -> drafter-free lookup), so any repo serves")
@@ -267,6 +267,9 @@ def cmd_serve(argv: list[str]) -> None:
                     help="cap on tokens verified per round; <=0 = full block; 'auto' = calibrate "
                          "for this machine+model and adapt live. Default: dspark=2, lookup=6, "
                          "dflash=full block.")
+    ap.add_argument("--mtp-depth", type=int, default=3,
+                    help="mtp mode: tokens the native MTP head rolls forward per round "
+                         "(default 3). Speed-only — the target verifies every draft.")
     ap.add_argument("--default-max-tokens", type=int, default=2048,
                     help="max_tokens used when a request doesn't send one (default 2048)")
     ap.add_argument("--max-tokens-cap", type=int, default=32768,
@@ -365,6 +368,7 @@ def cmd_serve(argv: list[str]) -> None:
         "mode": args.mode, "model": args.model, "drafter": args.drafter,
         "family": args.family, "target": args.target,
         "drafter_bits": args.drafter_bits, "max_draft_tokens": max_draft,
+        "mtp_depth": args.mtp_depth,
         "confidence_threshold": args.confidence_threshold,
         "enable_thinking": False if args.no_thinking else None,
         "reasoning_effort": args.reasoning_effort,

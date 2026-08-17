@@ -373,7 +373,11 @@ class DSparkDrafter(nn.Module):
     def make_ctx_cache(self) -> list[CtxCache]:
         return [CtxCache() for _ in self.layers]
 
-    def update_context(self, target_hidden_cat, ctx_offset, ctx_caches) -> None:
+    def update_context(self, target_hidden_cat, ctx_offset, ctx_caches,
+                       token_ids=None) -> None:
+        """``token_ids`` is accepted and ignored: this head's context is a function of the
+        target's hidden states alone. A native-MTP head additionally fuses the *next* token
+        at each position, so the shared prefill/spec loop passes them to every drafter."""
         fused = self.fuse_target(target_hidden_cat)
         for layer, cache in zip(self.layers, ctx_caches):
             layer.self_attn.update_ctx(fused, ctx_offset, cache)

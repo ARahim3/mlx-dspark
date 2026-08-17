@@ -43,13 +43,14 @@ from .generate import (
     greedy_generate,
     speculative_generate,
 )
-from .load import apply_wired_limit, load_dflash, load_drafter, load_target, resolve_mode
+from .load import (apply_wired_limit, load_dflash, load_drafter, load_mtp, load_target,
+                   resolve_mode)
 from .lookup import lookup_generate
 from .prefix_cache import PrefixCache, _lcp, target_cache_reusable
 from .telemetry import RoundLog, RoundRecorder
 from .tools import normalize_tool_messages, parse_tool_calls, schema_types
 
-MODES = ("dspark", "dflash", "lookup", "baseline")
+MODES = ("dspark", "dflash", "mtp", "lookup", "baseline")
 
 # The union of effort vocabularies across template lineages (Qwen3.8 knows low/medium/xhigh,
 # harmony-style templates low/medium/high). Values outside a given template's own vocabulary
@@ -203,14 +204,20 @@ class Engine:
         at all (hybrid linear-attention: Ornith, Bonsai, Qwen3.6-27B). Those used to get no
         prefix caching whatsoever, which cost them the agent workload outright: prefill is
         ~90% of an uncached Claude Code turn. Still disabled for DFlash (its *drafter*
-        cache can't roll back, and it isn't snapshotted here)."""
+        cache can't roll back, and it isn't snapshotted here).
+
+        **Enabled for mtp**, deliberately: a native MTP head is one full-attention layer,
+        so its context is position-local K/V that trims exactly — the same property the
+        DSpark drafter context has. That is what lets the head ride the existing snapshot
+        machinery instead of forcing restores onto block boundaries."""
         if not enabled or self.mode == "dflash":
             return None
         try:
             checkpoint = not target_cache_reusable(self.target.make_cache())
         except Exception:  # noqa: BLE001
             return None
-        make_ctx = self.drafter.make_ctx_cache if self.mode == "dspark" else None
+        make_ctx = (self.drafter.make_ctx_cache
+                    if self.mode in ("dspark", "mtp") else None)
         return PrefixCache(self.target.make_cache, make_ctx,
                            l2_dir=l2_dir, max_ram_bytes=max(0, max_ram_mb) * 1024 * 1024,
                            slots=self.prefix_cache_slots, checkpoint=checkpoint)
@@ -297,6 +304,10 @@ class Engine:
         family: str | None = None,     # deprecated alias for `model`
         target: str | None = None,     # deprecated alias for `model`
         drafter_bits: int = 4,
+        # mtp mode: how many tokens the head rolls itself forward per round. Measured
+        # per-depth acceptance on Japanese chat is [0.70, 0.29, 0.18], so 3 is where the
+        # marginal draft token stops paying for its verify row. Speed-only, like the cap.
+        mtp_depth: int = 3,
         max_draft_tokens: int | str | None = None,   # int, None (mode default) or "auto"
         confidence_threshold: float = 0.0,
         enable_thinking: bool | None = None,
@@ -341,7 +352,7 @@ class Engine:
         executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="mlx-gen")
 
         def _load_models():
-            tgt, tok = load_target(target_repo, require_tap=mode in ("dspark", "dflash"),
+            tgt, tok = load_target(target_repo, require_tap=mode in ("dspark", "dflash", "mtp"),
                                    kv_bits=kv_bits)
             draft = None
             if mode == "dspark":
@@ -351,10 +362,14 @@ class Engine:
                 draft, _ = load_dflash(drafter_repo, quantize=drafter_bits > 0,
                                        bits=max(drafter_bits, 2))
                 draft.bind(tgt.model)
+            elif mode == "mtp":
+                # Qwen ships the MTP block inside the base checkpoint; `--drafter` points
+                # at a separate one for the MLX conversions that dropped it.
+                draft, _ = load_mtp(drafter_repo or target_repo, max_depth=mtp_depth)
             # --max-draft auto: measure this machine+pair's cost curves once (disk-cached)
             # and let a CapController pick the cap per round. Only meaningful with a drafter.
             ctrl = None
-            if max_draft_tokens == "auto" and mode in ("dspark", "dflash"):
+            if max_draft_tokens == "auto" and mode in ("dspark", "dflash"):  # not mtp: depth, not width
                 from .calibrate import calibrate
 
                 ctrl = calibrate(tgt, draft, mode=mode, target_repo=target_repo,
@@ -472,7 +487,10 @@ class Engine:
                     elif pos < _stable:
                         self.prefix.rung(c, pos)
         try:
-            if self.mode == "dspark":
+            if self.mode in ("dspark", "mtp"):
+                # Same loop: the MTP head only changes how the draft is produced,
+                # so lookup, penalties, logprobs, stops, the cap controller and the
+                # prefix-cache hooks are shared rather than reimplemented.
                 res = speculative_generate(
                     self.target, self.tokenizer, self.drafter, prompt_ids=prompt_ids,
                     cache=cache, ctx_caches=ctx, reuse_len=reuse_len,

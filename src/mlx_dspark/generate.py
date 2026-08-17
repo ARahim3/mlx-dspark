@@ -22,6 +22,7 @@ from mlx.utils import tree_flatten
 
 from .sampling import sample_probs, truncate_probs
 from .wide_gemm import wide_matmul
+from .target import POST_NORM
 
 TAP = None  # set from drafter config at call time
 
@@ -735,7 +736,8 @@ def _prefill_tapped(target, ids: list[int], cache, tap, drafter=None, ctx_caches
                                            want_logits=last,
                                            head_last_row=PREFILL_LAST_ROW_HEAD)
             if drafter is not None:
-                drafter.update_context(fused, ctx_offset=pos, ctx_caches=ctx_caches)
+                drafter.update_context(fused, ctx_offset=pos, ctx_caches=ctx_caches,
+                                       token_ids=piece)
             else:
                 parts.append(fused)
             pos += len(piece)
@@ -862,12 +864,21 @@ def speculative_generate(
     cfg = drafter.config
     # DFlash-warm-started heads reuse the target's own embed_tokens and/or lm_head (they ship
     # neither weight): Nemotron reuses the head, Muse-Glimmer reuses both. Bind what's reused.
-    if not getattr(cfg, "has_own_lm_head", True):
+    # A native-MTP head ships neither by construction, and taps the post-norm final hidden
+    # rather than a set of residual-stream layers — the tensor the target already computes
+    # for its own lm_head, so the tap costs nothing extra.
+    if getattr(drafter, "sequential", False):
         drafter.bind_lm_head(target_model.lm_head_proj)
-    if not getattr(cfg, "has_own_embed", True):
         drafter.bind_embed(target_model.draft_embed)
-    tap = list(cfg.target_layer_ids)
-    mask_id = cfg.mask_token_id
+        tap = POST_NORM
+        mask_id = None
+    else:
+        if not getattr(cfg, "has_own_lm_head", True):
+            drafter.bind_lm_head(target_model.lm_head_proj)
+        if not getattr(cfg, "has_own_embed", True):
+            drafter.bind_embed(target_model.draft_embed)
+        tap = list(cfg.target_layer_ids)
+        mask_id = cfg.mask_token_id
     # A DFlash-derived head spends slot 0 on the anchor, so it can propose block_size-1.
     kdraft = drafter.max_draft
     cap_ceiling = kdraft if max_draft_tokens is None else max(1, min(max_draft_tokens, kdraft))
@@ -953,7 +964,8 @@ def speculative_generate(
             y = mx.array([[pending]])
             logits, fused = target_model.verify(y, cache, tap)
             nxt_arr = mx.argmax(logits[0, -1])
-            drafter.update_context(fused, ctx_offset=n_cached, ctx_caches=ctx_caches)
+            drafter.update_context(fused, ctx_offset=n_cached, ctx_caches=ctx_caches,
+                                   token_ids=[pending])
             n_cached += 1
             mx.async_eval(nxt_arr, [c.k for c in ctx_caches])
             while True:
@@ -980,7 +992,8 @@ def speculative_generate(
                 y = nxt_arr.reshape(1, 1)
                 logits, fused = target_model.verify(y, cache, tap)
                 nxt_next = mx.argmax(logits[0, -1])
-                drafter.update_context(fused, ctx_offset=n_cached, ctx_caches=ctx_caches)
+                drafter.update_context(fused, ctx_offset=n_cached, ctx_caches=ctx_caches,
+                                       token_ids=[pending])
                 n_cached += 1
                 mx.async_eval(nxt_next, [c.k for c in ctx_caches])
                 nxt_arr = nxt_next
@@ -1022,6 +1035,52 @@ def speculative_generate(
                 n_arr = mx.cumprod(match).sum()
                 mx.eval(n_arr, tt_arr)
                 n = int(n_arr.item())
+                tt = tt_arr.tolist()
+                committed = draft[:n] + [tt[n]]
+        elif getattr(drafter, "sequential", False):
+            # ---- 1'. draft sequentially (native MTP head) ----
+            # An MTP head cannot produce depth d+1 before depth d is sampled, so the block
+            # path below does not apply: the head rolls itself forward, feeding each depth
+            # the previous depth's token and its own post-norm hidden. The rollout stays on
+            # device (drafted tokens are embedded as arrays, never `.item()`d), so the
+            # greedy default keeps the property the fused block path has — draft heads,
+            # verify forward and accept still reach the GPU as one graph with one sync.
+            #
+            # Verification and acceptance are the shared ones below/above, untouched. That
+            # is what makes this lossless for the same reason the block path is: the target
+            # checks every drafted token, so a sequential proposal changes only how many
+            # survive, never what is emitted.
+            draft_arr, q_probs = drafter.draft_block(
+                pending, n_cached, ctx_caches, cap,
+                temperature=temperature, top_p=top_p, top_k=top_k)
+            if temperature > 0.0 or pen.active or lp_list is not None:
+                mx.eval(draft_arr, q_probs)
+                draft = [int(x) for x in draft_arr.tolist()]
+                verify_ids = mx.array([[pending] + draft])
+                v_logits, v_fused = target_model.verify(verify_ids, cache, tap)
+                mx.eval(v_logits, v_fused)
+                if temperature > 0.0:
+                    n, repl = _spec_sample_accept(
+                        pen.apply(v_logits[0], draft), draft, q_probs,
+                        temperature, top_p, top_k)
+                    committed = draft[:n] + [repl]
+                else:
+                    tt = [int(x) for x in mx.argmax(
+                        pen.apply(v_logits[0], draft), axis=-1).tolist()]
+                    n = 0
+                    while n < len(draft) and draft[n] == tt[n]:
+                        n += 1
+                    committed = draft[:n] + [tt[n]]
+            else:
+                verify_ids = mx.concatenate(
+                    [mx.array([pending], dtype=draft_arr.dtype), draft_arr]).reshape(1, -1)
+                v_logits, v_fused = target_model.verify(verify_ids, cache, tap)
+                tt_arr = mx.argmax(v_logits[0], axis=-1)
+                match = (draft_arr == tt_arr[: draft_arr.shape[0]]).astype(mx.int32)
+                n_arr = mx.cumprod(match).sum()
+                mx.eval(n_arr, tt_arr, draft_arr)
+                n = int(n_arr.item())
+                draft = draft_arr.tolist()
                 tt = tt_arr.tolist()
                 committed = draft[:n] + [tt[n]]
         else:
@@ -1134,8 +1193,11 @@ def speculative_generate(
         # ---- 4. update caches/context ----
         target_model.rollback(cache, len(draft) - n, draft[:n])
         # commit [pending, accepted drafts] (positions n_cached..n_cached+n) as context
+        # token_ids are the *input* tokens at these positions — the anchor plus the
+        # accepted drafts — which is what a native-MTP head fuses against each hidden.
         drafter.update_context(
-            v_fused[:, : n + 1, :], ctx_offset=n_cached, ctx_caches=ctx_caches
+            v_fused[:, : n + 1, :], ctx_offset=n_cached, ctx_caches=ctx_caches,
+            token_ids=[pending] + draft[:n],
         )
         n_cached = n_cached + n + 1
         # schedule (don't block): the ctx projections run while Python commits tokens and

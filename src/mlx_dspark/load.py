@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import glob
+import json
 import os
 
 import mlx.core as mx
@@ -705,3 +706,62 @@ def load_dflash_pair(model: str = "gemma4", *, drafter: str | None = None):
     drafter_m, cfg = load_dflash(drafter_repo)
     drafter_m.bind(target.model)
     return target, tok, drafter_m, cfg
+
+
+def load_mtp(repo_or_path: str, *, text_config: dict | None = None, max_depth: int = 3,
+             quantize: bool = False, bits: int = 8, group_size: int = 64):
+    """Return (MTP drafter, MTPConfig) for a checkpoint that ships Qwen's ``mtp.`` tensors.
+
+    ``repo_or_path`` may be a full model directory/repo (the MTP block travels inside the
+    base Qwen checkpoint) or a directory holding just ``mtp.safetensors``; both are read
+    the same way, since the 15 tensor names are identical either way.
+
+    ``text_config`` is the *target's* config, because the head is a sibling of the trunk's
+    full-attention layers and shares their geometry. Passing the target's own config is
+    what keeps head_dim / partial rope / rope_theta from drifting apart from the model the
+    head was trained against. When omitted it is read from ``config.json`` next to the
+    weights.
+
+    Left in bf16 by default (~0.85 GB for Qwen3.8-27B). Unlike the 6.9 GB DSpark drafter,
+    the MTP block is small enough that quantizing it buys little, and the published
+    MTP-bearing checkpoints keep it at full precision — so this matches what the head was
+    measured at rather than saving half a gigabyte.
+    """
+    from .mtp_model import MTPConfig, MTPDrafter
+
+    path = _resolve(repo_or_path)
+    if text_config is None:
+        with open(os.path.join(path, "config.json")) as f:
+            cfg_json = json.load(f)
+        text_config = cfg_json.get("text_config", cfg_json)
+
+    weights: dict[str, mx.array] = {}
+    for st in glob.glob(os.path.join(path, "*.safetensors")):
+        weights.update({k[len("mtp."):]: v for k, v in mx.load(st).items()
+                        if k.startswith("mtp.")})
+    if not weights:
+        raise ValueError(
+            f"{repo_or_path}: no `mtp.*` tensors found. Native-MTP drafting needs a "
+            f"checkpoint that ships Qwen's MTP block — the base Qwen/Qwen3.8-27B repo does, "
+            f"as do the `*-MTP-*` MLX conversions; most MLX conversions drop it.")
+
+    config = MTPConfig.from_text_config(text_config, max_depth=max_depth)
+    drafter = MTPDrafter(config)
+
+    # Same standard as load_drafter: a partially-loaded head runs and drafts badly, which
+    # costs throughput with no error to trace it to. Refuse instead.
+    model_keys = {k for k, _ in _flatten_params(drafter)}
+    missing = sorted(model_keys - set(weights))
+    unexpected = sorted(set(weights) - model_keys)
+    if missing or unexpected:
+        raise ValueError(
+            f"{repo_or_path}: MTP tensor names don't match Qwen's MTP block."
+            f"\n  missing in checkpoint ({len(missing)}): {missing[:8]}"
+            f"\n  unexpected in checkpoint ({len(unexpected)}): {unexpected[:8]}")
+
+    drafter.load_weights(list(weights.items()))
+    if quantize:
+        nn.quantize(drafter, group_size=group_size, bits=bits,
+                    class_predicate=lambda p, m: isinstance(m, nn.Linear))
+    mx.eval(drafter.parameters())
+    return drafter, config
