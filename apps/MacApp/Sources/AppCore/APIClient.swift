@@ -28,8 +28,9 @@ public struct HealthInfo: Decodable, Sendable, Equatable {
     /// Optional so the app keeps decoding health from older engines that don't report it.
     public let supportsReasoningEffort: Bool?
     /// Confidence-head early-stop threshold (0 = off). Part of a pair's measured-best
-    /// bundle where the verify curve still rises inside the cap window (Qwen3.8-27B-4bit:
-    /// cap 7 + 0.3). Optional: older engines don't report it.
+    /// bundle where the verify curve still rises inside the cap window AND the drafter
+    /// leaves acceptance headroom (e.g. the Qwen3.6-35B-A3B MoE). Optional: older engines
+    /// don't report it.
     public let confidenceThreshold: Double?
     /// Whether `/admin/race` arms accept a per-arm `confidence` — the capability gate for
     /// the Lab's cap+conf bundle chip. An engine without it would silently drop the field

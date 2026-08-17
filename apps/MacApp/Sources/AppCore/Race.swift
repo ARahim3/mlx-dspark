@@ -4,7 +4,7 @@ import Foundation
 /// adaptive cap driven by this machine's measured cost curves, raceable against any
 /// fixed cap since the engine grew it on `/admin/race`. `confidence` is a per-arm
 /// confidence-head threshold (engines with `/health.race_arm_confidence` only) — what
-/// lets a measured bundle like Qwen3.8-27B-4bit's cap 7 + 0.3 race its plain siblings.
+/// lets a measured bundle like a cap + confidence-threshold pair race its plain siblings.
 public struct RaceArm: Codable, Sendable, Hashable, Identifiable {
     public let mode: String
     public let cap: Int?
@@ -189,7 +189,11 @@ extension APIClient {
                     }
                     request.httpBody = try JSONSerialization.data(withJSONObject: payload)
 
-                    let (bytes, response) = try await URLSession.shared.bytes(for: request)
+                    // Use the APIClient's own session (3600 s resource / 60 s request
+                    // timeouts), not URLSession.shared's defaults: /admin/race sends no
+                    // heartbeat during the pre-first-token prefill, so a big prompt or slow
+                    // arm can go quiet past the default timeout and abort the race.
+                    let (bytes, response) = try await session.bytes(for: request)
                     if let http = response as? HTTPURLResponse, http.statusCode != 200 {
                         var detail = ""
                         for try await line in bytes.lines { detail += line }

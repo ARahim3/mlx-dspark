@@ -669,6 +669,29 @@ final class AppModel: ObservableObject {
 
         generationTask = Task { [weak self] in
             guard let self else { return }
+            // Coalesce streaming updates. Appending to a plain local string is O(1); the
+            // growing message is committed to the @Published `messages` array — which triggers
+            // a full markdown re-parse and invalidates every observing view — at most ~15x/s
+            // rather than once per token. Publishing per token made a long answer O(n^2) to
+            // render (each token re-parsed and re-scanned the whole message) and pinned the
+            // main thread: the "UI freezes / hangs while generating" report. Locating the
+            // message by id keeps a late flush correct if the list changed underneath it.
+            let messageID = self.messages.last?.id
+            var assembled = self.messages.last?.text ?? ""
+            var reasoningOpen = assembled.hasPrefix("<think>")
+            var thinkClosed = assembled.contains("</think>")
+            var lastFlush = Date.distantPast
+            @MainActor func commit(_ text: String) {
+                guard let messageID,
+                      let i = self.messages.firstIndex(where: { $0.id == messageID })
+                else { return }
+                self.messages[i].text = text
+            }
+            @MainActor func flush(force: Bool) {
+                guard force || Date().timeIntervalSince(lastFlush) >= 0.066 else { return }
+                commit(assembled)
+                lastFlush = Date()
+            }
             do {
                 for try await event in client.streamChat(
                     model: self.model,
@@ -683,25 +706,34 @@ final class AppModel: ObservableObject {
                     switch event {
                     case .delta(let piece):
                         // If channelled reasoning opened a synthetic think block, the first
-                        // answer text closes it — from here on the message reads exactly
-                        // like an inline-thinking model's output.
-                        var text = self.messages[self.messages.count - 1].text
-                        if text.hasPrefix("<think>"), !text.contains("</think>") {
-                            text += "</think>\n"
+                        // answer text closes it — from here on the message reads exactly like
+                        // an inline-thinking model's output. Tracked with a flag so it costs
+                        // O(1), not an O(n) scan of the whole message every token.
+                        if reasoningOpen, !thinkClosed {
+                            assembled += "</think>\n"
+                            thinkClosed = true
                         }
-                        self.messages[self.messages.count - 1].text = text + piece
+                        assembled += piece
+                        flush(force: false)
                     case .reasoning(let piece):
                         // Muse-class models stream thinking as a separate channel; fold it
                         // into the same `<think>` form the thinking card already renders.
-                        var text = self.messages[self.messages.count - 1].text
-                        if !text.hasPrefix("<think>") { text = "<think>" + text }
-                        self.messages[self.messages.count - 1].text = text + piece
+                        if !reasoningOpen {
+                            assembled = "<think>" + assembled
+                            reasoningOpen = true
+                        }
+                        assembled += piece
+                        flush(force: false)
                     case .finished(let info):
-                        self.messages[self.messages.count - 1].stats = info
+                        flush(force: true)
                         // The turn's true mean rate, replacing the smoothed live estimate.
                         if let info {
                             self.liveTokensPerSec = info.tokensPerSec
                             self.rateEWMA = info.tokensPerSec
+                        }
+                        if let messageID,
+                           let i = self.messages.firstIndex(where: { $0.id == messageID }) {
+                            self.messages[i].stats = info
                         }
                         self.lastActivity = Date()
                     }
@@ -709,6 +741,7 @@ final class AppModel: ObservableObject {
             } catch {
                 if !Task.isCancelled { self.chatError = error.localizedDescription }
             }
+            flush(force: true)     // commit any tokens buffered since the last throttled flush
             self.isGenerating = false
             self.persistCurrentSession()
             await self.refreshStats()

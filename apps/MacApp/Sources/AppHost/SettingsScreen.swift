@@ -237,9 +237,10 @@ struct DecodingControls: View {
         }
         .fixedSize()
         .help("Confidence-head early stop: the drafter truncates its own block when it "
-              + "stops believing in it. Pays where the verify curve still rises inside "
-              + "the cap — the measured best for Qwen3.8-27B-4bit is cap 7 + 0.3. Off is "
-              + "right where the curve is flat (its 8-bit sibling).")
+              + "stops believing in it. Pays only where the verify curve still rises inside "
+              + "the cap AND the drafter leaves acceptance headroom — e.g. the "
+              + "Qwen3.6-35B-A3B MoE. Off is right where the drafter already accepts near "
+              + "its ceiling (Qwen3.8-27B) or the curve is flat (8-bit targets).")
     }
 
     @ViewBuilder private var contextPicker: some View {

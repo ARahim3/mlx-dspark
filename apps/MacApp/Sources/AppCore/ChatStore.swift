@@ -1,7 +1,13 @@
 import Foundation
 
 /// One chat message, as the app renders and persists it.
-public struct ChatMessage: Identifiable, Codable, Sendable {
+///
+/// `Equatable` is load-bearing for chat performance: it lets SwiftUI skip re-rendering (and
+/// re-parsing the markdown of) a message whose value did not change when the god-object
+/// `AppModel` invalidates for an unrelated reason — e.g. the always-on round telemetry
+/// appends during a chat turn. Without it a long streaming answer re-parses on every
+/// telemetry tick as well as every flush.
+public struct ChatMessage: Identifiable, Codable, Sendable, Equatable {
     public enum Role: String, Codable, Sendable { case user, assistant }
 
     public let id: UUID
