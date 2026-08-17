@@ -19,8 +19,8 @@
 #
 # Per release, two lines change: `version` and `sha256`. `make_dmg.sh` prints both.
 cask "mlx-dspark" do
-  version "0.4.1"
-  sha256 "23aa85795b0dc7fd4fbbd0c0d43c427d5a558958fbd7961c7e4f62ec2b8d56f3"
+  version "0.4.2"
+  sha256 "d026e34a8c08de05b89459aca211489f78abdf961f7168b92654ccb2de8750de"
 
   # App releases are tagged `app-vX.Y.Z`, distinct from the engine's own `vX.Y.Z` PyPI tags in
   # the same repo — the app and the engine version independently, and without the prefix a cask
