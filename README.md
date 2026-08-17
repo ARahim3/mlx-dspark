@@ -489,8 +489,9 @@ and caps are this M4 Pro's — yours are derived fresh on first run):
 - **~48 GB** — `Qwen3.8-27B-8bit` (best ratio in the project: 2.72×, 3.37× on math) or
   `Muse-Glimmer-30B-8bit` (the strongest chat ratio, 2.2×+). Both ~29–40 GB resident.
 - **~24–36 GB** — `gemma-4-12B-it-8bit` (big ratio *and* real speed: ~46–55 tok/s),
-  `Qwen3.6-27B-8bit`, or `Qwen3.8-27B-4bit` (27B quality in ~18 GB at ~23–31 tok/s — use
-  `--max-draft 7 --confidence-threshold 0.3`, its measured best).
+  `Qwen3.6-27B-8bit`, or `Qwen3.8-27B-4bit` (27B quality in ~18 GB at ~23–31 tok/s — the
+  **4-bit** target's measured best is `--max-draft 7 --confidence-threshold 0.3`; the confidence
+  flag is 4-bit-only, don't carry it to the 8-bit sibling — see the note below).
 - **~16 GB** — `Ornith-1.0-9B-8bit` (2.4× at ~59–68 tok/s, the mid-size sweet spot),
   `Qwen3-8B-8bit`, or `Qwen3-4B-8bit` (~87–101 tok/s, fits ~8 GB).
 - **Raw tokens per second above all** — the MoEs: `Qwen3.6-35B-A3B-4bit` (~91–145 tok/s).
@@ -505,6 +506,22 @@ For target *precision*: **8-bit** is the sweet spot (best acceptance + quality);
 absolute throughput and fits smaller Macs but a smaller speedup ratio; bf16 is *slower* on M-series (verify
 dominates). The drafter stays 4-bit either way. Full numbers and the reasoning are in
 [Benchmarks & deep dive](#benchmarks--deep-dive).
+
+**On copying caps and flags from these tables.** Every cap and flag shown is *this M4 Pro's*
+derived optimum for that exact quant — a starting point, not a setting to paste in. Two things
+that trip people up:
+
+- **Don't copy the cap.** With no `--max-draft`, mlx-dspark derives it from your machine's own
+  curves (per model + quant + mlx version). A faster, higher-bandwidth machine can land *lower*,
+  not higher — an M5 Max may pick cap 2 for the 8-bit 27B where this M4 Pro picks 7, because
+  cheaper verify shifts the optimum down, and forcing 7 there is a small net loss. Prefer no
+  flag, or `--max-draft auto`.
+- **`--confidence-threshold 0.3` is a 4-bit-27B lever, not an 8-bit one.** It pays only where
+  the verify curve still *rises* inside the cap window: 4-bit Qwen3.8-27B gains from
+  `--max-draft 7 --confidence-threshold 0.3`; the **8-bit** sibling is flat under the small-M
+  kernel, wants **cap 7 with no confidence flag**, and measures *worse* with 0.3. The
+  `2.12× / 1.97× / 1.55×` figures are the **4-bit** row; the 8-bit's **2.72×** is a separate
+  end-to-end measurement, not the badge string beside it.
 
 ## Results at a glance
 

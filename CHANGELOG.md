@@ -41,7 +41,9 @@ All notable changes to `mlx-dspark`. Versions follow [SemVer](https://semver.org
 - Registry `speedup` strings (what `/admin/models` badges show) refreshed to the current
   measured table — several predated the 2026-07-22 cap re-measure (Qwen3-8B 1.6→2.1×,
   gemma-4-12B 2.1→2.8×, Ornith 2.2→2.4×) and the small-M kernel results (Qwen3.8-27B
-  1.5→1.9× / 8-bit 2.5→2.7×, Muse 1.5→1.7×).
+  **4-bit** 1.5→1.9× / **8-bit** 2.5→2.7×, Muse 1.5→1.7×) — these are `/admin/models` badge
+  summaries; the end-to-end small-M measurements (4-bit `cap 7 + conf 0.3`, 8-bit cap 7, no
+  confidence flag) are in the kernel entry below.
 - **Small-M MMA verify kernel** (`small_m_qmm.py`, vendored MIT from avlp12's mlx-lm fork —
   see NOTICE): `mx.quantized_matmul` re-pays the whole weight read per row for M in 2..8
   (upstream ml-explore/mlx#4265), which is exactly the speculative verify window — the reason
