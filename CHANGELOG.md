@@ -4,6 +4,12 @@ All notable changes to `mlx-dspark`. Versions follow [SemVer](https://semver.org
 
 ## [Unreleased]
 
+### Fixed
+- **`--max-draft` help text was stale** (`generate` and `serve` both said "Defaults: dspark=2").
+  The dspark default has been the calibrated `static_cap` for several versions — the help now
+  says the cap is derived per machine+model+quant on first run (cached), and clarifies that
+  `auto` adapts the cap per round.
+
 ## [0.12.2] — 2026-08-18 — better 4-bit Qwen3.8-27B drafter (DimInfer)
 
 ### Changed

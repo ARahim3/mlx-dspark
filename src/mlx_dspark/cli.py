@@ -84,8 +84,9 @@ def cmd_generate(argv: list[str]) -> None:
                          "run before trusting it.")
     ap.add_argument("--max-new-tokens", type=int, default=220)
     ap.add_argument("--max-draft", default=None,
-                    help="tokens verified per round (cap), or 'auto' to calibrate for this "
-                         "machine+model and adapt live. Defaults: dspark=2, lookup=6, "
+                    help="tokens verified per round (cap). Omit to let dspark DERIVE the cap "
+                         "from this machine+model+quant's measured curves (static_cap, ~5 s "
+                         "once, cached); 'auto' adapts it per round instead. lookup=6, "
                          "dflash=full block (<=0 also means full block).")
     ap.add_argument("--temperature", type=float, default=0.0,
                     help="0 = greedy (exact); >0 = speculative sampling (paper setup, lossless wrt target@T)")
@@ -281,9 +282,10 @@ def cmd_serve(argv: list[str]) -> None:
                     help=argparse.SUPPRESS)          # deprecated alias for --model
     ap.add_argument("--target", default=None, help=argparse.SUPPRESS)  # deprecated alias for --model
     ap.add_argument("--max-draft", default=None,
-                    help="cap on tokens verified per round; <=0 = full block; 'auto' = calibrate "
-                         "for this machine+model and adapt live. Default: dspark=2, lookup=6, "
-                         "dflash=full block.")
+                    help="cap on tokens verified per round; <=0 = full block; 'auto' = adapt "
+                         "the cap per round. Omit to let dspark DERIVE the cap from this "
+                         "machine+model+quant's measured curves (static_cap, ~5 s once, "
+                         "cached); lookup=6, dflash=full block.")
     ap.add_argument("--default-max-tokens", type=int, default=2048,
                     help="max_tokens used when a request doesn't send one (default 2048)")
     ap.add_argument("--max-tokens-cap", type=int, default=32768,
