@@ -48,14 +48,39 @@ chat/code/math), the Muse row per-content best (footnoted); full tables, baselin
 | **Qwen3.6-27B** (8-bit) | **2.67×** math · **2.26×** chat · 1.96× code | ~16–22 tok/s |
 | **Ornith-1.0-9B** (8-bit) | **2.53×** code · **2.48×** math · **2.21×** chat | ~59–68 tok/s |
 | **Qwen3-14B** (8-bit) | **2.36×** math · **2.11×** code · 1.62× chat | ~25–36 tok/s |
+| **Qwen3.8-27B** (4-bit)[^q38] | **2.31×** math · **2.14×** code · 1.51× chat | ~23–34 tok/s |
 | **Qwen3-8B** (8-bit) | **2.29×** math · **2.06×** code · 1.81× chat | ~51–64 tok/s |
-| **Qwen3.8-27B** (4-bit)[^q38] | **2.12×** code · **1.97×** math · 1.55× chat | ~23–31 tok/s |
 | **Qwen3-4B** (8-bit) | **1.98×** math · 1.77× chat · 1.70× code | ~87–101 tok/s |
 | **Qwen3.6-35B-A3B** (4-bit, MoE)[^moe] | **1.67×** math · 1.24× code · 1.05× chat | **~91–145 tok/s** |
 | **Nemotron-3.5-Lightning-30B-A3B** (4-bit, MoE+Mamba)[^nemotron] | **1.34×** math · **1.27×** code · 1.07× chat | **~87–112 tok/s** |
 | **Ternary-Bonsai-27B** (2-bit) | **1.13×** code | ~26–29 tok/s |
 
 </div>
+
+> [!TIP]
+> **On the Qwen3.8-27B _4-bit_ target?** Its drafter is now
+> [`DimInfer/Qwen3.8-27B-Dspark-v1`](https://huggingface.co/DimInfer/Qwen3.8-27B-Dspark-v1) — a
+> 4-bit-class head that out-accepts the previous `RadixArk/Qwen3.8-27B-DSpark` at **every** cap
+> and content (measured paired, same session): **1.99× mean** at `--max-draft 7` (2.31× math ·
+> 2.14× code · 1.51× chat, accept up to 5.3) vs RadixArk's 1.82×, and with **no
+> `--confidence-threshold` needed**. It is the auto-resolve default now, so a plain `--model
+> mlx-community/Qwen3.8-27B-4bit` picks it up:
+>
+> ```bash
+> # auto-resolves DimInfer (downloads it once from HF on first use):
+> mlx-dspark serve    --model mlx-community/Qwen3.8-27B-4bit --max-draft 7
+> mlx-dspark generate --model mlx-community/Qwen3.8-27B-4bit --max-draft 7 --prompt "…"
+>
+> # …or point --drafter at the repo / a local copy explicitly (no re-download if you have it):
+> mlx-dspark generate --model mlx-community/Qwen3.8-27B-4bit \
+>     --drafter DimInfer/Qwen3.8-27B-Dspark-v1 --max-draft 7 --prompt "…"
+> ```
+>
+> `--max-draft 7` is shown for clarity but is optional: the no-flag default **calibrates a cap
+> of 7 on its own here** (`static_cap` picks it from this machine's cost curves, where RadixArk
+> got 2), so a bare `--model … --serve/generate` already lands the 1.99×. The **8-bit** target
+> keeps `RadixArk/Qwen3.8-27B-DSpark` (trained against the FP8 verifier, so 8-bit is its matched
+> precision — 2.72×). Greedy-lossless either way.
 
 <sub>The speed column is the measured range across the three benchmark contents at the row's
 best configuration — chat at the low end, code/math at the high end (decoding speed depends on
@@ -346,7 +371,8 @@ anything else, add `--drafter <repo>`. Run `mlx-dspark models` to print this tab
 | `mlx-community/gemma-4-12B-it-8bit`  | `deepseek-ai/dspark_gemma4_12b_block7` | `z-lab/gemma4-12B-it-DFlash` | ~15 GB | not measured (partly window-bounded) |
 | `prism-ml/Ternary-Bonsai-27B-mlx-2bit` | `Rahim/Ternary-Bonsai-27B-dspark`    | — | ~12 GB | not measured yet |
 | `mlx-community/Qwen3.6-27B-8bit`     | `satgeze/Qwen3.6-27B-DSpark` (community) | — | ~32 GB | ~11 GB (est., same arch as Qwen3.8) |
-| `mlx-community/Qwen3.8-27B-4bit` / `-8bit`[^q38] | `RadixArk/Qwen3.8-27B-DSpark` (community, SpecForge) | — | ~18 GB (4-bit) / ~29 GB (8-bit) | **~11 GB measured** (~23 GB at full 256k) |
+| `mlx-community/Qwen3.8-27B-4bit`[^q38] | `DimInfer/Qwen3.8-27B-Dspark-v1` (community, 4-bit-class) | — | ~18 GB | **~11 GB measured** (~23 GB at full 256k) |
+| `mlx-community/Qwen3.8-27B-8bit`[^q38] | `RadixArk/Qwen3.8-27B-DSpark` (community, SpecForge) | — | ~29 GB | **~11 GB measured** (~23 GB at full 256k) |
 | `mlx-community/Ornith-1.0-9B-8bit`   | `stanleyphoong/Ornith-1.0-9B-DSpark` (community) | — | ~13 GB | not measured yet |
 | `mlx-community/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-4bit` | `mlx-community/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-DSpark-bf16` (NVIDIA head, MLX) | — | ~20 GB | not measured yet |
 | `mlx-community/Muse-Glimmer-30B-4bit` | `DaoCloud/Muse-Glimmer-30B-DSpark` (community, DFlash-lineage) | — | ~26 GB (4-bit) / ~40 GB (8-bit[^muse]) | not measured yet |
@@ -489,9 +515,9 @@ and caps are this M4 Pro's — yours are derived fresh on first run):
 - **~48 GB** — `Qwen3.8-27B-8bit` (best ratio in the project: 2.72×, 3.37× on math) or
   `Muse-Glimmer-30B-8bit` (the strongest chat ratio, 2.2×+). Both ~29–40 GB resident.
 - **~24–36 GB** — `gemma-4-12B-it-8bit` (big ratio *and* real speed: ~46–55 tok/s),
-  `Qwen3.6-27B-8bit`, or `Qwen3.8-27B-4bit` (27B quality in ~18 GB at ~23–31 tok/s — the
-  **4-bit** target's measured best is `--max-draft 7 --confidence-threshold 0.3`; the confidence
-  flag is 4-bit-only, don't carry it to the 8-bit sibling — see the note below).
+  `Qwen3.6-27B-8bit`, or `Qwen3.8-27B-4bit` (27B quality in ~18 GB at ~23–34 tok/s — its
+  `DimInfer` drafter's measured best is a plain `--max-draft 7`, which `static_cap` also derives
+  with no flag; no confidence flag needed here — see the note below).
 - **~16 GB** — `Ornith-1.0-9B-8bit` (2.4× at ~59–68 tok/s, the mid-size sweet spot),
   `Qwen3-8B-8bit`, or `Qwen3-4B-8bit` (~87–101 tok/s, fits ~8 GB).
 - **Raw tokens per second above all** — the MoEs: `Qwen3.6-35B-A3B-4bit` (~91–145 tok/s).
@@ -516,20 +542,21 @@ that trip people up:
   not higher — an M5 Max may pick cap 2 for the 8-bit 27B where this M4 Pro picks 7, because
   cheaper verify shifts the optimum down, and forcing 7 there is a small net loss. Prefer no
   flag, or `--max-draft auto`.
-- **`--confidence-threshold 0.3` is a 4-bit-27B lever, not an 8-bit one.** It pays only where
-  the verify curve still *rises* inside the cap window: 4-bit Qwen3.8-27B gains from
-  `--max-draft 7 --confidence-threshold 0.3`; the **8-bit** sibling is flat under the small-M
-  kernel, wants **cap 7 with no confidence flag**, and measures *worse* with 0.3. The
-  `2.12× / 1.97× / 1.55×` figures are the **4-bit** row; the 8-bit's **2.72×** is a separate
-  end-to-end measurement, not the badge string beside it.
+- **`--confidence-threshold` is drafter-specific, not just quant-specific.** It only pays when
+  the drafter leaves *acceptance headroom* for early truncation to recover. The previous 4-bit
+  head (`RadixArk`) did, and gained from `--max-draft 7 --confidence-threshold 0.3`; the shipped
+  4-bit head (`DimInfer`) accepts too well (3.3–5.3/round) for it to help — plain **cap 7, no
+  confidence flag** is its best, and 0.5 measures *worse*. The 8-bit `RadixArk` head is flat
+  under the small-M kernel and also wants cap 7 with no flag. Each row's per-content badge is its
+  own; don't paste a flag across quants *or* drafters.
 
 ## Results at a glance
 
 **DSpark** vs plain greedy decoding of the same model, each at **its own measured cap** (M4 Pro 48 GB,
 warm, 8-bit instruct target, 4-bit drafter, **mlx 0.32.0**). Regenerated 2026-07-22 with
 `mlx-dspark benchmark --trials 3` (Muse row 2026-08-12, post-0.8.1 drafter truncation; Qwen3.8
-4-bit row 2026-08-16 with the small-M verify kernel, `--max-draft 7 --confidence-threshold 0.3`):
-every number
+8-bit row 2026-08-16 with the small-M verify kernel; Qwen3.8 4-bit row 2026-08-18 on the
+`DimInfer` drafter, `--max-draft 7`, no confidence): every number
 is a median of 3 runs over the harness's three prompts, and the tok/s columns are the mean across
 them. Reproduce any row with that command.
 
@@ -552,7 +579,7 @@ curves.
 | **Qwen3.6-27B** (8-bit, hybrid)[^community][^q27] | 4 | 3.15 | 8.4 tok/s | 19.2 tok/s | **2.29×** | 2.26× / 1.96× / 2.67× |
 | **Qwen3-8B** | 4 | 2.94 | 28.1 tok/s | 57.7 tok/s | **2.05×** | 1.81× / 2.06× / 2.29× |
 | **Qwen3-14B**[^qwen14b] | 4 | 2.87 | 15.3 tok/s | 31.0 tok/s | **2.03×** | 1.62× / 2.11× / 2.36× |
-| **Qwen3.8-27B** (4-bit, hybrid)[^community][^q38] | 7+conf | 3.17 | 14.6 tok/s | 27.5 tok/s | **1.88×** | 1.55× / 2.12× / 1.97× |
+| **Qwen3.8-27B** (4-bit, hybrid)[^community][^q38] | 7 | 4.49 | 14.8 tok/s | 29.5 tok/s | **1.99×** | 1.51× / 2.14× / 2.31× |
 | **Qwen3-4B** | 4 | 2.79 | 50.9 tok/s | 92.4 tok/s | **1.82×** | 1.77× / 1.70× / 1.98× |
 | **Qwen3.6-35B-A3B** (4-bit, MoE, hybrid)[^community][^moe] | conf | 4.72 | 86.9 tok/s | 114.5 tok/s | **1.32×** | 1.05× / 1.24× / 1.67× |
 | **Nemotron-3.5-Lightning-30B-A3B** (4-bit, MoE+Mamba, hybrid)[^nemotron] | 3 | 3.28 | 91.4 tok/s | 100.9 tok/s | **1.10×** | 0.95× / 1.23× / 1.13× |
@@ -580,10 +607,13 @@ the same fact and are specific to this row:
   nothing. Here the verify curve rises from the very first extra row **and** acceptance swings
   from 2.8 (chat) to 7.0 (math), so deciding per round how far to draft is worth real time.
   `--confidence-threshold 0.3` (0.5 is within noise of it; 0.7 over-throttles, back to 1.21×).
-  The rule this generalized to (and the Qwen3.8-27B-4bit row confirms): **confidence pays iff
-  the verify curve still rises inside the cap's window** — 4-bit Qwen3.8 (rising to width 5)
-  gains from cap 7 + 0.3, while its 8-bit sibling (flat 1–8 under the kernel) measures *worse*
-  with it and ships it off.
+  The rule this generalized to — refined once more by the Qwen3.8-27B rows: **confidence pays
+  iff the verify curve still rises inside the cap's window _and_ the drafter leaves acceptance
+  headroom for truncation to recover.** The `RadixArk` 4-bit head (rising curve to width 5,
+  modest acceptance) gained from cap 7 + 0.3; its 8-bit sibling (flat 1–8 under the kernel)
+  measures *worse* with it. But the shipped 4-bit head, `DimInfer`, has the *same* rising curve
+  yet accepts 3.3–5.3/round — no headroom left — so confidence buys nothing there either. Same
+  curve, opposite verdict: the verify shape is necessary, not sufficient.
 
 Drafter quantization was swept for this pair and **4-bit remains right** — 3-bit is no cheaper
 (the drafter's cost is dominated by a 248K-vocab head, not by weight bytes) and 2-bit and 8-bit
@@ -997,25 +1027,28 @@ are bundled.
     ratio (each extra verify row pulls in fresh routed experts). See the MoE discussion under
     [Results at a glance](#results-at-a-glance).
 
-[^q38]: **Qwen3.8-27B** — the **8-bit** rows are cap 7 (the calibrated pick with the small-M
-    verify kernel: 8-bit qmm is flat to width 5 but cliffed at 6, and the kernel removes the
-    cliff, so the derived cap moved 4 → 7 with **no flag needed** — math acceptance reaches
-    5.15, this pair's highest), 3-trial medians, hybrid lookup drafts **off** — this
-    pair's **shipped default** (the registry rows carry it, no flag needed). The **4-bit**
-    row is `--max-draft 7 --confidence-threshold 0.3` with the **small-M MMA verify kernel**
-    (on by default where a one-time probe verifies it; it makes verify widths 6–8 cost
-    ~width-5 by dequantizing each 4-bit weight group once per row-block instead of per row):
-    **1.88×** mean (2.12× code / 1.97× math / 1.55× chat) at ~28 tok/s in ~18 GB — both
-    faster *and* a better ratio than the pre-kernel cap-2 optimum (1.74× mean, 25.3 tok/s);
-    plain defaults (no flags) still land 1.71×, `--max-draft auto` 1.77×. The registry
-    auto-resolves the same drafter for both quants, and the 4-bit keeps the
-    lookup-off default (re-measured at the flat curve: 1.78× off vs 1.69× on at cap 7 —
-    long lookup drafts land outside the kernel window; on 8-bit it's a wash). The drafter,
-    `RadixArk/Qwen3.8-27B-DSpark`, is the first **SpecForge/SGLang-packaged** head here
-    (DFlash backbone + DeepSpec markov/confidence heads, YaRN rope, reuses the target's embed
-    *and* lm_head; card: accept 3.39 at temp 0.6 vs the FP8 target). Trained against the FP8
-    verifier — which is why 8-bit lifts acceptance (2.44 → 3.43), the
-    Ornith/Qwen3.6-27B precision-matching pattern again.
+[^q38]: **Qwen3.8-27B** — two community drafters, one per quant (each matched to the precision
+    it was trained against), both with the **small-M MMA verify kernel** on by default (a
+    one-time probe verifies it; it makes 4-/8-bit verify widths 6–8 cost ~width-5 by
+    dequantizing each weight group once per row-block instead of per row). 3-trial medians,
+    hybrid lookup drafts **off** — this pair's shipped default (the registry rows carry it).
+    The **4-bit** row runs `DimInfer/Qwen3.8-27B-Dspark-v1`, a DeepSpec-stock `Qwen3DSparkModel`
+    (ungated qwen3 backbone, plain rope, block_size **15**, tap layers [1,16,31,46,61], reuses
+    the target's embed *and* lm_head) trained for the Q4_K_M / 4-bit class: **1.99×** mean at a
+    calibrated cap of 7 (2.31× math / 2.14× code / 1.51× chat, accept 3.28/4.86/5.32), ~29 tok/s
+    in ~18 GB. It out-accepts the previous 4-bit head (`RadixArk`, cap7+conf0.3 = 1.82× the same
+    session) at every cap and content; the confidence head does *not* pay here (acceptance is
+    already high, so truncation only sheds accepted tokens) and block-15 buys nothing past cap 7
+    (verify width 9 exits the kernel window), so `--max-draft 7` with no `--confidence-threshold`
+    is the recommendation — and `static_cap` picks 7 unaided, so a no-flag `--model` already
+    lands it. The **8-bit** row runs `RadixArk/Qwen3.8-27B-DSpark`, the first
+    **SpecForge/SGLang-packaged** head here (DFlash backbone + DeepSpec markov/confidence heads,
+    YaRN rope, block_7, reuses embed *and* lm_head; card: accept 3.39 at temp 0.6 vs the FP8
+    target it was trained against): the kernel removes 8-bit qmm's width-6 cliff so the derived
+    cap moved 4 → 7 with no flag — **2.72×** mean (3.37× math / 2.84× code / 1.95× chat, accept
+    4.05, math accept 5.15, this pair's highest). 8-bit lifts RadixArk's acceptance (2.44 → 3.43)
+    because it is the matched precision — the Ornith/Qwen3.6-27B pattern again. Lossless both
+    quants (fp ties only).
 
 [^nemotron]: **Nemotron-3.5-Lightning-30B-A3B** — the first **Mamba-2 + MoE hybrid** target
     (`nemotron_h`, NVIDIA's official DSpark head), the project's first non-attention recurrence,
@@ -1036,9 +1069,10 @@ are bundled.
     bf16 target with DeepSpec's online mode and warm-started from z-lab's DFlash head for the
     same target. Rule of thumb: **match the target's precision to what the drafter was trained
     against** — Ornith's drafter (bf16-qualified) wants 8-bit, and so does this one.
-    Qwen3.8-27B runs `RadixArk/Qwen3.8-27B-DSpark`, the first **SpecForge/SGLang**-packaged head
-    here (see its own footnote); its row is the 4-bit target, a precision step below the FP8
-    verifier it was trained against.
+    Qwen3.8-27B runs two heads (see the [^q38] footnote): the **4-bit** target uses
+    `DimInfer/Qwen3.8-27B-Dspark-v1` (a 4-bit-class DeepSpec head, block-15, out-accepts the
+    alternative at 4-bit), the **8-bit** target uses `RadixArk/Qwen3.8-27B-DSpark`, the first
+    **SpecForge/SGLang**-packaged head here — matched to the FP8 verifier it was trained against.
     Ornith-1.0-9B (an agentic-coding qwen3_5 hybrid, drafter qualified against the bf16 verifier)
     runs the **8-bit** house sweet spot — the first target here with chat above 2× — and its
     acceptance is so high on code (p≈0.96/position) that auto-cap drives the cap to the full

@@ -120,33 +120,40 @@ REGISTRY = [
      "dspark": "Koopah/Qwen3.6-35B-A3B-NVFP4-DSPARK", "lookup_drafts": False,
      "ram": "~23 GB", "speedup": "~1.3×"},
     # Qwen3.8-27B (qwen3_5 hybrid — same 64-layer/5120-hidden 48-linear/16-full shape class as
-    # Qwen3.6-27B, new 248320-token vocab). Drafter by RadixArk: the first **SpecForge/SGLang**
-    # packaging here (trained with sgl-project/SpecForge) — a DFlash-backbone DSpark: 5-layer
-    # plain qwen3 GQA (40/8 heads, hd 128, bidirectional full-attention block), block_size 7
-    # sampled anchor-as-pos0 (logits_start 0 -> 7 proposals; NOT the shipped base-DFlash
-    # loop's convention — see config.py), YARN rope (factor 32 /
-    # orig 8192 — honored; the reference builds it from the head's own config), markov-256 +
-    # confidence head, and it reuses the target's embed_tokens AND lm_head (ships neither).
-    # Card reports accept 3.39 mean incl. bonus (SGLang, FP8 target, temp 0.6). Measured
-    # (M4 Pro, warm, 3-trial medians, 200 tok, lookup off = this row's default):
-    # **4-bit** (registry target, broad-RAM/absolute-speed pick): baseline ~14.6 tok/s;
-    # cap 2 = **1.74x mean** (code 1.87x / math 1.83x / chat 1.52x, accept 2.44; cap 3 tied)
-    # vs 1.56x with lookup ON — the first non-MoE target where lookup drafts measure a clear
-    # net loss (the 4-bit 27B verify slope prices extra rows like the MoE expert pull does).
-    # **8-bit** (best ratio; drafter was trained vs the FP8 verifier, so 8-bit is the matched
-    # precision): baseline 8.3; cap 4 (= static_cap's pick, curve flat to width 5) =
-    # **2.45x mean** (math 3.00x / code 2.38x / chat 1.96x, accept 3.43), 20.3 tok/s, ~29 GB;
-    # lookup on-vs-off is a wash there (flat curve absorbs the rows) so the off default
-    # stands for both quants. static_cap picks 2 (4-bit) / 4 (8-bit) unaided. Lossless
-    # both quants (fp ties only, margins 0.0/0.125).
+    # Qwen3.6-27B, new 248320-token vocab). Two community drafters, one per quant, each matched
+    # to the precision it was trained against:
+    #
+    # **4-bit -> DimInfer/Qwen3.8-27B-Dspark-v1** (measured 2026-08-18; beats RadixArk here).
+    # A DeepSpec-stock `Qwen3DSparkModel` (NOT SpecForge — no dflash_config/projector_type):
+    # 5-layer ungated qwen3 GQA (q_proj [4096,5120]; `attn_output_gate:true` in its config is
+    # deepcopy-of-target noise), plain rope (no YaRN), **block_size 15** sampled anchor-as-pos0
+    # (logits_start 0), tap layers [1,16,31,46,61] (deeper than RadixArk's), markov-256 +
+    # confidence, reuses the target's embed AND lm_head. Trained for the Q4_K_M / 4-bit class.
+    # Paired vs RadixArk (M4 Pro, warm, 3-trial medians, 200 tok, small-M kernel on, lookup off):
+    # **`--max-draft 7` = 1.99x mean** (chat 1.51x / code 2.14x / math 2.31x, accept
+    # 3.28/4.86/5.32; ~23/32/34 tok/s) vs RadixArk's cap7+conf0.3 = 1.82x same session — higher
+    # acceptance at every cap/content. The confidence head does NOT pay here (already-high
+    # acceptance -> conf-truncation just sheds accepted tokens), so no --confidence-threshold;
+    # and block-15 buys nothing past cap 7 (cap 8 = 1.18x — verify width 9 exits the small-M
+    # kernel window M in [6,8]). static_cap picks **7** unaided here (its block-15 backbone cost
+    # amortizes at high cap where RadixArk's block-7 got 2), so a no-flag `--model` already
+    # lands the 1.99x — `--max-draft 7` is just explicit. Greedy-lossless (firstdiff=-1 vs
+    # single-row greedy). Loaded with zero model-code change.
+    #
+    # **8-bit -> RadixArk/Qwen3.8-27B-DSpark** (kept — DimInfer is 4-bit-class, not measured at
+    # 8-bit). The first **SpecForge/SGLang**-packaged head here: DFlash-backbone DSpark, block_7
+    # anchor-as-pos0, YaRN rope (factor 32 / orig 8192, honored), reuses embed AND lm_head,
+    # trained vs the FP8 verifier so 8-bit is its matched precision (accept 2.44 -> 3.43). cap 4
+    # was pre-kernel; with the small-M kernel static_cap moves to cap 7 = **2.72x mean** (math
+    # 3.37x / code 2.84x / chat 1.95x, accept 4.05), 22.6 tok/s, ~29 GB. Lookup off both quants
+    # (4-bit: net loss; 8-bit: a wash on the flat curve). Lossless (fp ties, margins 0.0/0.125).
     {"id": "qwen3.8-27b", "target": "mlx-community/Qwen3.8-27B-4bit",
-     "dspark": "RadixArk/Qwen3.8-27B-DSpark", "lookup_drafts": False,
-     "ram": "~18 GB", "speedup": "~1.9×"},
-    # Same pair at 8-bit — the measured-best quant (the drafter was trained vs an FP8
-    # verifier, so 8-bit is the matched precision: accept 2.44 -> 3.43, 2.45x at cap 4).
-    # Listed as its own row so pickers offer both; the 4-bit row keeps the absolute-speed
-    # crown (25.3 vs 20.3 tok/s) in ~18 GB. Resolution: the longest-id-first match sends
-    # "*-8bit" here and everything else Qwen3.8 to the row above.
+     "dspark": "DimInfer/Qwen3.8-27B-Dspark-v1", "lookup_drafts": False,
+     "ram": "~18 GB", "speedup": "~2.0×"},
+    # Same pair at 8-bit — best ratio (RadixArk was trained vs an FP8 verifier). Listed as its
+    # own row so pickers offer both; the 4-bit row keeps the absolute-speed crown (~29 vs 23
+    # tok/s) in ~18 GB. Resolution: the longest-id-first match sends "*-8bit" here and
+    # everything else Qwen3.8 to the row above.
     {"id": "qwen3.8-27b-8bit", "target": "mlx-community/Qwen3.8-27B-8bit",
      "dspark": "RadixArk/Qwen3.8-27B-DSpark", "lookup_drafts": False,
      "ram": "~29 GB", "speedup": "~2.7×"},
@@ -335,14 +342,20 @@ def _resolve(repo_or_path: str) -> str:
         return ensure_converted(repo, filename)
     if os.path.isdir(repo_or_path):
         return repo_or_path
-    # Prefer the plain-dir model cache (~/.cache/mlx_dspark/models/<repo basename>) over a
-    # hub download: models fetched by hand (e.g. around a wedged huggingface_hub) live there,
-    # and auto-resolved drafters must not re-download 6 GB the user already has on disk.
-    local = os.path.join(
-        os.path.expanduser("~/.cache/mlx_dspark/models"),
-        os.path.basename(repo_or_path.rstrip("/")))
-    if os.path.isdir(local):
-        return local
+    # Prefer the plain-dir model cache (~/.cache/mlx_dspark/models/…) over a hub download:
+    # models fetched by hand (e.g. around a wedged huggingface_hub) live there, and
+    # auto-resolved drafters must not re-download gigabytes the user already has on disk.
+    # Match BOTH naming conventions those hand-downloads use: the bare basename AND the
+    # org-prefixed "<org>_<name>" form (what huggingface-cli and robust_download.py produce,
+    # and what disambiguates two repos that share a basename — e.g. DimInfer's
+    # Qwen3.8-27B-Dspark-v1 vs the SpecForge Qwen3.8-27B-DSpark). Basename first keeps the
+    # historical preference. Must stay in lockstep with diagnostics._is_local.
+    models = os.path.expanduser("~/.cache/mlx_dspark/models")
+    stripped = repo_or_path.rstrip("/")
+    for name in (os.path.basename(stripped), stripped.replace("/", "_")):
+        local = os.path.join(models, name)
+        if os.path.isdir(local):
+            return local
     return snapshot_download(repo_or_path)
 
 

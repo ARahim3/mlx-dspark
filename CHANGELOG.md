@@ -4,6 +4,34 @@ All notable changes to `mlx-dspark`. Versions follow [SemVer](https://semver.org
 
 ## [Unreleased]
 
+## [0.12.2] — 2026-08-18 — better 4-bit Qwen3.8-27B drafter (DimInfer)
+
+### Changed
+- **`mlx-community/Qwen3.8-27B-4bit` now auto-resolves `DimInfer/Qwen3.8-27B-Dspark-v1`** as its
+  drafter (was `RadixArk/Qwen3.8-27B-DSpark`, which stays the 8-bit row's head). DimInfer is a
+  4-bit-class DeepSpec-stock head (block-15, deeper tap layers) that out-accepts RadixArk at
+  every cap and content on the 4-bit target: measured **1.99× mean** at `--max-draft 7` (2.31×
+  math / 2.14× code / 1.51× chat, accept up to 5.3) vs RadixArk's 1.82× the same session, and
+  `static_cap` picks cap 7 unaided so a no-flag `--model …-4bit` already lands it. No
+  `--confidence-threshold` needed (its acceptance is already high; the confidence head only pays
+  where the drafter leaves acceptance headroom). Greedy-lossless as always. The 8-bit registry
+  row is unchanged (RadixArk, trained against the FP8 verifier).
+
+### Fixed
+- **Small-M verify kernel was silently skipped when its shape cache predated the `b{bits}`
+  `shape_key` format**: `apply_small_m` matched zero live modules against the stale-format shape
+  strings and ran the stock kernel with no error (verify slower than intended). It now detects a
+  cache whose shapes match no live module and re-measures/overwrites it
+  (`small_m_qmm_shapes(refresh=True)`), self-healing without a global calibration-cache bump.
+- **A hand-downloaded model in the plain-dir cache under its org-prefixed name
+  (`<org>_<name>`, what `huggingface-cli`/`robust_download.py` produce) was treated as
+  not-installed** — `_resolve`/`_is_local` only matched the bare basename. So a drafter like
+  `DimInfer/Qwen3.8-27B-Dspark-v1` present on disk as `DimInfer_Qwen3.8-27B-Dspark-v1` was
+  re-downloaded on load and its registry pair reported `ready: false` (which hid it from the
+  app's ready-only model menu). All three checks — `load._resolve`, `diagnostics._is_local`,
+  and `download._looks_like_repo` (the cancellable pre-fetch gate) — now match the
+  `<org>_<name>` form, so a hand-downloaded copy is found instead of re-fetched.
+
 ## [0.12.1] — 2026-08-16 — race the confidence bundle
 
 ### Added

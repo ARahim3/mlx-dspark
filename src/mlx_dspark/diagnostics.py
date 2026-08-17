@@ -246,10 +246,13 @@ def _is_local(repo: str | None) -> bool:
         repo = repo[len("gguf:"):].rsplit("/", 1)[0]
     if os.path.isdir(repo):
         return True
-    plain = os.path.join(os.path.expanduser("~/.cache/mlx_dspark/models"),
-                         os.path.basename(repo.rstrip("/")))
-    if os.path.isdir(plain):
-        return True
+    # Both hand-download naming conventions: bare basename and org-prefixed "<org>_<name>"
+    # (see load._resolve — these two must agree, one answers "installed?" and the other "where").
+    models = os.path.expanduser("~/.cache/mlx_dspark/models")
+    stripped = repo.rstrip("/")
+    for name in (os.path.basename(stripped), stripped.replace("/", "_")):
+        if os.path.isdir(os.path.join(models, name)):
+            return True
     hub = os.path.expanduser("~/.cache/huggingface/hub")
     return os.path.isdir(os.path.join(hub, "models--" + repo.replace("/", "--")))
 

@@ -72,10 +72,17 @@ def _looks_like_repo(repo_or_path: str | None) -> bool:
         return False
     if repo_or_path.count("/") != 1:
         return False
-    # the plain-dir cache that _resolve prefers over the hub (see load.py)
-    local = os.path.join(os.path.expanduser("~/.cache/mlx_dspark/models"),
-                         os.path.basename(repo_or_path.rstrip("/")))
-    return not os.path.isdir(local)
+    # the plain-dir cache that _resolve prefers over the hub (see load.py) — match BOTH the
+    # bare basename and the org-prefixed "<org>_<name>" form, exactly as _resolve/_is_local do.
+    # Without the second form a hand-downloaded copy under the org-prefixed name (e.g.
+    # DimInfer_Qwen3.8-27B-Dspark-v1) gets needlessly re-fetched here even though it's on disk.
+    # These three checks must stay in lockstep.
+    models = os.path.expanduser("~/.cache/mlx_dspark/models")
+    stripped = repo_or_path.rstrip("/")
+    for name in (os.path.basename(stripped), stripped.replace("/", "_")):
+        if os.path.isdir(os.path.join(models, name)):
+            return False
+    return True
 
 
 def _fetch_total(repo: str, entry: dict) -> None:

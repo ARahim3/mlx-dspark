@@ -44,6 +44,8 @@ SCHEMA = 4   # 2: verify curve includes width 1; adds the measured per-round ove
 # 4: curves are measured inside the small-M MMA kernel context when it is enabled
 # (small_m_qmm.py flattens 4-bit verify at widths 6-8), and the cache key carries an
 # "|smm" tag so kernel-on and kernel-off curves never masquerade as each other.
+# (The small-M *shape* cache stores shape_key strings, whose format is NOT in this key;
+# a format change there is self-healed at load — see apply_small_m — not schema-gated.)
 CTX_LEN = 512          # curve shape is nearly ctx-independent (SDPA is flat in width)
 TOKEN_ID = 7           # arbitrary; timings are content-independent
 
@@ -605,17 +607,24 @@ def apply_wide_gemm(target, drafter=None, *, target_repo: str,
 def small_m_qmm_shapes(target, drafter=None, *, target_repo: str,
                        drafter_repo: str | None = None,
                        cache_dir: str | None = None,
+                       refresh: bool = False,
                        verbose: bool = True) -> list[str]:
     """Weight shapes whose verify-window forwards should run on the small-M MMA kernel
     (see :mod:`.small_m_qmm`), or ``[]`` when it never pays on this machine.
 
     Same doctrine as the cap and the wide-GEMM crossover: the win is a property of
     (chip x mlx version x shape), so each shape is raced and numerics-checked once
-    (~2-4 s total) and the verdict cached under a device+mlx key."""
+    (~2-4 s total) and the verdict cached under a device+mlx key.
+
+    ``refresh=True`` re-measures and overwrites the cached entry — used by
+    :func:`apply_small_m` to self-heal a cache written before a ``shape_key`` format
+    change (the stored shape strings would match no live module, silently disabling the
+    kernel with no error). The cache key carries the SCHEMA but not the shape-key format,
+    so this is the backstop for that; keep it."""
     from .small_m_qmm import measure_shapes
 
     key = _cache_key("smallm", target_repo, drafter_repo)
-    entry = load_cached(key, cache_dir)
+    entry = None if refresh else load_cached(key, cache_dir)
     if entry is None:
         if verbose:
             print("calibrating small-M qmm kernel (one-time, cached)…", flush=True)
@@ -647,9 +656,19 @@ def apply_small_m(target, drafter=None, *, target_repo: str,
     if enabled is False:
         _gen.SMALL_M_IDS = None
         return None
+    model = getattr(target, "model", target)
     shapes = small_m_qmm_shapes(target, drafter, target_repo=target_repo,
                                 drafter_repo=drafter_repo, verbose=verbose)
-    ids = ids_for_shapes(shapes, getattr(target, "model", target), drafter)
+    ids = ids_for_shapes(shapes, model, drafter)
+    if shapes and not ids:
+        # Cached shapes exist but match no live module => the entry predates a shape_key
+        # format change (e.g. the `b{bits}` tag), so the kernel would be silently skipped.
+        # Re-measure with the current format and overwrite the stale entry.
+        if verbose:
+            print("  small-M qmm: cached shapes are stale-format, re-measuring…", flush=True)
+        shapes = small_m_qmm_shapes(target, drafter, target_repo=target_repo,
+                                    drafter_repo=drafter_repo, refresh=True, verbose=verbose)
+        ids = ids_for_shapes(shapes, model, drafter)
     _gen.SMALL_M_IDS = ids or None
     return _gen.SMALL_M_IDS
 
