@@ -730,6 +730,14 @@ class MessageStream:
         sent = self.gate.sent_text
         if not sent:
             tail = cleaned
+        elif not self.gate.tripped:
+            # No marker ever fired, so the withheld lookahead is plain answer text — and
+            # ``cleaned`` can't reconcile it: parse_tool_calls strips its result, so it never
+            # startswith() a raw ``sent`` that leads with whitespace. Qwen3-style templates
+            # guarantee exactly that (the \n\n after the prefilled think-closer lands in its
+            # own round), and every streamed answer lost its final _MAX_MARKER - 1 characters
+            # while still reporting a clean stop and an accurate output_tokens.
+            tail = self.gate.buf[self.gate.sent:]
         elif cleaned.startswith(sent):
             tail = cleaned[len(sent):]
         else:

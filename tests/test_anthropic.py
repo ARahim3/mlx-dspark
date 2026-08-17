@@ -418,6 +418,29 @@ def test_stream_delivers_every_character_exactly_once():
     assert _streamed_text(ev) == "Hello world!"
 
 
+def test_stream_releases_the_held_back_tail_of_a_leading_whitespace_answer():
+    # The gate withholds _MAX_MARKER - 1 chars of lookahead; finish() must hand them back.
+    # parse_tool_calls strips its text, so reconciling against the raw sent prefix dropped
+    # the tail of any answer that reached the gate leading with whitespace.
+    body = "The quick brown fox jumps over the lazy dog."
+    ev = _drive(["\n\n" + body])
+    assert _assert_well_formed(ev) == {0: "text"}
+    assert _streamed_text(ev) == "\n\n" + body
+
+
+def test_stream_prefilled_thinking_answer_arrives_complete_one_char_at_a_time():
+    # The agent-shaped case: a Qwen3-style template prefills the <think> opener, the model
+    # emits the closer, and the \n\n that opens the answer lands in its own round — after
+    # the post-closer lstrip already ran — so the raw stream leads with whitespace.
+    st = A.MessageStream(model="m", input_tokens=1, in_thinking="</think>")
+    events = list(st.start())
+    for ch in "reasoning</think>\n\nSecond cousins once removed.":
+        events.extend(st.delta(ch))
+    events.extend(st.finish(finish_reason="stop", output_tokens=1))
+    assert _assert_well_formed(events) == {0: "thinking", 1: "text"}
+    assert _streamed_text(events).endswith("Second cousins once removed.")
+
+
 def test_stream_reports_usage_and_stop_reason():
     ev = _drive(["hi"], finish_reason="length", output_tokens=11)
     (delta,) = [d for n, d in ev if n == "message_delta"]
