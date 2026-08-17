@@ -43,8 +43,7 @@ from .generate import (
     greedy_generate,
     speculative_generate,
 )
-from .load import (apply_wired_limit, load_dflash, load_drafter, load_mtp, load_target,
-                   resolve_mode)
+from .load import apply_wired_limit, load_dflash, load_drafter, load_mtp, load_target, resolve_mode
 from .lookup import lookup_generate
 from .prefix_cache import PrefixCache, _lcp, target_cache_reusable
 from .telemetry import RoundLog, RoundRecorder

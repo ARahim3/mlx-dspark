@@ -21,8 +21,8 @@ import mlx.core as mx
 from mlx.utils import tree_flatten
 
 from .sampling import sample_probs, truncate_probs
-from .wide_gemm import wide_matmul
 from .target import POST_NORM
+from .wide_gemm import wide_matmul
 
 TAP = None  # set from drafter config at call time
 

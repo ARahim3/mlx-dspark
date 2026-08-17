@@ -82,7 +82,7 @@ class MTPConfig:
         self.max_depth = max_depth
 
     @classmethod
-    def from_text_config(cls, tc: dict, *, max_depth: int = 3) -> "MTPConfig":
+    def from_text_config(cls, tc: dict, *, max_depth: int = 3) -> MTPConfig:
         """Read the MTP block's shape off the target's own text config.
 
         The head is a sibling of the trunk's full-attention layers and shares their
