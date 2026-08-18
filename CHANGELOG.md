@@ -2,6 +2,25 @@
 
 All notable changes to `mlx-dspark`. Versions follow [SemVer](https://semver.org/) (pre-1.0: minor-ish features land as patch bumps).
 
+## [0.12.4] — 2026-08-18 — Curves calibration fix + LM Studio model reuse
+
+### Fixed
+- **`GET /calibration` found no curves on any machine where the small-M verify kernel is live
+  (i.e. every default setup since v0.12.0)** — the curves are cached under a `"|smm"`-tagged
+  key when the kernel is applied, but the endpoint still read only the untagged key, so the
+  app's Lab → Curves tab permanently showed "Not calibrated yet" on fully calibrated
+  machines. The reader now prefers the variant matching the live kernel state and falls back
+  to the other (`calibrate.cached_curve_entry`); the "not calibrated" hint no longer tells
+  users to run `--max-draft auto` (any load without a fixed cap calibrates automatically).
+
+### Added
+- **Models LM Studio already downloaded are reused** (issue #12): `--model <publisher>/<model>`
+  now loads straight from LM Studio's caches (`~/.lmstudio/models`, legacy
+  `~/.cache/lm-studio/models`) when the exact directory exists — MLX layouts only (GGUF
+  downloads are skipped and fall through to the hub). They also appear in the installed-models
+  scan (`mlx-dspark models`, `/admin/models`, the app's "On this Mac" list) tagged
+  `source: "lmstudio"`, and are excluded from the app-reclaimable disk total.
+
 ## [0.12.3] — 2026-08-18 — serve stream liveness: disconnects cancel generation, serve-side small-M toggle
 
 ### Fixed
