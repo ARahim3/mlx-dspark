@@ -2,13 +2,44 @@
 
 All notable changes to `mlx-dspark`. Versions follow [SemVer](https://semver.org/) (pre-1.0: minor-ish features land as patch bumps).
 
-## [Unreleased]
+## [0.12.3] — 2026-08-18 — serve stream liveness: disconnects cancel generation, serve-side small-M toggle
 
 ### Fixed
+- **A vanished streaming client no longer leaves its generation running to `max_tokens` on the
+  single MLX thread** (issue #14 — the "serve wedges, `/health` stays OK" report). The OpenAI
+  tool-calls stream buffers its whole generation by design (role chunk, then one delta at the
+  end), so a client that timed out and disconnected mid-buffer was undetectable: the abandoned
+  generation kept the one generation thread for minutes, every retry queued another one behind
+  it, and from outside the server looked hard-wedged while `/health` (which never touches that
+  thread) stayed green. Both stream dialects now run a keep-alive writer (SSE comments on the
+  OpenAI stream, the existing `ping` on the Anthropic one, every 15 s —
+  `MLX_DSPARK_STREAM_KEEPALIVE_S` overrides); a keep-alive write that fails marks the client
+  gone and generation stops at the next round with the prefix cache intact. Verified live: a
+  dropped 3000-token tools stream now frees the engine in ~1 s (was: the full generation), and
+  the keep-alives also stop compliant clients from idle-timing-out during long buffered
+  generations in the first place.
+- **Mid-stream client disconnects are now logged** (one stderr line with the route and how many
+  tokens the cut-short generation kept) — previously they were swallowed silently, which made a
+  stalled client indistinguishable from a wedged engine in the server's own output (issue #14's
+  diagnostic gap).
 - **`--max-draft` help text was stale** (`generate` and `serve` both said "Defaults: dspark=2").
   The dspark default has been the calibrated `static_cap` for several versions — the help now
   says the cap is derived per machine+model+quant on first run (cached), and clarifies that
   `auto` adapts the cap per round.
+
+### Added
+- **`serve --small-m/--no-small-m`** — the small-M MMA verify kernel can finally be toggled at
+  serve time (it was `generate`/`benchmark`-only, so the only serve-side A/B was downgrading the
+  whole package). Unset keeps the probe-gated default; `--no-small-m` forces the stock kernel.
+  `/health` reports the live state (`small_m`), the startup banner prints it, and `/admin/load`
+  takes a per-swap boolean `small_m` override.
+- **RAM-aware context-window warning at load** (issue #14's secondary finding): `serve` defaults
+  the window to the model's own maximum (262144 on Qwen3.8-27B ⇒ ~16 GB of KV on top of ~29 GB
+  of weights, which silently exhausted a 64 GB Mac). The engine now estimates the
+  context-growing KV bytes/token from the model config (hybrid-aware: recurrent and
+  sliding-window layers don't count; reproduces Qwen3.8-27B's measured 64 KB/token exactly) and
+  warns at load — with a `--context-window` value that fits — when weights + full-window KV
+  exceed ~90% of the machine's GPU working set. A warning, not a changed default.
 
 ## [0.12.2] — 2026-08-18 — better 4-bit Qwen3.8-27B drafter (DimInfer)
 
