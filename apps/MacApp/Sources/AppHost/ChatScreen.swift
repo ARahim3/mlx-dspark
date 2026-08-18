@@ -129,6 +129,7 @@ struct ChatSettingsButton: View {
 struct ChatSettingsPanel: View {
     @EnvironmentObject private var model: AppModel
     @State private var maxTokensText: String = ""
+    @State private var seedText: String = ""
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
@@ -179,6 +180,27 @@ struct ChatSettingsPanel: View {
                 }
             }
 
+            VStack(alignment: .leading, spacing: 6) {
+                Toggle(isOn: Binding(
+                    get: { model.chatSettings.topP != nil },
+                    set: { model.chatSettings.topP = $0 ? 0.9 : nil }
+                )) {
+                    Text("Custom top-p")
+                }
+                if let topP = model.chatSettings.topP {
+                    HStack {
+                        Slider(value: Binding(
+                            get: { topP },
+                            set: { model.chatSettings.topP = $0 }
+                        ), in: 0.05...1.0)
+                        Text(String(format: "%.2f", topP))
+                            .font(.caption.monospacedDigit()).frame(width: 34)
+                    }
+                    Text("Nucleus cutoff — applied losslessly to draft and target alike.")
+                        .font(.caption2).foregroundStyle(.secondary)
+                }
+            }
+
             VStack(alignment: .leading, spacing: 4) {
                 HStack {
                     Text("Max response tokens")
@@ -190,6 +212,34 @@ struct ChatSettingsPanel: View {
                         }
                 }
                 Text("Leave empty for the server default. Thinking counts against this budget.")
+                    .font(.caption2).foregroundStyle(.secondary)
+            }
+
+            VStack(alignment: .leading, spacing: 4) {
+                HStack {
+                    Text("Seed")
+                    TextField("random", text: $seedText)
+                        .textFieldStyle(.roundedBorder)
+                        .frame(width: 110)
+                        .onChange(of: seedText) { _, text in
+                            model.chatSettings.seed = Int(text)
+                        }
+                }
+                Text("Fix it to make sampled output reproducible. Empty = fresh randomness.")
+                    .font(.caption2).foregroundStyle(.secondary)
+            }
+
+            VStack(alignment: .leading, spacing: 4) {
+                HStack {
+                    Text("Stop sequences")
+                    TextField("none — comma-separated", text: Binding(
+                        get: { model.chatSettings.stopSequences ?? "" },
+                        set: { model.chatSettings.stopSequences = $0.isEmpty ? nil : $0 }
+                    ))
+                    .textFieldStyle(.roundedBorder)
+                }
+                Text("Generation ends when any of these appears; the sequence itself "
+                     + "isn't shown.")
                     .font(.caption2).foregroundStyle(.secondary)
             }
 
@@ -228,6 +278,7 @@ struct ChatSettingsPanel: View {
         .frame(width: 340)
         .onAppear {
             maxTokensText = model.chatSettings.maxTokens.map(String.init) ?? ""
+            seedText = model.chatSettings.seed.map(String.init) ?? ""
         }
     }
 }

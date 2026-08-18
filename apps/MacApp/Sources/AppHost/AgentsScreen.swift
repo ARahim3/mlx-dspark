@@ -89,6 +89,12 @@ struct AgentCard: View {
                             .font(.caption).foregroundStyle(.secondary)
                             .padding(.top, 2)
                     }
+                    // The one agent we can launch ourselves: `mlx-dspark claude` is a
+                    // one-shot command with no residue, so a button is honest here. The
+                    // raw config above stays visible — the button is a convenience on top.
+                    if integration.id == "claude-code" {
+                        LaunchClaudeCodeButton()
+                    }
                     RoundTripTest()
                 }
                 .padding(.top, 12)
@@ -97,6 +103,60 @@ struct AgentCard: View {
         .padding(14)
         .background(Theme.cardFill, in: RoundedRectangle(cornerRadius: 10))
         .overlay(RoundedRectangle(cornerRadius: 10).strokeBorder(Theme.cardStroke, lineWidth: 1))
+    }
+}
+
+/// One click from "the server is up" to a Claude Code session running on it.
+///
+/// Opens Terminal on a script that runs the app-owned engine's `claude` subcommand against
+/// this server — the same residue-free launcher the CLI documents: configuration lives in
+/// the launched process's environment only, other Claude Code sessions are untouched, and
+/// if `claude` isn't installed the subcommand's own install hint prints right there in the
+/// Terminal window.
+struct LaunchClaudeCodeButton: View {
+    @EnvironmentObject private var model: AppModel
+    @State private var launchError: String?
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Button {
+                launch()
+            } label: {
+                Label("Launch Claude Code in Terminal", systemImage: "terminal")
+                    .font(.caption)
+            }
+            .buttonStyle(.link)
+            .disabled(!model.isServerReady)
+            .help(model.isServerReady
+                  ? "Opens Terminal running Claude Code on this server — this session only"
+                  : "Load a model first")
+            if let launchError {
+                Label(launchError, systemImage: "xmark.circle")
+                    .font(.caption).foregroundStyle(Theme.warning)
+                    .textSelection(.enabled)
+            }
+        }
+    }
+
+    private func launch() {
+        launchError = nil
+        guard let client = model.apiClient else { return }
+        var command = "\"\(Paths.engineExecutable.path)\" claude --url \(client.baseURL.absoluteString)"
+        if let key = client.apiKey, !key.isEmpty { command += " --api-key \(key)" }
+        do {
+            // A .command file is the sanctioned "run this in Terminal" handoff: no
+            // AppleScript automation permission prompt, and the user can read exactly
+            // what will run. Not `exec` — if claude is missing, the error must stay
+            // on screen rather than vanish with the shell.
+            let url = FileManager.default.temporaryDirectory
+                .appendingPathComponent("mlx-dspark-claude.command")
+            try "#!/bin/zsh\n\(command)\n".write(to: url, atomically: true, encoding: .utf8)
+            try FileManager.default.setAttributes([.posixPermissions: 0o755],
+                                                  ofItemAtPath: url.path)
+            NSWorkspace.shared.open(url)
+        } catch {
+            launchError = "Couldn't launch: \(error.localizedDescription)"
+        }
     }
 }
 

@@ -85,9 +85,25 @@ public struct Calibration: Decodable, Sendable {
     public let drafter: String?
     /// Verify-forward cost in ms, keyed by verify width.
     public let verifyMs: [String: Double]?
+    /// Drafter cost per round in ms — keyed by cap for dspark, one flat number for dflash.
+    public let drafterMs: DrafterCost?
     public let roundOverheadMs: Double?
     public let recommendation: Recommendation?
     public let controller: Controller?
+
+    public enum DrafterCost: Decodable, Sendable {
+        case byCap([String: Double])
+        case flat(Double)
+
+        public init(from decoder: Decoder) throws {
+            let container = try decoder.singleValueContainer()
+            if let dict = try? container.decode([String: Double].self) {
+                self = .byCap(dict)
+            } else {
+                self = .flat(try container.decode(Double.self))
+            }
+        }
+    }
 
     public struct Recommendation: Decodable, Sendable {
         /// Width at which the quantized-matmul cost curve leaves its cheap region.
@@ -121,6 +137,7 @@ public struct Calibration: Decodable, Sendable {
     enum CodingKeys: String, CodingKey {
         case available, reason, mode, target, drafter, recommendation, controller
         case verifyMs = "verify_ms"
+        case drafterMs = "drafter_ms"
         case roundOverheadMs = "round_overhead_ms"
     }
 
@@ -129,5 +146,38 @@ public struct Calibration: Decodable, Sendable {
         (verifyMs ?? [:])
             .compactMap { key, value in Int(key).map { (width: $0, ms: value) } }
             .sorted { $0.width < $1.width }
+    }
+
+    /// Drafter cost for one round at `cap` drafted tokens, if measured.
+    public func drafterCost(cap: Int) -> Double? {
+        switch drafterMs {
+        case .byCap(let dict): return dict[String(cap)]
+        case .flat(let value): return value
+        case nil:              return nil
+        }
+    }
+
+    /// Expected tokens committed per round at `cap` if each drafted position survives with
+    /// probability `p` — the bonus token plus the geometric survival of each draft slot.
+    public static func expectedCommitted(cap: Int, p: Double) -> Double {
+        (0...max(0, cap)).reduce(0.0) { $0 + pow(p, Double($1)) }
+    }
+
+    /// Predicted tok/s at `cap` for acceptance `p` — the same cost model the engine's
+    /// controller prices caps with, computed client-side so the acceptance can be explored
+    /// interactively (the engine only reports rates at its current live estimate).
+    public func predictedRate(cap: Int, p: Double) -> Double? {
+        guard let verify = verifyMs?[String(cap + 1)] else { return nil }
+        let draft: Double
+        if cap == 0 {
+            draft = 0                             // cap 0 = a plain step, no drafter run
+        } else if let cost = drafterCost(cap: cap) {
+            draft = cost
+        } else {
+            return nil
+        }
+        let ms = verify + draft + (roundOverheadMs ?? 0)
+        guard ms > 0 else { return nil }
+        return Self.expectedCommitted(cap: cap, p: p) / ms * 1000
     }
 }

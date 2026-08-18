@@ -43,9 +43,12 @@ struct ModelsScreen: View {
 
                 sectionTitle("Measured pairs",
                              note: "Benchmarked drafter pairings — the speedups this project vouches for.")
+                // Not-downloaded rows stay clickable: they confirm, then download-and-load.
+                // They used to be disabled outright — which left a fresh machine with every
+                // pair greyed out and no way to download from this screen at all (issue #15).
                 ForEach(model.models) { row in
                     ModelRowView(row: row, isLoaded: row.target == model.model,
-                                 canLoad: row.ready && row.target != model.model) {
+                                 canLoad: row.target != model.model && !model.isModelLoading) {
                         Task { await model.switchModel(to: row.target) }
                     }
                 }
@@ -187,13 +190,29 @@ struct ModelRowView: View {
     let isLoaded: Bool
     var canLoad: Bool = false
     var onLoad: () -> Void = {}
+    @State private var confirmingDownload = false
 
     var body: some View {
-        Button(action: onLoad) {
+        Button {
+            // A ready pair loads immediately; a missing one confirms first — the size is
+            // right on the row, and a mis-click must not start a multi-gigabyte fetch
+            // (the accident behind issue #15; cancel exists now, but asking is cheaper).
+            if row.ready { onLoad() } else { confirmingDownload = true }
+        } label: {
             content
         }
         .buttonStyle(.plain)
         .disabled(!canLoad)
+        .confirmationDialog(
+            "Download \(row.shortTarget)\(row.ram.map { " (\($0))" } ?? "")?",
+            isPresented: $confirmingDownload, titleVisibility: .visible
+        ) {
+            Button("Download and load") { onLoad() }
+        } message: {
+            Text(row.fits == false
+                 ? "This model looks too large for this Mac — it may not run once downloaded."
+                 : "Downloads the missing pieces, then loads the pair. You can cancel mid-download.")
+        }
     }
 
     private var content: some View {
@@ -231,8 +250,9 @@ struct ModelRowView: View {
                     .help("Measured on an M4 Pro; yours will differ")
             }
             if canLoad {
-                Image(systemName: "arrow.right.circle").foregroundStyle(.tint)
-                    .help("Load this model")
+                Image(systemName: row.ready ? "arrow.right.circle" : "arrow.down.circle")
+                    .foregroundStyle(.tint)
+                    .help(row.ready ? "Load this model" : "Download and load this pair")
             }
         }
         .padding(14)
@@ -315,6 +335,9 @@ struct InstalledRowView: View {
                     } else {
                         Text("lookup speculation").font(.caption).foregroundStyle(.secondary)
                     }
+                    if installed.isLMStudio {
+                        Text("from LM Studio").font(.caption).foregroundStyle(.secondary)
+                    }
                 }
             }
             Spacer()
@@ -323,14 +346,18 @@ struct InstalledRowView: View {
                     .controlSize(.small)
             }
             RevealButton(path: installed.path)
-            Button {
-                confirmingDelete = true
-            } label: {
-                Image(systemName: "trash").imageScale(.small)
+            // LM Studio's downloads are another app's files — we read them, we don't
+            // offer to delete them.
+            if !installed.isLMStudio {
+                Button {
+                    confirmingDelete = true
+                } label: {
+                    Image(systemName: "trash").imageScale(.small)
+                }
+                .buttonStyle(.borderless)
+                .disabled(isLoaded)
+                .help(isLoaded ? "Can't delete the loaded model" : "Move to Trash")
             }
-            .buttonStyle(.borderless)
-            .disabled(isLoaded)
-            .help(isLoaded ? "Can't delete the loaded model" : "Move to Trash")
         }
         .padding(.horizontal, 14).padding(.vertical, 10)
         .background(Theme.cardFill, in: RoundedRectangle(cornerRadius: 10))

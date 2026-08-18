@@ -59,6 +59,22 @@ struct ChatSettings: Codable, Equatable {
     var systemPrompt: String = ""
     var temperature: Double?
     var maxTokens: Int?
+    /// Nucleus-sampling cutoff. The engine applies it losslessly (draft AND target
+    /// distributions are truncated identically), so this is a quality knob, not a speed one.
+    var topP: Double?
+    /// Fixed RNG seed for reproducible sampled output. nil = fresh randomness per turn.
+    var seed: Int?
+    /// Extra stop sequences, comma-separated. Optional (not defaulted) so settings saved
+    /// by older builds still decode.
+    var stopSequences: String?
+
+    /// The comma-separated field as the wire list — trimmed, empties dropped.
+    var stopList: [String]? {
+        let parts = (stopSequences ?? "").components(separatedBy: ",")
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .filter { !$0.isEmpty }
+        return parts.isEmpty ? nil : parts
+    }
     /// Reasoning models spend real tokens thinking; agentic/plain use often wants it off.
     var thinking: Bool = true
     /// Reasoning depth ("low"/"medium"/"xhigh") for models whose template supports it
@@ -483,7 +499,7 @@ final class AppModel: ObservableObject {
     /// overrides), so the port survives and output stays byte-identical either way; only
     /// speed changes.
     func applyEngineSettings(mode: String?, cap: String?, confidence: Double? = nil,
-                             contextWindow: Int? = nil) async {
+                             contextWindow: Int? = nil, lookupDrafts: Bool? = nil) async {
         guard let client = apiClient else { return }
         generationTask?.cancel()
         modelSwitchError = nil
@@ -503,7 +519,8 @@ final class AppModel: ObservableObject {
         do {
             _ = try await client.loadModel(model, mode: mode, maxDraft: cap,
                                            confidence: confidence,
-                                           contextWindow: contextWindow)
+                                           contextWindow: contextWindow,
+                                           lookupDrafts: lookupDrafts)
             currentHealth = try? await client.health()
             startTelemetry()
             startMemoryPolling()
@@ -701,7 +718,10 @@ final class AppModel: ObservableObject {
                     enableThinking: self.chatSettings.thinking ? nil : false,
                     // The template ignores effort when thinking is off, so don't send it then.
                     reasoningEffort: self.chatSettings.thinking && self.supportsReasoningEffort
-                        ? self.chatSettings.reasoningEffort : nil
+                        ? self.chatSettings.reasoningEffort : nil,
+                    topP: self.chatSettings.topP,
+                    seed: self.chatSettings.seed,
+                    stop: self.chatSettings.stopList
                 ) {
                     switch event {
                     case .delta(let piece):

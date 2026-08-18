@@ -40,6 +40,10 @@ public struct HealthInfo: Decodable, Sendable, Equatable {
     /// progress (`/health.download`). Nil once the fetch is done, on hot swaps of cached
     /// models, and on older engines.
     public let download: DownloadProgress?
+    /// Whether hybrid n-gram lookup drafts are on for this load — the per-pair measured
+    /// default the registry stamps (off for every MoE and the 4-bit 27B hybrids), settable
+    /// per swap. Optional: older engines don't report it, and the toggle hides then.
+    public let lookupDrafts: Bool?
 
     enum CodingKeys: String, CodingKey {
         case status, model, mode, target, drafter, download
@@ -49,6 +53,7 @@ public struct HealthInfo: Decodable, Sendable, Equatable {
         case supportsReasoningEffort = "supports_reasoning_effort"
         case confidenceThreshold = "confidence_threshold"
         case raceArmConfidence = "race_arm_confidence"
+        case lookupDrafts = "lookup_drafts"
     }
 
     /// True when a model is loaded and serving (`status == "ok"`).
@@ -203,7 +208,8 @@ public struct APIClient: Sendable {
     public func loadModel(_ target: String, mode: String? = nil,
                           maxDraft: String? = nil,
                           confidence: Double? = nil,
-                          contextWindow: Int? = nil) async throws -> LoadStatus {
+                          contextWindow: Int? = nil,
+                          lookupDrafts: Bool? = nil) async throws -> LoadStatus {
         var payload: [String: Any] = ["model": target]
         if let mode { payload["mode"] = mode }
         if let maxDraft {
@@ -213,6 +219,8 @@ public struct APIClient: Sendable {
         if let confidence { payload["confidence_threshold"] = confidence }
         // A limit below the model's own max — the KV-cache RAM lever. nil = model max.
         if let contextWindow { payload["context_window"] = contextWindow }
+        // nil = keep this pair's measured default; a bool overrides it for this load.
+        if let lookupDrafts { payload["lookup_drafts"] = lookupDrafts }
         let body = try JSONSerialization.data(withJSONObject: payload)
         var req = request("admin/load", method: "POST", body: body)
         req.timeoutInterval = 1800        // a first-time load downloads weights
@@ -334,7 +342,10 @@ public struct APIClient: Sendable {
         temperature: Double? = nil,
         maxTokens: Int? = nil,
         enableThinking: Bool? = nil,
-        reasoningEffort: String? = nil
+        reasoningEffort: String? = nil,
+        topP: Double? = nil,
+        seed: Int? = nil,
+        stop: [String]? = nil
     ) -> AsyncThrowingStream<ChatEvent, Error> {
         var payload: [String: Any] = [
             "model": model,
@@ -345,6 +356,9 @@ public struct APIClient: Sendable {
         if let maxTokens { payload["max_tokens"] = maxTokens }
         if let enableThinking { payload["enable_thinking"] = enableThinking }
         if let reasoningEffort { payload["reasoning_effort"] = reasoningEffort }
+        if let topP { payload["top_p"] = topP }
+        if let seed { payload["seed"] = seed }
+        if let stop, !stop.isEmpty { payload["stop"] = stop }
 
         return AsyncThrowingStream { continuation in
             let task = Task {

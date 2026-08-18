@@ -89,17 +89,21 @@ public struct InstalledModel: Decodable, Sendable, Identifiable {
     /// Registry pairing this repo resolves into (quant-agnostic) — nil means `--mode auto`
     /// will fall back to drafter-free lookup speculation.
     public let registryID: String?
+    /// "cache" (our download) or "lmstudio" (LM Studio's — loadable, but not ours to
+    /// delete). Optional: older engines don't report it.
+    public let source: String?
 
     public var id: String { repo }
 
     enum CodingKeys: String, CodingKey {
-        case repo, path, size, kind
+        case repo, path, size, kind, source
         case sizeBytes = "size_bytes"
         case registryID = "registry_id"
     }
 
     public var shortRepo: String { repo.components(separatedBy: "/").last ?? repo }
     public var isDrafter: Bool { kind == "drafter" }
+    public var isLMStudio: Bool { source == "lmstudio" }
 }
 
 public struct DiskUsage: Decodable, Sendable {

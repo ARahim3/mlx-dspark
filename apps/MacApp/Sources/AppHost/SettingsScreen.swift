@@ -123,6 +123,7 @@ struct DecodingControls: View {
     @State private var cap: String = "auto"
     @State private var confidence: String = "off"
     @State private var contextWindow: String = "default"
+    @State private var lookupDrafts: Bool = true
     @State private var applying = false
 
     /// Context presets as (tag, label, tokens). "default" = the model's own maximum.
@@ -183,6 +184,12 @@ struct DecodingControls: View {
                         contextPicker
                         Spacer(minLength: 0)
                     }
+                    if model.health?.lookupDrafts != nil {
+                        HStack(spacing: 14) {
+                            lookupToggle
+                            Spacer(minLength: 0)
+                        }
+                    }
                     HStack(spacing: 8) {
                         applyControl
                         if !applying, isDirty {
@@ -201,6 +208,9 @@ struct DecodingControls: View {
                     }
                     HStack(spacing: 14) {
                         contextPicker
+                        if model.health?.lookupDrafts != nil {
+                            lookupToggle
+                        }
                         applyControl
                         Spacer(minLength: 0)
                     }
@@ -215,6 +225,7 @@ struct DecodingControls: View {
             cap = model.health?.maxDraft ?? "auto"
             confidence = Self.confTag(model.health?.confidenceThreshold)
             contextWindow = Self.contextTag(model.health?.contextWindow)
+            lookupDrafts = model.health?.lookupDrafts ?? true
         }
     }
 
@@ -255,6 +266,18 @@ struct DecodingControls: View {
               + "which agent clients like Claude Code auto-compact on.")
     }
 
+    /// Only rendered when `/health` reports the field (older engines don't) — a toggle
+    /// that silently does nothing is worse than none.
+    @ViewBuilder private var lookupToggle: some View {
+        Toggle("Lookup drafts", isOn: $lookupDrafts)
+            .fixedSize()
+            .help("Hybrid n-gram drafts: a 4-gram match in the context supplies a free "
+                  + "draft instead of running the drafter that round. Shipped per-pair at "
+                  + "its measured best — OFF where extra verify rows cost more than the "
+                  + "free draft saves (every MoE, the 4-bit 27B hybrids), on elsewhere. "
+                  + "Flip it to A/B on your own content; it can't affect output, only speed.")
+    }
+
     @ViewBuilder private var applyControl: some View {
         if applying {
             ProgressView().controlSize(.small)
@@ -268,6 +291,7 @@ struct DecodingControls: View {
         mode != (model.health?.mode ?? "auto") || cap != (model.health?.maxDraft ?? "auto")
             || confidence != Self.confTag(model.health?.confidenceThreshold)
             || contextWindow != Self.contextTag(model.health?.contextWindow)
+            || lookupDrafts != (model.health?.lookupDrafts ?? lookupDrafts)
     }
 
     private func apply() {
@@ -276,7 +300,10 @@ struct DecodingControls: View {
             await model.applyEngineSettings(
                 mode: mode, cap: cap,
                 confidence: confidence == "off" ? 0.0 : Double(confidence),
-                contextWindow: contextWindow == "default" ? nil : Int(contextWindow))
+                contextWindow: contextWindow == "default" ? nil : Int(contextWindow),
+                // Sent only when the user actually flipped it, so an untouched Apply
+                // keeps riding the pair's measured default instead of pinning it.
+                lookupDrafts: lookupDrafts == model.health?.lookupDrafts ? nil : lookupDrafts)
             applying = false
         }
     }

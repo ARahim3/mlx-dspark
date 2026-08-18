@@ -266,7 +266,7 @@ struct CurvesTab: View {
         if let calibration = model.calibration, calibration.available {
             VerifyCurveCard(calibration: calibration)
             if let controller = calibration.controller {
-                PredictedRatesCard(controller: controller)
+                PredictedRatesCard(calibration: calibration, controller: controller)
             }
         } else {
             ContentUnavailableView(
@@ -293,7 +293,9 @@ struct VerifyCurveCard: View {
         let knee = calibration.recommendation?.kneeWidth
 
         Card(title: "Verify cost on this Mac",
-             subtitle: "Milliseconds for one target forward at each verify width. Speculation pays only while the extra rows stay cheap.") {
+             subtitle: "How much longer one model step gets when it checks several drafted "
+                 + "tokens at once (width = tokens checked together). Speculation pays only "
+                 + "while checking extra tokens stays nearly free.") {
             Chart {
                 ForEach(curve, id: \.width) { point in
                     LineMark(x: .value("Width", point.width), y: .value("ms", point.ms))
@@ -307,16 +309,32 @@ struct VerifyCurveCard: View {
                         .foregroundStyle(Theme.warning)
                         .lineStyle(StrokeStyle(lineWidth: 1, dash: [4, 3]))
                         // Bottom, not top: a top annotation collides with the card's own
-                        // subtitle at this chart height.
-                        .annotation(position: .bottom, alignment: .center) {
+                        // subtitle at this chart height. Trailing when the knee sits at
+                        // the right edge (a flat curve puts it there), or the label
+                        // overprints the last width tick.
+                        .annotation(position: .bottom,
+                                    alignment: knee == curve.last?.width ? .trailing : .center) {
                             Text("knee").font(.caption2).foregroundStyle(.orange)
                         }
                 }
             }
             .chartXAxis { AxisMarks(values: curve.map(\.width)) }
+            // Pin the floor at 0 ms: auto-scaling let the domain wander negative, which
+            // squeezed a 20-30 ms curve into the top third of the card.
+            .chartYScale(domain: 0...((curve.map(\.ms).max() ?? 1) * 1.15))
             .frame(height: 200)
 
             if let recommendation = calibration.recommendation {
+                // Say what the shape MEANS, not just where the knee is — the flat-to-the-
+                // edge case reads as "knee 8" and looks like an error otherwise.
+                Text(recommendation.kneeWidth >= (curve.last?.width ?? 0)
+                     ? "Nearly flat: checking \(curve.last?.width ?? 0) tokens costs about "
+                       + "the same as checking one, so this pair can afford wide drafts."
+                     : "Cheap up to width \(recommendation.kneeWidth), then each extra token "
+                       + "starts costing real time — draft caps want to sit below that knee.")
+                    .font(.caption2).foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+
                 HStack(spacing: 18) {
                     Metric(value: "\(recommendation.kneeWidth)", label: "knee width", tint: .orange)
                     Metric(value: recommendation.recommend, label: "best drafting strategy")
@@ -333,20 +351,30 @@ struct VerifyCurveCard: View {
 /// What the cost model predicts before anything runs — the calibrator's forecast, which the
 /// Live tab then measures against reality.
 struct PredictedRatesCard: View {
+    let calibration: Calibration
     let controller: Calibration.Controller
+    /// nil = track the controller's live estimate; a value = the user is exploring.
+    @State private var exploring: Double?
+
+    private var acceptance: Double { exploring ?? controller.p }
 
     private var rates: [(cap: Int, rate: Double)] {
-        controller.predictedRates
-            .compactMap { key, value in Int(key).map { (cap: $0, rate: value) } }
-            .sorted { $0.cap < $1.cap }
+        // Every cap the measured curves can price (verify needs width cap+1).
+        let maxCap = (calibration.verifyCurve.map(\.width).max() ?? 1) - 1
+        return (0...max(1, maxCap)).compactMap { cap in
+            calibration.predictedRate(cap: cap, p: acceptance).map { (cap: cap, rate: $0) }
+        }
     }
 
+    private var bestCap: Int? { rates.max(by: { $0.rate < $1.rate })?.cap }
+
     var body: some View {
-        Card(title: "Predicted throughput by cap",
-             subtitle: "From the measured curves alone, before generating a token. Cap 0 means \"don't speculate this round\".") {
+        Card(title: "Predicted speed, by tokens drafted per round",
+             subtitle: "How fast this pair should run if the drafter guesses right this often. "
+                 + "Cap = how many tokens it may guess ahead; 0 = no speculation.") {
             Chart(rates, id: \.cap) { point in
                 BarMark(x: .value("Cap", point.cap), y: .value("tok/s", point.rate))
-                    .foregroundStyle(point.cap == controller.cap ? Theme.spark : Color.secondary.opacity(0.45))
+                    .foregroundStyle(point.cap == bestCap ? Theme.spark : Color.secondary.opacity(0.45))
                     .annotation(position: .top) {
                         Text("\(Int(point.rate))")
                             .font(.caption2.monospacedDigit()).foregroundStyle(.secondary)
@@ -355,10 +383,42 @@ struct PredictedRatesCard: View {
             .chartXScale(domain: -0.5...(Double(rates.map(\.cap).max() ?? 1) + 0.5))
             .frame(height: 160)
 
+            HStack(spacing: 10) {
+                Text("If the drafter is right")
+                    .font(.caption).foregroundStyle(.secondary)
+                Slider(value: Binding(get: { acceptance }, set: { exploring = $0 }),
+                       in: 0.30...0.95)
+                    .frame(maxWidth: 220)
+                Text("\(Int((acceptance * 100).rounded()))% of the time")
+                    .font(.caption.monospacedDigit()).foregroundStyle(.secondary)
+                if exploring != nil {
+                    Button("Back to live") { exploring = nil }
+                        .controlSize(.small).buttonStyle(.link)
+                }
+                Spacer(minLength: 0)
+            }
+
+            // The number that decides everything is the CONTENT's, not the machine's:
+            // predictable code accepts far more than open chat — which is why a Race on a
+            // code prompt can leave this card's live-estimate prediction far behind.
+            Text("How often the drafter is right depends on what you generate — open chat "
+                 + "sits near 60–70%, predictable code can pass 90%. Drag the slider to see "
+                 + "why the same model races 3–4× faster on code. Races don't move the live "
+                 + "estimate below (each race arm starts fresh); normal chatting does.")
+                .font(.caption2).foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+
             HStack(spacing: 18) {
-                Metric(value: "\(controller.cap)", label: "cap in use", tint: .accentColor)
-                Metric(value: String(format: "%.2f", controller.p), label: "live acceptance estimate")
-                Metric(value: "\(controller.rounds)", label: "rounds observed")
+                if let bestCap {
+                    Metric(value: "\(bestCap)", label: "best cap at this rate", tint: Theme.spark)
+                }
+                Metric(value: "\(controller.cap)", label: "cap in use now", tint: .accentColor)
+                Metric(value: controller.rounds == 0
+                           ? String(format: "%.0f%% (guess)", controller.p * 100)
+                           : String(format: "%.0f%%", controller.p * 100),
+                       label: controller.rounds == 0
+                           ? "live estimate — nothing measured yet"
+                           : "live estimate, from \(controller.rounds) rounds")
                 Spacer()
             }
         }
