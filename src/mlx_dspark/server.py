@@ -955,17 +955,24 @@ class Engine:
         only ever appeared as one line of terminal output. Nothing here measures anything —
         it reads the cache and reports what is there, so it is safe to call at any time.
         """
-        from .calibrate import _cache_key, drafter_recommendation, load_cached
+        from . import generate as _gen
+        from .calibrate import cached_curve_entry, drafter_recommendation
 
         if self.mode not in ("dspark", "dflash"):
             return {"available": False,
                     "reason": f"calibration applies to dspark/dflash, not {self.mode!r}"}
-        key = _cache_key(self.mode, self.target_repo, self.drafter_repo,
-                         kv_bits=getattr(self.target, "kv_bits", None))
-        entry = load_cached(key)
+        # The curves are cached under a "|smm"-tagged key when the small-M kernel was live
+        # during calibration (the default since v0.12.0) — reading only the untagged key
+        # showed "not calibrated" on every calibrated kernel-on machine.
+        key, entry = cached_curve_entry(
+            self.mode, self.target_repo, self.drafter_repo,
+            kv_bits=getattr(self.target, "kv_bits", None),
+            smm_live=bool(_gen.SMALL_M_IDS))
         if entry is None:
             return {"available": False, "key": key,
-                    "reason": "not calibrated yet on this machine — run with --max-draft auto"}
+                    "reason": "not calibrated yet on this machine — loading the pair without "
+                              "a fixed cap (or --max-draft auto) measures the curves "
+                              "automatically"}
 
         verify = {int(k): float(v) for k, v in entry["verify"].items()}
         drafter_ms = entry["drafter"]

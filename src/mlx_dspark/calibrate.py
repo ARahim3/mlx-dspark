@@ -528,6 +528,26 @@ def _cache_key(mode: str, target_repo: str, drafter_repo: str | None,
     return f"v{SCHEMA}|{dev}|mlx{mx.__version__}|{mode}|{tgt}|{drf}|ctx{ctx_len}{kv}"
 
 
+def cached_curve_entry(mode: str, target_repo: str, drafter_repo: str | None, *,
+                       kv_bits: int | None = None, smm_live: bool = False,
+                       cache_dir: str | None = None) -> tuple[str, dict | None]:
+    """``(key, entry)`` for this pair's cost curves, or ``(key, None)`` if never measured.
+
+    Curves calibrated with the small-M verify kernel live are stored under a ``"|smm"``-tagged
+    key (they describe a different verify curve — see :func:`calibrate`). A reader must try
+    the variant matching the live kernel state FIRST and fall back to the other: the
+    ``/calibration`` endpoint read only the untagged key and reported "not calibrated" on
+    every kernel-on machine from v0.12.0 on — a calibrated machine with an invisible cache.
+    The returned key names which variant was found, so a client can tell.
+    """
+    base = _cache_key(mode, target_repo, drafter_repo, kv_bits=kv_bits)
+    for key in ((base + "|smm", base) if smm_live else (base, base + "|smm")):
+        entry = load_cached(key, cache_dir)
+        if entry is not None:
+            return key, entry
+    return base, None
+
+
 def load_cached(key: str, cache_dir: str | None = None) -> dict | None:
     try:
         with open(_cache_path(cache_dir)) as f:

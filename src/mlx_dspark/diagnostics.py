@@ -162,7 +162,8 @@ def _drafter_repos() -> set[str]:
     return repos
 
 
-def installed_models(hub_dir: str | None = None, plain_dir: str | None = None) -> list[dict]:
+def installed_models(hub_dir: str | None = None, plain_dir: str | None = None,
+                     lmstudio_roots: tuple[str, ...] | None = None) -> list[dict]:
     """Every model actually on this disk — the inventory the registry can't see.
 
     The registry answers "which pairs do we vouch for"; this answers "what has this user
@@ -171,16 +172,17 @@ def installed_models(hub_dir: str | None = None, plain_dir: str | None = None) -
     ``_resolve`` prefers. Rows carry ``path`` and ``size_bytes`` so a client can offer
     reveal/delete and honest disk accounting without re-walking anything.
     """
-    from .load import _registry_entry
+    from .load import LMSTUDIO_ROOTS, _registry_entry, is_mlx_model_dir
 
     hub = os.path.expanduser(hub_dir or _HUB_DIR)
     plain = os.path.expanduser(plain_dir or _PLAIN_DIR)
+    lmstudio = lmstudio_roots if lmstudio_roots is not None else LMSTUDIO_ROOTS
     drafters = _drafter_repos()
     drafter_basenames = {os.path.basename(r).lower() for r in drafters}
 
     rows: dict[str, dict] = {}
 
-    def add(repo: str, path: str) -> None:
+    def add(repo: str, path: str, source: str = "cache") -> None:
         if repo in rows:                       # plain dir wins (scanned first, _resolve's order)
             return
         entry = _registry_entry(repo)
@@ -199,6 +201,9 @@ def installed_models(hub_dir: str | None = None, plain_dir: str | None = None) -
             # Which registry pairing this repo would resolve into (quant-agnostic) —
             # i.e. whether `--mode auto` gets it a real drafter or falls back to lookup.
             "registry_id": entry["id"] if (entry and not is_drafter) else None,
+            # "cache" (ours: plain dir or HF hub) vs "lmstudio" (another app's download,
+            # readable but not ours to delete or bill against our disk total).
+            "source": source,
         }
 
     if os.path.isdir(plain):
@@ -216,6 +221,23 @@ def installed_models(hub_dir: str | None = None, plain_dir: str | None = None) -
             repo = name[len("models--"):].replace("--", "/")
             add(repo, path)
 
+    # LM Studio's caches last (our copy wins a duplicate repo id): plain
+    # <publisher>/<model> dirs, MLX-loadable ones only — a GGUF-only download would just
+    # produce a row that can't load. `_resolve` reads the same roots, so every row listed
+    # here is one `--model <publisher>/<model>` (or a picker click) away from serving.
+    for root in lmstudio:
+        root = os.path.expanduser(root)
+        if not os.path.isdir(root):
+            continue
+        for org in sorted(os.listdir(root)):
+            org_path = os.path.join(root, org)
+            if org.startswith(".") or not os.path.isdir(org_path):
+                continue
+            for name in sorted(os.listdir(org_path)):
+                path = os.path.join(org_path, name)
+                if os.path.isdir(path) and is_mlx_model_dir(path):
+                    add(f"{org}/{name}", path, source="lmstudio")
+
     return sorted(rows.values(), key=lambda r: (r["kind"] != "model", -r["size_bytes"]))
 
 
@@ -227,7 +249,9 @@ def disk_usage(rows: list[dict] | None = None, *, hub_dir: str | None = None,
     """
     if rows is None:
         rows = installed_models(hub_dir, plain_dir)
-    total = sum(r["size_bytes"] for r in rows)
+    # LM Studio's copies are listed as loadable but they are not OUR disk usage — counting
+    # them would tell a user "12 GB of models on disk" they can't reclaim from this app.
+    total = sum(r["size_bytes"] for r in rows if r.get("source") != "lmstudio")
     conv = os.path.expanduser(drafters_dir or _DRAFTERS_DIR)
     if os.path.isdir(conv):
         total += _dir_size_bytes(conv)

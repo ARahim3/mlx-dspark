@@ -169,14 +169,57 @@ class TestInstalledModels:
 
     def test_empty_caches_are_fine(self, tmp_path):
         assert diagnostics.installed_models(str(tmp_path / "nope"),
-                                            str(tmp_path / "also-nope")) == []
+                                            str(tmp_path / "also-nope"),
+                                            lmstudio_roots=()) == []
 
     def test_disk_usage_totals_the_rows(self, tmp_path):
         hub, plain = self._fake_caches(tmp_path)
-        rows = diagnostics.installed_models(hub, plain)
+        rows = diagnostics.installed_models(hub, plain, lmstudio_roots=())
         usage = diagnostics.disk_usage(rows, drafters_dir=str(tmp_path / "none"))
         assert usage["total_bytes"] == sum(r["size_bytes"] for r in rows)
         assert usage["total"]
+
+
+class TestLMStudioScan:
+    """Models LM Studio already downloaded are offered (issue #12) — readable, clearly
+    labeled as another app's files, and never billed against our disk total."""
+
+    def _roots(self, tmp_path):
+        root = tmp_path / "lmstudio"
+        mlx = root / "lmstudio-community" / "Qwen3-8B-MLX-8bit"
+        _write(mlx / "model.safetensors", 700)
+        _write(mlx / "config.json", 10)
+        gguf = root / "someone" / "Llama-3-GGUF"     # GGUF-only: our loaders can't read it
+        _write(gguf / "model.gguf", 300)
+        return (str(root),)
+
+    def test_mlx_dirs_listed_with_lmstudio_source(self, tmp_path):
+        rows = {r["repo"]: r for r in diagnostics.installed_models(
+            str(tmp_path / "hub"), str(tmp_path / "plain"),
+            lmstudio_roots=self._roots(tmp_path))}
+        row = rows["lmstudio-community/Qwen3-8B-MLX-8bit"]
+        assert row["source"] == "lmstudio"
+        assert row["kind"] == "model"
+
+    def test_gguf_only_dirs_are_skipped(self, tmp_path):
+        rows = {r["repo"] for r in diagnostics.installed_models(
+            str(tmp_path / "hub"), str(tmp_path / "plain"),
+            lmstudio_roots=self._roots(tmp_path))}
+        assert "someone/Llama-3-GGUF" not in rows
+
+    def test_our_copy_wins_a_duplicate_repo_id(self, tmp_path):
+        hub = tmp_path / "hub"
+        _write(hub / "models--lmstudio-community--Qwen3-8B-MLX-8bit" / "blobs" / "a", 100)
+        rows = {r["repo"]: r for r in diagnostics.installed_models(
+            str(hub), str(tmp_path / "plain"), lmstudio_roots=self._roots(tmp_path))}
+        assert rows["lmstudio-community/Qwen3-8B-MLX-8bit"]["source"] == "cache"
+
+    def test_disk_usage_excludes_lmstudio_rows(self, tmp_path):
+        rows = diagnostics.installed_models(
+            str(tmp_path / "hub"), str(tmp_path / "plain"),
+            lmstudio_roots=self._roots(tmp_path))
+        usage = diagnostics.disk_usage(rows, drafters_dir=str(tmp_path / "none"))
+        assert usage["total_bytes"] == 0             # every row here is LM Studio's disk
 
 
 class TestDoctor:

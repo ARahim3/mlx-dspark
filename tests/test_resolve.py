@@ -159,3 +159,39 @@ def test_lookup_drafts_default_follows_the_registry_row():
     # unknown target / no target: global default
     assert lookup_drafts_default("some-org/Weird-Model-3B") is True
     assert lookup_drafts_default(None) is True
+
+
+# --------------------------------------------------------------------- LM Studio reuse
+
+
+class TestLMStudioResolve:
+    """`_resolve` reuses models LM Studio already downloaded (issue #12) — exact
+    <publisher>/<model> match, MLX layouts only."""
+
+    def _lmstudio(self, tmp_path, *, mlx: bool):
+        d = tmp_path / "lmstudio" / "lmstudio-community" / "Qwen3-8B-MLX-8bit"
+        d.mkdir(parents=True)
+        if mlx:
+            (d / "config.json").write_text("{}")
+            (d / "model.safetensors").write_bytes(b"x")
+        else:
+            (d / "model.gguf").write_bytes(b"x")     # GGUF-only: targets can't load it
+        return str(tmp_path / "lmstudio"), str(d)
+
+    def test_mlx_dir_is_reused_without_downloading(self, tmp_path, monkeypatch):
+        from mlx_dspark import load
+
+        root, d = self._lmstudio(tmp_path, mlx=True)
+        monkeypatch.setattr(load, "LMSTUDIO_ROOTS", (root,))
+        monkeypatch.setattr(load, "snapshot_download",
+                            lambda *a, **k: pytest.fail("should not download"),
+                            raising=False)
+        assert load._resolve("lmstudio-community/Qwen3-8B-MLX-8bit") == d
+
+    def test_gguf_only_dir_falls_through_to_the_hub(self, tmp_path, monkeypatch):
+        from mlx_dspark import load
+
+        root, _ = self._lmstudio(tmp_path, mlx=False)
+        monkeypatch.setattr(load, "LMSTUDIO_ROOTS", (root,))
+        monkeypatch.setattr(load, "snapshot_download", lambda repo: "HUB", raising=False)
+        assert load._resolve("lmstudio-community/Qwen3-8B-MLX-8bit") == "HUB"

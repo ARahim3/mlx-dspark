@@ -402,6 +402,16 @@ A 4-bit target (`--model …-it-4bit`) roughly halves the target's share (fits s
 matched *instruct* target** the drafter was trained against — a base model drops acceptance sharply. The
 legacy `--family qwen3|gemma4` flags still work but are deprecated in favor of `--model`.
 
+**Already use LM Studio?** Its MLX downloads are reused automatically: pass the same
+`publisher/model` id LM Studio shows (e.g. `--model lmstudio-community/Qwen3-8B-MLX-8bit`) and
+the engine loads it straight from LM Studio's folder (`~/.lmstudio/models`) instead of
+re-downloading — they also appear in `mlx-dspark models` and the app's "On this Mac" list.
+Only **MLX** downloads work this way; LM Studio's **GGUF** files are a different format our
+loaders don't read (grab the `mlx-community` version of the same model instead). The reverse
+direction — using mlx-dspark as an engine *inside* LM Studio's chat window — isn't possible
+(LM Studio only runs its own bundled engines), but the server speaks the standard OpenAI API,
+so any client that takes a custom OpenAI endpoint can point at it.
+
 `--drafter` lets you run **any** other matched z-lab / DeepSpec checkpoint with no code change and no
 registry entry — the registry only saves you from having to name the drafter:
 

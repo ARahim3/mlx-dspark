@@ -333,6 +333,21 @@ def apply_wired_limit() -> None:
         pass
 
 
+# LM Studio's model caches, newest layout first (it moved from ~/.cache/lm-studio to
+# ~/.lmstudio). Both hold plain <publisher>/<model> dirs; the MLX ones load as-is.
+LMSTUDIO_ROOTS = ("~/.lmstudio/models", "~/.cache/lm-studio/models")
+
+
+def is_mlx_model_dir(path: str) -> bool:
+    """Whether ``path`` holds an MLX-loadable checkpoint (config + safetensors) — what
+    separates an LM Studio MLX download from a GGUF one our target loaders can't read."""
+    try:
+        names = os.listdir(path)
+    except OSError:
+        return False
+    return "config.json" in names and any(n.endswith(".safetensors") for n in names)
+
+
 def _resolve(repo_or_path: str) -> str:
     if repo_or_path.startswith("gguf:"):
         # "gguf:{hf_repo}/{filename}.gguf" — a PrismML dspark drafter shipped as GGUF;
@@ -355,6 +370,16 @@ def _resolve(repo_or_path: str) -> str:
     for name in (os.path.basename(stripped), stripped.replace("/", "_")):
         local = os.path.join(models, name)
         if os.path.isdir(local):
+            return local
+    # Reuse models LM Studio already downloaded (issue #12): its cache is plain
+    # <root>/<publisher>/<model> dirs, and its MLX downloads are exactly the safetensors
+    # layout our loaders read. Exact org/name match only — no basename guessing, so two
+    # publishers sharing a model name can't cross-resolve. GGUF-only dirs are skipped
+    # (is_mlx_model_dir), falling through to the hub download rather than failing deep
+    # inside a loader that can't read GGUF targets.
+    for root in LMSTUDIO_ROOTS:
+        local = os.path.join(os.path.expanduser(root), stripped)
+        if os.path.isdir(local) and is_mlx_model_dir(local):
             return local
     return snapshot_download(repo_or_path)
 

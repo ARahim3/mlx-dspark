@@ -235,3 +235,46 @@ def test_cap_for_without_grid_falls_back():
     c = CapController({2: 20.0, 3: 25.0}, 5.0, max_cap=4)
     assert c.cap_for(4) == c.cap
     assert "batch_caps" not in c.info()
+
+
+class TestCachedCurveEntry:
+    """The /calibration reader must find curves saved under the "|smm"-tagged key —
+    reading only the untagged key showed 'not calibrated' on every kernel-on machine
+    (v0.12.0 regression, found via the app's permanently-empty Curves tab)."""
+
+    def _base(self, tmp_path):
+        from mlx_dspark.calibrate import _cache_key
+        return _cache_key("dspark", "T", "D"), str(tmp_path)
+
+    def test_finds_the_smm_tagged_entry_when_kernel_is_live(self, tmp_path):
+        from mlx_dspark.calibrate import cached_curve_entry
+        base, cache = self._base(tmp_path)
+        save_cached(base + "|smm", {"verify": {"1": 1.0}}, cache)
+        key, entry = cached_curve_entry("dspark", "T", "D", smm_live=True, cache_dir=cache)
+        assert entry is not None and key == base + "|smm"
+
+    def test_falls_back_across_kernel_state(self, tmp_path):
+        # Only the tagged entry exists but the kernel is off now (--no-small-m after a
+        # kernel-on calibration): stale-but-real curves beat an empty screen, and the
+        # returned key names which variant was found.
+        from mlx_dspark.calibrate import cached_curve_entry
+        base, cache = self._base(tmp_path)
+        save_cached(base + "|smm", {"verify": {"1": 1.0}}, cache)
+        key, entry = cached_curve_entry("dspark", "T", "D", smm_live=False, cache_dir=cache)
+        assert entry is not None and key == base + "|smm"
+
+    def test_prefers_the_variant_matching_the_live_state(self, tmp_path):
+        from mlx_dspark.calibrate import cached_curve_entry
+        base, cache = self._base(tmp_path)
+        save_cached(base, {"verify": {"1": 2.0}}, cache)
+        save_cached(base + "|smm", {"verify": {"1": 1.0}}, cache)
+        assert cached_curve_entry("dspark", "T", "D",
+                                  smm_live=True, cache_dir=cache)[0] == base + "|smm"
+        assert cached_curve_entry("dspark", "T", "D",
+                                  smm_live=False, cache_dir=cache)[0] == base
+
+    def test_never_measured_returns_base_key_and_none(self, tmp_path):
+        from mlx_dspark.calibrate import cached_curve_entry
+        base, cache = self._base(tmp_path)
+        key, entry = cached_curve_entry("dspark", "T", "D", smm_live=True, cache_dir=cache)
+        assert entry is None and key == base
