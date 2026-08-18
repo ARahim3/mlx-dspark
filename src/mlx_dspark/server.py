@@ -26,6 +26,7 @@ import contextlib
 import json
 import os
 import queue as _queue
+import sys
 import threading
 import time
 import traceback
@@ -51,6 +52,17 @@ from .tools import normalize_tool_messages, parse_tool_calls, schema_types
 
 MODES = ("dspark", "dflash", "lookup", "baseline")
 
+# Seconds between stream keep-alive frames (SSE comments on the OpenAI dialect, `ping`
+# events on the Anthropic one). They serve two jobs: keeping idle-timeout clients/proxies
+# from aborting through stretches with nothing on the wire (long prefill; the buffered
+# tool-calls path emits nothing until generation finishes), and — because a failed
+# keep-alive write is the only way to notice a vanished client while nothing streams —
+# detecting disconnects so generation stops at the next round instead of grinding to
+# max_tokens on the single MLX thread with nobody listening. Issue #14: abandoned
+# generations piling up behind that thread is exactly what looked like a wedged server.
+# Env-overridable for aggressive proxies (and for exercising the path without a 15 s wait).
+STREAM_KEEPALIVE_S = float(os.environ.get("MLX_DSPARK_STREAM_KEEPALIVE_S", "") or 15.0)
+
 # The union of effort vocabularies across template lineages (Qwen3.8 knows low/medium/xhigh,
 # harmony-style templates low/medium/high). Values outside a given template's own vocabulary
 # still fail there — its raise_exception carries the model-specific list — but this boundary
@@ -66,6 +78,17 @@ def _reasoning_effort(value) -> str:
     return value.lower()
 
 
+def _target_config(target_repo: str) -> dict | None:
+    """The target's ``config.json`` as a dict, or ``None`` when it can't be read."""
+    try:
+        from .load import _resolve
+
+        with open(os.path.join(_resolve(target_repo), "config.json")) as f:
+            return json.load(f)
+    except Exception:  # noqa: BLE001 — no file / no net / bad json -> caller skips its check
+        return None
+
+
 def _context_window(target_repo: str) -> int | None:
     """The target's trained context length, from its ``config.json``.
 
@@ -74,18 +97,87 @@ def _context_window(target_repo: str) -> int | None:
     run off the end of the model's positions. Multimodal repos nest the text config, so check
     both. ``None`` when it can't be determined — the check is then skipped.
     """
-    try:
-        from .load import _resolve
-
-        with open(os.path.join(_resolve(target_repo), "config.json")) as f:
-            cfg = json.load(f)
-    except Exception:  # noqa: BLE001 — no file / no net / bad json -> no limit enforced
+    cfg = _target_config(target_repo)
+    if cfg is None:
         return None
     for c in (cfg, cfg.get("text_config") or {}):
         n = c.get("max_position_embeddings")
         if isinstance(n, int) and n > 0:
             return n
     return None
+
+
+def _kv_bytes_per_token(cfg: dict) -> int | None:
+    """Estimated bytes of *context-growing* target KV cache per token, from ``config.json``.
+
+    ``attn_layers × kv_heads × head_dim × 2 (K+V) × 2 (16-bit)`` — only the full-attention
+    layers count, because in a hybrid (qwen3_5 GDN, nemotron_h Mamba) the recurrent layers
+    hold fixed-size state and sliding-window layers hold at most their window. Validated
+    against the measured number: Qwen3.8-27B → 16 × 4 × 256 × 4 = 64 KB/token exactly (the
+    README's long-context column; its 0.086 GB/1k also counts drafter ctx, so this is a
+    slight *under*-estimate by design). ``0`` means the KV footprint is bounded (all layers
+    sliding/recurrent); ``None`` means the config doesn't say — both skip the RAM check.
+    """
+    for c in (cfg.get("text_config") or {}, cfg):
+        layers = c.get("num_hidden_layers")
+        heads = c.get("num_attention_heads")
+        if not (isinstance(layers, int) and layers > 0
+                and isinstance(heads, int) and heads > 0):
+            continue
+        kv_heads = c.get("num_key_value_heads") or heads
+        head_dim = c.get("head_dim") or (c.get("hidden_size") or 0) // heads
+        if not head_dim:
+            continue
+        attn = layers
+        # Hybrid layouts: prefer the explicit per-layer list, fall back to the interval.
+        types = c.get("layer_types") or c.get("layers_block_type")
+        pattern = c.get("hybrid_override_pattern")          # nemotron_h: "M*M-…", '*' = attn
+        if isinstance(types, list) and types:
+            attn = sum(1 for t in types
+                       if isinstance(t, str) and t in ("full_attention", "attention"))
+        elif isinstance(pattern, str) and pattern:
+            attn = pattern.count("*")
+        elif isinstance(c.get("full_attention_interval"), int) \
+                and c["full_attention_interval"] > 0:
+            attn = layers // c["full_attention_interval"]
+        return int(attn) * int(kv_heads) * int(head_dim) * 2 * 2
+    return None
+
+
+def _context_ram_warning(kv_per_token: int | None, context_window: int | None,
+                         resident_bytes: int, budget_bytes: int | None) -> str | None:
+    """The startup warning for a context window whose KV cache cannot fit in RAM, or None.
+
+    Pure so it's testable model-free; :meth:`Engine.load` feeds it the measured numbers.
+    ``budget_bytes`` is the GPU working-set budget (``max_recommended_working_set_size`` —
+    what macOS will wire before paging). Issue #14's secondary finding: the window defaults
+    to the model's own maximum (262144 on Qwen3.8-27B ⇒ ~16 GB of KV on top of ~29 GB of
+    weights), which silently exhausted a 64 GB Mac.
+    """
+    if not (kv_per_token and context_window and budget_bytes):
+        return None
+    # 90% of the working set, not all of it: the KV estimate covers only the target's
+    # attention cache, and the rest — drafter ctx, prefix-cache snapshots (a hybrid
+    # checkpoint copies whole caches), decode transients — needs real headroom. The
+    # issue-#14 machine sat exactly in that band (45 GB of weights+KV on a 48 GB budget)
+    # and was exhausted in practice.
+    budget = int(budget_bytes * 0.9)
+    need = resident_bytes + context_window * kv_per_token
+    if need <= budget:
+        return None
+    fit = (budget - resident_bytes) // kv_per_token // 8192 * 8192
+    gb = 1024 ** 3
+    msg = (f"note: the context window defaults to the model's own maximum "
+           f"({context_window} tokens), but at ~{kv_per_token / 1024:.0f} KB/token the KV "
+           f"cache could grow to ~{context_window * kv_per_token / gb:.1f} GB on top of "
+           f"~{resident_bytes / gb:.1f} GB already resident — past this machine's "
+           f"~{budget_bytes / gb:.0f} GB GPU working set, long contexts will page or stall.")
+    if fit >= 8192:
+        msg += f" Consider --context-window {fit} (or lower) to bound it."
+    else:
+        msg += (" This machine cannot hold a useful context for this model alongside its "
+                "weights; consider a smaller model or quant.")
+    return msg
 
 
 def _generation_defaults(target_repo: str) -> dict:
@@ -146,6 +238,7 @@ class Engine:
         lookup_long_draft: int = 32,
         wired_limit: bool = False,
         context_window: int | None = None,
+        small_m: bool = False,
         executor: ThreadPoolExecutor | None = None,
     ):
         self.target = target
@@ -168,6 +261,9 @@ class Engine:
         self.lookup_drafts = lookup_drafts                 # hybrid n-gram drafts in dspark mode
         self.lookup_long_draft = lookup_long_draft         # match-scaled long-draft ceiling
         self.context_window = context_window               # target's trained positions, if known
+        self.small_m = small_m                             # small-M MMA verify kernel active
+        #   (i.e. the per-shape probe admitted ≥1 shape AND it wasn't forced off) — reported
+        #   in /health so a client can see the knob, and so issue-#14-style A/Bs are possible
         if wired_limit:                                    # opt-in: see apply_wired_limit
             apply_wired_limit()
         # chat-template kwargs applied to every request unless the request overrides them
@@ -318,6 +414,8 @@ class Engine:
         kv_bits: int | None = None,              # quantize the target KV cache (4/8)
         context_window: int | None = None,       # override the target's own limit
         wide_gemm_min: int | None = None,        # prefill wide-GEMM: None=calibrate, 0=off, N=forced
+        small_m: bool | None = None,             # small-M MMA verify kernel: None=probe-gated
+        #                                          default, False=force off (serve-side A/B)
     ) -> Engine:
         if mode != "auto" and mode not in MODES:
             raise ValueError(f"mode must be one of {MODES} or 'auto', got {mode!r}")
@@ -361,11 +459,14 @@ class Engine:
                                        bits=max(drafter_bits, 2))
                 draft.bind(tgt.model)
             # small-M MMA verify kernel (see small_m_qmm.py): on for shapes the cached
-            # probe proves faster on this machine. MUST precede calibrate()/static_cap —
+            # probe proves faster on this machine, `small_m=False` forces it off (the
+            # serve-side A/B issue #14 asked for). MUST precede calibrate()/static_cap —
             # cap curves are measured under the same kernel dispatch generation uses.
             from .calibrate import apply_small_m
 
-            apply_small_m(tgt, draft, target_repo=target_repo, drafter_repo=drafter_repo)
+            smm_ids = apply_small_m(tgt, draft, target_repo=target_repo,
+                                    drafter_repo=drafter_repo,
+                                    enabled=False if small_m is False else None)
             # --max-draft auto: measure this machine+pair's cost curves once (disk-cached)
             # and let a CapController pick the cap per round. Only meaningful with a drafter.
             ctrl = None
@@ -379,9 +480,10 @@ class Engine:
             from .calibrate import apply_wide_gemm
 
             apply_wide_gemm(tgt, draft, target_repo=target_repo, min_rows=wide_gemm_min)
-            return tgt, tok, draft, ctrl
+            return tgt, tok, draft, ctrl, bool(smm_ids)
 
-        tgt, tok, draft, cap_controller = executor.submit(_load_models).result()
+        tgt, tok, draft, cap_controller, small_m_active = \
+            executor.submit(_load_models).result()
         if max_draft_tokens == "auto":
             max_draft_tokens = None                     # controller drives, up to the full block
         # default cap: dspark derives it from this machine+model+quant's measured curves
@@ -412,6 +514,22 @@ class Engine:
                          ("top_k", default_top_k)):
             if val is not None:
                 sampling_defaults[key] = val
+        # RAM sanity check (issue #14's secondary finding): the window defaults to the
+        # model's own maximum, and on a big model that KV budget can silently exhaust the
+        # machine. A warning, not a changed default — behaviour stays predictable.
+        window = context_window or _context_window(target_repo)
+        try:
+            import mlx.core as mx
+
+            cfg = _target_config(target_repo)
+            warn = _context_ram_warning(
+                _kv_bytes_per_token(cfg) if cfg else None, window,
+                mx.get_active_memory(),
+                mx.device_info().get("max_recommended_working_set_size"))
+            if warn:
+                print(warn, file=sys.stderr, flush=True)
+        except Exception:  # noqa: BLE001 — an estimate must never block a load
+            pass
         return cls(tgt, tok, draft, mode=mode, model_id=model_id, target_repo=target_repo,
                    drafter_repo=drafter_repo, max_draft_tokens=max_draft_tokens,
                    confidence_threshold=confidence_threshold, template_defaults=template_defaults,
@@ -424,7 +542,8 @@ class Engine:
                    prefix_cache_rungs=prefix_cache_rungs, lookup_drafts=lookup_drafts,
                    lookup_long_draft=lookup_long_draft,
                    wired_limit=wired_limit,
-                   context_window=context_window or _context_window(target_repo),
+                   context_window=window,
+                   small_m=small_m_active,
                    executor=executor)
 
     # --- generation ---
@@ -1219,7 +1338,8 @@ class EngineHolder:
              max_draft: int | str | None = None,
              lookup_drafts: bool | None = None,
              confidence_threshold: float | None = None,
-             context_window: int | None = None) -> dict:
+             context_window: int | None = None,
+             small_m: bool | None = None) -> dict:
         """Release the current model and load ``model`` in its place. Returns the new status.
 
         Serialized by ``_swap_lock`` so two concurrent loads can't race. Raises ``ValueError``
@@ -1251,6 +1371,8 @@ class EngineHolder:
                     kwargs["confidence_threshold"] = confidence_threshold
                 if context_window is not None:
                     kwargs["context_window"] = context_window
+                if small_m is not None:
+                    kwargs["small_m"] = small_m
                 engine = Engine.load(**kwargs)
                 engine = maybe_batch_engine(engine, self._max_batch)
                 self._engine = engine
@@ -1476,6 +1598,11 @@ def make_handler(engine: Engine, api_key: str | None):
                     # A client must gate its conf-bundle arm on this — an engine without
                     # it would silently DROP the field and the lane label would lie.
                     "race_arm_confidence": True,
+                    # whether the small-M MMA verify kernel is live for this load (the
+                    # per-shape probe admitted shapes and it wasn't forced off) — pairs
+                    # with serve --no-small-m / the /admin/load "small_m" override so a
+                    # kernel-vs-stock A/B no longer needs a version downgrade (issue #14)
+                    "small_m": bool(getattr(engine, "small_m", False)),
                     "context_window": getattr(engine, "context_window", None),
                     "max_output_tokens": engine.max_tokens_cap,
                     # Whether the loaded template reads `reasoning_effort`, and the server's
@@ -1582,11 +1709,17 @@ def make_handler(engine: Engine, api_key: str | None):
                 return self._send_error(400, "'context_window' must be an integer token "
                                              "count >= 1024 (omit it to use the model's "
                                              "own maximum)")
+            small_m = req.get("small_m")
+            if small_m is not None and not isinstance(small_m, bool):
+                return self._send_error(400, "'small_m' must be a boolean (false forces the "
+                                             "stock verify kernel; omit it to use the "
+                                             "server's setting)")
             try:
                 status = engine.swap(model=model, mode=mode, max_draft=max_draft,
                                      lookup_drafts=lookup_drafts,
                                      confidence_threshold=confidence,
-                                     context_window=context_window)
+                                     context_window=context_window,
+                                     small_m=small_m)
             except ValueError as e:                 # unknown model / unresolvable drafter
                 return self._send_error(400, str(e))
             except Exception as e:  # noqa: BLE001 — load failed; report, server stays up
@@ -1803,7 +1936,12 @@ def make_handler(engine: Engine, api_key: str | None):
                 if route == "/admin/race":
                     return self._race(req)
             except (BrokenPipeError, ConnectionResetError):
-                return  # client hung up mid-stream; nothing more to do
+                # Client hung up mid-stream; nothing more to do — but say so. Swallowing it
+                # silently left no server-side record at all, which made a stalled client
+                # indistinguishable from a wedged engine (issue #14's diagnostic gap).
+                print(f"[serve] client disconnected during {route}",
+                      file=sys.stderr, flush=True)
+                return
             except Exception as e:  # noqa: BLE001 — keep the server alive on a bad request
                 if anthropic:
                     traceback.print_exc()
@@ -1953,19 +2091,26 @@ def make_handler(engine: Engine, api_key: str | None):
 
             # Prefill on a long agent prompt runs for seconds with nothing on the wire. A
             # periodic ping (a real Anthropic event type) keeps the client's socket and any
-            # intermediary from timing out the request before the first token lands.
+            # intermediary from timing out the request before the first token lands — and a
+            # ping that fails to write is the disconnect signal for stretches where no text
+            # flows (a _ToolGate-buffered tool call), so generation stops at the next round
+            # instead of holding the MLX thread for a client that's gone (issue #14).
             done = threading.Event()
+            gone = threading.Event()
 
             def _heartbeat():
-                while not done.wait(15.0):
+                while not done.wait(STREAM_KEEPALIVE_S):
                     try:
                         self._sse({"type": "ping"}, "ping")
-                    except Exception:  # noqa: BLE001 — socket gone; the request thread reports it
+                    except Exception:  # noqa: BLE001 — socket gone; flag it and stand down
+                        gone.set()
                         return
 
             threading.Thread(target=_heartbeat, daemon=True).start()
 
             def on_text(piece: str):
+                if gone.is_set():
+                    raise StopStreaming()
                 try:
                     for name, payload in stream.delta(piece):
                         self._sse(payload, name)
@@ -1976,6 +2121,10 @@ def make_handler(engine: Engine, api_key: str | None):
                 res = engine.generate(prompt_ids, on_text=on_text, **params)
             finally:
                 done.set()
+            if gone.is_set():
+                print(f"[serve] client disconnected mid-stream; generation stopped early "
+                      f"after {res.num_tokens} tokens", file=sys.stderr, flush=True)
+                return
             for name, payload in stream.finish(finish_reason=res.finish_reason,
                                                output_tokens=res.num_tokens):
                 self._sse(payload, name)
@@ -2089,10 +2238,68 @@ def make_handler(engine: Engine, api_key: str | None):
             if chat:
                 self._sse(base({"role": "assistant"}, None))
 
+            # Keep-alive + liveness (see STREAM_KEEPALIVE_S). `gone` flips when a keep-alive
+            # write fails — the only disconnect signal available while nothing else is on the
+            # wire — and the on_text callbacks below turn it into StopStreaming, so the loop
+            # ends at the next round with a normal partial result and the prefix cache intact.
+            done = threading.Event()
+            gone = threading.Event()
+
+            def _heartbeat():
+                while not done.wait(STREAM_KEEPALIVE_S):
+                    try:
+                        self._sse_comment("keepalive")
+                    except OSError:
+                        gone.set()
+                        return
+
+            threading.Thread(target=_heartbeat, daemon=True).start()
+
+            def _alive():
+                if gone.is_set():
+                    raise StopStreaming()
+
+            try:
+                res, finish = self._run_stream_body(prompt_ids, params, base, chat, req,
+                                                    want_tools, _alive, gone)
+            finally:
+                done.set()
+            if gone.is_set():
+                # The client is gone; generation was cut short at a round boundary. Say so —
+                # a silently dropped stream is indistinguishable from a wedge in the logs
+                # (issue #14's diagnostic gap) — and skip the writes that would just raise.
+                print(f"[serve] client disconnected mid-stream; generation stopped early "
+                      f"after {res.num_tokens} tokens", file=sys.stderr, flush=True)
+                return
+
+            # final chunk carries finish_reason (+ usage if the client asked for it)
+            final = base({} if chat else "", finish)
+            opts = req.get("stream_options") or {}
+            if opts.get("include_usage"):
+                final["usage"] = {
+                    "prompt_tokens": len(prompt_ids),
+                    "completion_tokens": res.num_tokens,
+                    "total_tokens": len(prompt_ids) + res.num_tokens,
+                }
+            final["x_mlx_dspark"] = engine.spec_info(res)
+            self._sse(final)
+            self.wfile.write(b"data: [DONE]\n\n")
+            self.wfile.flush()
+
+        def _run_stream_body(self, prompt_ids, params, base, chat, req, want_tools,
+                             alive, gone):
+            """One streaming generation: returns ``(GenResult, finish_reason)``. ``alive``
+            raises StopStreaming once the keep-alive thread has seen the socket die
+            (``gone`` is the same signal as a checkable flag)."""
             if want_tools:
                 # buffer, then emit tool_calls (or cleaned content) in one delta — incremental
-                # tool-call streaming isn't reliable to reconstruct, so we resolve at the end
-                res = engine.generate(prompt_ids, on_text=None, **params)
+                # tool-call streaming isn't reliable to reconstruct, so we resolve at the end.
+                # `alive` still rides along as on_text (its text ignored): without it a
+                # buffered generation had NO disconnect signal at all and ran to max_tokens
+                # holding the MLX thread — the issue-#14 pile-up.
+                res = engine.generate(prompt_ids, on_text=lambda _piece: alive(), **params)
+                if gone.is_set():
+                    return res, res.finish_reason   # nobody listening; skip the emission
                 reasoning, answer = A.split_thinking(res.text)
                 parsed, cleaned = parse_tool_calls(answer, schema_types(req.get("tools")))
                 if reasoning:
@@ -2100,12 +2307,11 @@ def make_handler(engine: Engine, api_key: str | None):
                 if parsed:
                     self._sse(base({"tool_calls": [{"index": i, **tc}
                                                    for i, tc in enumerate(parsed)]}, None))
-                    finish = "tool_calls"
-                else:
-                    if cleaned:
-                        self._sse(base({"content": cleaned}, None))
-                    finish = res.finish_reason
-            elif chat and engine.is_muse:
+                    return res, "tool_calls"
+                if cleaned:
+                    self._sse(base({"content": cleaned}, None))
+                return res, res.finish_reason
+            if chat and engine.is_muse:
                 # muse streams its analysis (`to=self`) and answer (`to=user`) channels
                 # interleaved with structural markers; split them incrementally so reasoning
                 # rides in `reasoning_content` and only the answer lands in `content`.
@@ -2119,14 +2325,15 @@ def make_handler(engine: Engine, api_key: str | None):
                         self._sse(base({field: text}, None))
 
                 def on_text(piece: str):
+                    alive()
                     try:
                         _emit_muse(muse.feed(piece))
                     except (BrokenPipeError, ConnectionResetError) as e:
                         raise StopStreaming() from e
                 res = engine.generate(prompt_ids, on_text=on_text, **params)
                 _emit_muse(muse.feed("", final=True))   # flush the held-back tail
-                finish = res.finish_reason
-            elif chat:
+                return res, res.finish_reason
+            if chat:
                 # Split reasoning into `reasoning_content` incrementally (the streaming twin
                 # of the non-streaming path's split_thinking). Covers both the self-opened
                 # `<think>` and the prefilled-opener templates (Qwen3-2507 / qwen3_5 / Qwen3.8
@@ -2144,6 +2351,7 @@ def make_handler(engine: Engine, api_key: str | None):
                         self._sse(base({field: text}, None))
 
                 def on_text(piece: str):
+                    alive()
                     try:
                         _emit_split(splitter.feed(piece))
                     except (BrokenPipeError, ConnectionResetError) as e:
@@ -2153,29 +2361,16 @@ def make_handler(engine: Engine, api_key: str | None):
                         raise StopStreaming() from e
                 res = engine.generate(prompt_ids, on_text=on_text, **params)
                 _emit_split(splitter.feed("", final=True))   # flush the held-back tail
-                finish = res.finish_reason
-            else:
-                def on_text(piece: str):
-                    try:
-                        self._sse(base(piece, None))
-                    except (BrokenPipeError, ConnectionResetError) as e:
-                        raise StopStreaming() from e
-                res = engine.generate(prompt_ids, on_text=on_text, **params)
-                finish = res.finish_reason
+                return res, res.finish_reason
 
-            # final chunk carries finish_reason (+ usage if the client asked for it)
-            final = base({} if chat else "", finish)
-            opts = req.get("stream_options") or {}
-            if opts.get("include_usage"):
-                final["usage"] = {
-                    "prompt_tokens": len(prompt_ids),
-                    "completion_tokens": res.num_tokens,
-                    "total_tokens": len(prompt_ids) + res.num_tokens,
-                }
-            final["x_mlx_dspark"] = engine.spec_info(res)
-            self._sse(final)
-            self.wfile.write(b"data: [DONE]\n\n")
-            self.wfile.flush()
+            def on_text(piece: str):
+                alive()
+                try:
+                    self._sse(base(piece, None))
+                except (BrokenPipeError, ConnectionResetError) as e:
+                    raise StopStreaming() from e
+            res = engine.generate(prompt_ids, on_text=on_text, **params)
+            return res, res.finish_reason
 
     return Handler
 
@@ -2204,6 +2399,10 @@ def run_server(engine, *, host: str = "127.0.0.1", port: int = 8080,
             print(f"  prefix cache: on{'  (+SSD spill)' if engine.prefix.l2_dir else ''}")
         else:
             print("  prefix cache: off (not reusable for this mode/target)")
+        # Stated up front so a serve session's kernel arm is on record (benchmark prints
+        # the same); forced off via --no-small-m, per-swap via /admin/load {"small_m": ...}.
+        print(f"  small-M verify kernel: "
+              f"{'on (probe-verified shapes)' if getattr(engine, 'small_m', False) else 'off'}")
         if isinstance(engine, BatchEngine):
             print(f"  batching: micro-batch up to {engine.max_batch} concurrent "
                   f"({engine.mode}; serial fallback for temp>0 dspark / lone requests)")

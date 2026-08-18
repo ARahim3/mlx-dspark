@@ -8,7 +8,9 @@ and error paths. End-to-end correctness with a real drafter is exercised separat
 from __future__ import annotations
 
 import json
+import socket
 import threading
+import time
 import urllib.error
 import urllib.request
 from http.server import ThreadingHTTPServer
@@ -238,8 +240,6 @@ def test_events_stream_ends_cleanly_across_a_model_swap():
     The stream must END — so the client reconnects to the new engine's log — never
     traceback through the holder's no-engine guard (that stack trace lands in the app's
     loading screen and reads as a crash)."""
-    import time
-
     from mlx_dspark.server import EngineHolder
     from mlx_dspark.telemetry import RoundLog
 
@@ -735,3 +735,170 @@ def test_race_arm_confidence_validated_and_passed(server):
         assert e.value.code == 400, bad_arm
 
     assert _get(base, "/health")["race_arm_confidence"] is True
+
+
+# --------------------------------------------------------------- issue #14: stream liveness
+
+
+def test_health_reports_small_m(server):
+    """/health carries the small-M kernel's live state so a serve-side A/B is visible
+    (issue #14: with no flag and no report, the only A/B was a version downgrade)."""
+    eng, base = server
+    assert _get(base, "/health")["small_m"] is False    # fake engine: attribute absent
+    eng.small_m = True
+    assert _get(base, "/health")["small_m"] is True
+
+
+class _SlowStreamEngine(_FakeEngine):
+    """Generation that emits a piece every ``delay`` seconds, honouring StopStreaming the
+    way the real loops do (stop at the next boundary, return a normal partial result)."""
+
+    def __init__(self, pieces: int = 8, delay: float = 0.05):
+        super().__init__()
+        self.pieces = pieces
+        self.delay = delay
+        self.stopped_early = False
+        self.finished = threading.Event()
+
+    def generate(self, prompt_ids, *, on_text=None, **kw):
+        from mlx_dspark.generate import StopStreaming
+
+        emitted = 0
+        try:
+            for _ in range(self.pieces):
+                time.sleep(self.delay)
+                if on_text is not None:
+                    try:
+                        on_text("x ")
+                    except StopStreaming:
+                        self.stopped_early = True
+                        break
+                emitted += 1
+        finally:
+            self.finished.set()
+        return GenResult(text="x " * emitted, token_ids=list(range(emitted)),
+                         num_tokens=emitted, num_rounds=emitted, accept_lengths=[1],
+                         target_forwards=emitted, seconds=self.delay * emitted,
+                         finish_reason="stop")
+
+
+_TOOLS_STREAM_REQ = {
+    "messages": [{"role": "user", "content": "hi"}],
+    "stream": True,
+    "tools": [{"type": "function",
+               "function": {"name": "t", "description": "d",
+                            "parameters": {"type": "object", "properties": {}}}}],
+}
+
+
+def _slow_server(monkeypatch, keepalive: float, **engine_kw):
+    monkeypatch.setattr(S, "STREAM_KEEPALIVE_S", keepalive)
+    eng = _SlowStreamEngine(**engine_kw)
+    httpd = ThreadingHTTPServer(("127.0.0.1", 0), S.make_handler(eng, api_key=None))
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    return eng, httpd
+
+
+def test_tools_stream_sends_keepalives_while_buffering(monkeypatch):
+    """The tool-calls stream buffers the whole generation (role chunk, then one delta at
+    the end) — issue #14's client saw that as 300 s of dead air and timed out. Keep-alive
+    SSE comments now flow through the buffered stretch."""
+    eng, httpd = _slow_server(monkeypatch, keepalive=0.03, pieces=8, delay=0.03)
+    try:
+        base = f"http://127.0.0.1:{httpd.server_address[1]}"
+        raw = _post(base, "/v1/chat/completions", _TOOLS_STREAM_REQ, stream=True)
+        assert ": keepalive" in raw                     # comments rode along mid-generation
+        assert raw.rstrip().endswith("data: [DONE]")    # and the stream still finishes clean
+        assert not eng.stopped_early
+    finally:
+        httpd.shutdown()
+
+
+def test_tools_stream_stops_generation_when_client_disconnects(monkeypatch):
+    """A vanished client must stop a buffered-tools generation at the next round — not let
+    it grind to max_tokens holding the single MLX thread while retries pile up behind it
+    (the issue-#14 'wedge': /health green, every later request queued for minutes)."""
+    eng, httpd = _slow_server(monkeypatch, keepalive=0.03, pieces=400, delay=0.01)
+    try:
+        host, port = httpd.server_address
+        body = json.dumps(_TOOLS_STREAM_REQ)
+        with socket.create_connection((host, port)) as s:
+            s.sendall((f"POST /v1/chat/completions HTTP/1.1\r\nHost: {host}\r\n"
+                       f"Content-Type: application/json\r\n"
+                       f"Content-Length: {len(body)}\r\n\r\n{body}").encode())
+            s.recv(4096)                # headers + the role chunk have arrived
+        # socket closed: the keep-alive write fails, gone flips, on_text raises StopStreaming
+        assert eng.finished.wait(5.0)
+        assert eng.stopped_early            # cut short, nowhere near all 400 pieces
+    finally:
+        httpd.shutdown()
+
+
+def test_plain_chat_stream_stops_generation_when_client_disconnects(monkeypatch):
+    """Same liveness contract on the ordinary (non-tools) chat stream: mid-thinking or
+    mid-answer, a dead socket ends generation at the next round via the same flag (the
+    write-failure path already covered it whenever a delta went out; the flag covers
+    stretches where nothing does)."""
+    eng, httpd = _slow_server(monkeypatch, keepalive=0.03, pieces=400, delay=0.01)
+    try:
+        host, port = httpd.server_address
+        body = json.dumps({"messages": [{"role": "user", "content": "hi"}], "stream": True})
+        with socket.create_connection((host, port)) as s:
+            s.sendall((f"POST /v1/chat/completions HTTP/1.1\r\nHost: {host}\r\n"
+                       f"Content-Type: application/json\r\n"
+                       f"Content-Length: {len(body)}\r\n\r\n{body}").encode())
+            s.recv(4096)
+        assert eng.finished.wait(5.0)
+        assert eng.stopped_early
+    finally:
+        httpd.shutdown()
+
+
+# ------------------------------------------------- issue #14: RAM-aware context warning
+
+
+def test_kv_bytes_per_token_qwen38_hybrid():
+    """Qwen3.8-27B's real layout: 64 layers, every 4th full attention, 4 kv-heads,
+    head_dim 256 -> exactly the measured 64 KB/token of context-growing KV."""
+    cfg = {"text_config": {
+        "num_hidden_layers": 64, "num_attention_heads": 24, "num_key_value_heads": 4,
+        "head_dim": 256, "hidden_size": 5120, "full_attention_interval": 4,
+        "layer_types": ["linear_attention"] * 3 + ["full_attention"]
+                       + (["linear_attention"] * 3 + ["full_attention"]) * 15,
+    }}
+    assert S._kv_bytes_per_token(cfg) == 16 * 4 * 256 * 4 == 65536
+
+
+def test_kv_bytes_per_token_dense_and_patterns():
+    dense = {"num_hidden_layers": 36, "num_attention_heads": 32,
+             "num_key_value_heads": 8, "head_dim": 128, "hidden_size": 2560}
+    assert S._kv_bytes_per_token(dense) == 36 * 8 * 128 * 4      # every layer counts
+
+    nemotron = dict(dense, hybrid_override_pattern="M*M-M*M-")   # '*' marks attention
+    assert S._kv_bytes_per_token(nemotron) == 2 * 8 * 128 * 4
+
+    sliding = dict(dense, layer_types=["sliding_attention"] * 36)
+    assert S._kv_bytes_per_token(sliding) == 0                   # bounded cache: no warning
+
+    assert S._kv_bytes_per_token({}) is None                     # config doesn't say
+
+
+def test_context_ram_warning_triggers_and_suggests_a_cap():
+    gb = 1024 ** 3
+    # Issue #14's shape: ~29 GB resident, 262144-token window at 64 KB/token (~16 GB of
+    # KV) against a 64 GB Mac's ~48 GB working set -> warn, and suggest a window that fits.
+    msg = S._context_ram_warning(65536, 262144, 29 * gb, 48 * gb)
+    assert msg is not None and "--context-window" in msg
+    suggested = int(msg.split("--context-window ")[1].split()[0])
+    assert suggested % 8192 == 0
+    assert 29 * gb + suggested * 65536 <= 0.9 * 48 * gb          # the suggestion itself fits
+
+    # Fits comfortably -> silent.
+    assert S._context_ram_warning(65536, 32768, 29 * gb, 48 * gb) is None
+    # Unknown KV cost / bounded cache / unknown budget -> silent, never a false alarm.
+    assert S._context_ram_warning(None, 262144, 29 * gb, 48 * gb) is None
+    assert S._context_ram_warning(0, 262144, 29 * gb, 48 * gb) is None
+    assert S._context_ram_warning(65536, 262144, 29 * gb, None) is None
+    # Weights alone already blow the budget -> warn without a useless tiny suggestion.
+    msg = S._context_ram_warning(65536, 262144, 47 * gb, 48 * gb)
+    assert msg is not None and "--context-window" not in msg

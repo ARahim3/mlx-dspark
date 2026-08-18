@@ -224,6 +224,28 @@ class TestSwapConfidence:
         h.swap(model="repo2")
         assert captured["confidence_threshold"] == 0.0   # unset -> server default kept
 
+    def test_swap_small_m_override_and_default_passthrough(self, monkeypatch):
+        """An explicit small_m rides the swap (the serve-side kernel A/B issue #14 asked
+        for); absent, the server's stored kwargs pass through untouched — a serve started
+        without the flag stores None, so Engine.load applies its probe-gated default."""
+        h = EngineHolder(FakeEngine("old"), load_kwargs={"small_m": None})
+        captured = {}
+
+        import mlx_dspark.server as server
+
+        def capture(**kw):
+            captured.update(kw)
+            return FakeEngine("new")
+
+        monkeypatch.setattr(server.Engine, "load", staticmethod(capture))
+        monkeypatch.setattr(server, "maybe_batch_engine", lambda e, b: e)
+
+        h.swap(model="repo", small_m=False)
+        assert captured["small_m"] is False              # request override wins
+        captured.clear()
+        h.swap(model="repo2")
+        assert captured["small_m"] is None               # unset -> probe-gated default
+
     def test_status_reports_download_progress_while_loading(self, monkeypatch):
         """While a swap is fetching weights, status() carries the download progress so
         /health can show a real bar and the client can offer Cancel."""

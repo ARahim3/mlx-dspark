@@ -361,6 +361,12 @@ def cmd_serve(argv: list[str]) -> None:
     ap.add_argument("--wide-gemm-min", type=int, default=None, metavar="N",
                     help="prefill wide-GEMM crossover row count (default: calibrated once and "
                          "cached; 0 disables — see `mlx-dspark generate -h`)")
+    ap.add_argument("--small-m", action=argparse.BooleanOptionalAction, default=None,
+                    help="small-M MMA verify kernel (see `mlx-dspark generate --help`). "
+                         "Unset = on where the cached probe proves it faster on this machine; "
+                         "--no-small-m forces the stock kernel — the serve-side A/B that "
+                         "previously required downgrading. /health reports the live state; "
+                         "/admin/load takes a per-swap `small_m` boolean override.")
     ap.add_argument("--prefix-cache-dir", default=None,
                     help="directory for the L2 SSD spill tier (enables spilling the cache to disk)")
     ap.add_argument("--prefix-cache-max-ram-mb", type=int, default=0,
@@ -401,6 +407,7 @@ def cmd_serve(argv: list[str]) -> None:
         "lookup_long_draft": args.lookup_long_draft,
         "wired_limit": args.wired_limit,
         "wide_gemm_min": args.wide_gemm_min,
+        "small_m": args.small_m,                 # None = probe-gated default, False = off
         "batch_widths": (sorted({2, args.max_batch}) if args.max_batch > 1 else None),
         "kv_bits": args.kv_bits or None,
         "context_window": args.context_window,

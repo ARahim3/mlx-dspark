@@ -320,6 +320,7 @@ Practical notes for a local model:
 | **`--no-thinking` is a speed knob, not a requirement** | Leaving it off works fine — reasoning is streamed as proper `thinking` blocks either way. It just costs: on Qwen3-8B the same Claude Code task ran 3:17 and 2762 output tokens with thinking vs ~2:20 and 169 without, since the model thinks before *every* tool call. A client sending `thinking: {"type": "disabled"}` gets the same effect per-request. Note it's a no-op on Gemma-4, whose template doesn't think by default. |
 | **Leave prefix caching on** | It is doing most of the work (see the table). The first request of a *cold server* is the slow one; since 0.10.1 a fresh session over a system prompt the server has already seen partially reuses it (rungs — see [Prefix caching](#prefix-caching)). |
 | **Context** | An over-long request is refused with the wording Claude Code recognises as a context limit, so it compacts and retries instead of dying. `--context-window N` lowers the bar deliberately (e.g. to keep the KV cache inside your RAM budget). |
+| **Streams stay alive, and disconnects actually stop generation** (v0.12.3) | Keep-alive frames flow every 15 s through stretches with nothing on the wire (long prefills; tool-call responses are buffered until complete), so agent clients don't idle-timeout mid-request. And if a client *does* vanish, generation stops at the next round instead of running to `max_tokens` while later requests queue behind it — the "server stalls but `/health` is fine" failure mode. |
 
 ### One-shot generation (CLI)
 
@@ -851,7 +852,10 @@ The third thing that grows is **RAM**: the KV cache is linear in context. Measur
 bits), i.e. ~11 GB on top of the weights at 128k — the "[+ cache at 128k ctx](#models)" column in the
 models table. When RAM is the constraint, cap it with `--context-window N` (also a per-swap
 `context_window` override on `/admin/load`): requests past the cap get the "prompt is too long" error that
-agent clients like Claude Code auto-compact on, instead of a swap-storm.
+agent clients like Claude Code auto-compact on, instead of a swap-storm. Since v0.12.3 `serve` does this
+math for you at load — the window defaults to the model's own maximum (262144 on Qwen3.8-27B ≈ 16 GB of
+KV on top of ~29 GB of weights), and if weights + full-window KV would overrun your GPU working set it
+prints a warning with a `--context-window` value that fits.
 
 ### DSpark vs DFlash (head-to-head)
 
@@ -953,9 +957,10 @@ is unchanged):
   weight group once and reuses it across rows, making widths 6–8 cost ~width-5. It is enabled per shape
   only after a one-time cached probe proves it faster *and* numerically sane **on your machine**
   (the wide-GEMM doctrine); everything else stays on the stock kernel. `--no-small-m` forces it off
-  for A/B runs. Output stays greedy-correct (the target verifies every token); ids can differ from the
-  stock kernel at floating-point ties, same class as the batched path. This is what moved
-  Qwen3.8-27B-8bit's derived cap to 7.
+  for A/B runs — on `generate`, `benchmark` **and (v0.12.3) `serve`**, where `/health` reports the live
+  state (`small_m`) and `/admin/load` takes a per-swap `small_m` boolean. Output stays greedy-correct
+  (the target verifies every token); ids can differ from the stock kernel at floating-point ties, same
+  class as the batched path. This is what moved Qwen3.8-27B-8bit's derived cap to 7.
 - **`--wired-limit`** — off by default, and you almost certainly want to leave it that way. It raises MLX's
   wired-memory ceiling to the recommended working set (~75% of RAM) so weights can't be paged out. Wired
   pages can't be reclaimed by the OS, so on a machine already holding a large working set this can **hang
