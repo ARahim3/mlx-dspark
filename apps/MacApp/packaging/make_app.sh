@@ -19,7 +19,7 @@ cd "$(dirname "$0")/.."
 APP_NAME="mlx-dspark"                 # display name — see AppIdentity.swift
 BUNDLE_ID="com.arahim.mlx-dspark"
 EXECUTABLE="MlxDspark"                # SwiftPM product name
-VERSION="${APP_VERSION:-0.6.0}"
+VERSION="${APP_VERSION:-0.6.1}"
 MIN_MACOS="14.0"
 
 CONFIG="release"
