@@ -52,9 +52,18 @@ struct AboutCard: View {
                         .font(.caption).foregroundStyle(.secondary)
                 }
                 if let engineUpdate = model.engineUpdateAvailable {
-                    Label("Engine \(engineUpdate) is available — it installs on the next launch.",
-                          systemImage: "arrow.triangle.2.circlepath")
-                        .font(.caption).foregroundStyle(.secondary)
+                    HStack(spacing: 8) {
+                        Label("Engine \(engineUpdate) is available.",
+                              systemImage: "arrow.triangle.2.circlepath")
+                            .font(.caption).foregroundStyle(.secondary)
+                        Button(model.engineUpdating ? "Updating…" : "Update now") {
+                            Task { await model.applyEngineUpdateNow() }
+                        }
+                        .buttonStyle(.link).font(.caption)
+                        .disabled(model.engineUpdating)
+                        Text("or it installs on the next launch")
+                            .font(.caption).foregroundStyle(.tertiary)
+                    }
                 }
             }
         }
@@ -366,12 +375,17 @@ struct MachineCard: View {
 
 struct ServerCard: View {
     @EnvironmentObject private var model: AppModel
+    // String mirror, committed on submit/apply — a TextField(value:format:) with a live
+    // clamp rewrites the text under the cursor (see the Race max-tokens field).
+    @State private var portText: String =
+        Defaults.enginePort == 0 ? "" : String(Defaults.enginePort)
+    @State private var restarting = false
 
     var body: some View {
         Card(title: "Local server",
              subtitle: "OpenAI- and Anthropic-compatible, on this machine only.") {
-            if case .ready(let port, let health) = model.serverState {
-                VStack(alignment: .leading, spacing: 8) {
+            VStack(alignment: .leading, spacing: 8) {
+                if case .ready(let port, let health) = model.serverState {
                     endpoint("OpenAI", "http://127.0.0.1:\(port)/v1")
                     endpoint("Anthropic", "http://127.0.0.1:\(port)")
                     if let window = health.contextWindow {
@@ -381,11 +395,43 @@ struct ServerCard: View {
                     Text("Point Claude Code at it with:  mlx-dspark claude")
                         .font(.caption.monospaced()).foregroundStyle(.secondary)
                         .textSelection(.enabled)
+                } else {
+                    Text(model.statusLine).foregroundStyle(.secondary)
                 }
-            } else {
-                Text(model.statusLine).foregroundStyle(.secondary)
+                Divider()
+                portRow
             }
         }
+    }
+
+    /// Fixed engine port (issue #16): external clients (Claude Code, Open WebUI, …) need a
+    /// base URL that survives an app restart; the automatic port changes on every launch.
+    @ViewBuilder private var portRow: some View {
+        HStack(spacing: 8) {
+            Text("Port").font(.callout).foregroundStyle(.secondary)
+                .frame(width: 78, alignment: .leading)
+            TextField("automatic", text: $portText)
+                .textFieldStyle(.roundedBorder)
+                .frame(width: 92)
+                .onSubmit { commitPort() }
+            Button(restarting ? "Restarting…" : "Apply & restart engine") {
+                commitPort()
+                restarting = true
+                Task { await model.restartEngine(); restarting = false }
+            }
+            .font(.caption)
+            .disabled(restarting)
+            Spacer()
+        }
+        Text("A fixed port keeps external clients' base URL stable across launches. "
+             + "Blank = automatic. Ports 1024–65535.")
+            .font(.caption).foregroundStyle(.secondary)
+    }
+
+    private func commitPort() {
+        let value = Int(portText.trimmingCharacters(in: .whitespaces)) ?? 0
+        Defaults.enginePort = (1024...65535).contains(value) ? value : 0
+        portText = Defaults.enginePort == 0 ? "" : String(Defaults.enginePort)
     }
 
     private func endpoint(_ label: String, _ url: String) -> some View {

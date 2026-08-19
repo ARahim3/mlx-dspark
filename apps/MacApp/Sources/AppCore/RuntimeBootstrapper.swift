@@ -288,6 +288,15 @@ public actor RuntimeBootstrapper {
         return Paths.engineExecutable
     }
 
+    /// Apply a pending engine update NOW — the UI-triggered path ("Update now" in Settings).
+    /// The same in-place upgrade the next launch would run; stop the server first (upgrading
+    /// the venv under a running engine risks mixing module versions in one process).
+    /// Returns the engine executable on success, nil on failure (the working install is kept).
+    public func applyPendingUpdate(onProgress: ProgressHandler? = nil) async -> URL? {
+        guard let version = Self.pendingEngineUpdate else { return nil }
+        return await upgradeInPlace(to: version, onProgress: onProgress)
+    }
+
     /// Upgrade the engine inside the existing venv (`uv pip install pkg==version`) — no venv
     /// rebuild, nothing deleted, so any failure leaves the working install untouched.
     private func upgradeInPlace(to version: String, onProgress: ProgressHandler?) async -> URL? {
@@ -299,12 +308,20 @@ public actor RuntimeBootstrapper {
         set(.engine, .running, "Updating to \(requirement)")
         onProgress?(steps)
         do {
+            // --refresh-package: force uv to revalidate this package's index metadata. A
+            // cached index that predates the release makes `pkg==new` unsatisfiable, and the
+            // launch-path retry then never converges (issue #16 item 3 — an update stuck
+            // pending across relaunches until a manual venv install).
             try await Shell.check(uv, ["pip", "install", "--python", venvPython().path,
+                                       "--refresh-package", AppIdentity.enginePackage,
                                        requirement],
                                   environment: env) { [logStore] line in
                 logStore?.append(line)
             }
         } catch {
+            // The caller keeps the working runtime; make the WHY visible in the log instead
+            // of a bare "didn't complete".
+            logStore?.note("engine update to \(version) failed: \(error.localizedDescription)")
             return nil
         }
         set(.engine, .done, requirement)

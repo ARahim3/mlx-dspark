@@ -16,14 +16,18 @@ public struct ServerConfig: Equatable, Sendable {
     public var maxDraft: String?
     public var host: String
     public var apiKey: String?
+    /// Fixed engine port (issue #16) so external OpenAI/Anthropic clients keep a stable
+    /// base URL across launches. 0 = automatic (kernel-assigned, the old behavior).
+    public var port: Int
 
     public init(model: String? = nil, mode: String = "auto", maxDraft: String? = "auto",
-                host: String = "127.0.0.1", apiKey: String? = nil) {
+                host: String = "127.0.0.1", apiKey: String? = nil, port: Int = 0) {
         self.model = model
         self.mode = mode
         self.maxDraft = maxDraft
         self.host = host
         self.apiKey = apiKey
+        self.port = port
     }
 }
 
@@ -56,7 +60,26 @@ public actor ServerSupervisor {
         if case .ready = state { return port }
         await stop()
 
-        let chosenPort = try Self.freePort()
+        let chosenPort: Int
+        if config.port > 0 {
+            // Fixed port (Settings → Local server). A quit-and-relaunch can race the old
+            // process still letting go of it, so wait briefly before declaring it taken —
+            // and then fail with a message that names the fix, instead of the generic
+            // "exited during startup" the bind error would produce.
+            let deadline = Date().addingTimeInterval(5)
+            while !Self.portIsFree(config.port, host: config.host), Date() < deadline {
+                try? await Task.sleep(nanoseconds: 300_000_000)
+            }
+            guard Self.portIsFree(config.port, host: config.host) else {
+                let msg = "Port \(config.port) is already in use — quit whatever holds it, "
+                        + "or set the engine port back to automatic in Settings."
+                transition(.failed(msg))
+                throw ShellError.launchFailed("mlx-dspark serve", underlying: msg)
+            }
+            chosenPort = config.port
+        } else {
+            chosenPort = try Self.freePort()
+        }
         port = chosenPort
 
         var args = ["serve", "--host", config.host, "--port", String(chosenPort),
@@ -161,11 +184,34 @@ public actor ServerSupervisor {
         }
     }
 
+    /// Can a listener bind this port right now? Advisory (the engine does the real bind
+    /// moments later) — its job is a clean, actionable error for a fixed port that is
+    /// genuinely taken. Uses SO_REUSEADDR like the engine's own HTTP server, so lingering
+    /// TIME_WAIT connections from a previous run don't read as "busy".
+    public static func portIsFree(_ portNumber: Int, host: String) -> Bool {
+        let fd = socket(AF_INET, SOCK_STREAM, 0)
+        guard fd >= 0 else { return true }        // can't check -> let the engine's bind decide
+        defer { close(fd) }
+        var yes: Int32 = 1
+        setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &yes, socklen_t(MemoryLayout<Int32>.size))
+        var addr = sockaddr_in()
+        addr.sin_family = sa_family_t(AF_INET)
+        addr.sin_port = UInt16(portNumber).bigEndian
+        addr.sin_addr.s_addr = inet_addr(host)
+        let bound = withUnsafePointer(to: &addr) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                Darwin.bind(fd, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
+            }
+        }
+        return bound == 0
+    }
+
     /// Ask the kernel for an unused port.
     ///
     /// Binding a fixed 8080 is how every one of these apps first breaks — it collides with
     /// whatever else the user runs. There is an unavoidable race between closing this socket
-    /// and the child binding it; the caller retries.
+    /// and the child binding it; the caller retries. (A *user-chosen* fixed port is different:
+    /// it's opt-in, checked with ``portIsFree(_:host:)``, and fails with a named fix.)
     public static func freePort() throws -> Int {
         let fd = socket(AF_INET, SOCK_STREAM, 0)
         guard fd >= 0 else { throw ShellError.launchFailed("socket", underlying: "unavailable") }

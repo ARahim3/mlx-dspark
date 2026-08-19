@@ -166,6 +166,8 @@ final class AppModel: ObservableObject {
     /// A newer engine release on PyPI, found by the post-launch background check. It installs
     /// itself on the next launch (in place, no venv rebuild) — this only *tells* the user.
     @Published var engineUpdateAvailable: String?
+    /// An engine update is being applied right now ("Update now" in Settings).
+    @Published var engineUpdating = false
 
     /// What the loading screen should say this load *is* — a first download, a hot swap, a
     /// settings reload. Without it every load claims "downloading", which reads as broken
@@ -333,6 +335,33 @@ final class AppModel: ObservableObject {
         }
     }
 
+    /// Stop the engine process and bring it back with the current settings — how a changed
+    /// fixed port (Settings → Local server) takes effect without relaunching the app. The
+    /// model reloads through the same path a launch uses.
+    func restartEngine() async {
+        await supervisor?.stop()
+        await startServer(model: model)
+    }
+
+    /// Apply a pending engine update NOW instead of on the next launch (issue #16: a stuck
+    /// pending update was invisible and un-actionable). Stops the server first — upgrading
+    /// the venv under a running engine risks mixing module versions — and comes back up on
+    /// whichever engine version the upgrade left behind (the old one if it failed; the log
+    /// carries the reason).
+    func applyEngineUpdateNow() async {
+        guard let bootstrapper, engineUpdateAvailable != nil, !engineUpdating else { return }
+        engineUpdating = true
+        defer { engineUpdating = false }
+        await supervisor?.stop()
+        if let engine = await bootstrapper.applyPendingUpdate() {
+            engineURL = engine
+            engineUpdateAvailable = nil
+        } else {
+            logStore.note("engine update didn't apply — see the log; keeping the current engine")
+        }
+        await startServer(model: model)
+    }
+
     /// Spawn `mlx-dspark serve --no-model` and wait for `/health` — up in seconds (python
     /// import, no weights). Returns false after calling `fail()` when even that can't start.
     private func spawnServer() async -> Bool {
@@ -345,17 +374,21 @@ final class AppModel: ObservableObject {
         }
         do {
             let port = try await supervisor.start(
-                config: ServerConfig(model: nil, mode: "auto", maxDraft: "auto"))
+                config: ServerConfig(model: nil, mode: "auto", maxDraft: "auto",
+                                     port: Defaults.enginePort))
             return await connect(port: port)
         } catch {
             // An engine below this app's floor doesn't know `--no-model`, and an offline
             // machine can't be force-upgraded to one that does — fall back to the classic
-            // blocking start with the model loaded at spawn.
+            // blocking start with the model loaded at spawn. (A fixed port that is genuinely
+            // taken fails the same way on both attempts; the supervisor's message names the
+            // fix either way.)
             logStore.note("model-less start failed — retrying with the model inline "
                           + "(older engine?)")
             do {
                 let port = try await supervisor.start(
-                    config: ServerConfig(model: model, mode: "auto", maxDraft: "auto"))
+                    config: ServerConfig(model: model, mode: "auto", maxDraft: "auto",
+                                         port: Defaults.enginePort))
                 return await connect(port: port)
             } catch {
                 fail(error)
@@ -996,6 +1029,13 @@ enum Defaults {
     static var selectedModel: String? {
         get { store.string(forKey: "selectedModel") }
         set { store.set(newValue, forKey: "selectedModel") }
+    }
+
+    /// Fixed engine port so external OpenAI/Anthropic clients keep a stable base URL across
+    /// launches (issue #16). 0 = automatic (kernel-assigned each start, the old behavior).
+    static var enginePort: Int {
+        get { store.integer(forKey: "enginePort") }
+        set { store.set(newValue, forKey: "enginePort") }
     }
 
     static var currentSession: UUID? {
