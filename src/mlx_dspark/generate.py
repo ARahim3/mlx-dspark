@@ -607,12 +607,35 @@ def dflash_generate(
     # ending there, older rows from the restored window) BEFORE on_prefill, so a checkpoint
     # snapshot sees the drafter state a later restore needs. ---
     suffix = ids[reuse_len:] if reuse_len else ids
+    # An all-sliding head can only ever attend the last (window - 1) ctx rows, so the
+    # prefill accumulator keeps a bounded tail instead of the whole prompt's fused states
+    # (~30 KB/token on Qwen3.8-27B — ~1 GB per 32k prompt tokens held at peak-prefill RAM
+    # pressure, plus an O(prompt)-row projection in the first draft call). Any
+    # full-attention layer -> unbounded, it needs every row (gemma-4 DFlash 1).
+    lt = tuple(getattr(cfg, "layer_types", ()) or ())
+    keep_ctx = (int(cfg.sliding_window) - 1
+                if lt and cfg.sliding_window and all(t == "sliding_attention" for t in lt)
+                else None)
     acc: list = []
+    trimmed = {"dropped": 0}           # leading fused rows discarded by the bound
 
     class _Acc:                        # fused-state accumulator riding the drafter hook
         @staticmethod
         def update_context(fused, ctx_offset=0, ctx_caches=None):
             acc.append(fused)
+            if keep_ctx is None:
+                return
+            excess = sum(a.shape[1] for a in acc) - keep_ctx
+            while excess > 0:
+                w = acc[0].shape[1]
+                if w <= excess:
+                    acc.pop(0)
+                    trimmed["dropped"] += w
+                    excess -= w
+                else:
+                    acc[0] = acc[0][:, excess:]
+                    trimmed["dropped"] += excess
+                    excess = 0
 
     def _fused_all():
         return acc[0] if len(acc) == 1 else mx.concatenate(acc, axis=1)
@@ -635,6 +658,12 @@ def dflash_generate(
     if on_prefill is not None:
         _mark(len(ids))                # caches hold exactly `ids` (stable == n templates)
     pending_ctx = _fused_all()         # the first draft call appends the suffix's ctx
+    if trimmed["dropped"]:
+        # Rows the bound discarded would have been skipped inside append_ctx anyway; its
+        # skip logic advances cache.offset past them so rope positions stay absolute —
+        # reproduce that bump here (the window-restore preset above did the same).
+        for c in dcache:
+            c.offset += trimmed["dropped"]
     pending = _pick(logits[0, -1], temperature, top_p, top_k)
     out_ids: list[int] = [pending]
     accept_lengths: list[int] = []
@@ -646,6 +675,10 @@ def dflash_generate(
         # committed positions to the draft KV cache (DFlash caches only ctx KV, never
         # block KV) -> correct absolute RoPE offsets, no trim needed.
         if cap_controller is not None:
+            # live context depth -> the controller's verify pricing (the measured
+            # width-x-depth KV term; without it the model ranks wide caps as ~free at
+            # any depth and ratchets up — measured 1.04x vs cap 3's 1.48x at 32k)
+            cap_controller.set_depth(len(ids) + len(out_ids))
             cap = max(1, min(cap_controller.cap, cap_ceiling))
         block = mx.array([[pending] + [mask_id] * (bs - 1)])
         sel = getattr(drafter, "candidate_selector", None)   # DFlash 2 path when present
@@ -1038,6 +1071,8 @@ def speculative_generate(
             )[:max_new_tokens - len(out_ids)]
         use_conf = confidence_threshold > 0.0 and drafter.confidence_head is not None
         if cap_controller is not None and not lk_draft:
+            # live context depth -> the controller's verify pricing (see dflash_generate)
+            cap_controller.set_depth(len(ids) + len(out_ids))
             # cap 0 = the controller parked speculation (live acceptance too low for this
             # machine's verify slope): run a plain committed step; probe rounds re-enter.
             cap = max(0, min(cap_controller.cap, cap_ceiling))

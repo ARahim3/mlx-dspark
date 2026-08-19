@@ -255,7 +255,7 @@ def test_config_rejects_log_snr_without_bounds(tmp_path):
 # ---------------------------------------------------------------- hybrid target verify
 
 
-def _tiny_hybrid():
+def _tiny_hybrid(head_dim: int = 8):
     """A real (tiny, random) mlx-lm qwen3_5 hybrid model: 3 linear + 1 full-attn layers."""
     from mlx_lm.models.qwen3_5 import Model, ModelArgs
 
@@ -264,7 +264,7 @@ def _tiny_hybrid():
         "text_config": {
             "model_type": "qwen3_5_text",
             "hidden_size": 32, "intermediate_size": 64, "num_hidden_layers": 4,
-            "num_attention_heads": 4, "num_key_value_heads": 2, "head_dim": 8,
+            "num_attention_heads": 4, "num_key_value_heads": 2, "head_dim": head_dim,
             "vocab_size": 64, "rms_norm_eps": 1e-6,
             "linear_num_value_heads": 4, "linear_num_key_heads": 2,
             "linear_key_head_dim": 8, "linear_value_head_dim": 8,
@@ -527,3 +527,44 @@ def test_gguf_drafter_scheme_parses():
     with patch("mlx_dspark.gguf_convert.ensure_converted", return_value="/tmp/x") as ec:
         assert _resolve("gguf:some-org/some-repo/some-drafter-bf16.gguf") == "/tmp/x"
         ec.assert_called_once_with("some-org/some-repo", "some-drafter-bf16.gguf")
+
+
+def test_hybrid_kv_bits_builds_mixed_cache_and_rollback_matches_committed():
+    """kv_bits on a gated-DeltaNet hybrid quantizes ONLY the full-attention layers' KV —
+    the entire per-token cache growth, and the whole verify depth slope at long context
+    (NOTES "Long-context decode", 2026-08-20) — while recurrent layers keep their
+    fixed-size ArraysCache. The dense kv-bits guarantee carries over: spec verify +
+    partial-accept rollback on the kv8 cache reproduces the kv8 committed forward.
+    (head_dim 32 + kv_group_size 32: mlx quantization needs groups of >= 32.)"""
+    from mlx_lm.models.cache import KVCache, QuantizedKVCache
+
+    t = Target(_tiny_hybrid(head_dim=32), tokenizer=None, kv_bits=8, kv_group_size=32)
+    kinds = [type(c) for c in t.make_cache()]
+    assert kinds.count(QuantizedKVCache) == 1        # 1 of 4 layers is full attention
+    assert KVCache not in kinds
+
+    committed = [1, 2, 3, 4, 5, 6, 7, 10, 11, 12]
+    ref = _committed_reference(t, committed)         # kv8 end to end (same make_cache)
+
+    cache = t.make_cache()
+    t.reset_spec()
+    t.run(mx.array([committed[:5]]), cache, [0])
+    v1, _ = t.verify(mx.array([[6, 7, 8, 9]]), cache, [0])
+    assert v1.shape[1] == 4
+    t.rollback(cache, 2, [7])                        # rebuilds state at [.., 6, 7]
+    v2, _ = t.verify(mx.array([[10, 11, 12]]), cache, [0])
+    assert bool(mx.allclose(v2[0], ref[-3:], atol=1e-4, rtol=1e-4).item())
+
+
+def test_hybrid_kv_bits_mamba2_refused_with_reason():
+    """The Mamba-2 (nemotron_h) mixed-cache path is unvalidated — refuse it by name."""
+    import pytest
+
+    class _Layer:
+        block_type = "M"
+
+    class _Fake:
+        layers = [_Layer()]
+
+    with pytest.raises(ValueError, match="Mamba-2"):
+        Target(_Fake(), tokenizer=None, kv_bits=8)

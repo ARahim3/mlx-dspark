@@ -62,6 +62,9 @@ MODES = ("dspark", "dflash", "lookup", "baseline")
 # generations piling up behind that thread is exactly what looked like a wedged server.
 # Env-overridable for aggressive proxies (and for exercising the path without a 15 s wait).
 STREAM_KEEPALIVE_S = float(os.environ.get("MLX_DSPARK_STREAM_KEEPALIVE_S", "") or 15.0)
+# Log any inter-round gap longer than this (stderr, with mode/cap/ctx) — the remote
+# diagnostic for "generation stalled mid-stream" reports (issue #19). 0 disables.
+SLOW_ROUND_LOG_S = float(os.environ.get("MLX_DSPARK_SLOW_ROUND_LOG_S", "") or 10.0)
 
 # The union of effort vocabularies across template lineages (Qwen3.8 knows low/medium/xhigh,
 # harmony-style templates low/medium/high). Values outside a given template's own vocabulary
@@ -107,7 +110,7 @@ def _context_window(target_repo: str) -> int | None:
     return None
 
 
-def _kv_bytes_per_token(cfg: dict) -> int | None:
+def _kv_bytes_per_token(cfg: dict, kv_bits: int | None = None) -> int | None:
     """Estimated bytes of *context-growing* target KV cache per token, from ``config.json``.
 
     ``attn_layers × kv_heads × head_dim × 2 (K+V) × 2 (16-bit)`` — only the full-attention
@@ -140,7 +143,10 @@ def _kv_bytes_per_token(cfg: dict) -> int | None:
         elif isinstance(c.get("full_attention_interval"), int) \
                 and c["full_attention_interval"] > 0:
             attn = layers // c["full_attention_interval"]
-        return int(attn) * int(kv_heads) * int(head_dim) * 2 * 2
+        # Quantized KV shrinks the per-element bytes; each group of 64 adds a 16-bit
+        # scale + bias (= 0.5 bits/element), so kv8 ≈ 0.53x and kv4 ≈ 0.28x of 16-bit.
+        bytes_per_elem = 2.0 if not kv_bits else (kv_bits + 0.5) / 8
+        return int(int(attn) * int(kv_heads) * int(head_dim) * 2 * bytes_per_elem)
     return None
 
 
@@ -240,6 +246,7 @@ class Engine:
         context_window: int | None = None,
         small_m: bool = False,
         executor: ThreadPoolExecutor | None = None,
+        depth_capper=None,
     ):
         self.target = target
         self.tokenizer = tokenizer
@@ -251,6 +258,13 @@ class Engine:
         self.max_draft_tokens = max_draft_tokens
         self.confidence_threshold = confidence_threshold
         self.cap_controller = cap_controller               # --max-draft auto (persists across requests)
+        # Depth-aware refinement of a DERIVED default cap (None when the user pinned one):
+        # a CapController used purely as the measured cost model, so long-prompt requests
+        # shrink the verify width instead of running the chat-depth cap into the measured
+        # width-x-depth KV-read term (cap 7 at 32k measured 1.05x vs cap 3's 1.48x on
+        # Qwen3.8-27B-4bit — NOTES "Long-context decode").
+        self._depth_capper = depth_capper
+        self._last_cap = max_draft_tokens                  # effective cap of the last request
         self.sampling_defaults = dict(sampling_defaults or {})
         self.default_max_tokens = default_max_tokens
         self.max_tokens_cap = max_tokens_cap
@@ -501,6 +515,7 @@ class Engine:
 
         tgt, tok, draft, cap_controller, small_m_active = \
             executor.submit(_load_models).result()
+        user_pinned_cap = isinstance(max_draft_tokens, int)
         if max_draft_tokens == "auto":
             max_draft_tokens = None                     # controller drives, up to the full block
         # default cap: dspark derives it from this machine+model+quant's measured curves
@@ -517,6 +532,22 @@ class Engine:
                     drafter_repo=drafter_repo).result()
             elif mode == "lookup":
                 max_draft_tokens = 6
+        # DERIVED caps get depth-aware per-request refinement (instant here: static_cap
+        # above already measured-or-loaded the curves; this reuses the same cache entry,
+        # plus a one-time depth-slope backfill). A user-pinned cap is never overridden.
+        depth_capper = None
+        if (not user_pinned_cap and cap_controller is None
+                and mode in ("dspark", "dflash") and draft is not None):
+            from .calibrate import calibrate
+
+            def _mk_capper():
+                try:
+                    return calibrate(tgt, draft, mode=mode, target_repo=target_repo,
+                                     drafter_repo=drafter_repo, verbose=False)
+                except Exception:  # noqa: BLE001 — depth pricing is an optimization, never a gate
+                    return None
+
+            depth_capper = executor.submit(_mk_capper).result()
         model_id = target_repo.rstrip("/").split("/")[-1]
         template_defaults = {} if enable_thinking is None else {"enable_thinking": enable_thinking}
         if reasoning_effort is not None:
@@ -540,7 +571,7 @@ class Engine:
 
             cfg = _target_config(target_repo)
             warn = _context_ram_warning(
-                _kv_bytes_per_token(cfg) if cfg else None, window,
+                _kv_bytes_per_token(cfg, kv_bits) if cfg else None, window,
                 mx.get_active_memory(),
                 mx.device_info().get("max_recommended_working_set_size"))
             if warn:
@@ -561,7 +592,8 @@ class Engine:
                    wired_limit=wired_limit,
                    context_window=window,
                    small_m=small_m_active,
-                   executor=executor)
+                   executor=executor,
+                   depth_capper=depth_capper)
 
     # --- generation ---
     def generate(
@@ -584,10 +616,32 @@ class Engine:
             self._generate_impl, prompt_ids, max_tokens, temperature, top_p, top_k,
             stop, seed, on_text, presence_penalty, frequency_penalty, logprobs).result()
 
+    def _with_slow_round_log(self, inner, n_prompt: int):
+        """Wrap a per-round callback with a stall detector: any gap over
+        ``SLOW_ROUND_LOG_S`` between rounds is logged with the live shape (mode/cap/ctx).
+        Exists for remote diagnosis of reports like issue #19's M5 ~100 s mid-stream
+        stall — it answers "was the stall inside the generation loop, and at what depth/
+        cap" without a profiler. The first round is exempt (its gap is the prefill)."""
+        state = {"t": None, "n": 0}
+
+        def wrapped(**kw):
+            now = time.time()
+            prev, state["t"] = state["t"], now
+            state["n"] += kw.get("committed") or 0
+            if SLOW_ROUND_LOG_S and prev is not None and now - prev > SLOW_ROUND_LOG_S:
+                print(f"[serve] slow round: {now - prev:.1f}s between rounds "
+                      f"(mode={self.mode} cap={kw.get('cap')} "
+                      f"ctx~{n_prompt + state['n']})", file=sys.stderr, flush=True)
+            if inner is not None:
+                inner(**kw)
+
+        return wrapped
+
     def _generate_impl(self, prompt_ids, max_tokens, temperature, top_p, top_k, stop, seed,
                        on_text, presence_penalty=0.0, frequency_penalty=0.0,
                        logprobs=None) -> GenResult:
-        on_round = RoundRecorder(self.rounds, uuid.uuid4().hex[:8], self.mode)
+        on_round = self._with_slow_round_log(
+            RoundRecorder(self.rounds, uuid.uuid4().hex[:8], self.mode), len(prompt_ids))
         # prefix caching: reuse the shared conversation prefix's KV (all modes; dflash is
         # checkpoint-only); `cache is None` means prefix caching is disabled.
         cache = ctx = None
@@ -622,12 +676,26 @@ class Engine:
                         self.prefix.checkpoint(c, x, pos, _ids)
                     elif pos < _stable:
                         self.prefix.rung(c, pos)
+        # Depth-aware cap for DERIVED defaults: a long prompt shrinks the verify width,
+        # because verify cost carries a measured width-x-depth KV-read term the flat
+        # chat-depth curves can't see (cap 7 at 32k measured 1.05x vs cap 3's 1.48x;
+        # below ~4k ctx the refinement is a no-op by construction). A user-pinned cap
+        # (no _depth_capper) is never touched; --max-draft auto prices depth inside the
+        # controller instead (set_depth from the loops).
+        eff_cap = self.max_draft_tokens
+        if self._depth_capper is not None and self.mode in ("dspark", "dflash"):
+            from .calibrate import STATIC_PRIOR_P
+            default = (self.max_draft_tokens if self.max_draft_tokens is not None
+                       else self._depth_capper.max_cap)          # dflash: full block
+            eff_cap = self._depth_capper.depth_adjusted_cap(
+                len(prompt_ids), default, STATIC_PRIOR_P)
+        self._last_cap = eff_cap
         try:
             if self.mode == "dspark":
                 res = speculative_generate(
                     self.target, self.tokenizer, self.drafter, prompt_ids=prompt_ids,
                     cache=cache, ctx_caches=ctx, reuse_len=reuse_len,
-                    max_new_tokens=max_tokens, max_draft_tokens=self.max_draft_tokens,
+                    max_new_tokens=max_tokens, max_draft_tokens=eff_cap,
                     cap_controller=self.cap_controller, lookup_drafts=self.lookup_drafts,
                     lookup_long_draft=self.lookup_long_draft,
                     confidence_threshold=self.confidence_threshold,
@@ -640,7 +708,7 @@ class Engine:
                 res = dflash_generate(
                     self.target, self.tokenizer, self.drafter, prompt_ids=prompt_ids,
                     cache=cache, ctx_caches=ctx, reuse_len=reuse_len,
-                    max_new_tokens=max_tokens, max_draft_tokens=self.max_draft_tokens,
+                    max_new_tokens=max_tokens, max_draft_tokens=eff_cap,
                     cap_controller=self.cap_controller,
                     temperature=temperature, top_p=top_p, top_k=top_k,
                     seed=seed, stop=stop, on_text=on_text, on_round=on_round,
@@ -692,8 +760,9 @@ class Engine:
         }
         if self.cap_controller is not None:
             info["cap"] = self.cap_controller.cap
-        elif self.max_draft_tokens is not None:
-            info["cap"] = self.max_draft_tokens      # incl. the curve-derived default
+        elif self._last_cap is not None:
+            info["cap"] = self._last_cap             # incl. the curve-derived default,
+            #                                          after any depth-aware refinement
         if res.lookup_rounds:
             info["lookup_rounds"] = res.lookup_rounds
         return info
@@ -1389,6 +1458,15 @@ class EngineHolder:
                     if inner is not None and inner is not old and hasattr(inner, "close"):
                         inner.close()
 
+                if context_window is not None:
+                    # STICKY across swaps: a context window is a machine/RAM policy, not a
+                    # per-pair tuning — scripts that set it once expect it to survive a later
+                    # /admin/load that omits the field (community report: an omitted override
+                    # silently reverted a 32k cap to the model's 262k max). 0 resets to the
+                    # model's own maximum. Per-pair knobs (mode/max_draft/lookup_drafts/
+                    # confidence) stay per-swap: omitted, they re-resolve to the pair's
+                    # measured defaults, which IS their reset semantics.
+                    self._load_kwargs["context_window"] = context_window or None
                 kwargs = dict(self._load_kwargs)
                 kwargs["model"] = model
                 if mode is not None:
@@ -1399,8 +1477,6 @@ class EngineHolder:
                     kwargs["lookup_drafts"] = lookup_drafts
                 if confidence_threshold is not None:
                     kwargs["confidence_threshold"] = confidence_threshold
-                if context_window is not None:
-                    kwargs["context_window"] = context_window
                 if small_m is not None:
                     kwargs["small_m"] = small_m
                 if kv_bits is not None:
@@ -1743,10 +1819,12 @@ def make_handler(engine: Engine, api_key: str | None):
             context_window = req.get("context_window")
             if context_window is not None and (
                     isinstance(context_window, bool) or not isinstance(context_window, int)
-                    or not 1024 <= context_window <= 10_000_000):
+                    or (context_window != 0
+                        and not 1024 <= context_window <= 10_000_000)):
                 return self._send_error(400, "'context_window' must be an integer token "
-                                             "count >= 1024 (omit it to use the model's "
-                                             "own maximum)")
+                                             "count >= 1024, or 0 to reset to the model's "
+                                             "own maximum (omit it to keep the current "
+                                             "setting — it is sticky across loads)")
             small_m = req.get("small_m")
             if small_m is not None and not isinstance(small_m, bool):
                 return self._send_error(400, "'small_m' must be a boolean (false forces the "
@@ -2293,7 +2371,17 @@ def make_handler(engine: Engine, api_key: str | None):
             def _heartbeat():
                 while not done.wait(STREAM_KEEPALIVE_S):
                     try:
-                        self._sse_comment("keepalive")
+                        if chat:
+                            # A spec-legal EMPTY delta chunk, not an SSE comment: most
+                            # client SDKs never surface comments, so a comment doesn't
+                            # reset their inter-chunk idle timer and a long quiet stretch
+                            # (a 32k prefill, a long tool-gated tail) still times the
+                            # stream out client-side (issue #19's DSH at 300 s). An empty
+                            # delta parses as a normal chunk everywhere — OpenAI itself
+                            # emits them (role-only and final chunks).
+                            self._sse(base({}, None))
+                        else:
+                            self._sse_comment("keepalive")
                     except OSError:
                         gone.set()
                         return
@@ -2337,18 +2425,43 @@ def make_handler(engine: Engine, api_key: str | None):
             raises StopStreaming once the keep-alive thread has seen the socket die
             (``gone`` is the same signal as a checkable flag)."""
             if want_tools:
-                # buffer, then emit tool_calls (or cleaned content) in one delta — incremental
-                # tool-call streaming isn't reliable to reconstruct, so we resolve at the end.
-                # `alive` still rides along as on_text (its text ignored): without it a
-                # buffered generation had NO disconnect signal at all and ran to max_tokens
-                # holding the MLX thread — the issue-#14 pile-up.
-                res = engine.generate(prompt_ids, on_text=lambda _piece: alive(), **params)
+                # Stream reasoning AND pre-tool-call answer text live; buffer only from the
+                # first native tool-call marker on (the _ToolGate composition the Anthropic
+                # dialect has had since v0.6.0). This used to buffer the ENTIRE generation
+                # into one end-of-stream delta — with thinking models' 4-6k-token reasoning
+                # preambles that meant minutes of dead air, and agent clients with
+                # inter-chunk idle timeouts (DSH/pi, 300 s) dropped the stream and lost the
+                # whole turn (issue #19). Only whole tool_use blocks land atomically at the
+                # end — incremental tool-call streaming isn't reliable to reconstruct.
+                splitter = A.ThinkingStreamSplitter(
+                    in_thinking=self._prompt_opens_thinking(prompt_ids))
+                gate = A._ToolGate()
+
+                def _emit_tools_split(chunks):
+                    for kind, text in chunks:
+                        if not text:
+                            continue
+                        if kind == "reasoning":
+                            self._sse(base({"reasoning_content": text}, None))
+                        else:
+                            safe = gate.feed(text)
+                            if safe:
+                                self._sse(base({"content": safe}, None))
+
+                def on_text(piece: str):
+                    alive()
+                    try:
+                        _emit_tools_split(splitter.feed(piece))
+                    except (BrokenPipeError, ConnectionResetError) as e:
+                        raise StopStreaming() from e
+                res = engine.generate(prompt_ids, on_text=on_text, **params)
                 if gone.is_set():
                     return res, res.finish_reason   # nobody listening; skip the emission
-                reasoning, answer = A.split_thinking(res.text)
-                parsed, cleaned = parse_tool_calls(answer, schema_types(req.get("tools")))
-                if reasoning:
-                    self._sse(base({"reasoning_content": reasoning}, None))
+                _emit_tools_split(splitter.feed("", final=True))
+                # the gate's held-back tail: everything from the first marker (a complete
+                # tool-call markup), or just the marker-length holdback when none appeared
+                tail = gate.buf[gate.sent:]
+                parsed, cleaned = parse_tool_calls(tail, schema_types(req.get("tools")))
                 if parsed:
                     self._sse(base({"tool_calls": [{"index": i, **tc}
                                                    for i, tc in enumerate(parsed)]}, None))

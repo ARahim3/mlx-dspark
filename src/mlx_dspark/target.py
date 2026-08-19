@@ -56,10 +56,15 @@ class Target:
         if kv_bits and self.is_vlm:
             raise ValueError("--kv-bits is supported for mlx-lm text targets only "
                              "(the mlx-vlm/gemma-4 cache layout is managed by mlx-vlm)")
-        if kv_bits and self.is_hybrid:
-            raise ValueError("--kv-bits is unsupported for hybrid linear-attention targets "
-                             "(their recurrent-state caches are not KV caches; only 16 of "
-                             "64 layers even hold KV). Run without --kv-bits.")
+        if kv_bits and self._recurrence == "mamba2":
+            raise ValueError("--kv-bits is not yet supported for Mamba-2 hybrid targets "
+                             "(nemotron_h) — the mixed-cache path is only validated on the "
+                             "gated-DeltaNet families. Run without --kv-bits.")
+        # gated-DeltaNet hybrids (qwen3_5 / qwen3_5_moe): kv_bits quantizes ONLY the
+        # full-attention layers' KV caches (make_cache builds a mixed list); the recurrent
+        # ArraysCache layers are fixed-size state, not KV, and stay untouched. Those few KV
+        # layers are the ENTIRE per-token cache growth (64 KB/token on Qwen3.8-27B) and the
+        # entire verify depth slope — see NOTES "Long-context decode" (2026-08-20).
         self.kv_bits = int(kv_bits) if kv_bits else None
         self.kv_group_size = int(kv_group_size)
         if not self.is_vlm:
@@ -83,16 +88,22 @@ class Target:
     def make_cache(self):
         if self.is_vlm:
             return self.model.language_model.make_cache()
+        from mlx_lm.models.cache import make_prompt_cache
+        cache = make_prompt_cache(self.model)
         if self.kv_bits:
             # Quantized KV from token 0: trimmable (spec rollback + prefix reuse work
             # unchanged), halves-or-quarters the KV bandwidth bill on long contexts.
             # Output is the greedy decoding of the KV-quantized target (a quality knob of
             # the same class as target quantization, not a spec-decoding approximation).
-            from mlx_lm.models.cache import QuantizedKVCache
-            return [QuantizedKVCache(self.kv_group_size, self.kv_bits)
-                    for _ in self.model.layers]
-        from mlx_lm.models.cache import make_prompt_cache
-        return make_prompt_cache(self.model)
+            # Replace exactly the plain-KVCache entries: on a dense target that is every
+            # layer (the old uniform build); on a gated-DeltaNet hybrid only the
+            # full-attention layers — the recurrent ArraysCache layers are fixed-size
+            # state, not KV. mlx-lm's shared attention helper dispatches per-cache
+            # (hasattr(cache, "bits")), so a mixed list needs no model-side support.
+            from mlx_lm.models.cache import KVCache, QuantizedKVCache
+            cache = [QuantizedKVCache(self.kv_group_size, self.kv_bits)
+                     if type(c) is KVCache else c for c in cache]
+        return cache
 
     # -- forward with hidden-state tap --
     def run(self, ids: mx.array, cache, tap: list[int]):

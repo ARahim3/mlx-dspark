@@ -260,9 +260,11 @@ class TestSwapConfidence:
         h._loading = False
         assert "download" not in h.status()
 
-    def test_swap_context_window_override(self, monkeypatch):
-        """context_window rides the swap as a per-load override (the KV-RAM lever);
-        absent, the server's stored kwargs pass through untouched."""
+    def test_swap_context_window_override_is_sticky(self, monkeypatch):
+        """context_window rides the swap as a load override (the KV-RAM lever) and is
+        STICKY: a later swap that omits it keeps the last explicit value instead of
+        reverting to the model's 262k max (community report — scripts set it once).
+        Explicit 0 resets to the model's own maximum."""
         h = EngineHolder(FakeEngine("old"), load_kwargs={"context_window": None})
         captured = {}
 
@@ -278,7 +280,13 @@ class TestSwapConfidence:
         h.swap(model="repo", context_window=32768)
         assert captured["context_window"] == 32768
         captured.clear()
-        h.swap(model="repo2")
+        h.swap(model="repo2")                            # omitted -> keeps 32768
+        assert captured["context_window"] == 32768
+        captured.clear()
+        h.swap(model="repo3", context_window=0)          # 0 -> back to the model's max
+        assert captured["context_window"] is None
+        captured.clear()
+        h.swap(model="repo4")                            # and the reset sticks too
         assert captured["context_window"] is None
 
 

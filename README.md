@@ -892,16 +892,25 @@ identical acceptance; 4-bit is simply fastest).
 
 ### Long context
 
-The speculative speedup **holds with context depth** — measured flat at ~1.6× out to 12k+ tokens on
-Qwen3-4B (M4 Pro, mlx 0.31.2; absolute levels are higher on 0.32 — the flatness is the point). (Before v0.3.1 the drafter tiled its GQA/MQA KV cache redundantly every round, which
-scaled with depth and made speculation go *net-negative* past a few thousand tokens on cheap-verify
-targets; that's fixed — the fix is bit-for-bit identical output.) On expensive-verify targets (Gemma-12B)
-speculation actually *gains* slightly with depth, since the target slows faster than the cheap drafter.
+**The verify width now adapts to context depth** (2026-08-20, unreleased). Verify cost is not
+depth-flat: with 2–8 rows Metal's attention kernel re-reads the whole KV cache once *per row*, so a
+wide verify that is free at chat depth gets expensive at agent depth — measured on Qwen3.8-27B-4bit
+(M4 Pro, decode-only, same accept), the fixed cap-7 configs fell from 1.17–1.41× at 2k context to
+**0.53–0.97× (net loss) at 32k**, while cap 3 at 32k still gives **1.48×**. So calibration now also
+measures each pair's per-width *depth slope* (one-time, cached), and both the derived default cap and
+`--max-draft auto` price it: short prompts keep the measured chat-depth optimum untouched, long prompts
+shrink the verify width automatically. A cap you set explicitly is never overridden. (History: before
+v0.3.1 the *drafter* also had a depth-scaling bug — redundant GQA/KV tiling — fixed bit-identically;
+the 2026-08-20 finding is the verify side, and it explains "slows down a lot on large context" reports
+with DFlash 2/DSpark at coding-agent context sizes.)
 
 Two things do still grow with a longer prompt, for **every** decoder (baseline, `mlx-lm`, this) — not the
 speculative speedup: **time-to-first-token** (reading an *L*-token prompt is inherent work) and **per-token
-decode** (attention reads a longer KV cache). Soften both with prefix caching (reuse the conversation prefix
-across turns, on by default) and `--kv-bits 8` (quantized KV cache — the long-context bandwidth lever).
+decode** (attention reads a longer KV cache). Prefix caching (on by default) is the lever for the first.
+`--kv-bits 8` halves the KV **RAM** (and now works on the hybrid Qwen3.6/3.8/Ornith-class targets too —
+only their full-attention layers quantize); treat it as a context-length/RAM lever, not a speed lever —
+measured at 32k the quantized-KV attention kernel is a little *slower* than bf16 at the widths that
+matter, so leave it off unless RAM is the constraint.
 
 The third thing that grows is **RAM**: the KV cache is linear in context. Measured on Qwen3.8-27B it costs
 **0.086 GB per 1k tokens of context** (identical for both quants — the cache is bf16 regardless of weight

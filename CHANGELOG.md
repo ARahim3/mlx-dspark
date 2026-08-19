@@ -2,6 +2,59 @@
 
 All notable changes to `mlx-dspark`. Versions follow [SemVer](https://semver.org/) (pre-1.0: minor-ish features land as patch bumps).
 
+## [0.14.0] — 2026-08-20 — depth-aware verify caps: long-context decode fixed
+
+### Fixed
+- **OpenAI tool-calls streams no longer buffer the whole generation** (issue #19). With
+  `tools` in a streaming request, the server used to hold back every token until the end —
+  with thinking models' 4–6k-token reasoning preambles that meant minutes of dead air, and
+  agent clients with inter-chunk idle timeouts (DSH/pi at 300 s) dropped the stream and lost
+  the turn. Now reasoning streams live as `reasoning_content` deltas and pre-tool-call answer
+  text streams as `content`; only whole `tool_calls` land atomically at the end (the same
+  splitter+gate composition the Anthropic dialect has had since v0.6.0).
+- **Stream keep-alives on the chat dialect are now spec-legal empty-delta chunks**, not SSE
+  comments — most client SDKs never surface comments, so a comment didn't reset their idle
+  timer and a long quiet stretch (a 32k prefill, a long tool tail) still timed the stream out
+  client-side. An empty delta parses as a normal chunk everywhere. The Anthropic dialect
+  already used native `ping` events; legacy `/v1/completions` keeps the comment.
+- **Slow-round diagnostic**: any inter-round gap over 10 s (`MLX_DSPARK_SLOW_ROUND_LOG_S`)
+  is logged to stderr with mode/cap/context — so "generation stalled mid-stream" reports can
+  say whether the stall was inside the loop and at what depth, without a profiler.
+- **Long-context decode collapse: the verify width now adapts to context depth.** Community
+  report ("slowing down a lot on large context") reproduced and root-caused: with 2–8 query
+  rows Metal's attention kernel re-reads the whole KV cache once per row, so verify cost picks
+  up a width-proportional depth term the chat-depth calibration curves cannot see — measured
+  on Qwen3.8-27B-4bit the shipped cap-7 defaults fell from 1.17–1.41× at 2k context to
+  **0.53×/0.97× (net loss) at 32k** while cap 3 there still gives **1.48×**, with acceptance
+  flat throughout. Calibration now also measures each pair's per-width **verify depth slope**
+  (one-time ~10 s, backfilled into existing cache entries), `--max-draft auto` prices it live
+  (the controller's observed-time feedback alone measurably failed to fix depth), and the
+  server refines a **derived** default cap per request from the prompt length — a no-op below
+  ~4k context (every measured chat-depth default, including dflash's full block, is
+  untouched), shrink-only beyond it, and never applied to a cap you set explicitly.
+  `spec_info.cap` reports the effective value. Full write-up: NOTES "Long-context decode".
+
+### Added
+- **`--kv-bits` now works on gated-DeltaNet hybrid targets** (qwen3_5 / qwen3_5_moe — so
+  Qwen3.6/3.8/Ornith/Bonsai-class models). `make_cache` builds a MIXED cache: only the
+  full-attention layers' KV is quantized (on Qwen3.8-27B those 16 of 64 layers are the
+  entire 64 KB/token context growth — and the entire long-context decode slowdown, see
+  NOTES "Long-context decode"); the recurrent layers keep their fixed-size state
+  untouched. Spec verify + hybrid rollback + prefix caching all carry the quantized
+  entries unchanged (the machinery is generic over cache state); a model-free test pins
+  spec-with-rollback == committed-forward on the kv8 mixed cache. Mamba-2 hybrids
+  (nemotron_h) stay refused by name until measured. The RAM-aware context warning now
+  also scales its estimate by the configured kv-bits.
+
+### Changed
+- **`context_window` is now sticky across `/admin/load`s** (community report: scripts that set
+  it once via a manual `/admin/load` found a later load without the field silently reverting to
+  the model's 262k maximum — a RAM hazard on machines the cap was protecting). An explicit value
+  persists until changed; `0` resets to the model's own maximum; omitted keeps the current
+  setting. Per-pair knobs (`mode`/`max_draft`/`lookup_drafts`/`confidence_threshold`) are
+  unchanged: omitted, they re-resolve to the pair's measured defaults on every swap — that IS
+  their reset semantics, so they stay per-swap by design.
+
 ## [0.13.1] — 2026-08-19 — kv_bits joins the /admin/load overrides
 
 ### Added

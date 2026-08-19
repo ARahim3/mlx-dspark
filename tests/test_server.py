@@ -799,16 +799,29 @@ def _slow_server(monkeypatch, keepalive: float, **engine_kw):
     return eng, httpd
 
 
-def test_tools_stream_sends_keepalives_while_buffering(monkeypatch):
-    """The tool-calls stream buffers the whole generation (role chunk, then one delta at
-    the end) — issue #14's client saw that as 300 s of dead air and timed out. Keep-alive
-    SSE comments now flow through the buffered stretch."""
-    eng, httpd = _slow_server(monkeypatch, keepalive=0.03, pieces=8, delay=0.03)
+def test_tools_stream_streams_text_live_and_keepalives_are_real_chunks(monkeypatch):
+    """Issue #19: the tool-calls stream used to buffer the WHOLE generation (role chunk,
+    then one delta at the end) — a thinking model's 4-6k-token reasoning preamble meant
+    minutes of dead air, and agent clients' inter-chunk idle timers (DSH/pi, 300 s)
+    dropped the stream. Now pre-tool-call text streams live through the splitter+gate,
+    and the keep-alive on the chat dialect is a spec-legal EMPTY DELTA chunk (SSE
+    comments never reset most SDKs' idle timers)."""
+    # 40 pieces x "x " = 80 chars: well past the gate's marker holdback (20 chars), so a
+    # healthy stretch must stream live; keepalive fires several times over the ~0.4 s run
+    eng, httpd = _slow_server(monkeypatch, keepalive=0.03, pieces=40, delay=0.01)
     try:
         base = f"http://127.0.0.1:{httpd.server_address[1]}"
         raw = _post(base, "/v1/chat/completions", _TOOLS_STREAM_REQ, stream=True)
-        assert ": keepalive" in raw                     # comments rode along mid-generation
-        assert raw.rstrip().endswith("data: [DONE]")    # and the stream still finishes clean
+        chunks = [json.loads(l[6:]) for l in raw.split("\n\n")
+                  if l.startswith("data: ") and l != "data: [DONE]"]
+        # live streaming: several separate content deltas, not one end-of-stream blob
+        content = [c for c in chunks if c["choices"][0]["delta"].get("content")]
+        assert len(content) >= 5
+        # keep-alives are data chunks with an empty delta — every SDK parses them
+        assert any(c["choices"][0]["delta"] == {} and c["choices"][0].get("finish_reason")
+                   is None for c in chunks)
+        assert ": keepalive" not in raw
+        assert raw.rstrip().endswith("data: [DONE]")    # and the stream finishes clean
         assert not eng.stopped_early
     finally:
         httpd.shutdown()
@@ -883,6 +896,16 @@ def test_kv_bytes_per_token_dense_and_patterns():
     assert S._kv_bytes_per_token({}) is None                     # config doesn't say
 
 
+def test_kv_bytes_per_token_scales_with_kv_bits():
+    """Quantized KV shrinks the estimate: bits + 0.5 bits/element of group scale+bias
+    (group 64, 16-bit scale + bias), so kv8 = 8.5/16 and kv4 = 4.5/16 of full precision."""
+    dense = {"num_hidden_layers": 36, "num_attention_heads": 32,
+             "num_key_value_heads": 8, "head_dim": 128, "hidden_size": 2560}
+    full = S._kv_bytes_per_token(dense)
+    assert S._kv_bytes_per_token(dense, 8) == int(full * 8.5 / 16)
+    assert S._kv_bytes_per_token(dense, 4) == int(full * 4.5 / 16)
+
+
 def test_context_ram_warning_triggers_and_suggests_a_cap():
     gb = 1024 ** 3
     # Issue #14's shape: ~29 GB resident, 262144-token window at 64 KB/token (~16 GB of
@@ -926,3 +949,36 @@ def test_admin_load_rejects_bad_kv_bits(holder_server):
             _post(base, "/admin/load", {"model": "repo", "kv_bits": bad})
         assert e.value.code == 400, bad
         assert "kv_bits" in json.loads(e.value.read())["error"]["message"]
+
+
+def test_tools_stream_reasoning_and_pretool_text_stream_incrementally(server):
+    """Issue #19's shape end to end: thinking + answer + tool call, with `tools` in the
+    request. The reasoning must arrive as MULTIPLE reasoning_content deltas while
+    generation runs (a thinking model's preamble is most of the wait), pre-marker answer
+    text streams as content, and the tool call still lands atomically at the end with
+    finish_reason tool_calls."""
+    eng, base = server
+    eng.response_text = ("<think>first I plan then I act on the plan carefully"
+                         "</think>Sure — calling it now for you. "
+                         '<tool_call>{"name": "f", "arguments": {"x": 1}}</tool_call>')
+    sse = _post(base, "/v1/chat/completions",
+                {"messages": [{"role": "user", "content": "call f"}], "tools": _TOOLS,
+                 "stream": True}, stream=True)
+    chunks = [json.loads(l[6:]) for l in sse.split("\n\n")
+              if l.startswith("data: ") and l != "data: [DONE]"]
+    reasoning = [c for c in chunks if c["choices"][0]["delta"].get("reasoning_content")]
+    content = "".join(c["choices"][0]["delta"].get("content", "") for c in chunks)
+    tc = [c for c in chunks if c["choices"][0]["delta"].get("tool_calls")]
+    assert len(reasoning) >= 3                      # incremental, not one end-of-stream blob
+    assert "".join(c["choices"][0]["delta"]["reasoning_content"]
+                   for c in reasoning).strip() == "first I plan then I act on the plan carefully"
+    assert content.strip() == "Sure — calling it now for you."
+    assert tc and tc[0]["choices"][0]["delta"]["tool_calls"][0]["function"]["name"] == "f"
+    assert json.loads(tc[0]["choices"][0]["delta"]["tool_calls"][0]["function"]["arguments"]) \
+        == {"x": 1}
+    assert chunks[-1]["choices"][0]["finish_reason"] == "tool_calls"
+    # ordering: every reasoning/content delta precedes the tool_calls delta
+    assert max(i for i, c in enumerate(chunks)
+               if c["choices"][0]["delta"].get("reasoning_content")
+               or c["choices"][0]["delta"].get("content")) \
+        < next(i for i, c in enumerate(chunks) if c["choices"][0]["delta"].get("tool_calls"))

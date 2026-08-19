@@ -46,8 +46,22 @@ SCHEMA = 4   # 2: verify curve includes width 1; adds the measured per-round ove
 # "|smm" tag so kernel-on and kernel-off curves never masquerade as each other.
 # (The small-M *shape* cache stores shape_key strings, whose format is NOT in this key;
 # a format change there is self-healed at load — see apply_small_m — not schema-gated.)
-CTX_LEN = 512          # curve shape is nearly ctx-independent (SDPA is flat in width)
+CTX_LEN = 512          # NOTE: the curves are ONLY valid near this depth. The old claim
+# here ("curve shape is nearly ctx-independent — SDPA is flat in width") is FALSE at
+# depth: multi-row SDPA re-reads the KV stream per query row, so verify(w) picks up a
+# depth term ~proportional to w x kv_bytes(ctx) — measured on Qwen3.8-27B-4bit, width-8
+# rounds gained +140 ms from 2k->32k ctx while width-1 gained +12 ms, which is what
+# drove the shipped cap-7 configs below 1.0x at 32k (NOTES "Long-context decode",
+# 2026-08-20). The fix is measured, like everything here: measure_verify_depth_slope
+# adds a per-width depth slope to the cached entry (backfilled on demand, like the
+# batch grid) and the cost model prices verify(w, ctx) = curve(w) + slope(w)·(ctx − 512).
+# The controller's observed-round-time feedback alone does NOT fix depth (measured
+# 2026-08-20: auto at 32k ratcheted back UP to wide caps and landed at 1.04x vs cap 3's
+# 1.48x — a uniform correction factor preserves the depth-blind model's cap RANKING).
 TOKEN_ID = 7           # arbitrary; timings are content-independent
+DEPTH_PROBE = 16384    # second depth for the verify slope: far enough from CTX_LEN that
+# the per-token term dominates timing noise, cheap enough to build synthetically (~1 GB
+# of KV on Qwen3.8-27B, a few seconds)
 
 
 def _bench(fn, iters: int = 8, warmup: int = 3) -> float:
@@ -84,6 +98,72 @@ def measure_verify_curve(target, tap: list[int], widths: list[int],
 
         curve[m] = _bench(fn)
     return curve
+
+
+def _inflate_kv(cache, depth: int) -> None:
+    """Grow every unbounded KV cache in ``cache`` to ``depth`` positions with synthetic
+    rows, appended through the cache's own ``update_and_fetch`` (attention cost depends on
+    length, not content). Plain and quantized KV caches grow; bounded (rotating) and
+    recurrent-state caches are left alone — depth does not grow their cost. Chunked so the
+    raw random rows never all materialize at once."""
+    from mlx_lm.models.cache import KVCache, QuantizedKVCache
+
+    for c in cache:
+        if c is None or type(c) not in (KVCache, QuantizedKVCache):
+            continue
+        if type(c) is KVCache:
+            if c.keys is None:
+                continue
+            B, H, _, dk = c.keys.shape
+            dv = c.values.shape[3]
+            dtype = c.keys.dtype
+        else:
+            if c.keys is None:
+                continue
+            el_per_int = 8 * 4 // c.bits            # uint32 packing
+            B, H = c.keys[0].shape[:2]
+            dk = c.keys[0].shape[3] * el_per_int
+            dv = c.values[0].shape[3] * el_per_int
+            dtype = c.keys[1].dtype                 # the scales carry the model dtype
+        while c.offset < depth:
+            s = min(4096, depth - c.offset)
+            c.update_and_fetch(
+                mx.random.normal((B, H, s, dk)).astype(dtype),
+                mx.random.normal((B, H, s, dv)).astype(dtype))
+            mx.eval(c.state)
+
+
+def measure_verify_depth_slope(target, tap: list[int], widths: list[int],
+                               d0: int = CTX_LEN, d1: int = DEPTH_PROBE,
+                               base_curve: dict[int, float] | None = None
+                               ) -> dict[int, float] | None:
+    """Per-width verify depth slope: extra ms per verify forward per token of context
+    beyond ``d0``. This is the term the ``d0``-depth curves cannot see — multi-row SDPA
+    re-reads the KV stream per query row, so it grows ~linearly in BOTH width and depth
+    (measured Qwen3.8-27B-4bit: width-8 rounds +140 ms from 2k to 32k while width-1 steps
+    gained +12 ms), and it is what drove wide caps below baseline at agent-size contexts.
+    ``base_curve`` is the already-measured ``d0`` curve (same timing harness). Returns
+    None for targets whose cache this can't inflate (mlx-vlm-managed layouts)."""
+    if getattr(target, "is_vlm", False):
+        return None
+    curve0 = base_curve or measure_verify_curve(target, tap, widths)
+    cache = target.make_cache()
+    mx.eval(target.run(mx.array([[TOKEN_ID] * d0]), cache, tap)[0])
+    _inflate_kv(cache, d1)
+    slope: dict[int, float] = {}
+    for m in sorted(widths):
+        x = mx.array([[TOKEN_ID] * m])
+
+        def fn(x=x, m=m):
+            logits, _ = target.run(x, cache, tap)
+            for c in cache:                      # roll back so every iteration is identical
+                if c is not None and hasattr(c, "trim"):
+                    c.trim(m)
+            return logits
+
+        slope[m] = max(0.0, (_bench(fn) - curve0[m]) / (d1 - d0))
+    mx.clear_cache()
+    return slope
 
 
 def measure_dspark_drafter_curve(drafter, caps: list[int],
@@ -312,9 +392,20 @@ class CapController:
                  alpha: float = 0.02, hysteresis: float = 1.03, repick_every: int = 4,
                  verify_grid: dict[int, dict[int, float]] | None = None,
                  allow_zero: bool = False, hybrid_replay: bool = False,
-                 probe_every: int = 8, overhead_ms: float = 0.0):
+                 probe_every: int = 8, overhead_ms: float = 0.0,
+                 depth_slope: dict[int, float] | None = None, depth0: int = 512):
         self.verify_ms = {int(k): float(v) for k, v in verify_ms.items()}
         self.drafter_ms = drafter_ms
+        # Verify depth pricing (measure_verify_depth_slope): extra ms per verify forward
+        # per token of context beyond depth0, by width. The loops feed the live context
+        # length via set_depth(); without it (depth 0) pricing reduces to the flat curves,
+        # so load-time behavior (static_best at chat depth) is unchanged. This is what
+        # keeps the model's cap RANKING honest at agent-size contexts — the observed-time
+        # feedback alone measurably fails to (see the module-top depth note).
+        self.depth_slope = ({int(k): float(v) for k, v in depth_slope.items()}
+                            if depth_slope else None)
+        self.depth0 = int(depth0)
+        self.depth = 0
         self.max_cap = max(1, int(max_cap))
         self.cap = max(1, min(init_cap, self.max_cap))
         self.p = prior_p
@@ -375,6 +466,17 @@ class CapController:
         self.overhead_ms = float(overhead_ms)
 
     # -- cost model --
+    def set_depth(self, n_ctx: int) -> None:
+        """Tell the pricing model the live context length (prompt + generated). Cheap —
+        the loops call it every round."""
+        self.depth = max(0, int(n_ctx))
+
+    def _depth_ms(self, width: int) -> float:
+        """Extra verify cost at the live depth for this width, 0 without slope data."""
+        if not self.depth_slope or self.depth <= self.depth0:
+            return 0.0
+        return _interp(self.depth_slope, width) * (self.depth - self.depth0)
+
     def _draft_cost(self, cap: int) -> float:
         if isinstance(self.drafter_ms, dict):
             return _interp({int(k): float(v) for k, v in self.drafter_ms.items()}, cap)
@@ -402,11 +504,12 @@ class CapController:
 
     def rate(self, cap: int) -> float:
         """Expected committed tokens per ms of round time at this cap. Cap 0 is a plain
-        step: one committed token for one width-1 forward, no drafter."""
+        step: one committed token for one width-1 forward, no drafter. Both include the
+        measured per-width depth term at the live context length (zero at chat depth)."""
         if cap == 0:
-            return 1.0 / max(_interp(self.verify_ms, 1), 1e-6)
+            return 1.0 / max(_interp(self.verify_ms, 1) + self._depth_ms(1), 1e-6)
         t = (self._draft_cost(cap) + _interp(self.verify_ms, cap + 1)
-             + self._replay_ms(cap) + self.overhead_ms)
+             + self._depth_ms(cap + 1) + self._replay_ms(cap) + self.overhead_ms)
         return self.expected_committed(cap) / max(t, 1e-6)
 
     def _rate_eff(self, cap: int) -> float:
@@ -485,10 +588,43 @@ class CapController:
         curve = self.verify_grid[b_key]
 
         def rate_b(c: int) -> float:
-            t = self._draft_cost(c) + _interp(curve, c + 1) + self.overhead_ms
+            # depth term: measured at B=1; an underestimate for B rows sharing the read,
+            # conservative in the same direction as the B=1 drafter-cost note above
+            t = (self._draft_cost(c) + _interp(curve, c + 1)
+                 + self._depth_ms(c + 1) + self.overhead_ms)
             return self.expected_committed(c) / max(t, 1e-6)
 
         return max(range(1, self.max_cap + 1), key=rate_b)
+
+    def static_best_at_depth(self, depth: int, p: float | None = None) -> int:
+        """:meth:`static_best` evaluated at a given context depth (prompt length)."""
+        saved = self.depth
+        self.depth = max(0, int(depth))
+        try:
+            return self.static_best(p)
+        finally:
+            self.depth = saved
+
+    def depth_adjusted_cap(self, depth: int, default_cap: int,
+                           p: float | None = None) -> int:
+        """Depth-aware refinement of a measured/derived default cap, for the fixed-cap
+        serving path. Below the noise floor — depth term under 15% of the block's verify
+        cost, i.e. inside this machine's ±14% benchmark noise — the measured default is
+        better evidence than the model and stands untouched (so chat-depth behavior,
+        including dflash's measured full-block default, never changes). Beyond it the
+        model's argmax at this depth takes over; it can only shrink the cap (the depth
+        term grows with width), never raise it."""
+        if not self.depth_slope or depth <= self.depth0:
+            return default_cap
+        w = default_cap + 1
+        saved = self.depth
+        self.depth = int(depth)
+        try:
+            if self._depth_ms(w) < 0.15 * _interp(self.verify_ms, w):
+                return default_cap
+            return min(default_cap, self.static_best(p))
+        finally:
+            self.depth = saved
 
     def static_best(self, p: float | None = None) -> int:
         """The single best FIXED cap for this machine+model+quant, straight off the measured
@@ -734,10 +870,10 @@ def calibrate(target, drafter, *, mode: str, target_repo: str, drafter_repo: str
     if smm_ids:
         key += "|smm"
     entry = load_cached(key, cache_dir)
+    tap = list(cfg.target_layer_ids)
     if entry is None:
         if verbose:
             print(f"calibrating {mode} cap for this machine (one-time, cached)…", flush=True)
-        tap = list(cfg.target_layer_ids)
         with small_m_matmul(smm_ids):
             verify = measure_verify_curve(target, tap, widths)
             if mode == "dspark":
@@ -773,10 +909,39 @@ def calibrate(target, drafter, *, mode: str, target_repo: str, drafter_repo: str
             vg[str(B)] = {str(k): v for k, v in row.items()}
         save_cached(key, entry, cache_dir)
 
+    # verify depth slope, measured on demand (backfills older cached entries, like the
+    # batch grid): the CTX_LEN curves alone price wide caps as ~free at ANY depth, which
+    # is false past a few k tokens of context — see the CTX_LEN note at the top.
+    if entry.get("verify_depth") is None:
+        vd: dict = {"d0": CTX_LEN, "d1": DEPTH_PROBE}
+        if getattr(target, "is_vlm", False):
+            vd["unsupported"] = True                 # mlx-vlm manages its own cache layout
+        else:
+            if verbose:
+                print("calibrating verify depth slope (one-time, cached)…", flush=True)
+            avail = sorted(int(k) for k in entry["verify"])
+            wsel = sorted({avail[0], avail[len(avail) // 2], avail[-1]})
+            base = {w: float(entry["verify"][str(w)]) for w in wsel}
+            with small_m_matmul(smm_ids):
+                slope = measure_verify_depth_slope(target, tap, wsel, base_curve=base)
+            if slope is None:
+                vd["unsupported"] = True
+            else:
+                vd["slope"] = {str(k): v for k, v in slope.items()}
+                if verbose:
+                    ss = " ".join(f"{k}:{v * 1000:.2f}" for k, v in sorted(slope.items()))
+                    print(f"  verify depth slope (ms per 1k ctx tokens, by width): {ss}",
+                          flush=True)
+        entry["verify_depth"] = vd
+        save_cached(key, entry, cache_dir)
+
     verify = {int(k): float(v) for k, v in entry["verify"].items()}
     drafter_ms = (entry["drafter"] if not isinstance(entry["drafter"], dict)
                   else {int(k): float(v) for k, v in entry["drafter"].items()})
+    vd = entry.get("verify_depth") or {}
+    depth_slope = {int(k): float(v) for k, v in (vd.get("slope") or {}).items()} or None
     ctrl = CapController(verify, drafter_ms, max_cap, init_cap=2,
+                         depth_slope=depth_slope, depth0=int(vd.get("d0", CTX_LEN)),
                          verify_grid=entry.get("verify_grid"),
                          # the dspark loop supports cap-0 (skip drafting) rounds.
                          # hybrid_replay stays False: since the capture-and-rerun

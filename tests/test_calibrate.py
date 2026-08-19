@@ -278,3 +278,33 @@ class TestCachedCurveEntry:
         base, cache = self._base(tmp_path)
         key, entry = cached_curve_entry("dspark", "T", "D", smm_live=True, cache_dir=cache)
         assert entry is None and key == base
+
+
+def test_depth_pricing_shrinks_the_cap_at_agent_context():
+    """The 2026-08-20 long-context finding, locked in. On the real Qwen3.8-27B-4bit
+    curves (small-M kernel: flat at widths 6-8) the chat-depth argmax is wide — but
+    verify carries a measured width-x-depth KV-read term (measure_verify_depth_slope)
+    that took the shipped cap 7 to 1.05x baseline at 32k ctx while cap 3 measured 1.48x.
+    With the slope wired in, the model must rank small caps on top at that depth, stand
+    pat at chat depth, and treat a missing slope (old cache entry) as a pure no-op."""
+    from mlx_dspark.calibrate import STATIC_PRIOR_P, CapController
+
+    verify = {1: 67.6, 2: 69.4, 3: 75.8, 4: 92.2, 5: 112.3, 6: 111.0, 7: 111.0, 8: 111.0}
+    slope = {1: 0.0004, 4: 0.0018, 8: 0.0046}       # ms per ctx token, measured shape
+    ctrl = CapController(verify, 25.0, max_cap=7, depth_slope=slope, depth0=512)
+    short = ctrl.static_best_at_depth(512, STATIC_PRIOR_P)
+    deep = ctrl.static_best_at_depth(32768, STATIC_PRIOR_P)
+    assert short == 7                                # flat curve: wide wins at chat depth
+    assert deep <= 3                                 # the measured 32k optimum region
+    # the fixed-path refinement: no-op inside the noise floor, shrink-only beyond it
+    assert ctrl.depth_adjusted_cap(2048, 7, STATIC_PRIOR_P) == 7
+    assert ctrl.depth_adjusted_cap(32768, 7, STATIC_PRIOR_P) == deep
+    assert ctrl.depth_adjusted_cap(32768, 2, STATIC_PRIOR_P) <= 2
+    # live pricing: set_depth moves the model's ranking the same way (the auto path)
+    ctrl.set_depth(32768)
+    assert ctrl.static_best(STATIC_PRIOR_P) <= 3
+    ctrl.set_depth(0)
+    assert ctrl.static_best(STATIC_PRIOR_P) == 7
+    # an entry without slope data behaves exactly as before
+    bare = CapController(verify, 25.0, max_cap=7)
+    assert bare.depth_adjusted_cap(32768, 7, STATIC_PRIOR_P) == 7

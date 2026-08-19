@@ -198,3 +198,26 @@ def test_append_ctx_advances_offsets_to_boundary():
         c.offset = w.start
     model.append_ctx(w.k, dcache)
     assert all(c.offset == 100 for c in dcache)
+
+def test_trimmed_prefill_accumulator_reproduces_full_path():
+    """dflash_generate bounds the prefill fused accumulator to the last (window - 1) rows
+    for all-sliding heads (the whole-prompt accumulation held ~30 KB/token at peak-prefill
+    RAM). Feeding only the kept tail with cache offsets advanced past the dropped rows —
+    the same bump append_ctx's skip logic performs — must reproduce the full-ctx forward:
+    same rope positions, same retained rows, same block output."""
+    sliding = 16
+    keep = sliding - 1
+    for n in [20, 47]:                                   # both well past the window
+        model = _tiny(sliding=sliding)
+        fused = mx.random.normal((1, n, 2 * 32))
+        full, dcache_full = _forward(model, fused)
+
+        dropped = n - keep
+        dcache_trim = model.make_cache()
+        for c in dcache_trim:
+            c.offset = dropped                           # generate.py's post-trim bump
+        block = mx.array([[1] + [3] * 3])
+        trimmedout = model.forward_hidden(block, fused[:, dropped:], dcache_trim,
+                                          logits_start=1)
+        assert np.allclose(np.array(full), np.array(trimmedout), atol=1e-5), n
+        assert dcache_trim[0].offset == dcache_full[0].offset == n
