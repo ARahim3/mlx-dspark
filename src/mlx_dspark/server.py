@@ -1368,7 +1368,8 @@ class EngineHolder:
              lookup_drafts: bool | None = None,
              confidence_threshold: float | None = None,
              context_window: int | None = None,
-             small_m: bool | None = None) -> dict:
+             small_m: bool | None = None,
+             kv_bits: int | None = None) -> dict:
         """Release the current model and load ``model`` in its place. Returns the new status.
 
         Serialized by ``_swap_lock`` so two concurrent loads can't race. Raises ``ValueError``
@@ -1402,6 +1403,8 @@ class EngineHolder:
                     kwargs["context_window"] = context_window
                 if small_m is not None:
                     kwargs["small_m"] = small_m
+                if kv_bits is not None:
+                    kwargs["kv_bits"] = kv_bits or None    # 0 -> full precision
                 engine = Engine.load(**kwargs)
                 engine = maybe_batch_engine(engine, self._max_batch)
                 self._engine = engine
@@ -1633,6 +1636,12 @@ def make_handler(engine: Engine, api_key: str | None):
                     # kernel-vs-stock A/B no longer needs a version downgrade (issue #14)
                     "small_m": bool(getattr(engine, "small_m", False)),
                     "context_window": getattr(engine, "context_window", None),
+                    # KV-cache quantization for the loaded target: 0 = full precision,
+                    # 4/8 = quantized. Always present (0 when off) so a client can gate its
+                    # picker on the key's presence — an engine without the /admin/load
+                    # "kv_bits" override (< 0.13.1) also lacks this key (issue #17).
+                    "kv_bits": int(getattr(getattr(engine, "target", None),
+                                           "kv_bits", 0) or 0),
                     "max_output_tokens": engine.max_tokens_cap,
                     # Whether the loaded template reads `reasoning_effort`, and the server's
                     # default when one was configured — so a client only offers the control
@@ -1743,12 +1752,19 @@ def make_handler(engine: Engine, api_key: str | None):
                 return self._send_error(400, "'small_m' must be a boolean (false forces the "
                                              "stock verify kernel; omit it to use the "
                                              "server's setting)")
+            # KV-cache quantization for the target (issue #17 — the app had no way to set
+            # --kv-bits). 0 = explicitly full precision; omit = keep the server's setting.
+            kv_bits = req.get("kv_bits")
+            if kv_bits is not None and (isinstance(kv_bits, bool)
+                                        or kv_bits not in (0, 4, 8)):
+                return self._send_error(400, "'kv_bits' must be 0 (full precision), 4, or 8 "
+                                             "(omit it to keep the server's setting)")
             try:
                 status = engine.swap(model=model, mode=mode, max_draft=max_draft,
                                      lookup_drafts=lookup_drafts,
                                      confidence_threshold=confidence,
                                      context_window=context_window,
-                                     small_m=small_m)
+                                     small_m=small_m, kv_bits=kv_bits)
             except ValueError as e:                 # unknown model / unresolvable drafter
                 return self._send_error(400, str(e))
             except Exception as e:  # noqa: BLE001 — load failed; report, server stays up

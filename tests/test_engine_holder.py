@@ -280,3 +280,31 @@ class TestSwapConfidence:
         captured.clear()
         h.swap(model="repo2")
         assert captured["context_window"] is None
+
+
+class TestKvBitsOverride:
+    def test_swap_kv_bits_override_and_zero_means_full_precision(self, monkeypatch):
+        """issue #17: `kv_bits` rides /admin/load. Explicit 4/8 quantize the swapped-in
+        target's KV cache; explicit 0 means full precision (Engine.load's None); omitted
+        keeps whatever the server was started with."""
+
+        import mlx_dspark.server as server
+
+        h = server.EngineHolder(FakeEngine("old"), load_kwargs={"kv_bits": 8})
+        captured = {}
+
+        def capture(**kw):
+            captured.update(kw)
+            return FakeEngine("new")
+
+        monkeypatch.setattr(server.Engine, "load", staticmethod(capture))
+        monkeypatch.setattr(server, "maybe_batch_engine", lambda e, b: e)
+
+        h.swap(model="repo", kv_bits=4)
+        assert captured["kv_bits"] == 4              # override applied
+        captured.clear()
+        h.swap(model="repo", kv_bits=0)
+        assert captured["kv_bits"] is None           # explicit full precision
+        captured.clear()
+        h.swap(model="repo")
+        assert captured["kv_bits"] == 8              # omitted -> server's startup setting

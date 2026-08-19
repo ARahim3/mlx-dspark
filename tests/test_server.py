@@ -902,3 +902,27 @@ def test_context_ram_warning_triggers_and_suggests_a_cap():
     # Weights alone already blow the budget -> warn without a useless tiny suggestion.
     msg = S._context_ram_warning(65536, 262144, 47 * gb, 48 * gb)
     assert msg is not None and "--context-window" not in msg
+
+
+# --------------------------------------------------------------- issue #17: kv_bits
+
+def test_health_reports_kv_bits(server):
+    """/health always carries kv_bits (0 = full precision) so a client can gate its picker
+    on the key's presence — engines without the /admin/load override also lack the key."""
+    eng, base = server
+    assert _get(base, "/health")["kv_bits"] == 0     # fake engine: no target attribute
+
+    class _T:
+        kv_bits = 8
+
+    eng.target = _T()
+    assert _get(base, "/health")["kv_bits"] == 8
+
+
+def test_admin_load_rejects_bad_kv_bits(holder_server):
+    _holder, base = holder_server
+    for bad in (2, 16, "8", True):
+        with pytest.raises(urllib.error.HTTPError) as e:
+            _post(base, "/admin/load", {"model": "repo", "kv_bits": bad})
+        assert e.value.code == 400, bad
+        assert "kv_bits" in json.loads(e.value.read())["error"]["message"]
