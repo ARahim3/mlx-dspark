@@ -36,6 +36,13 @@ The MIT permission notice is reproduced in that file's header. The generation/
 verification loop around it (`generate.dflash_generate`) is mlx-dspark's own. DFlash
 checkpoints (e.g. `z-lab/gemma4-12B-it-DFlash`) are downloaded at runtime from z-lab.
 
+The same file's **DFlash 2** components (DFlashGroupedConv, CandidateSelector and the
+selector drafting path) are an MLX port of the DFlash 2 reference implementation
+contributed to SGLang (sgl-project/sglang, `srt/models/dflash.py` and
+`srt/speculative/dflash_worker_v2.py`, Apache License 2.0). DFlash 2 is by Inco AI
+(https://inco.ai/blog/dflash2/); its checkpoints (e.g. `incoai/Qwen3.8-27B-DFlash2`,
+Apache-2.0) are downloaded at runtime from their publisher.
+
 ---
 
 Small-M quantized-matmul kernel (avlp12)

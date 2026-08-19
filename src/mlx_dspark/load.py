@@ -147,16 +147,28 @@ REGISTRY = [
     # was pre-kernel; with the small-M kernel static_cap moves to cap 7 = **2.72x mean** (math
     # 3.37x / code 2.84x / chat 1.95x, accept 4.05), 22.6 tok/s, ~29 GB. Lookup off both quants
     # (4-bit: net loss; 8-bit: a wash on the flat curve). Lossless (fp ties, margins 0.0/0.125).
+    #
+    # **DFlash 2 (`incoai/Qwen3.8-27B-DFlash2`) beats BOTH DSpark heads at the identical
+    # verify width 8 (measured 2026-08-19, same-session pairs, 3-trial medians)** — its
+    # candidate path selector + dynamic convs lift acceptance without widening the verify:
+    # 8-bit cap 7 = **3.63x mean** (2.79x chat / 4.05x code / 4.06x math, accept 5.53,
+    # 30.5 tok/s) vs RadixArk 2.92x; 4-bit cap 7 = **2.30x** (accept 5.14, 33.8 tok/s —
+    # the absolute-speed crown) vs DimInfer 2.01x. Full block (= the dflash-mode default
+    # cap) is the peak on both quants; prefix caching covers dflash since the same day.
+    # So `"mode": "dflash"` makes `--mode auto` (and the app, which loads with auto) serve
+    # these targets with DFlash 2; `--mode dspark` still gets the DSpark heads for A/B.
     {"id": "qwen3.8-27b", "target": "mlx-community/Qwen3.8-27B-4bit",
-     "dspark": "DimInfer/Qwen3.8-27B-Dspark-v1", "lookup_drafts": False,
-     "ram": "~18 GB", "speedup": "~2.0×"},
+     "dspark": "DimInfer/Qwen3.8-27B-Dspark-v1", "dflash": "incoai/Qwen3.8-27B-DFlash2",
+     "mode": "dflash", "lookup_drafts": False,
+     "ram": "~18 GB", "speedup": "~2.3×"},
     # Same pair at 8-bit — best ratio (RadixArk was trained vs an FP8 verifier). Listed as its
-    # own row so pickers offer both; the 4-bit row keeps the absolute-speed crown (~29 vs 23
+    # own row so pickers offer both; the 4-bit row keeps the absolute-speed crown (~34 vs 30.5
     # tok/s) in ~18 GB. Resolution: the longest-id-first match sends "*-8bit" here and
     # everything else Qwen3.8 to the row above.
     {"id": "qwen3.8-27b-8bit", "target": "mlx-community/Qwen3.8-27B-8bit",
-     "dspark": "RadixArk/Qwen3.8-27B-DSpark", "lookup_drafts": False,
-     "ram": "~29 GB", "speedup": "~2.7×"},
+     "dspark": "RadixArk/Qwen3.8-27B-DSpark", "dflash": "incoai/Qwen3.8-27B-DFlash2",
+     "mode": "dflash", "lookup_drafts": False,
+     "ram": "~29 GB", "speedup": "~3.6×"},
     # NVIDIA Nemotron-3.5-Lightning-30B-A3B — a hybrid **Mamba-2 + MoE + attention** target
     # (model_type nemotron_h: 52 blocks, 128 experts top-6 + 1 shared, ~3B active, latent MoE),
     # the first non-attention recurrence here. NVIDIA's official DSpark head: a plain qwen3 GQA
@@ -277,9 +289,11 @@ def resolve_mode(model: str | None = None, *, mode: str = "auto", drafter: str |
                  family: str | None = None, target: str | None = None
                  ) -> tuple[str, str, str | None]:
     """Like :func:`resolve` but also resolves ``mode="auto"``: pick the best available
-    speculation for this target — the registry's DSpark drafter if the target is known
-    (DSpark won every M-series head-to-head at the short-block operating point), else its
-    DFlash drafter, else drafter-free prompt-lookup — so ANY target gets some speculation.
+    speculation for this target — the registry row's **measured-best mode** where one is
+    stamped (``"mode"``: Qwen3.8-27B's DFlash 2 beat both DSpark heads at the same verify
+    width, 2026-08-19), else its DSpark drafter (DSpark won every other M-series
+    head-to-head at the short-block operating point), else its DFlash drafter, else
+    drafter-free prompt-lookup — so ANY target gets some speculation.
     Returns ``(resolved_mode, target_repo, drafter_repo)``."""
     if mode != "auto":
         tgt, drf = resolve(model, mode=mode, drafter=drafter, family=family, target=target)
@@ -290,6 +304,9 @@ def resolve_mode(model: str | None = None, *, mode: str = "auto", drafter: str |
     tgt, _ = resolve(model, mode="baseline", family=family, target=target)
     entry = _registry_entry(tgt)
     if entry is not None:
+        best = entry.get("mode")
+        if best in ("dspark", "dflash") and entry.get(best):
+            return best, tgt, entry[best]
         if entry.get("dspark"):
             return "dspark", tgt, entry["dspark"]
         if entry.get("dflash"):
@@ -536,6 +553,17 @@ def load_dflash(repo_or_path: str, *, quantize: bool = True, bits: int = 4, grou
             f"{repo_or_path}: no block_size in the config (looked at the top level and under "
             f"'dflash_config') — this does not look like a z-lab DFlash drafter checkpoint."
         )
+    # DFlash 2 (incoai/*-DFlash2): a candidate path selector + per-sublayer dynamic convs,
+    # declared in dflash_config. Absent -> plain DFlash 1 (fields default to 0 / off).
+    selector_rank = int(dfc.get("selector_rank") or 0)
+    selector_top_k = int(dfc.get("selector_top_k") or 0)
+    if "DFlash2DraftModel" in (cfg.get("architectures") or []) and not (
+            selector_rank and selector_top_k):
+        raise ValueError(
+            f"{repo_or_path}: architectures says DFlash2DraftModel but dflash_config carries no "
+            f"selector_rank/selector_top_k — refusing to run a DFlash 2 head as DFlash 1 "
+            f"(the selector is where its acceptance comes from)."
+        )
     config = DFlashConfig(
         hidden_size=cfg["hidden_size"], num_hidden_layers=cfg["num_hidden_layers"],
         num_attention_heads=cfg["num_attention_heads"], num_key_value_heads=cfg["num_key_value_heads"],
@@ -547,7 +575,13 @@ def load_dflash(repo_or_path: str, *, quantize: bool = True, bits: int = 4, grou
         mask_token_id=dfc.get("mask_token_id", cfg.get("mask_token_id", 0)),
         rope_scaling=cfg.get("rope_scaling"), layer_types=layer_types,
         sliding_window=cfg.get("sliding_window"),
-        final_logit_softcapping=cfg.get("final_logit_softcapping"),
+        # DFlash 2 nests these in dflash_config (muse); DFlash 1 gemma had softcap top-level
+        final_logit_softcapping=dfc.get("final_logit_softcapping",
+                                        cfg.get("final_logit_softcapping")),
+        selector_rank=selector_rank, selector_top_k=selector_top_k,
+        conv_kernel_size=int(dfc.get("conv_kernel_size") or 0),
+        conv_group_size=int(dfc.get("conv_group_size") or 16),
+        output_multiplier=float(dfc.get("output_multiplier") or 1.0),
     )
     drafter = DFlashDraftModel(config)
 
@@ -569,9 +603,14 @@ def load_dflash(repo_or_path: str, *, quantize: bool = True, bits: int = 4, grou
 
     if quantize:
         # quantize only the backbone Linears — embed/lm_head come from the (already
-        # quantized) target via bind(), so leave them untouched.
+        # quantized) target via bind(), so leave them untouched. DFlash 2's conv
+        # kernel_projections and selector hidden_projection stay bf16 like the reference
+        # (they produce multiplicative coefficients / lattice scores — semantics-sensitive
+        # and tiny, ~130 MB total on the 27B head); the [vocab, rank] codebooks are raw
+        # arrays (gather-only) that nn.quantize never touches.
         nn.quantize(drafter, group_size=group_size, bits=bits,
-                    class_predicate=lambda p, m: isinstance(m, nn.Linear))
+                    class_predicate=lambda p, m: isinstance(m, nn.Linear)
+                    and "_conv" not in p and "candidate_selector" not in p)
 
     mx.eval(drafter.parameters())
     return drafter, config

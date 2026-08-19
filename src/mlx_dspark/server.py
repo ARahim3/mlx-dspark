@@ -292,21 +292,38 @@ class Engine:
         }
 
     def _build_prefix_cache(self, enabled, l2_dir, max_ram_mb):
-        """Enable prefix caching for dspark/lookup/baseline, in whichever mode this target
-        supports (see :mod:`~mlx_dspark.prefix_cache`): **trim** for dense (KVCache) and
+        """Enable prefix caching for every mode, in whichever mode this target supports
+        (see :mod:`~mlx_dspark.prefix_cache`): **trim** for dense (KVCache) and
         sliding-window targets — which latches to checkpoint the first time a window wraps
         — and **checkpoint** from the start for targets whose caches can't be rolled back
         at all (hybrid linear-attention: Ornith, Bonsai, Qwen3.6-27B). Those used to get no
         prefix caching whatsoever, which cost them the agent workload outright: prefill is
-        ~90% of an uncached Claude Code turn. Still disabled for DFlash (its *drafter*
-        cache can't roll back, and it isn't snapshotted here)."""
-        if not enabled or self.mode == "dflash":
+        ~90% of an uncached Claude Code turn.
+
+        DFlash (incl. DFlash 2) is **checkpoint-only**: its drafter ctx caches can't roll
+        back, but the drafter state is recoverable from a bounded window of projected ctx
+        rows (:class:`~mlx_dspark.dflash_model.DFlashCtxWindow`) captured at the snapshot
+        boundary — ``sliding_window - 1`` rows when every drafter layer is sliding
+        (~21 MB on Qwen3.8-27B), the whole prompt's rows when any layer is full-attention.
+        The trim-mode ``store()`` after generation is skipped for dflash (see the call
+        site) — its slots come only from the boundary checkpoint."""
+        if not enabled:
             return None
         try:
             checkpoint = not target_cache_reusable(self.target.make_cache())
         except Exception:  # noqa: BLE001
             return None
         make_ctx = self.drafter.make_ctx_cache if self.mode == "dspark" else None
+        if self.mode == "dflash":
+            from .dflash_model import DFlashCtxWindow
+
+            cfg = self.drafter.config
+            cap = None
+            if cfg.sliding_window and all(
+                    t == "sliding_attention" for t in cfg.layer_types):
+                cap = int(cfg.sliding_window) - 1
+            make_ctx = lambda: [DFlashCtxWindow(cap)]  # noqa: E731
+            checkpoint = True
         return PrefixCache(self.target.make_cache, make_ctx,
                            l2_dir=l2_dir, max_ram_bytes=max(0, max_ram_mb) * 1024 * 1024,
                            slots=self.prefix_cache_slots, checkpoint=checkpoint)
@@ -571,8 +588,8 @@ class Engine:
                        on_text, presence_penalty=0.0, frequency_penalty=0.0,
                        logprobs=None) -> GenResult:
         on_round = RoundRecorder(self.rounds, uuid.uuid4().hex[:8], self.mode)
-        # prefix caching: reuse the shared conversation prefix's KV (dspark/baseline on a
-        # dense target); `cache is None` means this mode/target doesn't reuse.
+        # prefix caching: reuse the shared conversation prefix's KV (all modes; dflash is
+        # checkpoint-only); `cache is None` means prefix caching is disabled.
         cache = ctx = None
         reuse_len = 0
         on_prefill = None
@@ -622,10 +639,12 @@ class Engine:
             elif self.mode == "dflash":
                 res = dflash_generate(
                     self.target, self.tokenizer, self.drafter, prompt_ids=prompt_ids,
+                    cache=cache, ctx_caches=ctx, reuse_len=reuse_len,
                     max_new_tokens=max_tokens, max_draft_tokens=self.max_draft_tokens,
                     cap_controller=self.cap_controller,
                     temperature=temperature, top_p=top_p, top_k=top_k,
                     seed=seed, stop=stop, on_text=on_text, on_round=on_round,
+                    on_prefill=on_prefill, prefill_marks=prefill_marks,
                 )
             elif self.mode == "lookup":
                 res = lookup_generate(
@@ -651,7 +670,10 @@ class Engine:
             if self.prefix is not None:
                 self.prefix.reset()
             raise
-        if self.prefix is not None and cache is not None:
+        if self.prefix is not None and cache is not None and self.mode != "dflash":
+            # dflash slots come only from the boundary checkpoint during prefill: its
+            # drafter ctx window can't serve trim-mode reuse, so a post-generation trim
+            # slot would be a broken promise on a dense target (see _build_prefix_cache).
             self.prefix.store(cache, ctx, prompt_ids, res.token_ids)
         self.stats["requests"] += 1
         self.stats["prompt_tokens"] += len(prompt_ids)

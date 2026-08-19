@@ -195,3 +195,38 @@ class TestLMStudioResolve:
         monkeypatch.setattr(load, "LMSTUDIO_ROOTS", (root,))
         monkeypatch.setattr(load, "snapshot_download", lambda repo: "HUB", raising=False)
         assert load._resolve("lmstudio-community/Qwen3-8B-MLX-8bit") == "HUB"
+
+
+def test_resolve_mode_auto_honors_row_best_mode_dflash():
+    # Qwen3.8-27B rows are stamped "mode": "dflash" — DFlash 2 beat both DSpark heads at
+    # the identical verify width (2026-08-19), so auto (and the app) serve it by default.
+    from mlx_dspark.load import resolve_mode
+
+    for tgt in ("mlx-community/Qwen3.8-27B-4bit", "mlx-community/Qwen3.8-27B-8bit"):
+        mode, _t, drf = resolve_mode(tgt, mode="auto")
+        assert (mode, drf) == ("dflash", "incoai/Qwen3.8-27B-DFlash2"), tgt
+
+
+def test_resolve_mode_explicit_dspark_still_gets_the_dspark_heads():
+    from mlx_dspark.load import resolve_mode
+
+    mode, _t, drf = resolve_mode("mlx-community/Qwen3.8-27B-4bit", mode="dspark")
+    assert (mode, drf) == ("dspark", "DimInfer/Qwen3.8-27B-Dspark-v1")
+    mode, _t, drf = resolve_mode("mlx-community/Qwen3.8-27B-8bit", mode="dspark")
+    assert (mode, drf) == ("dspark", "RadixArk/Qwen3.8-27B-DSpark")
+
+
+def test_resolve_mode_rows_without_best_mode_keep_dspark_first():
+    # rows without a "mode" stamp (everything but Qwen3.8-27B) are unchanged: dspark first
+    from mlx_dspark.load import REGISTRY, resolve_mode
+
+    assert sum(1 for e in REGISTRY if e.get("mode")) == 2   # exactly the two Qwen3.8 rows
+    mode, _t, _d = resolve_mode("mlx-community/Qwen3-4B-8bit", mode="auto")
+    assert mode == "dspark"
+
+
+def test_resolve_mode_explicit_dflash_resolves_dflash2_head():
+    from mlx_dspark.load import resolve_mode
+
+    mode, _t, drf = resolve_mode("mlx-community/Qwen3.8-27B-8bit", mode="dflash")
+    assert (mode, drf) == ("dflash", "incoai/Qwen3.8-27B-DFlash2")

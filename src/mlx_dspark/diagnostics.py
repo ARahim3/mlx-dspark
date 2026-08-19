@@ -296,10 +296,13 @@ def model_inventory(ram_gb: float | None = _DETECT) -> list[dict]:  # type: igno
     rows = []
     for entry in REGISTRY:
         need = _parse_ram_gb(entry.get("ram", ""))
-        drafter = entry.get("dspark") or entry.get("dflash")
+        best_mode = entry.get("mode") or ("dspark" if entry.get("dspark") else "dflash")
+        drafter = entry.get(best_mode) or entry.get("dspark") or entry.get("dflash")
         rows.append({
             "id": entry["id"],
             "target": entry["target"],
+            # the mode `--mode auto` (and the app) resolves for this row — its measured best
+            "mode": best_mode,
             "dspark_drafter": entry.get("dspark"),
             "dflash_drafter": entry.get("dflash"),
             "ram": entry.get("ram"),

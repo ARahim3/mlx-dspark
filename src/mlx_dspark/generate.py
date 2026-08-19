@@ -521,6 +521,9 @@ def dflash_generate(
     prompt: str = "",
     *,
     prompt_ids: list[int] | None = None,
+    cache=None,
+    ctx_caches=None,
+    reuse_len: int = 0,
     max_new_tokens: int = 128,
     max_draft_tokens: int | None = None,
     cap_controller=None,
@@ -532,6 +535,8 @@ def dflash_generate(
     stop: list[str] | None = None,
     on_text=None,
     on_round=None,
+    on_prefill=None,
+    prefill_marks=None,
 ) -> GenResult:
     """Speculative decoding with a **z-lab DFlash** (block-diffusion) drafter.
 
@@ -549,6 +554,12 @@ def dflash_generate(
     diffusion is bidirectional); ``max_draft_tokens`` only bounds how many drafted tokens
     are *verified* per round. ``None`` = verify the whole block (DFlash's native operating
     point — best on structured content; on open chat a short cap is faster).
+
+    **DFlash 2** heads (``candidate_selector`` present) draft through
+    ``drafter.select_block``: target-head top-K per slot + a selector walk from the anchor
+    instead of per-slot argmax/sampling. Greedy stays single-sync; T>0 scatters the
+    selector's sparse q dense for the same ``_spec_sample_accept``. Same block/verify
+    conventions otherwise — the verify side cannot tell the two apart.
     """
     if seed is not None:
         mx.random.seed(seed)
@@ -566,15 +577,64 @@ def dflash_generate(
 
     ids = prompt_ids if prompt_ids is not None else encode_prompt(
         tokenizer, prompt, use_chat=apply_chat_template)
-    cache = _make_target_cache(target_model)
+    # Prefix caching (checkpoint mode, server path): the caller may pass a target cache
+    # already holding the first `reuse_len` tokens plus a DFlashCtxWindow of the drafter's
+    # projected ctx rows ending at that boundary — then only the suffix is prefilled and
+    # the drafter context is rebuilt from the window. `cache is None` = library path.
+    if cache is None:
+        cache = _make_target_cache(target_model)
+        ctx_caches = None
+        reuse_len = 0
     target_model.reset_spec()                          # hybrid targets: clear capture state
     dcache = drafter.make_cache()                      # persistent draft ctx cache
+    window = ctx_caches[0] if ctx_caches else None     # DFlashCtxWindow (see dflash_model)
     st = _Streamer(tokenizer, eos_ids, on_text, stop)
     t0 = time.time()
 
-    # prefill (chunked; DFlash's first draft call consumes the whole prompt's fused states)
-    logits, fused = _prefill_tapped(target_model, ids, cache, tap)
-    pending_ctx = fused                                # fused hidden appended to draft ctx next round
+    # --- restore the drafter's ctx from the stored window (prefix-cache hit). A window
+    # trimmed too deep to cover the reuse point is skipped: drafting starts context-bare
+    # and self-heals as rounds append (correctness is the target's job either way). The
+    # preset offsets reproduce the fresh path's skip bookkeeping (z-lab's own pattern). ---
+    restored = None
+    if reuse_len and window is not None and window.rows and window.end == reuse_len:
+        restored = window.k
+        for c in dcache:
+            c.offset = window.start
+        drafter.append_ctx(restored, dcache)
+
+    # --- prefill the suffix (chunked), accumulating the fused states the first draft call
+    # consumes; at each server mark, refresh the window (the last <= cap projected rows
+    # ending there, older rows from the restored window) BEFORE on_prefill, so a checkpoint
+    # snapshot sees the drafter state a later restore needs. ---
+    suffix = ids[reuse_len:] if reuse_len else ids
+    acc: list = []
+
+    class _Acc:                        # fused-state accumulator riding the drafter hook
+        @staticmethod
+        def update_context(fused, ctx_offset=0, ctx_caches=None):
+            acc.append(fused)
+
+    def _fused_all():
+        return acc[0] if len(acc) == 1 else mx.concatenate(acc, axis=1)
+
+    def _mark(pos):
+        if window is not None:
+            sfx = _fused_all()                          # covers [reuse_len, pos)
+            m, need = sfx.shape[1], window.cap
+            rows = drafter.project_ctx(sfx if need is None or m <= need else sfx[:, -need:])
+            if restored is not None and (need is None or m < need):
+                tail = restored if need is None else restored[:, -(need - m):]
+                rows = mx.concatenate([tail, rows], axis=1)
+            window.set(rows, end=pos)
+        if on_prefill is not None:
+            on_prefill(cache, ctx_caches, pos)
+
+    logits, _ = _prefill_tapped(
+        target_model, suffix, cache, tap, drafter=_Acc, ctx_offset=reuse_len,
+        marks=prefill_marks, on_mark=_mark if on_prefill is not None else None)
+    if on_prefill is not None:
+        _mark(len(ids))                # caches hold exactly `ids` (stable == n templates)
+    pending_ctx = _fused_all()         # the first draft call appends the suffix's ctx
     pending = _pick(logits[0, -1], temperature, top_p, top_k)
     out_ids: list[int] = [pending]
     accept_lengths: list[int] = []
@@ -588,11 +648,25 @@ def dflash_generate(
         if cap_controller is not None:
             cap = max(1, min(cap_controller.cap, cap_ceiling))
         block = mx.array([[pending] + [mask_id] * (bs - 1)])
-        head = drafter(block, pending_ctx, dcache, logits_start=1)[0][:cap]  # [cap, V] mask logits
+        sel = getattr(drafter, "candidate_selector", None)   # DFlash 2 path when present
         if temperature > 0.0:
             # two-phase: the accept test needs the q distributions on hand
-            q_probs = truncate_probs(mx.softmax(head / temperature, axis=-1), top_p, top_k)
-            draft_arr = sample_probs(q_probs)
+            if sel is not None:
+                # DFlash 2: sampled selector walk. q lives on the K candidates per slot,
+                # scattered dense for the shared accept (reference: dflash_worker_v2's
+                # _selector_sampling_accept). The selector q IS the proposal distribution
+                # — top_p/top_k truncate only the target p inside _spec_sample_accept;
+                # lossless holds for any proposal q the tokens were actually drawn from.
+                uniforms = mx.random.uniform(shape=(cap,))
+                draft_arr, cand_ids, q_rows = drafter.select_block(
+                    block, pending_ctx, dcache, cap=cap, anchor_id=pending,
+                    uniforms=uniforms, temperature=temperature)
+                q_probs = mx.put_along_axis(
+                    mx.zeros((cap, drafter.config.vocab_size)), cand_ids, q_rows, axis=1)
+            else:
+                head = drafter(block, pending_ctx, dcache, logits_start=1)[0][:cap]
+                q_probs = truncate_probs(mx.softmax(head / temperature, axis=-1), top_p, top_k)
+                draft_arr = sample_probs(q_probs)
             mx.eval(draft_arr, q_probs)
             drafted = [int(x) for x in draft_arr.tolist()]
 
@@ -605,7 +679,14 @@ def dflash_generate(
         else:
             # fused greedy path: draft + verify + accept reach the device as one graph with
             # a single sync per round (see speculative_generate for the same pattern).
-            draft_arr = mx.argmax(head, axis=-1)
+            # DFlash 2's greedy selector walk is chain-argmax over tiny [K, K] lattices —
+            # it stays in-graph, so the single sync per round survives.
+            if sel is not None:
+                draft_arr = drafter.select_block(
+                    block, pending_ctx, dcache, cap=cap, anchor_id=pending)[0]
+            else:
+                head = drafter(block, pending_ctx, dcache, logits_start=1)[0][:cap]
+                draft_arr = mx.argmax(head, axis=-1)
             verify_ids = mx.concatenate(
                 [mx.array([pending], dtype=draft_arr.dtype), draft_arr]).reshape(1, -1)
             v_logits, v_fused = target_model.verify(verify_ids, cache, tap)

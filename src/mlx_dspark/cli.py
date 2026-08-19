@@ -58,10 +58,12 @@ def cmd_generate(argv: list[str]) -> None:
 
     ap = argparse.ArgumentParser(prog="mlx-dspark generate")
     ap.add_argument("--mode", choices=["auto", "dspark", "dflash", "lookup", "baseline"],
-                    default="dspark",
-                    help="dspark = DSpark spec decoding; dflash = z-lab DFlash (block diffusion); "
+                    default="auto",
+                    help="auto (default) = this target's measured-best speculation (the "
+                         "registry row's stamped mode, e.g. DFlash 2 on Qwen3.8-27B; else "
+                         "dspark -> dflash -> drafter-free lookup, so ANY repo runs); "
+                         "dspark = DSpark spec decoding; dflash = z-lab DFlash / DFlash 2; "
                          "lookup = drafter-free prompt-lookup spec decoding (any target); "
-                         "auto = best available for this target (dspark -> dflash -> lookup); "
                          "baseline = plain greedy target")
     ap.add_argument("--model", default=None,
                     help="target model: an HF repo or local path (e.g. mlx-community/Qwen3-8B-8bit). "
@@ -265,9 +267,10 @@ def cmd_serve(argv: list[str]) -> None:
     ap = argparse.ArgumentParser(prog="mlx-dspark serve",
                                  description="OpenAI-compatible API server.")
     ap.add_argument("--mode", choices=["auto", "dspark", "dflash", "lookup", "baseline"],
-                    default="dspark",
-                    help="'auto' picks the best available speculation for the target "
-                         "(dspark -> dflash -> drafter-free lookup), so any repo serves")
+                    default="auto",
+                    help="'auto' (default) picks the target's measured-best speculation "
+                         "(the registry row's stamped mode, e.g. DFlash 2 on Qwen3.8-27B; "
+                         "else dspark -> dflash -> drafter-free lookup), so any repo serves")
     ap.add_argument("--model", default=None,
                     help="target model: an HF repo or local path (e.g. mlx-community/Qwen3-8B-8bit). "
                          "Matched drafter auto-resolves for known targets; else pass --drafter. "
