@@ -375,7 +375,8 @@ final class AppModel: ObservableObject {
         do {
             let port = try await supervisor.start(
                 config: ServerConfig(model: nil, mode: "auto", maxDraft: "auto",
-                                     port: Defaults.enginePort))
+                                     port: Defaults.enginePort,
+                                     portIsExplicit: Defaults.enginePortIsExplicit))
             return await connect(port: port)
         } catch {
             // An engine below this app's floor doesn't know `--no-model`, and an offline
@@ -388,7 +389,8 @@ final class AppModel: ObservableObject {
             do {
                 let port = try await supervisor.start(
                     config: ServerConfig(model: model, mode: "auto", maxDraft: "auto",
-                                         port: Defaults.enginePort))
+                                         port: Defaults.enginePort,
+                                         portIsExplicit: Defaults.enginePortIsExplicit))
                 return await connect(port: port)
             } catch {
                 fail(error)
@@ -1033,12 +1035,27 @@ enum Defaults {
         set { store.set(newValue, forKey: "selectedModel") }
     }
 
+    /// The out-of-the-box engine port. Fixed BY DEFAULT (community ask: agent configs —
+    /// opencode/pi/Claude Code — pin a base URL, and the old automatic port moved on every
+    /// launch). Unassigned by IANA, clear of the common dev ports (3000/5000/8080/8888/
+    /// 11434/1234) and below macOS's ephemeral range, so collisions stay rare — and if
+    /// something does hold it, the supervisor falls back to automatic rather than fail.
+    static let defaultEnginePort = 8484
+
     /// Fixed engine port so external OpenAI/Anthropic clients keep a stable base URL across
-    /// launches (issue #16). 0 = automatic (kernel-assigned each start, the old behavior).
+    /// launches (issue #16). Never-set = `defaultEnginePort`; an explicit 0 (blank field in
+    /// Settings) = automatic, kernel-assigned each start (the pre-0.7 default behavior).
     static var enginePort: Int {
-        get { store.integer(forKey: "enginePort") }
+        get {
+            store.object(forKey: "enginePort") == nil
+                ? defaultEnginePort : store.integer(forKey: "enginePort")
+        }
         set { store.set(newValue, forKey: "enginePort") }
     }
+
+    /// True when the user chose the port (any value, including 0 = automatic) — a taken
+    /// user-chosen port is a hard error naming the fix; the app default falls back.
+    static var enginePortIsExplicit: Bool { store.object(forKey: "enginePort") != nil }
 
     static var currentSession: UUID? {
         get { store.string(forKey: "currentSession").flatMap(UUID.init(uuidString:)) }

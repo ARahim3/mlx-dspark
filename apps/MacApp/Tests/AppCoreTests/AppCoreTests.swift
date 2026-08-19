@@ -167,3 +167,28 @@ struct SetupStepTests {
         }
     }
 }
+
+@Suite("Engine version probe")
+struct VersionProbeTests {
+    /// Shell.capture merges stdout and stderr, so the probe output can carry import-time
+    /// warnings around the version line. A polluted fingerprint never equals PyPI's version
+    /// string — that made the "Engine X is available" banner permanent and re-ran the
+    /// in-place upgrade on every launch. The sentinel parse must survive the noise.
+    @Test func parsesVersionOutOfMergedWarnings() {
+        let noisy = """
+        [transformers] PyTorch was not found. Models won't be available.
+        MLXDSPARK_VERSION=0.13.1
+        """
+        #expect(RuntimeBootstrapper.parseVersionProbe(noisy) == "0.13.1")
+        #expect(RuntimeBootstrapper.parseVersionProbe("MLXDSPARK_VERSION=0.13.1\n") == "0.13.1")
+        // warnings can also arrive AFTER the print (flushed on exit)
+        let trailing = "MLXDSPARK_VERSION=0.14.0\nsome/late.py:1: UserWarning: whatever"
+        #expect(RuntimeBootstrapper.parseVersionProbe(trailing) == "0.14.0")
+    }
+
+    @Test func rejectsOutputWithoutTheSentinel() {
+        #expect(RuntimeBootstrapper.parseVersionProbe("0.13.1") == nil)
+        #expect(RuntimeBootstrapper.parseVersionProbe("") == nil)
+        #expect(RuntimeBootstrapper.parseVersionProbe("MLXDSPARK_VERSION=") == nil)
+    }
+}

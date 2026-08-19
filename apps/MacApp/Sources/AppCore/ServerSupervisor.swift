@@ -19,15 +19,21 @@ public struct ServerConfig: Equatable, Sendable {
     /// Fixed engine port (issue #16) so external OpenAI/Anthropic clients keep a stable
     /// base URL across launches. 0 = automatic (kernel-assigned, the old behavior).
     public var port: Int
+    /// Whether `port` was chosen by the user (Settings) rather than being the app default.
+    /// An explicit port that is taken is a hard error naming the fix; the DEFAULT fixed
+    /// port falls back to automatic instead — a default must never block launch.
+    public var portIsExplicit: Bool
 
     public init(model: String? = nil, mode: String = "auto", maxDraft: String? = "auto",
-                host: String = "127.0.0.1", apiKey: String? = nil, port: Int = 0) {
+                host: String = "127.0.0.1", apiKey: String? = nil, port: Int = 0,
+                portIsExplicit: Bool = true) {
         self.model = model
         self.mode = mode
         self.maxDraft = maxDraft
         self.host = host
         self.apiKey = apiKey
         self.port = port
+        self.portIsExplicit = portIsExplicit
     }
 }
 
@@ -62,21 +68,27 @@ public actor ServerSupervisor {
 
         let chosenPort: Int
         if config.port > 0 {
-            // Fixed port (Settings → Local server). A quit-and-relaunch can race the old
-            // process still letting go of it, so wait briefly before declaring it taken —
-            // and then fail with a message that names the fix, instead of the generic
-            // "exited during startup" the bind error would produce.
+            // Fixed port (the app default, or Settings → Local server). A quit-and-relaunch
+            // can race the old process still letting go of it, so wait briefly before
+            // declaring it taken — then a USER-chosen port fails with a message that names
+            // the fix, while the app-DEFAULT port falls back to automatic (a default must
+            // never keep the app from launching because some other tool holds it).
             let deadline = Date().addingTimeInterval(5)
             while !Self.portIsFree(config.port, host: config.host), Date() < deadline {
                 try? await Task.sleep(nanoseconds: 300_000_000)
             }
-            guard Self.portIsFree(config.port, host: config.host) else {
+            if Self.portIsFree(config.port, host: config.host) {
+                chosenPort = config.port
+            } else if config.portIsExplicit {
                 let msg = "Port \(config.port) is already in use — quit whatever holds it, "
                         + "or set the engine port back to automatic in Settings."
                 transition(.failed(msg))
                 throw ShellError.launchFailed("mlx-dspark serve", underlying: msg)
+            } else {
+                logStore.note("default port \(config.port) is in use — "
+                              + "starting on an automatic port instead")
+                chosenPort = try Self.freePort()
             }
-            chosenPort = config.port
         } else {
             chosenPort = try Self.freePort()
         }

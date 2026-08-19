@@ -462,8 +462,10 @@ struct ServerCard: View {
             .disabled(restarting)
             Spacer()
         }
-        Text("A fixed port keeps external clients' base URL stable across launches. "
-             + "Blank = automatic. Ports 1024–65535.")
+        Text("A fixed port keeps external clients' base URL stable across launches "
+             + "(default \(Defaults.defaultEnginePort); if something else holds it, the "
+             + "app falls back to an automatic port). Blank = always automatic. "
+             + "Ports 1024–65535.")
             .font(.caption).foregroundStyle(.secondary)
     }
 

@@ -130,6 +130,25 @@ public actor RuntimeBootstrapper {
         return payload.info.version
     }
 
+    /// Version probe with a sentinel prefix. `Shell.capture` merges stdout and stderr, so a
+    /// bare `print(__version__)` picks up any import-time warning the venv emits
+    /// (transformers, urllib3, …) — the polluted fingerprint then never equals PyPI's
+    /// version string, which made the "Engine X is available" banner permanent and re-ran
+    /// the in-place upgrade on every launch (community report, app-v0.6.1).
+    static let versionProbeCode =
+        "import mlx_dspark; print('MLXDSPARK_VERSION=' + mlx_dspark.__version__)"
+
+    /// The version from a `versionProbeCode` run: the last sentinel-prefixed line, or nil.
+    static func parseVersionProbe(_ output: String) -> String? {
+        let prefix = "MLXDSPARK_VERSION="
+        let version = output.split(whereSeparator: \.isNewline)
+            .last { $0.trimmingCharacters(in: .whitespaces).hasPrefix(prefix) }
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .map { String($0.dropFirst(prefix.count)) }
+        guard let version, !version.isEmpty else { return nil }
+        return version
+    }
+
     /// A newer release discovered by the background check, recorded to install on the next
     /// launch. Stored rather than acted on immediately: upgrading the venv while the running
     /// server lazily imports from it risks mixing module versions inside one process.
@@ -267,14 +286,12 @@ public actor RuntimeBootstrapper {
         set(.verify, .running, "Checking the engine")
         onProgress?(steps)
         let probe = await Shell.capture(
-            venvPython(),
-            ["-c", "import mlx_dspark; print(mlx_dspark.__version__)"],
-            environment: env)
-        let installed = probe.output.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard probe.code == 0, !installed.isEmpty else {
-            set(.verify, .failed(installed), "")
+            venvPython(), ["-c", Self.versionProbeCode], environment: env)
+        guard probe.code == 0, let installed = Self.parseVersionProbe(probe.output) else {
+            let detail = probe.output.trimmingCharacters(in: .whitespacesAndNewlines)
+            set(.verify, .failed(detail), "")
             onProgress?(steps)
-            throw BootstrapError.verifyFailed(installed.isEmpty ? "no version reported" : installed)
+            throw BootstrapError.verifyFailed(detail.isEmpty ? "no version reported" : detail)
         }
         // Fingerprint the version that actually installed (the probe's answer, not the
         // query's) — that is what the next launch's latest-check compares against.
@@ -328,11 +345,8 @@ public actor RuntimeBootstrapper {
         set(.verify, .running, "Checking the engine")
         onProgress?(steps)
         let probe = await Shell.capture(
-            venvPython(),
-            ["-c", "import mlx_dspark; print(mlx_dspark.__version__)"],
-            environment: env)
-        let installed = probe.output.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard probe.code == 0, !installed.isEmpty else { return nil }
+            venvPython(), ["-c", Self.versionProbeCode], environment: env)
+        guard probe.code == 0, let installed = Self.parseVersionProbe(probe.output) else { return nil }
         try? writeFingerprint(RuntimeFingerprint(engineVersion: installed,
                                                  pythonVersion: AppIdentity.pythonVersion,
                                                  source: EngineSource.pypi.fingerprint))
