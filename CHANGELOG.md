@@ -2,6 +2,18 @@
 
 All notable changes to `mlx-dspark`. Versions follow [SemVer](https://semver.org/) (pre-1.0: minor-ish features land as patch bumps).
 
+## [0.13.1] — 2026-08-19 — kv_bits joins the /admin/load overrides
+
+### Added
+- **`kv_bits` is now an `/admin/load` override and a `/health` field** (issue #17 — the desktop
+  app had no way to set `--kv-bits`). Per-swap: `4`/`8` quantize the target's KV cache (the
+  long-context RAM lever — 8-bit halves, 4-bit quarters the per-token cache), `0` is explicitly
+  full precision, omitted keeps the server's startup setting. `/health` always reports the live
+  value (`0` = full precision), so clients can gate their picker on the key's presence — engines
+  without the override also lack the key. Validated live: load with `kv_bits: 8` → health
+  reports 8 → generation runs the kv-quantized cache (accept/speedup unchanged, the v0.2.0
+  kv-bits guarantees apply); bad values 400 with the accepted set named.
+
 ## [0.13.0] — 2026-08-19 — DFlash 2: the new project best, with prefix caching and auto-mode pickup
 
 ### Added
