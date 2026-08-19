@@ -47,8 +47,9 @@ struct ModelsScreen: View {
                 // They used to be disabled outright — which left a fresh machine with every
                 // pair greyed out and no way to download from this screen at all (issue #15).
                 ForEach(model.models) { row in
-                    ModelRowView(row: row, isLoaded: row.target == model.model,
-                                 canLoad: row.target != model.model && !model.isModelLoading) {
+                    ModelRowView(row: row, isLoaded: model.isServerReady && row.target == model.model,
+                                 canLoad: (!model.isServerReady || row.target != model.model)
+                                    && !model.isModelLoading) {
                         Task { await model.switchModel(to: row.target) }
                     }
                 }
@@ -64,7 +65,7 @@ struct ModelsScreen: View {
                                      + "unpaired models run with lookup speculation.")
                     ForEach(onDisk) { installed in
                         InstalledRowView(installed: installed,
-                                         isLoaded: installed.repo == model.model)
+                                         isLoaded: model.isServerReady && installed.repo == model.model)
                     }
                 }
 

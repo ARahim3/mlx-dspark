@@ -42,6 +42,19 @@ def test_looks_like_repo_prefers_plain_dir_cache(tmp_path, monkeypatch):
     assert _looks_like_repo("org/Other-Model")
 
 
+def test_looks_like_repo_skips_complete_lmstudio_mlx_dir(tmp_path, monkeypatch):
+    """LM Studio models are local inputs too: preflight must not start a Hub fetch."""
+    root = tmp_path / "lmstudio"
+    model = root / "org" / "Some-Model-4bit"
+    model.mkdir(parents=True)
+    (model / "config.json").write_text("{}")
+    (model / "model.safetensors").write_bytes(b"weights")
+    import mlx_dspark.load as load
+    monkeypatch.setattr(load, "LMSTUDIO_ROOTS", (str(root),))
+    assert not _looks_like_repo("org/Some-Model-4bit")
+    assert _looks_like_repo("org/Other-Model")
+
+
 def test_ensure_local_is_a_noop_for_non_repos(tmp_path):
     ensure_local(None)
     ensure_local(str(tmp_path))

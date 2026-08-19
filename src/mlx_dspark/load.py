@@ -365,6 +365,57 @@ def is_mlx_model_dir(path: str) -> bool:
     return "config.json" in names and any(n.endswith(".safetensors") for n in names)
 
 
+def lmstudio_model_path(repo_or_path: str | None) -> str | None:
+    """Return the exact LM Studio MLX directory for a repo id, if it exists.
+
+    LM Studio stores models as ``<root>/<publisher>/<model>`` rather than in the
+    Hugging Face cache layout.  Keep this lookup in one place so the loader,
+    downloader preflight, and the model inventory make the same decision.  Exact
+    publisher/model matching is deliberate: two publishers may use the same
+    basename, and GGUF-only directories are not MLX checkpoints.
+    """
+    if not repo_or_path or repo_or_path.startswith("gguf:"):
+        return None
+    stripped = str(repo_or_path).rstrip("/")
+    if stripped.count("/") != 1:
+        return None
+    for root in LMSTUDIO_ROOTS:
+        local = os.path.join(os.path.expanduser(root), stripped)
+        if os.path.isdir(local) and is_mlx_model_dir(local):
+            return local
+    return None
+
+
+def resolve_local(repo_or_path: str | None) -> str | None:
+    """Resolve a model to an on-disk path without network access.
+
+    This is the single local-resolution path shared by the loader, download
+    preflight, and diagnostics.  A caller that gets ``None`` may explicitly
+    choose to fetch the Hub repo; this function itself never does that.
+    """
+    if not repo_or_path or repo_or_path.startswith("gguf:"):
+        return None
+    if os.path.isdir(repo_or_path):
+        return repo_or_path
+    models = os.path.expanduser("~/.cache/mlx_dspark/models")
+    stripped = str(repo_or_path).rstrip("/")
+    for name in (os.path.basename(stripped), stripped.replace("/", "_")):
+        local = os.path.join(models, name)
+        if os.path.isdir(local):
+            return local
+    local = lmstudio_model_path(repo_or_path)
+    if local:
+        return local
+    if stripped.count("/") != 1:
+        return None
+    # HF's local-only resolver handles complete snapshots and never contacts the
+    # network.  Incomplete/missing snapshots simply fall through to ``None``.
+    try:
+        return snapshot_download(stripped, local_files_only=True)
+    except Exception:  # noqa: BLE001 — local probing is never a load gate
+        return None
+
+
 def _resolve(repo_or_path: str) -> str:
     if repo_or_path.startswith("gguf:"):
         # "gguf:{hf_repo}/{filename}.gguf" — a PrismML dspark drafter shipped as GGUF;
@@ -372,32 +423,9 @@ def _resolve(repo_or_path: str) -> str:
         from .gguf_convert import ensure_converted
         repo, filename = repo_or_path[len("gguf:"):].rsplit("/", 1)
         return ensure_converted(repo, filename)
-    if os.path.isdir(repo_or_path):
-        return repo_or_path
-    # Prefer the plain-dir model cache (~/.cache/mlx_dspark/models/…) over a hub download:
-    # models fetched by hand (e.g. around a wedged huggingface_hub) live there, and
-    # auto-resolved drafters must not re-download gigabytes the user already has on disk.
-    # Match BOTH naming conventions those hand-downloads use: the bare basename AND the
-    # org-prefixed "<org>_<name>" form (what huggingface-cli and robust_download.py produce,
-    # and what disambiguates two repos that share a basename — e.g. DimInfer's
-    # Qwen3.8-27B-Dspark-v1 vs the SpecForge Qwen3.8-27B-DSpark). Basename first keeps the
-    # historical preference. Must stay in lockstep with diagnostics._is_local.
-    models = os.path.expanduser("~/.cache/mlx_dspark/models")
-    stripped = repo_or_path.rstrip("/")
-    for name in (os.path.basename(stripped), stripped.replace("/", "_")):
-        local = os.path.join(models, name)
-        if os.path.isdir(local):
-            return local
-    # Reuse models LM Studio already downloaded (issue #12): its cache is plain
-    # <root>/<publisher>/<model> dirs, and its MLX downloads are exactly the safetensors
-    # layout our loaders read. Exact org/name match only — no basename guessing, so two
-    # publishers sharing a model name can't cross-resolve. GGUF-only dirs are skipped
-    # (is_mlx_model_dir), falling through to the hub download rather than failing deep
-    # inside a loader that can't read GGUF targets.
-    for root in LMSTUDIO_ROOTS:
-        local = os.path.join(os.path.expanduser(root), stripped)
-        if os.path.isdir(local) and is_mlx_model_dir(local):
-            return local
+    local = resolve_local(repo_or_path)
+    if local:
+        return local
     return snapshot_download(repo_or_path)
 
 

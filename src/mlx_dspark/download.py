@@ -68,21 +68,10 @@ def _looks_like_repo(repo_or_path: str | None) -> bool:
     here."""
     if not repo_or_path or ":" in repo_or_path:
         return False
-    if os.path.isdir(os.path.expanduser(repo_or_path)):
-        return False
     if repo_or_path.count("/") != 1:
         return False
-    # the plain-dir cache that _resolve prefers over the hub (see load.py) — match BOTH the
-    # bare basename and the org-prefixed "<org>_<name>" form, exactly as _resolve/_is_local do.
-    # Without the second form a hand-downloaded copy under the org-prefixed name (e.g.
-    # DimInfer_Qwen3.8-27B-Dspark-v1) gets needlessly re-fetched here even though it's on disk.
-    # These three checks must stay in lockstep.
-    models = os.path.expanduser("~/.cache/mlx_dspark/models")
-    stripped = repo_or_path.rstrip("/")
-    for name in (os.path.basename(stripped), stripped.replace("/", "_")):
-        if os.path.isdir(os.path.join(models, name)):
-            return False
-    return True
+    from .load import resolve_local
+    return resolve_local(repo_or_path) is None
 
 
 def _fetch_total(repo: str, entry: dict) -> None:
@@ -108,12 +97,6 @@ def ensure_local(repo_or_path: str | None) -> None:
     if not _looks_like_repo(repo_or_path):
         return
     repo = str(repo_or_path)
-    with contextlib.suppress(Exception):
-        from huggingface_hub import snapshot_download
-
-        snapshot_download(repo, local_files_only=True)   # complete already -> no child
-        return
-
     env = dict(os.environ, HF_HUB_DISABLE_PROGRESS_BARS="1")
     # The child watches its parent and exits when orphaned: the server dies by SIGTERM
     # (the app's supervisor), which runs no atexit hooks — without this, killing the

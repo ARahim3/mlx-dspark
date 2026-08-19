@@ -261,24 +261,15 @@ def disk_usage(rows: list[dict] | None = None, *, hub_dir: str | None = None,
 def _is_local(repo: str | None) -> bool:
     """Whether a repo's weights are already on disk — no download, no network.
 
-    Checks the plain-dir cache that ``_resolve`` prefers and the HF hub cache layout directly;
+    Checks the plain-dir cache that ``_resolve`` prefers, LM Studio's MLX cache, and the HF hub cache;
     calling ``_resolve`` itself would *start a download*, which is exactly what this must not do.
     """
     if not repo:
         return False
     if repo.startswith("gguf:"):
         repo = repo[len("gguf:"):].rsplit("/", 1)[0]
-    if os.path.isdir(repo):
-        return True
-    # Both hand-download naming conventions: bare basename and org-prefixed "<org>_<name>"
-    # (see load._resolve — these two must agree, one answers "installed?" and the other "where").
-    models = os.path.expanduser("~/.cache/mlx_dspark/models")
-    stripped = repo.rstrip("/")
-    for name in (os.path.basename(stripped), stripped.replace("/", "_")):
-        if os.path.isdir(os.path.join(models, name)):
-            return True
-    hub = os.path.expanduser("~/.cache/huggingface/hub")
-    return os.path.isdir(os.path.join(hub, "models--" + repo.replace("/", "--")))
+    from .load import resolve_local
+    return resolve_local(repo) is not None
 
 
 _DETECT = object()      # distinguishes "measure this machine" from "RAM is genuinely unknown"

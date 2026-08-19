@@ -386,7 +386,21 @@ def cmd_serve(argv: list[str]) -> None:
         max_draft = max(1, md)
 
     if not args.no_model:
-        print(f"loading {args.mode} engine — first run downloads weights…")
+        # Keep the startup message honest: local paths and complete local snapshots do not
+        # enter the cancellable Hub prefetch at all.  The loader still performs calibration
+        # on first use, so "loading" remains accurate without implying a download.
+        from .load import resolve_local
+        local_inputs = [args.model]
+        if args.drafter:
+            local_inputs.append(args.drafter)
+        # With an omitted drafter, auto/dspark/dflash may select a registry drafter later;
+        # do not claim an offline load until that input is explicit too.
+        all_local = (all(resolve_local(value) is not None for value in local_inputs)
+                     and (args.drafter is not None or args.mode in ("lookup", "baseline")))
+        if all_local:
+            print(f"loading {args.mode} engine — using local weights…")
+        else:
+            print(f"loading {args.mode} engine — missing weights may download…")
     # Captured so a `/admin/load` model swap re-loads with the same server flags, changing only
     # the model — an in-place swap that keeps the port instead of a full restart.
     load_kwargs = {
