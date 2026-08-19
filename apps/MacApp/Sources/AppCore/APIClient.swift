@@ -44,6 +44,11 @@ public struct HealthInfo: Decodable, Sendable, Equatable {
     /// default the registry stamps (off for every MoE and the 4-bit 27B hybrids), settable
     /// per swap. Optional: older engines don't report it, and the toggle hides then.
     public let lookupDrafts: Bool?
+    /// KV-cache quantization for the loaded target: 0 = full precision, 4/8 = quantized
+    /// (issue #17). Optional: engines below 0.13.1 don't report it — and they also lack the
+    /// `/admin/load` override, so the picker hides then (a control that silently does
+    /// nothing is worse than none).
+    public let kvBits: Int?
 
     enum CodingKeys: String, CodingKey {
         case status, model, mode, target, drafter, download
@@ -54,6 +59,7 @@ public struct HealthInfo: Decodable, Sendable, Equatable {
         case confidenceThreshold = "confidence_threshold"
         case raceArmConfidence = "race_arm_confidence"
         case lookupDrafts = "lookup_drafts"
+        case kvBits = "kv_bits"
     }
 
     /// True when a model is loaded and serving (`status == "ok"`).
@@ -209,7 +215,8 @@ public struct APIClient: Sendable {
                           maxDraft: String? = nil,
                           confidence: Double? = nil,
                           contextWindow: Int? = nil,
-                          lookupDrafts: Bool? = nil) async throws -> LoadStatus {
+                          lookupDrafts: Bool? = nil,
+                          kvBits: Int? = nil) async throws -> LoadStatus {
         var payload: [String: Any] = ["model": target]
         if let mode { payload["mode"] = mode }
         if let maxDraft {
@@ -221,6 +228,9 @@ public struct APIClient: Sendable {
         if let contextWindow { payload["context_window"] = contextWindow }
         // nil = keep this pair's measured default; a bool overrides it for this load.
         if let lookupDrafts { payload["lookup_drafts"] = lookupDrafts }
+        // KV-cache quantization (issue #17): 0 = explicitly full precision, 4/8 = quantized;
+        // nil = keep the server's setting. The caller gates on /health.kv_bits presence.
+        if let kvBits { payload["kv_bits"] = kvBits }
         let body = try JSONSerialization.data(withJSONObject: payload)
         var req = request("admin/load", method: "POST", body: body)
         req.timeoutInterval = 1800        // a first-time load downloads weights

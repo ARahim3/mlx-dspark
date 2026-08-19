@@ -133,6 +133,7 @@ struct DecodingControls: View {
     @State private var confidence: String = "off"
     @State private var contextWindow: String = "default"
     @State private var lookupDrafts: Bool = true
+    @State private var kvBits: String = "default"
     @State private var applying = false
 
     /// Context presets as (tag, label, tokens). "default" = the model's own maximum.
@@ -145,6 +146,12 @@ struct DecodingControls: View {
     private static func contextTag(_ value: Int?) -> String {
         guard let value, contextPresets.contains(where: { $0.tokens == value })
         else { return "default" }
+        return String(value)
+    }
+
+    /// Health's kv_bits (0 = full precision) as a picker tag.
+    private static func kvTag(_ value: Int?) -> String {
+        guard let value, value == 4 || value == 8 else { return "default" }
         return String(value)
     }
 
@@ -193,6 +200,12 @@ struct DecodingControls: View {
                         contextPicker
                         Spacer(minLength: 0)
                     }
+                    if model.health?.kvBits != nil {
+                        HStack(spacing: 14) {
+                            kvPicker
+                            Spacer(minLength: 0)
+                        }
+                    }
                     if model.health?.lookupDrafts != nil {
                         HStack(spacing: 14) {
                             lookupToggle
@@ -217,6 +230,9 @@ struct DecodingControls: View {
                     }
                     HStack(spacing: 14) {
                         contextPicker
+                        if model.health?.kvBits != nil {
+                            kvPicker
+                        }
                         if model.health?.lookupDrafts != nil {
                             lookupToggle
                         }
@@ -235,6 +251,7 @@ struct DecodingControls: View {
             confidence = Self.confTag(model.health?.confidenceThreshold)
             contextWindow = Self.contextTag(model.health?.contextWindow)
             lookupDrafts = model.health?.lookupDrafts ?? true
+            kvBits = Self.kvTag(model.health?.kvBits)
         }
     }
 
@@ -275,6 +292,23 @@ struct DecodingControls: View {
               + "which agent clients like Claude Code auto-compact on.")
     }
 
+    /// Only rendered when `/health` reports `kv_bits` (engines below 0.13.1 also lack the
+    /// `/admin/load` override, so the picker would silently do nothing — issue #17).
+    @ViewBuilder private var kvPicker: some View {
+        Picker("KV cache", selection: $kvBits) {
+            Text("Full").tag("default")
+            Text("8-bit").tag("8")
+            Text("4-bit").tag("4")
+        }
+        .fixedSize()
+        .help("Quantize the KV cache (the per-token memory that grows with context): 8-bit "
+              + "halves it, 4-bit quarters it — the long-context RAM lever after the "
+              + "context cap. Output stays lossless the same way the rest of the engine "
+              + "is (the target verifies every token against its own kv-quantized "
+              + "forward); quality at very long contexts is the usual KV-quantization "
+              + "trade. Full = the model's own precision.")
+    }
+
     /// Only rendered when `/health` reports the field (older engines don't) — a toggle
     /// that silently does nothing is worse than none.
     @ViewBuilder private var lookupToggle: some View {
@@ -301,6 +335,7 @@ struct DecodingControls: View {
             || confidence != Self.confTag(model.health?.confidenceThreshold)
             || contextWindow != Self.contextTag(model.health?.contextWindow)
             || lookupDrafts != (model.health?.lookupDrafts ?? lookupDrafts)
+            || kvBits != Self.kvTag(model.health?.kvBits)
     }
 
     private func apply() {
@@ -312,7 +347,11 @@ struct DecodingControls: View {
                 contextWindow: contextWindow == "default" ? nil : Int(contextWindow),
                 // Sent only when the user actually flipped it, so an untouched Apply
                 // keeps riding the pair's measured default instead of pinning it.
-                lookupDrafts: lookupDrafts == model.health?.lookupDrafts ? nil : lookupDrafts)
+                lookupDrafts: lookupDrafts == model.health?.lookupDrafts ? nil : lookupDrafts,
+                // Same: unchanged -> nil (keep the server's setting); "default" -> explicit
+                // 0 (full precision). Gated on health reporting the field at all.
+                kvBits: kvBits == Self.kvTag(model.health?.kvBits) ? nil
+                        : (kvBits == "default" ? 0 : Int(kvBits)))
             applying = false
         }
     }

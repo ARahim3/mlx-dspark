@@ -532,7 +532,8 @@ final class AppModel: ObservableObject {
     /// overrides), so the port survives and output stays byte-identical either way; only
     /// speed changes.
     func applyEngineSettings(mode: String?, cap: String?, confidence: Double? = nil,
-                             contextWindow: Int? = nil, lookupDrafts: Bool? = nil) async {
+                             contextWindow: Int? = nil, lookupDrafts: Bool? = nil,
+                             kvBits: Int? = nil) async {
         guard let client = apiClient else { return }
         generationTask?.cancel()
         modelSwitchError = nil
@@ -553,7 +554,8 @@ final class AppModel: ObservableObject {
             _ = try await client.loadModel(model, mode: mode, maxDraft: cap,
                                            confidence: confidence,
                                            contextWindow: contextWindow,
-                                           lookupDrafts: lookupDrafts)
+                                           lookupDrafts: lookupDrafts,
+                                           kvBits: kvBits)
             currentHealth = try? await client.health()
             startTelemetry()
             startMemoryPolling()
