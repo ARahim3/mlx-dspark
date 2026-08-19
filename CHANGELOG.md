@@ -2,6 +2,35 @@
 
 All notable changes to `mlx-dspark`. Versions follow [SemVer](https://semver.org/) (pre-1.0: minor-ish features land as patch bumps).
 
+## [0.13.0] — 2026-08-19 — DFlash 2: the new project best, with prefix caching and auto-mode pickup
+
+### Added
+- **DFlash 2 drafters run natively** (`--mode dflash`; Inco AI's DFlash successor — a candidate
+  path selector over the target head's top-16 tokens per slot plus two-tap dynamic convolutions,
+  ported from the merged SGLang reference implementation). Config-gated in the existing DFlash
+  loader, so DFlash 1 checkpoints behave byte-identically. Greedy stays single-sync; sampled
+  decoding is lossless through the selector's own proposal distribution.
+- **Qwen3.8-27B's measured best is now DFlash 2 on both quants** (`incoai/Qwen3.8-27B-DFlash2`,
+  one head serves both; registered for auto-resolution). Same-session paired benchmarks at the
+  identical verify width 8: **8-bit 3.63× mean** (4.06× math / 4.05× code / 2.79× chat, accept
+  5.53, 8.4 → 30.5 tok/s) vs the DSpark head's 2.92×; **4-bit 2.30×** (accept 5.14,
+  **33.8 tok/s — the fastest decode in the project**, ~18 GB) vs 2.01×. Lossless both quants
+  (divergences from single-row greedy are fp ties at margins 0.0–0.125).
+- **Prefix caching now covers `--mode dflash`** (checkpoint mode) — the one mode it skipped. The
+  drafter's context is rebuilt from a bounded window of projected rows snapshotted at the stable
+  prompt boundary (~21 MB on Qwen3.8-27B). Measured on the DFlash 2 pair (~4k-token system
+  prompt): identical-repeat TTFT 38.3 s → **0.24 s (159×)**, next conversation turn 31.1 s →
+  **1.08 s (29×)**, outputs byte-identical to cold runs and drafter acceptance preserved.
+- **Registry rows can stamp a measured-best mode** (`"mode"`; the two Qwen3.8-27B rows carry
+  `"dflash"`), and `--mode auto` resolves it first. `/admin/models` rows report `"mode"`.
+
+### Changed
+- **`serve` and `generate` default to `--mode auto`** (was `dspark`): a bare `--model` now runs
+  each registry row's measured-best mode — which is what the README's numbers show. Side effect:
+  an unknown target with no `--drafter` now runs drafter-free lookup speculation (with its
+  banner) instead of erroring; pass `--mode dspark` to keep the old behavior. Explicit modes are
+  unchanged, and `--mode dspark` still resolves the DSpark heads on Qwen3.8-27B for A/B.
+
 ## [0.12.4] — 2026-08-18 — Curves calibration fix + LM Studio model reuse
 
 ### Fixed

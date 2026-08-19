@@ -42,13 +42,13 @@ chat/code/math), the Muse row per-content best (footnoted); full tables, baselin
 
 | target | best measured speedup | speed (chat → best) |
 |---|---|---|
-| **Qwen3.8-27B** (8-bit)[^q38] | **3.37×** math · **2.84×** code · 1.95× chat | ~17–28 tok/s |
+| **Qwen3.8-27B** (8-bit, DFlash 2)[^q38] | **4.06×** math · **4.05×** code · **2.79×** chat | ~24–34 tok/s |
 | **Muse-Glimmer-30B** (8-bit, dense)[^muse] | **3.27×** math · **2.50×** code · **2.22×** chat | ~18–26 tok/s |
 | **Gemma-4 12B** (8-bit) | **3.09×** math · **2.63×** chat · **2.61×** code | ~46–55 tok/s |
 | **Qwen3.6-27B** (8-bit) | **2.67×** math · **2.26×** chat · 1.96× code | ~16–22 tok/s |
+| **Qwen3.8-27B** (4-bit, DFlash 2)[^q38] | **2.63×** math · **2.62×** code · 1.68× chat | **~25–38 tok/s** |
 | **Ornith-1.0-9B** (8-bit) | **2.53×** code · **2.48×** math · **2.21×** chat | ~59–68 tok/s |
 | **Qwen3-14B** (8-bit) | **2.36×** math · **2.11×** code · 1.62× chat | ~25–36 tok/s |
-| **Qwen3.8-27B** (4-bit)[^q38] | **2.31×** math · **2.14×** code · 1.51× chat | ~23–34 tok/s |
 | **Qwen3-8B** (8-bit) | **2.29×** math · **2.06×** code · 1.81× chat | ~51–64 tok/s |
 | **Qwen3-4B** (8-bit) | **1.98×** math · 1.77× chat · 1.70× code | ~87–101 tok/s |
 | **Qwen3.6-35B-A3B** (4-bit, MoE)[^moe] | **1.67×** math · 1.24× code · 1.05× chat | **~91–145 tok/s** |
@@ -58,29 +58,31 @@ chat/code/math), the Muse row per-content best (footnoted); full tables, baselin
 </div>
 
 > [!TIP]
-> **On the Qwen3.8-27B _4-bit_ target?** Its drafter is now
-> [`DimInfer/Qwen3.8-27B-Dspark-v1`](https://huggingface.co/DimInfer/Qwen3.8-27B-Dspark-v1) — a
-> 4-bit-class head that out-accepts the previous `RadixArk/Qwen3.8-27B-DSpark` at **every** cap
-> and content (measured paired, same session): **1.99× mean** at `--max-draft 7` (2.31× math ·
-> 2.14× code · 1.51× chat, accept up to 5.3) vs RadixArk's 1.82×, and with **no
-> `--confidence-threshold` needed**. It is the auto-resolve default now, so a plain `--model
-> mlx-community/Qwen3.8-27B-4bit` picks it up:
+> **Qwen3.8-27B's measured best is now a DFlash 2 drafter, on both quants** —
+> [`incoai/Qwen3.8-27B-DFlash2`](https://huggingface.co/incoai/Qwen3.8-27B-DFlash2) (Inco AI's
+> DFlash successor: a candidate path selector + dynamic convs that lift acceptance at the *same*
+> verify width). Measured paired, same session, identical width 8: **8-bit 3.63× mean** (4.06×
+> math · 4.05× code · 2.79× chat, accept 5.53) vs the DSpark head's 2.92×; **4-bit 2.30×**
+> (accept 5.14, **33.8 tok/s — the fastest decode in this project**) vs 2.01×. Chat gains the
+> most (+40% at 8-bit). Greedy-lossless like everything here, and prefix caching covers this
+> mode too. **No flags needed**: `--mode auto` — the default, and what the Mac app uses —
+> resolves each row's measured-best mode, which is DFlash 2 here:
 >
 > ```bash
-> # auto-resolves DimInfer (downloads it once from HF on first use):
-> mlx-dspark serve    --model mlx-community/Qwen3.8-27B-4bit --max-draft 7
-> mlx-dspark generate --model mlx-community/Qwen3.8-27B-4bit --max-draft 7 --prompt "…"
+> # the default mode (auto) resolves DFlash 2 for this target (downloads it once):
+> mlx-dspark serve    --model mlx-community/Qwen3.8-27B-8bit
+> mlx-dspark generate --model mlx-community/Qwen3.8-27B-8bit --prompt "…"
 >
-> # …or point --drafter at the repo / a local copy explicitly (no re-download if you have it):
-> mlx-dspark generate --model mlx-community/Qwen3.8-27B-4bit \
->     --drafter DimInfer/Qwen3.8-27B-Dspark-v1 --max-draft 7 --prompt "…"
+> # name a mode explicitly to A/B; --mode dspark still gets the DSpark heads:
+> mlx-dspark generate --model mlx-community/Qwen3.8-27B-4bit --mode dspark --prompt "…"
 > ```
 >
-> `--max-draft 7` is shown for clarity but is optional: the no-flag default **calibrates a cap
-> of 7 on its own here** (`static_cap` picks it from this machine's cost curves, where RadixArk
-> got 2), so a bare `--model … --serve/generate` already lands the 1.99×. The **8-bit** target
-> keeps `RadixArk/Qwen3.8-27B-DSpark` (trained against the FP8 verifier, so 8-bit is its matched
-> precision — 2.72×). Greedy-lossless either way.
+> No cap flag needed: the dflash default (full block = cap 7) **is** the measured optimum on
+> both quants. The DSpark rows remain the measured best of their mode —
+> [`DimInfer/Qwen3.8-27B-Dspark-v1`](https://huggingface.co/DimInfer/Qwen3.8-27B-Dspark-v1)
+> at 4-bit (1.99–2.01×, cap 7, no confidence flag) and `RadixArk/Qwen3.8-27B-DSpark` at 8-bit
+> (2.72–2.92×, cap 7) — see [DSpark vs DFlash](#dspark-vs-dflash-head-to-head) for the
+> head-to-head.
 
 <sub>The speed column is the measured range across the three benchmark contents at the row's
 best configuration — chat at the low end, code/math at the high end (decoding speed depends on
@@ -434,6 +436,7 @@ a silent mis-load):
 |---|---|---|
 | **DeepSpec-native standalone drafter** (qwen3/gemma4 backbone, any size/quant) | `deepseek-ai/dspark_qwen3_32b_block7` | ✅ runs via `--drafter` — no registry entry needed (4B/8B/14B/gemma-12B are measured *and* registered, so they need no flag; larger sizes should run — reports welcome) |
 | **z-lab DFlash adapter** for a qwen3/gemma4-family target | `z-lab/Qwen3-8B-DFlash-b16` | ✅ runs via `--mode dflash --drafter` |
+| **DFlash 2** (Inco AI: candidate selector + dynamic convs) | `incoai/Qwen3.8-27B-DFlash2` | ✅ runs via `--mode dflash --drafter`; the Qwen3.8-27B heads are measured *and* registered (auto-resolve, and `--mode auto` picks them as that target's best) |
 | **PrismML dspark GGUF** (Bonsai-27B) | `prism-ml/Ternary-Bonsai-27B-gguf` → `*-dspark-bf16.gguf` | ✅ pre-converted repacks auto-resolve (`Rahim/*-dspark`); any future GGUF-only drop runs via `--drafter gguf:<repo>/<file>.gguf` (converted locally, once) |
 | **vLLM "speculators" format** (`dspark` algorithm) | `makora-ai/gemma4-26b-a4b-dspark`, `mgoin/Qwen3-8B-speculator.dspark` | ✅ runs via `--drafter` — the config schema is translated on load (the tensor names are already DeepSpec's). Includes EAGLE-3-style **reduced draft vocabularies** (`draft_vocab_size` + a `d2t` table). Other speculators algorithms (eagle/eagle3) are refused by name. `makora-ai/gemma4-26b-a4b-dspark` (Google's 26B/4B-active MoE) measures **1.27×** on `mlx-community/gemma-4-26b-a4b-it-8bit` (`--max-draft 2 --no-lookup-drafts`: 1.38× code / 1.37× math / 1.06× chat, 46.9→59.5 tok/s) — not registered for auto-resolution while the ratio is under review |
 | **Full model with embedded drafter** | `deepseek-ai/DeepSeek-V4-Pro-DSpark` (893 GB, MLA+MoE) | ❌ different architecture & packaging — out of scope for consumer Macs |
@@ -512,23 +515,27 @@ quantization doesn't change acceptance — that's set by the drafter↔target ma
 
 ## Which target should I use?
 
-**Mode first, because it's the short one: DSpark, everywhere** — `--mode auto` picks it for you.
-On current mlx (≥ 0.32) DSpark beats DFlash on every pair measured here (the receipts are in
-[DSpark vs DFlash](#dspark-vs-dflash-head-to-head)). That verdict is *version-dependent* and worth
-knowing about: on mlx 0.31, verify cost rose steeply with the number of tokens verified, which made
-DFlash's full 16-block the winner on Gemma-12B code/math; 0.32's kernels made narrow multi-row
-verify disproportionately cheaper and flipped it. If your mlx/hardware differs, `--max-draft auto`
-re-measures the curves on your machine, and `mlx-dspark benchmark` settles it empirically.
+**Mode first, because it's the short one: `--mode auto` picks each pair's measured best.**
+That is DSpark everywhere except **Qwen3.8-27B, where the DFlash 2 drafter wins on both quants**
+(same verify width, higher acceptance — receipts in
+[DSpark vs DFlash](#dspark-vs-dflash-head-to-head)). The original-DFlash verdict is
+*version-dependent* and worth knowing about: on mlx 0.31, verify cost rose steeply with the
+number of tokens verified, which made DFlash's full 16-block the winner on Gemma-12B code/math;
+0.32's kernels made narrow multi-row verify disproportionately cheaper and flipped it to DSpark —
+and v0.12.0's small-M verify kernel flattened the curve enough that DFlash 2's
+acceptance-at-fixed-width wins it back on Qwen3.8. If your mlx/hardware differs,
+`--max-draft auto` re-measures the curves on your machine, and `mlx-dspark benchmark` settles it
+empirically.
 
 **Target, by the Mac you have** (all numbers from [the table above](#supported-models); speedups
 and caps are this M4 Pro's — yours are derived fresh on first run):
 
-- **~48 GB** — `Qwen3.8-27B-8bit` (best ratio in the project: 2.72×, 3.37× on math) or
-  `Muse-Glimmer-30B-8bit` (the strongest chat ratio, 2.2×+). Both ~29–40 GB resident.
-- **~24–36 GB** — `gemma-4-12B-it-8bit` (big ratio *and* real speed: ~46–55 tok/s),
-  `Qwen3.6-27B-8bit`, or `Qwen3.8-27B-4bit` (27B quality in ~18 GB at ~23–34 tok/s — its
-  `DimInfer` drafter's measured best is a plain `--max-draft 7`, which `static_cap` also derives
-  with no flag; no confidence flag needed here — see the note below).
+- **~48 GB** — `Qwen3.8-27B-8bit` (best ratio in the project: **3.63× with its DFlash 2
+  drafter**, 4.06× on math — `--mode auto` picks it) or `Muse-Glimmer-30B-8bit` (the strongest
+  DSpark chat ratio, 2.2×+). Both ~29–40 GB resident.
+- **~24–36 GB** — `Qwen3.8-27B-4bit` (27B quality in ~18 GB at **~25–38 tok/s, the fastest
+  decode here** — DFlash 2 via `--mode auto`, no cap flag needed), `gemma-4-12B-it-8bit`
+  (big ratio *and* real speed: ~46–55 tok/s), or `Qwen3.6-27B-8bit`.
 - **~16 GB** — `Ornith-1.0-9B-8bit` (2.4× at ~59–68 tok/s, the mid-size sweet spot),
   `Qwen3-8B-8bit`, or `Qwen3-4B-8bit` (~87–101 tok/s, fits ~8 GB).
 - **Raw tokens per second above all** — the MoEs: `Qwen3.6-35B-A3B-4bit` (~91–145 tok/s).
@@ -595,6 +602,39 @@ curves.
 | **Qwen3.6-35B-A3B** (4-bit, MoE, hybrid)[^community][^moe] | conf | 4.72 | 86.9 tok/s | 114.5 tok/s | **1.32×** | 1.05× / 1.24× / 1.67× |
 | **Nemotron-3.5-Lightning-30B-A3B** (4-bit, MoE+Mamba, hybrid)[^nemotron] | 3 | 3.28 | 91.4 tok/s | 100.9 tok/s | **1.10×** | 0.95× / 1.23× / 1.13× |
 | **Ternary-Bonsai-27B** (2-bit, hybrid) | 2 | 2.60 | 25.4 tok/s | 27.2 tok/s | **1.07×** | 1.01× / 1.13× / 1.07× |
+
+### DFlash 2 on Qwen3.8-27B — the project best (2026-08-19)
+
+The table above is DSpark-mode; on Qwen3.8-27B the **DFlash 2** drafter
+([`incoai/Qwen3.8-27B-DFlash2`](https://huggingface.co/incoai/Qwen3.8-27B-DFlash2)) beats the
+DSpark heads at the **identical verify width** (cap 7 = full block, the dflash-mode default),
+so `--mode auto` — and the Mac app — resolve it for both quants. Same-session pairs, 3-trial
+medians, small-M kernel on, 200 tok:
+
+**8-bit** (baseline 8.4 tok/s):
+
+| method (cap 7) | mean | chat | code | math | accept | tok/s |
+|---|---|---|---|---|---|---|
+| DSpark (`RadixArk`) | 2.92× | 1.99× | 3.24× | 3.55× | 4.15 | 24.5 |
+| **DFlash 2** | **3.63×** | **2.79×** | **4.05×** | **4.06×** | **5.53** | **30.5** |
+
+**4-bit** (baseline 14.7 tok/s, ~18 GB):
+
+| method (cap 7) | mean | chat | code | math | accept | tok/s |
+|---|---|---|---|---|---|---|
+| DSpark (`DimInfer`) | 2.01× | 1.57× | 2.21× | 2.27× | 4.41 | 29.6 |
+| **DFlash 2** | **2.30×** | **1.68×** | **2.62×** | **2.63×** | **5.14** | **33.8** |
+
+DFlash 2 adds a **candidate path selector** (top-16 target-head candidates per slot, a bilinear
+lattice walked from the verified anchor) and per-sublayer **dynamic convolutions** to the DFlash
+backbone — acceptance rises ~+1.1–1.4 tokens *without widening the verify*, which is exactly the
+kind of gain that converts on Apple Silicon (the small-M kernel made verify width 8 nearly flat
+on these targets). Greedy-lossless like everything here (the only divergences from single-row
+greedy are fp ties at margins 0.0–0.125), sampled decoding stays lossless through the selector's
+own proposal distribution, and prefix caching covers this mode (identical-repeat TTFT **159×**,
+multi-turn **29×**, outputs byte-identical to the cold runs). The win is smaller at 4-bit than
+8-bit (1.14× vs 1.24× over DSpark) because the 4-bit verify curve still rises to width 5 — the
+acceptance converts less efficiently, as the curve predicts.
 
 **The MoE row is the interesting one, and its lesson is about the baseline, not the drafter.**
 Qwen3.6-35B-A3B activates ~3.8B of its 35B parameters per token, so plain greedy decoding
@@ -776,7 +816,13 @@ follow-up turns **~13× faster** (measured: 87 ms vs 1132 ms). It's **lossless**
 rest of the project (a warm turn differs from a cold one only at logit-margin≈0 ties) and invalidates itself
 on any error so it can't desync.
 
-On by default for `--mode dspark` / `baseline`; disabled for DFlash. It runs in one of two modes,
+On by default for every mode — `dspark` / `baseline` / `lookup`, and (since 2026-08-19)
+**`dflash` too, checkpoint-only**: the DFlash drafter's context is recoverable from a bounded
+window of projected rows (its sliding-window attention sees at most `window − 1` of them,
+~21 MB on Qwen3.8-27B), which is snapshotted at the boundary and replayed into fresh drafter
+caches on a hit. Measured with the DFlash 2 pair (~4k-token system prompt): identical-repeat
+TTFT 38.3 s → **0.24 s (159×)**, next conversation turn 31.1 s → **1.08 s (29×)**, outputs
+byte-identical to cold runs and drafter acceptance preserved. It runs in one of two modes,
 picked automatically — you don't choose:
 
 - **Trim** (dense targets, e.g. Qwen3): the cache is trimmed back to the shared prefix and the rest
@@ -869,13 +915,24 @@ prints a warning with a `--context-window` value that fits.
 
 ### DSpark vs DFlash (head-to-head)
 
-Three drafters from the same DeepSpec lineage, all EAGLE-family (a tiny drafter that consumes the *target's
+Four drafters from the same DeepSpec lineage, all EAGLE-family (a tiny drafter that consumes the *target's
 hidden states*): **EAGLE3** is autoregressive (high quality, draft latency grows with block size); **DFlash**
 drafts a whole block in one pass (fast, but later positions collide — "suffix decay"); **DSpark** =
 DFlash's parallel backbone **+ a rank-256 Markov head** that reinjects token-to-token dependency, fixing
-suffix decay for ~0.6 ms/round. This is the first MLX port of DSpark; it also runs
+suffix decay for ~0.6 ms/round; **DFlash 2** ([Inco AI, 2026-08](https://inco.ai/blog/dflash2/)) = the
+DFlash backbone **+ a candidate path selector + dynamic convolutions** — it keeps the target head's
+top-16 candidates per position and walks one coherent chain through them, fixing the same incoherence
+with a trained selector instead of a Markov head. This is the first MLX port of DSpark; it also runs
 [z-lab](https://github.com/z-lab/dflash)'s **original** DFlash (block diffusion, Chen et al.,
-[arXiv:2602.06036](https://arxiv.org/abs/2602.06036), MIT) through the same lossless loop.
+[arXiv:2602.06036](https://arxiv.org/abs/2602.06036), MIT) and the DFlash 2 heads through the same
+lossless loop.
+
+**Current verdict (this M4 Pro, mlx 0.32.1): DFlash 2 wins where its checkpoints exist
+(Qwen3.8-27B, both quants — the [tables above](#dflash-2-on-qwen38-27b--the-project-best-2026-08-19));
+DSpark wins everywhere else.** The mechanism matters more than the scoreboard: DFlash 2's
+selector buys its acceptance at the *same* verify width as DSpark's block, so the win survives the
+M-series rule that killed original DFlash on small targets — **acceptance per unit of verify width
+is the objective**, and it is the axis DFlash 2 actually moves.
 
 > **mlx-version note:** the two multi-prompt tables below are the last full sweep, measured on
 > **mlx 0.31.2**. On mlx 0.32 the balance shifted toward DSpark — narrow multi-row verify got
@@ -1061,9 +1118,15 @@ are bundled.
     YaRN rope, block_7, reuses embed *and* lm_head; card: accept 3.39 at temp 0.6 vs the FP8
     target it was trained against): the kernel removes 8-bit qmm's width-6 cliff so the derived
     cap moved 4 → 7 with no flag — **2.72×** mean (3.37× math / 2.84× code / 1.95× chat, accept
-    4.05, math accept 5.15, this pair's highest). 8-bit lifts RadixArk's acceptance (2.44 → 3.43)
+    4.05, math accept 5.15). 8-bit lifts RadixArk's acceptance (2.44 → 3.43)
     because it is the matched precision — the Ornith/Qwen3.6-27B pattern again. Lossless both
-    quants (fp ties only).
+    quants (fp ties only). **Since 2026-08-19 the hook-table numbers for both quants come from
+    the DFlash 2 drafter** (`incoai/Qwen3.8-27B-DFlash2`, one head serves both quants), which
+    beats both DSpark heads at the identical verify width — same-session head-to-heads and the
+    lossless/caching notes are under
+    [DFlash 2 on Qwen3.8-27B](#dflash-2-on-qwen38-27b--the-project-best-2026-08-19); the
+    registry rows carry `mode: dflash`, so `--mode auto` (and the Mac app) resolve it, while
+    the DSpark numbers in this footnote remain that mode's measured best for A/B.
 
 [^nemotron]: **Nemotron-3.5-Lightning-30B-A3B** — the first **Mamba-2 + MoE hybrid** target
     (`nemotron_h`, NVIDIA's official DSpark head), the project's first non-attention recurrence,
