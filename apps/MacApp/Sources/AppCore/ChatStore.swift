@@ -30,15 +30,19 @@ public struct ChatSession: Identifiable, Codable, Sendable {
     public var createdAt: Date
     public var updatedAt: Date
     public var messages: [ChatMessage]
+    /// Per-conversation reasoning-budget override; nil = inherit the server setting.
+    /// Optional so session files saved by older builds still decode.
+    public var reasoningBudget: Int?
 
     public init(id: UUID = UUID(), title: String = "New chat",
                 createdAt: Date = Date(), updatedAt: Date = Date(),
-                messages: [ChatMessage] = []) {
+                messages: [ChatMessage] = [], reasoningBudget: Int? = nil) {
         self.id = id
         self.title = title
         self.createdAt = createdAt
         self.updatedAt = updatedAt
         self.messages = messages
+        self.reasoningBudget = reasoningBudget
     }
 
     /// Titles derive from the first thing the user asked; nobody names chats by hand.

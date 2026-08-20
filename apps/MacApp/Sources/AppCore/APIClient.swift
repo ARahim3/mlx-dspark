@@ -49,6 +49,22 @@ public struct HealthInfo: Decodable, Sendable, Equatable {
     /// `/admin/load` override, so the picker hides then (a control that silently does
     /// nothing is worse than none).
     public let kvBits: Int?
+    /// Server-default reasoning budget: thinking tokens before the engine force-closes the
+    /// block (nil = disabled OR an older engine that doesn't report it — gate on
+    /// `adminConfig`, not this).
+    public let reasoningBudget: Int?
+    /// Text the engine injects when the budget fires. Nil = the engine's built-in default.
+    public let reasoningBudgetMessage: String?
+    /// Server-default thinking switch: true/false = an explicit override, nil = the chat
+    /// template's own default (or an older engine).
+    public let enableThinking: Bool?
+    /// Capability flag: the engine accepts `POST /admin/config` (live reasoning settings,
+    /// no reload). The Reasoning settings card gates on this — older engines 404 there.
+    public let adminConfig: Bool?
+    /// Whether the LOADED model honors reasoning budgets at all — muse-format models
+    /// don't. Per-request budget controls gate on this, not `adminConfig` (which is about
+    /// the server). Nil with no model loaded and on older engines.
+    public let supportsReasoningBudget: Bool?
 
     enum CodingKeys: String, CodingKey {
         case status, model, mode, target, drafter, download
@@ -60,6 +76,11 @@ public struct HealthInfo: Decodable, Sendable, Equatable {
         case raceArmConfidence = "race_arm_confidence"
         case lookupDrafts = "lookup_drafts"
         case kvBits = "kv_bits"
+        case reasoningBudget = "reasoning_budget"
+        case reasoningBudgetMessage = "reasoning_budget_message"
+        case enableThinking = "enable_thinking"
+        case adminConfig = "admin_config"
+        case supportsReasoningBudget = "supports_reasoning_budget"
     }
 
     /// True when a model is loaded and serving (`status == "ok"`).
@@ -115,6 +136,19 @@ public struct LoadStatus: Decodable, Sendable {
     public let loading: Bool
     public let model: String?
     public let error: String?
+}
+
+/// The effective reasoning defaults, as `/admin/config` echoes them back.
+public struct ReasoningConfig: Decodable, Sendable, Equatable {
+    public let enableThinking: Bool?
+    public let reasoningBudget: Int?
+    public let reasoningBudgetMessage: String?
+
+    enum CodingKeys: String, CodingKey {
+        case enableThinking = "enable_thinking"
+        case reasoningBudget = "reasoning_budget"
+        case reasoningBudgetMessage = "reasoning_budget_message"
+    }
 }
 
 /// One event from a streaming completion.
@@ -239,6 +273,34 @@ public struct APIClient: Sendable {
         return try JSONDecoder().decode(LoadStatus.self, from: data)
     }
 
+    /// The `/admin/config` payload as a pure function, so the encoding is unit-testable.
+    /// `thinkingEnabled` is sent as an explicit true/false BOTH ways (LM Studio semantics:
+    /// ON must win over a template whose own default is off — `null`, which merely clears
+    /// the override, stays an API-only affair). `budget` 0 = disabled (the checkbox-off
+    /// state). `message` nil = the engine's default text as JSON null; `""` is sent as `""`
+    /// — the engine's explicit close-with-no-message mode.
+    public static func reasoningPayload(thinkingEnabled: Bool, budget: Int,
+                                        message: String?) -> [String: Any] {
+        ["enable_thinking": thinkingEnabled,
+         "reasoning_budget": budget,
+         "reasoning_budget_message": message ?? NSNull()]
+    }
+
+    /// Set the server-default reasoning knobs live (`POST /admin/config`) — no model
+    /// reload; also effective in the no-model state (the next load carries the values).
+    /// Gate calls on `/health.admin_config` — older engines 404 here.
+    @discardableResult
+    public func configureReasoning(thinkingEnabled: Bool, budget: Int,
+                                   message: String?) async throws -> ReasoningConfig {
+        let payload = Self.reasoningPayload(thinkingEnabled: thinkingEnabled,
+                                            budget: budget, message: message)
+        let body = try JSONSerialization.data(withJSONObject: payload)
+        let req = request("admin/config", method: "POST", body: body)
+        let (data, response) = try await session.data(for: req)
+        try Self.check(response, data)
+        return try JSONDecoder().decode(ReasoningConfig.self, from: data)
+    }
+
     /// Cancel an in-flight first-time download (`/admin/load/cancel`). The blocked
     /// `/admin/load` then fails cleanly and the server stays up, model-less. `cleanup`
     /// also removes the partial files; the default keeps them so loading the same model
@@ -345,18 +407,21 @@ public struct APIClient: Sendable {
         }
     }
 
-    /// Stream a chat completion, yielding text deltas and finally the spec-decode stats.
-    public func streamChat(
+    /// The chat-completions request body, as a pure function so the encoding is
+    /// unit-testable — nil-omit vs real-value matters (a per-chat `reasoning_budget` of 0
+    /// must survive as a JSON 0, the engine's "unbounded for this request").
+    public static func chatPayload(
         model: String,
         messages: [[String: String]],
         temperature: Double? = nil,
         maxTokens: Int? = nil,
         enableThinking: Bool? = nil,
         reasoningEffort: String? = nil,
+        reasoningBudget: Int? = nil,
         topP: Double? = nil,
         seed: Int? = nil,
         stop: [String]? = nil
-    ) -> AsyncThrowingStream<ChatEvent, Error> {
+    ) -> [String: Any] {
         var payload: [String: Any] = [
             "model": model,
             "messages": messages,
@@ -366,9 +431,31 @@ public struct APIClient: Sendable {
         if let maxTokens { payload["max_tokens"] = maxTokens }
         if let enableThinking { payload["enable_thinking"] = enableThinking }
         if let reasoningEffort { payload["reasoning_effort"] = reasoningEffort }
+        if let reasoningBudget { payload["reasoning_budget"] = reasoningBudget }
         if let topP { payload["top_p"] = topP }
         if let seed { payload["seed"] = seed }
         if let stop, !stop.isEmpty { payload["stop"] = stop }
+        return payload
+    }
+
+    /// Stream a chat completion, yielding text deltas and finally the spec-decode stats.
+    public func streamChat(
+        model: String,
+        messages: [[String: String]],
+        temperature: Double? = nil,
+        maxTokens: Int? = nil,
+        enableThinking: Bool? = nil,
+        reasoningEffort: String? = nil,
+        reasoningBudget: Int? = nil,
+        topP: Double? = nil,
+        seed: Int? = nil,
+        stop: [String]? = nil
+    ) -> AsyncThrowingStream<ChatEvent, Error> {
+        let payload = Self.chatPayload(
+            model: model, messages: messages, temperature: temperature,
+            maxTokens: maxTokens, enableThinking: enableThinking,
+            reasoningEffort: reasoningEffort, reasoningBudget: reasoningBudget,
+            topP: topP, seed: seed, stop: stop)
 
         return AsyncThrowingStream { continuation in
             let task = Task {

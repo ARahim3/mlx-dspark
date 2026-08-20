@@ -8,7 +8,10 @@ terminal user would run.
 > syntax highlighting, collapsible reasoning), Lab (Race with lossless verdict, live
 > acceptance decay, this Mac's cost curves), Models (measured pairs with speedups, anything
 > on disk, any HF repo, hot swap via `/admin/load`), Agents (per-client config + round-trip
-> test), menu bar with live rate/memory/accept ribbon, DMG + Homebrew cask tooling.
+> test), Settings → Reasoning (LM Studio Bionic-style thinking switch + reasoning budget —
+> off by default, opt-in — applied live via `/admin/config`, no reload; the chat settings
+> popover adds a per-conversation budget override), menu bar with live rate/memory/accept
+> ribbon, DMG + Homebrew cask tooling.
 >
 > **Engine version:** the bootstrapper installs the **latest PyPI release** at launch (no
 > pin; it rebuilds the runtime when a newer release exists, and offline launches keep the

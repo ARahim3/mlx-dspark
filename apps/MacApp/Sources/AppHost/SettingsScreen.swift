@@ -9,6 +9,10 @@ struct SettingsScreen: View {
             VStack(alignment: .leading, spacing: 16) {
                 DetailLevelCard()
                 if model.detail != .simple { DecodingCard() }
+                // User-level like LM Studio's panel, so it shows in every tier — but only
+                // on engines that accept POST /admin/config (a control that silently does
+                // nothing is worse than none).
+                if model.health?.adminConfig == true { ReasoningCard() }
                 if let report = model.doctorReport { MachineCard(report: report) }
                 ServerCard()
                 AboutCard()
@@ -409,6 +413,123 @@ struct MachineCard: View {
             Text(value).font(.callout).textSelection(.enabled)
             Spacer()
         }
+    }
+}
+
+/// LM Studio Bionic-style Reasoning panel — the SERVER defaults for thinking models,
+/// applied instantly via `POST /admin/config` (no model reload) and persisted so every
+/// server start re-pushes them. No Apply button: toggles apply on change, fields on
+/// Enter/focus loss; `AppModel`'s coalescer serializes the pushes latest-wins.
+struct ReasoningCard: View {
+    @EnvironmentObject private var model: AppModel
+    @State private var budgetText = ""
+    @State private var messageText = ""
+    @FocusState private var focus: Field?
+
+    private enum Field { case budget, message }
+
+    /// The engine's built-in budget message, shown as the field's initial editable value.
+    private static let defaultMessage = "I have to answer now."
+
+    var body: some View {
+        Card(title: "Reasoning",
+             subtitle: "Server defaults for thinking models — applied instantly, no reload.") {
+            VStack(alignment: .leading, spacing: 10) {
+                thinkingRow
+                Divider()
+                budgetRow
+                messageRow
+                if let err = model.reasoningApplyError {
+                    Text(err).font(.caption).foregroundStyle(.orange)
+                }
+                Text("Requests that set their own values still win (e.g. a client sending "
+                     + "Anthropic budget_tokens), and concurrently batched requests skip "
+                     + "the server default. The chat toolbar's Allow-thinking toggle can "
+                     + "still veto thinking per chat.")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+        }
+        // The config endpoint is deliberately lock-free server-side; not posting while our
+        // own /admin/load runs is what keeps the app clear of the accepted config/load race.
+        .disabled(model.isModelLoading)
+        .opacity(model.isModelLoading ? 0.55 : 1)
+        .onAppear {
+            budgetText = String(model.reasoningBudget)
+            messageText = model.reasoningBudgetMessage ?? Self.defaultMessage
+        }
+        .onChange(of: focus) { old, _ in
+            // Commit whichever field just lost focus — tabbing straight from one field to
+            // the other must still commit the first (onSubmit alone misses click-away).
+            if old == .budget { commitBudget() }
+            if old == .message { commitMessage() }
+        }
+    }
+
+    @ViewBuilder private var thinkingRow: some View {
+        Toggle(isOn: $model.thinkingEnabled) {
+            VStack(alignment: .leading, spacing: 2) {
+                Text("Enable Thinking")
+                Text("Controls thinking for chat templates that support enable_thinking.")
+                    .font(.caption2).foregroundStyle(.secondary)
+            }
+        }
+        .toggleStyle(.switch)
+        .onChange(of: model.thinkingEnabled) { _, _ in model.scheduleApplyReasoning() }
+    }
+
+    @ViewBuilder private var budgetRow: some View {
+        HStack(spacing: 8) {
+            Toggle("Reasoning Budget", isOn: $model.reasoningBudgetEnabled)
+                .onChange(of: model.reasoningBudgetEnabled) { _, _ in
+                    model.scheduleApplyReasoning()
+                }
+                .help("Caps how many tokens a thinking model may spend inside its reasoning "
+                      + "block. Past the budget, the message below plus the closing tag are "
+                      + "force-fed through the model so it answers instead of overthinking.")
+            Spacer()
+            TextField("8192", text: $budgetText)
+                .textFieldStyle(.roundedBorder)
+                .frame(width: 92)
+                .multilineTextAlignment(.trailing)
+                .focused($focus, equals: .budget)
+                .onSubmit { commitBudget() }
+                .disabled(!model.reasoningBudgetEnabled)
+                .accessibilityLabel("Reasoning budget tokens")
+        }
+    }
+
+    @ViewBuilder private var messageRow: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text("Reasoning Budget Message").font(.callout).foregroundStyle(.secondary)
+            TextField("", text: $messageText)
+                .textFieldStyle(.roundedBorder)
+                .focused($focus, equals: .message)
+                .onSubmit { commitMessage() }
+                .accessibilityLabel("Reasoning budget message")
+            Text("Injected when the budget fires. Clear it to close the thinking block "
+                 + "with no message.")
+                .font(.caption2).foregroundStyle(.secondary)
+        }
+    }
+
+    /// A checked budget must always mean an enforced budget: only a positive integer
+    /// commits; 0, negative, or non-numeric input restores the last valid value (the
+    /// checkbox — not a zero — is how you disable).
+    private func commitBudget() {
+        let trimmed = budgetText.trimmingCharacters(in: .whitespaces)
+        if let value = Int(trimmed), value >= 1, value != model.reasoningBudget {
+            model.reasoningBudget = value
+            model.scheduleApplyReasoning()
+        }
+        budgetText = String(model.reasoningBudget)      // echo back the effective value
+    }
+
+    private func commitMessage() {
+        guard messageText != (model.reasoningBudgetMessage ?? Self.defaultMessage) else {
+            return
+        }
+        model.reasoningBudgetMessage = messageText      // "" = explicit close-with-no-message
+        model.scheduleApplyReasoning()
     }
 }
 

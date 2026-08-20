@@ -124,9 +124,34 @@ final class AppModel: ObservableObject {
         didSet { Defaults.chatSettings = chatSettings }
     }
 
+    // MARK: Reasoning (Settings → Reasoning)
+    // Server defaults for every request that doesn't set its own values, applied live via
+    // POST /admin/config (no model reload) and re-pushed on every server start, so they
+    // survive restarts. The app's persisted values are the source of truth.
+    @Published var thinkingEnabled: Bool = Defaults.thinkingEnabled {
+        didSet { Defaults.thinkingEnabled = thinkingEnabled }
+    }
+    @Published var reasoningBudgetEnabled: Bool = Defaults.reasoningBudgetEnabled {
+        didSet { Defaults.reasoningBudgetEnabled = reasoningBudgetEnabled }
+    }
+    @Published var reasoningBudget: Int = Defaults.reasoningBudget {
+        didSet { Defaults.reasoningBudget = reasoningBudget }
+    }
+    /// nil = the engine's default message; "" = explicit close-with-no-message.
+    @Published var reasoningBudgetMessage: String? = Defaults.reasoningBudgetMessage {
+        didSet { Defaults.reasoningBudgetMessage = reasoningBudgetMessage }
+    }
+    /// A failed /admin/config push. Rendered inline in the Reasoning card.
+    @Published var reasoningApplyError: String?
+
     // MARK: Chat sessions
     @Published var sessions: [ChatSession] = []
     @Published private(set) var currentSessionID: UUID?
+    /// The CURRENT conversation's reasoning-budget override (nil = inherit the server
+    /// setting). Deliberately not in ChatSettings and not a Defaults key: it is
+    /// per-conversation state that lives in the session files — persisted in
+    /// persistCurrentSession(), restored on select/load, reset for a new chat.
+    @Published var chatReasoningBudget: Int?
 
     // MARK: Telemetry (Lab)
     @Published var rounds: [RoundEvent] = []
@@ -403,7 +428,56 @@ final class AppModel: ObservableObject {
         let client = APIClient(baseURL: URL(string: "http://127.0.0.1:\(port)")!)
         self.apiClient = client
         currentHealth = try? await client.health()
+        // Push the persisted reasoning defaults NOW — after the client exists, before any
+        // model load — so the engine's stored load kwargs already carry them when weights
+        // come up. Unconditional on capable engines: argv can't express an explicit
+        // thinking-ON, so this push is what makes the setting survive restarts.
+        if currentHealth?.adminConfig == true {
+            await performApplyReasoning()
+        }
         return true
+    }
+
+    // MARK: Reasoning apply (instant, serialized latest-wins)
+
+    private lazy var reasoningCoalescer = Coalescer { [weak self] in
+        await self?.performApplyReasoning()
+    }
+
+    /// Instant apply for the Reasoning settings card. Serialized and coalescing: rapid
+    /// toggles/edits can't complete out of order, and the final request always carries the
+    /// newest values (read at send time).
+    func scheduleApplyReasoning() {
+        reasoningCoalescer.schedule()
+    }
+
+    /// A model load snapshots the engine's stored kwargs before publishing the new engine,
+    /// so a reasoning config that lands mid-load (the accepted lock-free window — e.g. a
+    /// coalesced apply still in flight when the load starts) can miss the swapped-in engine.
+    /// Re-pushing the full configuration after every successful load closes the
+    /// app-originated race without locks; the push is idempotent and instant.
+    private func reapplyReasoningAfterLoad() async {
+        guard currentHealth?.adminConfig == true else { return }
+        await performApplyReasoning()
+    }
+
+    private func performApplyReasoning() async {
+        guard let client = apiClient else { return }   // server not up; connect() will push
+        reasoningApplyError = nil
+        let budget = reasoningBudgetEnabled ? reasoningBudget : 0
+        logStore.note("reasoning config → thinking \(thinkingEnabled ? "on" : "off") · "
+                      + "budget \(budget > 0 ? String(budget) : "off")")
+        do {
+            _ = try await client.configureReasoning(thinkingEnabled: thinkingEnabled,
+                                                    budget: budget,
+                                                    message: reasoningBudgetMessage)
+            currentHealth = try? await client.health()
+        } catch {
+            // The card only shows on engines advertising admin_config, so a failure here
+            // is a genuine configuration problem — surface it, don't swallow it.
+            reasoningApplyError = error.localizedDescription
+            logStore.note("reasoning config failed — \(error.localizedDescription)")
+        }
     }
 
     /// Load `target` into the running server (`/admin/load`) with inline progress — the
@@ -443,6 +517,7 @@ final class AppModel: ObservableObject {
             // Re-point health at the new model and restart the telemetry stream (the old one
             // ended when the engine it was streaming from was torn down).
             currentHealth = try? await client.health()
+            await reapplyReasoningAfterLoad()
             startTelemetry()
             startMemoryPolling()
             await refreshDiagnostics()
@@ -559,6 +634,7 @@ final class AppModel: ObservableObject {
                                            lookupDrafts: lookupDrafts,
                                            kvBits: kvBits)
             currentHealth = try? await client.health()
+            await reapplyReasoningAfterLoad()
             startTelemetry()
             startMemoryPolling()
             await refreshDiagnostics()
@@ -568,6 +644,7 @@ final class AppModel: ObservableObject {
             // If even that fails, the server survives model-less; the picker still works.
             _ = try? await client.loadModel(model)
             currentHealth = try? await client.health()
+            await reapplyReasoningAfterLoad()
             startTelemetry()
             startMemoryPolling()
         }
@@ -756,6 +833,9 @@ final class AppModel: ObservableObject {
                     // The template ignores effort when thinking is off, so don't send it then.
                     reasoningEffort: self.chatSettings.thinking && self.supportsReasoningEffort
                         ? self.chatSettings.reasoningEffort : nil,
+                    // A budget is meaningless when thinking is vetoed for this chat.
+                    reasoningBudget: self.chatSettings.thinking
+                        ? self.chatReasoningBudget : nil,
                     topP: self.chatSettings.topP,
                     seed: self.chatSettings.seed,
                     stop: self.chatSettings.stopList
@@ -819,9 +899,11 @@ final class AppModel: ObservableObject {
            let session = sessions.first(where: { $0.id == saved }) {
             currentSessionID = session.id
             messages = session.messages
+            chatReasoningBudget = session.reasoningBudget
         } else if let latest = sessions.first {
             currentSessionID = latest.id
             messages = latest.messages
+            chatReasoningBudget = latest.reasoningBudget
         }
         // No sessions yet: stay unsaved until the first message, so quitting a fresh app
         // doesn't litter empty files.
@@ -833,6 +915,7 @@ final class AppModel: ObservableObject {
         currentSessionID = nil
         Defaults.currentSession = nil
         messages = []
+        chatReasoningBudget = nil
         chatError = nil
         screen = .chat
     }
@@ -845,6 +928,7 @@ final class AppModel: ObservableObject {
         currentSessionID = session.id
         Defaults.currentSession = session.id
         messages = session.messages
+        chatReasoningBudget = session.reasoningBudget
         chatError = nil
     }
 
@@ -855,6 +939,7 @@ final class AppModel: ObservableObject {
             currentSessionID = nil
             Defaults.currentSession = nil
             messages = []
+            chatReasoningBudget = nil
         }
     }
 
@@ -870,6 +955,7 @@ final class AppModel: ObservableObject {
             Defaults.currentSession = session.id
         }
         session.messages = messages
+        session.reasoningBudget = chatReasoningBudget
         session.updatedAt = Date()
         session.retitleFromContent()
         chatStore.save(session)
@@ -1070,5 +1156,34 @@ enum Defaults {
             return settings
         }
         set { store.set(try? JSONEncoder().encode(newValue), forKey: "chatSettings") }
+    }
+
+    // Reasoning defaults (Settings → Reasoning). Never-set means: thinking on, budget OFF
+    // (opt-in, like LM Studio's unticked checkbox; 8192 seeds the field when enabled),
+    // the engine's own budget message.
+    static var thinkingEnabled: Bool {
+        get { store.object(forKey: "thinkingEnabled") == nil
+              ? true : store.bool(forKey: "thinkingEnabled") }
+        set { store.set(newValue, forKey: "thinkingEnabled") }
+    }
+
+    static var reasoningBudgetEnabled: Bool {
+        get { store.bool(forKey: "reasoningBudgetEnabled") }
+        set { store.set(newValue, forKey: "reasoningBudgetEnabled") }
+    }
+
+    static var reasoningBudget: Int {
+        get {
+            let v = store.integer(forKey: "reasoningBudget")
+            return v > 0 ? v : 8192
+        }
+        set { store.set(newValue, forKey: "reasoningBudget") }
+    }
+
+    /// nil (key never set) = the engine's default text; a stored value — INCLUDING "" —
+    /// is explicit ("" is the engine's close-with-no-message mode, a real choice).
+    static var reasoningBudgetMessage: String? {
+        get { store.string(forKey: "reasoningBudgetMessage") }
+        set { store.set(newValue, forKey: "reasoningBudgetMessage") }
     }
 }

@@ -2,7 +2,62 @@
 
 All notable changes to `mlx-dspark`. Versions follow [SemVer](https://semver.org/) (pre-1.0: minor-ish features land as patch bumps).
 
-## [0.14.0] — 2026-08-20 — depth-aware verify caps: long-context decode fixed
+## [Unreleased]
+
+### Fixed
+- **Non-streaming responses no longer leak a truncated thinking block as content on
+  prefill-opener templates** (Qwen3-2507/qwen3_5-class, whose chat template opens `<think>`
+  at the end of the prompt). When `max_tokens` cut the generation before the closer, the
+  text had neither opener nor closer and `split_thinking` misread it as all-answer — the
+  whole chain of thought landed in `content` (OpenAI) / a `text` block (Anthropic). The
+  non-streaming paths now pass the same prefilled-opener hint the streaming splitters have
+  always used (`split_thinking(..., in_thinking=...)` / `build_message(..., in_thinking=...)`),
+  so a truncated block correctly reads as all-reasoning. Surfaced by the reasoning-budget
+  end-to-end tests (a disabled budget is exactly the state that runs thinking into the cap).
+
+### Added
+- **`POST /admin/config`** sets the server-default reasoning knobs on the LIVE engine — no
+  model reload, effective on the very next request: `enable_thinking` (true/false, or null
+  to clear the override), `reasoning_budget` (0 disables), `reasoning_budget_message`
+  (null = the default text, `""` = close the block with no message). Values survive
+  `/admin/load` swaps and the no-model state (written into the holder's stored load
+  kwargs); the whole patch is validated before anything mutates, so a 400 never leaves a
+  partial update. `/health` now also reports `enable_thinking`, `reasoning_budget_message`,
+  and an `admin_config` capability flag (both the ready and no-model branches). Known
+  limitation (deliberately lock-free): a config landing inside an in-flight swap's
+  copy-to-publish window may be missed by that engine — the next swap still carries it.
+- **Mac app: Reasoning settings card** (Settings, all tiers) replicating LM Studio Bionic's
+  panel — an Enable Thinking switch, a Reasoning Budget checkbox + token field (unchecked by
+  default, like LM Studio; checking seeds 8192), and the budget message field. Changes apply
+  instantly via `/admin/config` (serialized latest-wins), persist across launches (re-pushed
+  on every server start, before the model loads), and the card is capability-gated on
+  `/health.admin_config` and disabled during model loads.
+- **Mac app: per-chat reasoning budget** in the chat settings popover — unchecked inherits
+  the server setting, a value enforces it for that conversation only (persisted in the
+  session file), and `0` lifts the budget for that chat even when the server default is on.
+  Hidden unless the loaded model honors budgets (`/health.supports_reasoning_budget`, false
+  on muse-format models) and inert while the chat's Allow-thinking veto is off.
+- **Reasoning budget** (LM Studio Bionic-style): a thinking model is stopped from reasoning
+  unboundedly. Past `N` tokens inside `<think>…</think>` (or Gemma-4's channel pair), the
+  budget message (default *"I have to answer now."*) plus the family-correct closing tag are
+  force-fed through the target — KV cache and drafter context stay consistent on every path
+  (dspark, dflash, lookup, baseline) — and generation continues into the answer. Fires at most
+  once per response, round-granular, disarmed when the model closes its own block, and counts
+  the injected tokens against `max_tokens`. **Opt-in at every layer** (like LM Studio's
+  unticked checkbox): the loops default to no budget, and the knobs are `serve` / `generate`
+  `--reasoning-budget N` (**default 0 = off**, e.g. 8192 to opt in) and
+  `--reasoning-budget-message`;
+  per-request `reasoning_budget` / `reasoning_budget_message` (OpenAI, `0` disables) and
+  `thinking.budget_tokens` (Anthropic — previously accepted-and-ignored, now enforced;
+  `type: "disabled"` also disables the budget); `/health` reports the default
+  (`reasoning_budget`, including in the `--no-model` state) and whether the loaded model
+  honors budgets at all (`supports_reasoning_budget`, false on muse-format models);
+  `GenResult.budget_forced` flags a fired budget. Not applied to muse/harmony-channel
+  models. Under `--max-batch`, an
+  **explicitly requested** budget takes the serial path (enforced exactly), while the ambient
+  server default never forfeits batching — concurrently batched rows just don't enforce it
+  (a lone request runs serial anyway and does). Library calls (`speculative_generate` etc.)
+  default to `think_budget=None` — unchanged behavior.
 
 ### Fixed
 - **OpenAI tool-calls streams no longer buffer the whole generation** (issue #19). With

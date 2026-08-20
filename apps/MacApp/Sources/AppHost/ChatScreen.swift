@@ -130,6 +130,7 @@ struct ChatSettingsPanel: View {
     @EnvironmentObject private var model: AppModel
     @State private var maxTokensText: String = ""
     @State private var seedText: String = ""
+    @State private var chatBudgetText: String = ""
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
@@ -252,6 +253,49 @@ struct ChatSettingsPanel: View {
                 }
             }
 
+            // Only for models that honor per-request budgets (muse-format models don't —
+            // the server reports support in /health). Per-CHAT and three-state, unlike the
+            // Settings card: unchecked = inherit the server setting, a value = enforce it
+            // for this conversation, 0 = unbounded here even if the server default is on.
+            if model.health?.supportsReasoningBudget == true {
+                VStack(alignment: .leading, spacing: 4) {
+                    HStack {
+                        Toggle(isOn: Binding(
+                            get: { model.chatReasoningBudget != nil },
+                            set: { on in
+                                // Keep the text mirror in lockstep so uncheck→recheck
+                                // can't show one number while sending another.
+                                model.chatReasoningBudget = on ? 8192 : nil
+                                chatBudgetText = on ? "8192" : ""
+                            }
+                        )) {
+                            Text("Reasoning budget")
+                        }
+                        Spacer()
+                        if model.chatReasoningBudget != nil {
+                            TextField("8192", text: $chatBudgetText)
+                                .textFieldStyle(.roundedBorder)
+                                .multilineTextAlignment(.trailing)
+                                .frame(width: 92)
+                                .accessibilityLabel("Per-chat reasoning budget tokens")
+                                .onChange(of: chatBudgetText) { _, text in
+                                    // Only a parsed non-negative number commits; a stray
+                                    // keystroke must not nil the value (that would uncheck
+                                    // the box and collapse this row mid-typing).
+                                    if let v = Int(text), v >= 0 {
+                                        model.chatReasoningBudget = v
+                                    }
+                                }
+                        }
+                    }
+                    .disabled(!model.chatSettings.thinking)
+                    Text("Overrides the server's budget for this chat only. 0 lifts the "
+                         + "budget entirely; uncheck to inherit the server setting.")
+                        .font(.caption2).foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+
             // Only for models whose template actually reads it (the server reports support
             // in /health) — a control that silently does nothing is worse than none.
             if model.supportsReasoningEffort {
@@ -279,6 +323,7 @@ struct ChatSettingsPanel: View {
         .onAppear {
             maxTokensText = model.chatSettings.maxTokens.map(String.init) ?? ""
             seedText = model.chatSettings.seed.map(String.init) ?? ""
+            chatBudgetText = model.chatReasoningBudget.map(String.init) ?? ""
         }
     }
 }
