@@ -200,6 +200,11 @@ mlx-dspark serve --model mlx-community/Qwen3-8B-8bit        # → http://127.0.0
 #   --mode auto|dspark|dflash|lookup|baseline   ·   --no-thinking   ·   --api-key KEY
 #   --reasoning-effort low|medium|xhigh   default reasoning depth on models that support it
 #                   (Qwen3.8-class; /health reports support, requests can override)
+#   --reasoning-budget N   cap thinking at N tokens (LM Studio Bionic-style; default 0 =
+#                   off, opt in with e.g. 8192): past the budget the message + closing tag
+#                   are force-injected so the model answers instead of overthinking.
+#                   --reasoning-budget-message sets the injected text
+#                   (default "I have to answer now.")
 #   --no-model      start instantly with nothing loaded; POST /admin/load loads later,
 #                   POST /admin/unload frees the model again (port survives both).
 #                   A first-time load reports download progress in /health and is
@@ -233,8 +238,14 @@ The server speaks the OpenAI API: `POST /v1/chat/completions` (streaming **and**
 multi-turn), `POST /v1/completions`, `GET /v1/models`, `GET /health`, `GET /metrics`. It supports
 `temperature`, `top_p`, `top_k`, `max_tokens`, `stop`, `seed`, `presence_penalty` / `frequency_penalty`,
 `logprobs` / `top_logprobs`, **tool calling** (`tools` / `tool_calls`), a per-request thinking toggle
-(`enable_thinking`), and per-request `reasoning_effort` on models whose template supports it (Qwen3.8-class;
-`GET /health` reports `supports_reasoning_effort`). Each response carries an `x_mlx_dspark` block (accept length + tok/s) so the
+(`enable_thinking`), per-request `reasoning_effort` on models whose template supports it (Qwen3.8-class;
+`GET /health` reports `supports_reasoning_effort`), and a per-request **reasoning budget**
+(`reasoning_budget`, plus optional `reasoning_budget_message`) that caps how long a thinking model may
+reason before being forced to answer — `0` disables it for the request, and `GET /health` reports the
+server defaults (`reasoning_budget`, `reasoning_budget_message`, `enable_thinking`). Those server
+defaults are also settable **live** — `POST /admin/config` changes them on the running engine with no
+model reload (`/health` advertises the capability as `admin_config`); values stick across
+`/admin/load` swaps and the no-model state. Each response carries an `x_mlx_dspark` block (accept length + tok/s) so the
 spec-decode gain is visible. **Continuous batching** (`--max-batch N`) serves concurrent requests in one
 batched forward for ~2.5× aggregate throughput (see [Concurrent throughput](#concurrent-throughput));
 **prefix caching** (on by default) reuses the conversation prefix so multi-turn chat and agents don't
@@ -268,7 +279,10 @@ Tool calling, multi-turn `tool_use`/`tool_result` history, `stop_sequences`, and
 translated to whatever the loaded model's own chat template expects — including each family's tool
 syntax (Hermes JSON, Gemma-4, and the XML `<function=>` form) — and a reasoning model's `<think>` or
 `<|channel>thought` output is lifted into proper Anthropic `thinking` blocks rather than leaking as
-prose.
+prose. `thinking: {"type": "enabled", "budget_tokens": N}` is **enforced**: past N thinking tokens the
+budget message + closing tag are force-injected so the model answers (the server's `--reasoning-budget`
+default applies when the request doesn't send one; `type: "disabled"` turns both thinking and the
+budget off).
 
 **Measured** — each of these ran a real Claude Code session that read a buggy file and fixed it with
 the `Edit` tool (M4 Pro, `--no-thinking`, identical task):
@@ -320,6 +334,7 @@ Practical notes for a local model:
 | **Use a tool-calling model** | These are tool-use agents first. Qwen3-8B and up handle it; smaller models flail. |
 | **Agent choice moves the clock more than model choice** | The client's prompt size is the dominant cost on a local model — a lean agent like pi is an order of magnitude faster on the same hardware and the same task. |
 | **`--no-thinking` is a speed knob, not a requirement** | Leaving it off works fine — reasoning is streamed as proper `thinking` blocks either way. It just costs: on Qwen3-8B the same Claude Code task ran 3:17 and 2762 output tokens with thinking vs ~2:20 and 169 without, since the model thinks before *every* tool call. A client sending `thinking: {"type": "disabled"}` gets the same effect per-request. Note it's a no-op on Gemma-4, whose template doesn't think by default. |
+| **The reasoning budget is the middle ground** (v0.14) | `--reasoning-budget N` (opt-in — the default is off; 8192 is the LM Studio-parity value) keeps thinking but stops a model from sitting in `<think>` for minutes on a simple question: past N thinking tokens the budget message (default *"I have to answer now."*, `--reasoning-budget-message`) plus the closing tag are force-fed through the model, which then answers normally. Enforcement is approximate (round-granular on the speculative paths, can overshoot by a few tokens), fires at most once per response, counts the injected tokens against `max_tokens`, and doesn't apply to gpt-oss/harmony-channel models. Under `--max-batch`, a budget the request asked for **explicitly** runs serially so it's enforced exactly; the server default never costs you batching — concurrently batched rows simply don't enforce it (a lone request runs serial anyway and does). |
 | **Leave prefix caching on** | It is doing most of the work (see the table). The first request of a *cold server* is the slow one; since 0.10.1 a fresh session over a system prompt the server has already seen partially reuses it (rungs — see [Prefix caching](#prefix-caching)). |
 | **Context** | An over-long request is refused with the wording Claude Code recognises as a context limit, so it compacts and retries instead of dying. `--context-window N` lowers the bar deliberately (e.g. to keep the KV cache inside your RAM budget). |
 | **Streams stay alive, and disconnects actually stop generation** (v0.12.3) | Keep-alive frames flow every 15 s through stretches with nothing on the wire (long prefills; tool-call responses are buffered until complete), so agent clients don't idle-timeout mid-request. And if a client *does* vanish, generation stops at the next round instead of running to `max_tokens` while later requests queue behind it — the "server stalls but `/health` is fine" failure mode. |

@@ -57,6 +57,7 @@ class GenResult:
     finish_reason: str = "stop"  # "stop" (eos/stop-string) | "length" (hit max_new_tokens)
     lookup_rounds: int = 0       # rounds whose draft came from the free n-gram lookup
     logprobs: list | None = None  # per-token [{token_id, logprob, top:[(id, logprob), …]}], if requested
+    budget_forced: bool = False  # a reasoning budget fired and force-closed the thinking block
 
     @property
     def mean_accept_len(self) -> float:
@@ -404,6 +405,131 @@ def _finish_reason(out_ids: list[int], max_new_tokens: int, last_tok: int,
     return "length" if len(out_ids) >= max_new_tokens else "stop"
 
 
+# LM Studio's default message, matched deliberately so a reasoning budget behaves the way
+# its "Bionic" feature taught people to expect. The budget itself is opt-in at every layer
+# (CLI --reasoning-budget, per-request fields, the Mac app's checkbox — LM Studio ships its
+# checkbox unticked too); the loop functions default to think_budget=None (no injection),
+# so library callers keep byte-identical behavior.
+DEFAULT_BUDGET_MESSAGE = "I have to answer now."
+
+
+class ThinkBudget:
+    """Reasoning-budget tracker shared by every generation loop.
+
+    Watches the committed tokens for a thinking block (``<think>…</think>`` or the Gemma-4
+    channel pair) and, once ``budget`` tokens have been spent inside one, hands the loop the
+    token ids of a forced close — ``"\\n\\n{message}\\n" + closer + "\\n\\n"`` — to feed through
+    the target so the model is compelled to start answering. The loop owns the cache/context
+    mechanics; this class owns detection and the forced text.
+
+    Tracking is text-level (its own streaming detokenizer + a
+    :class:`~mlx_dspark.anthropic_api.ThinkingStreamSplitter` observer), because openers can
+    span several tokens and straddle round boundaries. A template-prefilled opener (Qwen3-2507
+    style — generation starts *inside* the block) is auto-detected from the prompt tail via
+    :func:`~mlx_dspark.anthropic_api.prompt_opens_thinking` unless ``in_thinking`` is given.
+    Fires at round granularity (an overshoot of one round's commit is possible) and at most
+    once per generation; a model that closes its own block first disarms the budget.
+    """
+
+    def __init__(self, tokenizer, budget: int, message: str | None = None,
+                 prompt_tail_ids: list[int] | None = None,
+                 eos_ids: set[int] | None = None,
+                 in_thinking: str | None = None):
+        from . import anthropic_api as A  # deferred: anthropic_api imports tools, not us
+
+        self._tok = tokenizer
+        self.budget = int(budget)
+        if self.budget <= 0:
+            raise ValueError(f"think budget must be a positive token count, got {budget!r}")
+        # "" is a real choice — close the block with no message; only None means default
+        self.message = DEFAULT_BUDGET_MESSAGE if message is None else message
+        self.eos_ids = eos_ids or set()
+        if in_thinking is None and prompt_tail_ids:
+            try:
+                in_thinking = A.prompt_opens_thinking(
+                    tokenizer.decode(list(prompt_tail_ids)[-8:]))
+            except Exception:  # noqa: BLE001 — tail decode is best-effort on exotic tokenizers
+                in_thinking = None
+        self._splitter = A.ThinkingStreamSplitter(in_thinking=in_thinking)
+        self._detok = _make_detokenizer(tokenizer)
+        self._n_fed = 0          # tokens of out_ids already fed to the detokenizer
+        self._n_chars = 0        # chars of detok.text already fed to the splitter (its
+        #                          .text is cumulative; the splitter wants increments)
+        self._start = 0 if in_thinking else None   # len(out_ids) when thinking began
+        self._done = False       # fired, or the model closed its own block
+        self.fired = False       # a forced close was actually handed out
+
+    def note(self, out_ids: list[int]) -> bool:
+        """Feed the newly committed tokens; True when the budget is exceeded inside a
+        thinking block and the loop should inject :meth:`take_forced_ids`. Idempotent —
+        repeated calls with unchanged ``out_ids`` return the same answer."""
+        if self._done:
+            return False
+        for t in out_ids[self._n_fed:]:
+            if t not in self.eos_ids:
+                self._detok.add_token(t)
+        self._n_fed = len(out_ids)
+        text = self._detok.text
+        new = text[self._n_chars:]
+        self._n_chars = len(text)
+        if new:
+            self._splitter.feed(new)
+        state = self._splitter.state
+        if state == "answer":     # closed its own block (or never opened one): disarm
+            self._done = True
+            return False
+        if state != "thinking":
+            return False
+        if self._start is None:   # opener completed somewhere in this round's commit
+            self._start = len(out_ids)
+        if len(out_ids) - self._start < self.budget:
+            return False
+        # Don't fire while the splitter's held-back tail could still complete the closer —
+        # the model may be mid-`</think>` right now; the next round settles it either way
+        # (more thinking text -> fire then; the closer completes -> disarmed).
+        buf, close = self._splitter.buf, self._splitter.close
+        return not (buf and any(buf.endswith(close[:i]) for i in range(1, len(close))))
+
+    @property
+    def close_marker(self) -> str:
+        """The family-correct closing marker (known once the opener has been seen, or from
+        a prefilled opener; the Qwen ``</think>`` default otherwise)."""
+        return self._splitter.close
+
+    def _encode(self, text: str) -> list[int]:
+        try:
+            ids = self._tok.encode(text, add_special_tokens=False)
+        except TypeError:         # tokenizer without the kwarg (same retry as encode_messages)
+            ids = self._tok.encode(text)
+        return [int(i) for i in ids]
+
+    def _closer_ids(self) -> list[int]:
+        # `</think>` is a single added token on Qwen; resolve it like eos_token_ids does,
+        # falling back to a plain-text encode (Gemma's `<channel|>` etc.).
+        unk = getattr(self._tok, "unk_token_id", None)
+        try:
+            i = self._tok.convert_tokens_to_ids(self.close_marker)
+        except Exception:  # noqa: BLE001 — tokenizers raise various types for unknown tokens
+            i = None
+        if isinstance(i, int) and i >= 0 and i != unk:
+            return [i]
+        return self._encode(self.close_marker)
+
+    def take_forced_ids(self, remaining: int) -> list[int]:
+        """Token ids of the forced close, or ``[]`` when fewer than ``remaining`` tokens are
+        left (the closer must never be truncated — generation then just runs to the cap as it
+        would today). A non-empty return arms once-only and sets :attr:`fired`."""
+        ids = (self._encode("\n\n" + self.message + "\n" if self.message else "\n")
+               + self._closer_ids()
+               + self._encode("\n\n"))
+        ids = [i for i in ids if i not in self.eos_ids]  # a forced eos would end the turn
+        if not ids or remaining < len(ids):
+            return []
+        self._done = True
+        self.fired = True
+        return ids
+
+
 def greedy_generate(
     target_model,
     tokenizer,
@@ -422,6 +548,8 @@ def greedy_generate(
     seed: int | None = None,
     apply_chat_template: bool = True,
     stop: list[str] | None = None,
+    think_budget: int | None = None,
+    budget_message: str | None = None,
     on_text=None,
     on_round=None,
     on_prefill=None,
@@ -433,12 +561,17 @@ def greedy_generate(
     ``presence_penalty`` / ``frequency_penalty`` (OpenAI) penalize the completion's own tokens.
 
     ``prompt_ids`` overrides ``prompt`` with a pre-tokenized prompt (the server passes a full
-    multi-turn transcript this way); ``stop`` adds string stop-sequences (OpenAI ``stop``)."""
+    multi-turn transcript this way); ``stop`` adds string stop-sequences (OpenAI ``stop``).
+    ``think_budget`` caps reasoning: past that many tokens inside a thinking block, a
+    :class:`ThinkBudget` forced close (``budget_message`` + the closing marker) is fed through
+    the model and generation continues into the answer."""
     if seed is not None:
         mx.random.seed(seed)
     eos_ids = eos_token_ids(tokenizer)
     ids = prompt_ids if prompt_ids is not None else encode_prompt(
         tokenizer, prompt, use_chat=apply_chat_template)
+    tb = (ThinkBudget(tokenizer, think_budget, budget_message,
+                      prompt_tail_ids=ids, eos_ids=eos_ids) if think_budget else None)
     if cache is None:                                  # fresh, or reuse a prefix-cached one
         cache = target_model.make_cache()
         reuse_len = 0
@@ -454,6 +587,8 @@ def greedy_generate(
     out_ids: list[int] = []
     pen = _Penalizer(presence_penalty, frequency_penalty)
     lp_list: list | None = [] if logprobs is not None else None
+    accepts: list[int] = []   # per-forward committed counts: 1 per plain step, len(forced)
+    #                           for a budget injection — so rounds/forwards stay truthful
 
     if pen.active or logprobs is not None:
         # Sequential decode: needed when penalties are on (penalty state must include the just-
@@ -465,6 +600,7 @@ def greedy_generate(
                     if pen.active else 0.0)
             nxt = int(_sample_arr(logits_row - pen0, temperature, top_p, top_k).item())
             out_ids.append(nxt)
+            accepts.append(1)
             pen.add([nxt])
             if on_round is not None:
                 on_round(drafted=0, accepted=0, committed=1, cap=0, source="plain")
@@ -474,6 +610,27 @@ def greedy_generate(
             if len(out_ids) >= max_new_tokens or nxt in eos_ids or st.stopped:
                 break
             logits_row = target_model.plain(mx.array([[nxt]]), cache)[0, -1]
+            if tb is not None and tb.note(out_ids):
+                forced = tb.take_forced_ids(max_new_tokens - len(out_ids))
+                if forced:
+                    # cache holds prompt + out_ids exactly here; one forward commits the
+                    # whole forced close and leaves logits_row at the post-close position
+                    full = target_model.plain(mx.array([forced]), cache)
+                    if lp_list is not None:
+                        # row predicting forced[i]: the pre-injection row, then full[:-1]
+                        rows = mx.concatenate([logits_row[None, :], full[0, :-1]])
+                        lp_list.extend(_logprobs_for_block(rows, forced, logprobs))
+                    out_ids.extend(forced)
+                    accepts.append(len(forced))
+                    pen.add(forced)
+                    if on_round is not None:
+                        on_round(drafted=0, accepted=0, committed=len(forced), cap=0,
+                                 source="plain")
+                    st.update(out_ids)
+                    nxt = forced[-1]
+                    if len(out_ids) >= max_new_tokens or st.stopped:
+                        break
+                    logits_row = full[0, -1]
     else:
         # Pipelined decode (mlx-lm style): schedule step t+1 on the GPU *before* syncing on
         # step t's token, so detokenize/emit overlaps GPU compute instead of serializing with
@@ -487,6 +644,7 @@ def greedy_generate(
             mx.async_eval(y_next)
             nxt = int(y.item())
             out_ids.append(nxt)
+            accepts.append(1)
             # Baseline has no speculation, but reporting each step keeps the live view's
             # event shape identical across modes — which is what makes a side-by-side race
             # between baseline and dspark a single rendering path.
@@ -495,6 +653,24 @@ def greedy_generate(
             st.update(out_ids)
             if len(out_ids) >= max_new_tokens or nxt in eos_ids or st.stopped:
                 break
+            if tb is not None and tb.note(out_ids):
+                forced = tb.take_forced_ids(max_new_tokens - len(out_ids))
+                if forced:
+                    # cache holds prompt + out_ids here; y_next was sampled but never fed,
+                    # so discarding it costs only this round's pipelining overlap
+                    logits = target_model.plain(mx.array([forced]), cache)
+                    out_ids.extend(forced)
+                    accepts.append(len(forced))
+                    if on_round is not None:
+                        on_round(drafted=0, accepted=0, committed=len(forced), cap=0,
+                                 source="plain")
+                    st.update(out_ids)
+                    nxt = forced[-1]
+                    if len(out_ids) >= max_new_tokens or st.stopped:
+                        break
+                    y = _sample_arr(logits[0, -1], temperature, top_p, top_k)
+                    mx.async_eval(y)
+                    continue
             y = y_next
     st.flush()
 
@@ -504,12 +680,13 @@ def greedy_generate(
         text=text,
         token_ids=out_ids,
         num_tokens=len(out_ids),
-        num_rounds=len(out_ids),
-        accept_lengths=[1] * len(out_ids),
-        target_forwards=len(out_ids),
+        num_rounds=len(accepts),
+        accept_lengths=accepts,
+        target_forwards=len(accepts),
         seconds=secs,
         finish_reason=_finish_reason(out_ids, max_new_tokens, nxt, eos_ids, st),
         logprobs=lp_list,
+        budget_forced=tb.fired if tb is not None else False,
     )
 
 
@@ -533,6 +710,8 @@ def dflash_generate(
     apply_chat_template: bool = True,
     seed: int | None = None,
     stop: list[str] | None = None,
+    think_budget: int | None = None,
+    budget_message: str | None = None,
     on_text=None,
     on_round=None,
     on_prefill=None,
@@ -577,6 +756,8 @@ def dflash_generate(
 
     ids = prompt_ids if prompt_ids is not None else encode_prompt(
         tokenizer, prompt, use_chat=apply_chat_template)
+    tb = (ThinkBudget(tokenizer, think_budget, budget_message,
+                      prompt_tail_ids=ids, eos_ids=eos_ids) if think_budget else None)
     # Prefix caching (checkpoint mode, server path): the caller may pass a target cache
     # already holding the first `reuse_len` tokens plus a DFlashCtxWindow of the drafter's
     # projected ctx rows ending at that boundary — then only the suffix is prefilled and
@@ -671,6 +852,27 @@ def dflash_generate(
 
     st.update(out_ids)
     while len(out_ids) < max_new_tokens and pending not in eos_ids and not st.stopped:
+        if tb is not None and tb.note(out_ids):
+            forced = tb.take_forced_ids(max_new_tokens - len(out_ids))
+            if forced:
+                # ---- forced close (reasoning budget): one verify commits the whole close,
+                # forced[-1] becomes the new `pending` (committed, not yet in cache). The
+                # current pending_ctx rows haven't been appended to the draft cache yet
+                # (the *next* draft call does that), so the forced rows are CONCATENATED —
+                # overwriting would drop committed drafter context.
+                v_logits, v_fused = target_model.verify(
+                    mx.array([[pending] + forced[:-1]]), cache, tap)
+                target_model.rollback(cache, 0, [])   # hybrid targets: clear capture stash
+                pending_ctx = mx.concatenate([pending_ctx, v_fused], axis=1)
+                out_ids.extend(forced)
+                pending = forced[-1]
+                target_forwards += 1
+                accept_lengths.append(len(forced))
+                if on_round is not None:
+                    on_round(drafted=0, accepted=0, committed=len(forced), cap=0,
+                             source="plain")
+                st.update(out_ids)
+                continue
         # ---- draft full-width block; feeding pending_ctx appends exactly the just-
         # committed positions to the draft KV cache (DFlash caches only ctx KV, never
         # block KV) -> correct absolute RoPE offsets, no trim needed.
@@ -762,6 +964,7 @@ def dflash_generate(
         target_forwards=target_forwards,
         seconds=secs,
         finish_reason=_finish_reason(out_ids, max_new_tokens, pending, eos_ids, st),
+        budget_forced=tb.fired if tb is not None else False,
     )
 
 
@@ -945,6 +1148,8 @@ def speculative_generate(
     seed: int | None = None,
     apply_chat_template: bool = True,
     stop: list[str] | None = None,
+    think_budget: int | None = None,
+    budget_message: str | None = None,
     on_text=None,
     on_round=None,
     on_prefill=None,
@@ -990,6 +1195,10 @@ def speculative_generate(
     scaling when long drafts keep getting chopped early (insertion-heavy edits) and probes
     back in. Set equal to ``lookup_max_draft`` to disable. Speed-only; output unchanged
     (see :meth:`NGramIndex.propose`).
+
+    ``think_budget`` caps reasoning (see :class:`ThinkBudget`): past that many tokens inside
+    a thinking block, ``budget_message`` + the closing marker are force-fed through one
+    verify round and generation continues into the answer. Round-granular and once-only.
     """
     if seed is not None:
         mx.random.seed(seed)
@@ -1012,6 +1221,8 @@ def speculative_generate(
     # --- tokenize prompt ---
     ids = prompt_ids if prompt_ids is not None else encode_prompt(
         tokenizer, prompt, use_chat=apply_chat_template)
+    tb = (ThinkBudget(tokenizer, think_budget, budget_message,
+                      prompt_tail_ids=ids, eos_ids=eos_ids) if think_budget else None)
 
     # Prefix caching: the caller may pass a target cache + drafter ctx already holding the
     # first `reuse_len` tokens (a shared conversation prefix); then we only prefill the
@@ -1063,6 +1274,36 @@ def speculative_generate(
 
     st.update(out_ids)
     while len(out_ids) < max_new_tokens and pending not in eos_ids and not st.stopped:
+        if tb is not None and tb.note(out_ids):
+            forced = tb.take_forced_ids(max_new_tokens - len(out_ids))
+            if forced:
+                # ---- forced close (reasoning budget) ----
+                # One verify feeds [pending] + forced[:-1] (= len(forced) rows) and commits
+                # everything unconditionally; forced[-1] becomes the new `pending` (committed,
+                # not yet in cache), so the round invariant is untouched. Row i of v_logits
+                # predicts forced[i]; v_fused rows are exactly the tokens just fed.
+                v_logits, v_fused = target_model.verify(
+                    mx.array([[pending] + forced[:-1]]), cache, tap)
+                target_model.rollback(cache, 0, [])   # hybrid targets: clear capture stash
+                drafter.update_context(v_fused, ctx_offset=n_cached, ctx_caches=ctx_caches)
+                n_cached += len(forced)
+                mx.async_eval([c.k for c in ctx_caches])
+                out_ids.extend(forced)
+                pen.add(forced)
+                if lp_list is not None:
+                    lp_list.extend(
+                        _logprobs_for_block(v_logits[0][:len(forced)], forced, logprobs))
+                if index is not None:
+                    index.extend(forced)
+                pending = forced[-1]
+                target_forwards += 1
+                accept_lengths.append(len(forced))
+                if on_round is not None:
+                    on_round(drafted=0, accepted=0, committed=len(forced), cap=0,
+                             source="plain")
+                st.update(out_ids)
+                _rt = time.perf_counter()   # don't bill the injection to the cap controller
+                continue
         lk_draft = []
         if index is not None:
             # clamp to the remaining budget: no verify width wasted past max_new_tokens
@@ -1111,7 +1352,8 @@ def speculative_generate(
                 pending = nxt
                 st.update(out_ids)
                 if (steps <= 0 or len(out_ids) >= max_new_tokens or pending in eos_ids
-                        or st.stopped or cap_controller.cap != 0):
+                        or st.stopped or cap_controller.cap != 0
+                        or (tb is not None and tb.note(out_ids))):
                     break
                 y = nxt_arr.reshape(1, 1)
                 logits, fused = target_model.verify(y, cache, tap)
@@ -1313,4 +1555,5 @@ def speculative_generate(
         finish_reason=_finish_reason(out_ids, max_new_tokens, pending, eos_ids, st),
         lookup_rounds=lookup_rounds,
         logprobs=lp_list,
+        budget_forced=tb.fired if tb is not None else False,
     )

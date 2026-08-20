@@ -39,6 +39,8 @@ class _FakeEngine:
     sampling_defaults = {}
     default_max_tokens = 2048
     max_tokens_cap = 32768
+    default_think_budget = None   # mirrors Engine (server default reasoning budget)
+    think_budget_message = None
     cap_controller = None
     is_muse = False           # mirrors Engine.is_muse (muse_glimmer channel parsing off)
 
@@ -46,15 +48,21 @@ class _FakeEngine:
         self.tokenizer = _FakeTok()
         self.calls = []
         self.response_text = "Hello world from mlx dspark"
+        # instance-level: /admin/config mutates it, and a class-level dict would leak
+        # one test's mutation into the next
+        self.template_defaults = {}
 
     def generate(self, prompt_ids, *, max_tokens, temperature, top_p=1.0, top_k=0,
                  presence_penalty=0.0, frequency_penalty=0.0, logprobs=None,
-                 stop, seed, on_text=None):
+                 stop, seed, think_budget=None, budget_message=None, budget_explicit=False,
+                 on_text=None):
         self.calls.append({"prompt_ids": prompt_ids, "max_tokens": max_tokens,
                                "temperature": temperature, "top_p": top_p, "top_k": top_k,
                                "presence_penalty": presence_penalty,
                                "frequency_penalty": frequency_penalty, "logprobs": logprobs,
-                               "stop": stop, "seed": seed})
+                               "stop": stop, "seed": seed, "think_budget": think_budget,
+                               "budget_message": budget_message,
+                               "budget_explicit": budget_explicit})
         text = self.response_text
         if on_text:
             for w in text.split(" "):
@@ -547,6 +555,306 @@ def test_supports_reasoning_effort_tracks_the_template():
     tok = _ThinkTok()
     tok.chat_template = "{% if reasoning_effort == 'low' %}brief{% endif %}"
     assert _probe_engine(tok).supports_reasoning_effort is True
+
+
+def test_nonstream_chat_truncated_prefilled_thinking_stays_reasoning(server):
+    # A template that PREFILLS <think> (the prompt tail ends with the opener) plus a
+    # generation truncated by max_tokens leaves neither opener nor closer in the text.
+    # The non-streaming split must still classify it as reasoning, not leak it as content.
+    eng, base = server
+    eng.response_text = "half a thought, cut by max_tokens"
+    body = {"messages": [{"role": "user", "content": "hi\n<think>"}]}
+    msg = _post(base, "/v1/chat/completions", body)["choices"][0]["message"]
+    assert msg["reasoning_content"] == "half a thought, cut by max_tokens"
+    assert not msg["content"]
+    # when the closer DID arrive, the split is what it always was
+    eng.response_text = "done thinking</think>\nThe answer."
+    msg = _post(base, "/v1/chat/completions", body)["choices"][0]["message"]
+    assert msg["reasoning_content"] == "done thinking"
+    assert msg["content"] == "The answer."
+    # and a prompt that does NOT end in an opener keeps the old all-answer reading
+    eng.response_text = "half a thought, cut by max_tokens"
+    msg = _post(base, "/v1/chat/completions",
+                {"messages": [{"role": "user", "content": "hi"}]})["choices"][0]["message"]
+    assert msg["content"] == "half a thought, cut by max_tokens"
+    assert "reasoning_content" not in msg
+
+
+def test_think_budget_normalization():
+    assert S._think_budget(512) == 512
+    assert S._think_budget(0) is None                    # explicit 0 = disabled
+    for bad in (True, False, "lots", 1.5, -1, None):
+        with pytest.raises(ValueError):
+            S._think_budget(bad)
+
+
+def test_reasoning_budget_field_reaches_generate(server):
+    eng, base = server
+    _post(base, "/v1/chat/completions",
+          {"messages": [{"role": "user", "content": "hi"}], "reasoning_budget": 512,
+           "reasoning_budget_message": "Wrap it up."})
+    assert eng.calls[-1]["think_budget"] == 512
+    assert eng.calls[-1]["budget_message"] == "Wrap it up."
+    assert eng.calls[-1]["budget_explicit"] is True
+    # "" is preserved (close the block with no message), not swapped for the default
+    eng.think_budget_message = "Server default."
+    _post(base, "/v1/chat/completions",
+          {"messages": [{"role": "user", "content": "hi"}], "reasoning_budget": 512,
+           "reasoning_budget_message": ""})
+    assert eng.calls[-1]["budget_message"] == ""
+    # streaming goes through the same params dict
+    _post(base, "/v1/chat/completions",
+          {"messages": [{"role": "user", "content": "hi"}], "reasoning_budget": 256,
+           "stream": True}, stream=True)
+    assert eng.calls[-1]["think_budget"] == 256
+
+
+def test_reasoning_budget_engine_default_and_zero_disables(server):
+    eng, base = server
+    body = {"messages": [{"role": "user", "content": "hi"}]}
+    _post(base, "/v1/chat/completions", body)
+    assert eng.calls[-1]["think_budget"] is None         # no default configured
+    eng.default_think_budget = 8192
+    eng.think_budget_message = "Answer."
+    _post(base, "/v1/chat/completions", body)
+    assert eng.calls[-1]["think_budget"] == 8192         # server default applies
+    assert eng.calls[-1]["budget_message"] == "Answer."
+    assert eng.calls[-1]["budget_explicit"] is False     # ambient: batching keeps working
+    _post(base, "/v1/chat/completions", {**body, "reasoning_budget": 0})
+    assert eng.calls[-1]["think_budget"] is None         # explicit 0 overrides the default
+
+
+def test_reasoning_budget_invalid_is_400(server):
+    _eng, base = server
+    for bad in (True, "lots", 1.5, -1):
+        with pytest.raises(urllib.error.HTTPError) as e:
+            _post(base, "/v1/chat/completions",
+                  {"messages": [{"role": "user", "content": "hi"}], "reasoning_budget": bad})
+        assert e.value.code == 400
+    with pytest.raises(urllib.error.HTTPError) as e:
+        _post(base, "/v1/chat/completions",
+              {"messages": [{"role": "user", "content": "hi"}], "reasoning_budget": 5,
+               "reasoning_budget_message": 7})
+    assert e.value.code == 400
+
+
+def test_reasoning_budget_not_passed_on_muse(server):
+    eng, base = server
+    eng.is_muse = True
+    eng.default_think_budget = 8192
+    _post(base, "/v1/chat/completions",
+          {"messages": [{"role": "user", "content": "hi"}], "reasoning_budget": 512})
+    assert eng.calls[-1]["think_budget"] is None
+
+
+def test_health_reports_reasoning_budget(server):
+    eng, base = server
+    assert _get(base, "/health")["reasoning_budget"] is None
+    eng.default_think_budget = 4096
+    assert _get(base, "/health")["reasoning_budget"] == 4096
+
+
+def test_health_supports_reasoning_budget_gates_on_muse(server):
+    # A per-request budget control must gate on this, not admin_config: the muse request
+    # path deliberately skips think_budget, so the control would do nothing there.
+    eng, base = server
+    assert _get(base, "/health")["supports_reasoning_budget"] is True
+    eng.is_muse = True
+    assert _get(base, "/health")["supports_reasoning_budget"] is False
+
+
+def test_health_reports_reasoning_budget_with_no_model_loaded():
+    holder = S.EngineHolder(None, {"default_think_budget": 4096}, max_batch=1)
+    httpd = ThreadingHTTPServer(("127.0.0.1", 0), S.make_handler(holder, api_key=None))
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    try:
+        h = _get(f"http://127.0.0.1:{httpd.server_address[1]}", "/health")
+        assert h["status"] == "no_model" and h["reasoning_budget"] == 4096
+        # no model = no answer about what the model supports; the key stays absent
+        assert "supports_reasoning_budget" not in h
+    finally:
+        httpd.shutdown()
+
+
+def test_engine_load_rejects_bad_budget_knobs():
+    with pytest.raises(ValueError):
+        S.Engine.load(model="whatever", default_think_budget=-5)
+    with pytest.raises(ValueError):
+        S.Engine.load(model="whatever", think_budget_message=7)
+
+
+def test_admin_config_mutates_live_engine_no_reload(server):
+    eng, base = server
+    r = _post(base, "/admin/config", {"enable_thinking": False, "reasoning_budget": 512,
+                                      "reasoning_budget_message": "Hurry."})
+    assert r == {"enable_thinking": False, "reasoning_budget": 512,
+                 "reasoning_budget_message": "Hurry."}
+    assert eng.default_think_budget == 512
+    assert eng.think_budget_message == "Hurry."
+    assert eng.template_defaults["enable_thinking"] is False
+    # effective immediately: the very next request runs with the new default
+    _post(base, "/v1/chat/completions", {"messages": [{"role": "user", "content": "hi"}]})
+    assert eng.calls[-1]["think_budget"] == 512
+    assert eng.calls[-1]["budget_message"] == "Hurry."
+
+
+def test_admin_config_explicit_true_null_zero_and_empty(server):
+    eng, base = server
+    # explicit ON is stored as True — it must WIN over a template whose default is off,
+    # not merely clear the override
+    _post(base, "/admin/config", {"enable_thinking": True})
+    assert eng.template_defaults["enable_thinking"] is True
+    _post(base, "/admin/config", {"enable_thinking": None})
+    assert "enable_thinking" not in eng.template_defaults      # null clears the override
+    eng.default_think_budget = 8192
+    _post(base, "/admin/config", {"reasoning_budget": 0})
+    assert eng.default_think_budget is None                     # 0 disables
+    _post(base, "/admin/config", {"reasoning_budget_message": ""})
+    assert eng.think_budget_message == ""                       # explicit empty preserved
+    _post(base, "/admin/config", {"reasoning_budget_message": None})
+    assert eng.think_budget_message is None                     # null = engine default
+
+
+def test_admin_config_validates_whole_patch_before_mutating(server):
+    eng, base = server
+    # a valid budget beside an invalid message must change NOTHING
+    with pytest.raises(urllib.error.HTTPError) as e:
+        _post(base, "/admin/config", {"reasoning_budget": 512,
+                                      "reasoning_budget_message": 7})
+    assert e.value.code == 400
+    assert eng.default_think_budget is None
+    for body in ({"reasoning_budget": -1}, {"reasoning_budget": True},
+                 {"reasoning_budget": "x"}, {"enable_thinking": 3}):
+        with pytest.raises(urllib.error.HTTPError) as e:
+            _post(base, "/admin/config", body)
+        assert e.value.code == 400
+
+
+def test_admin_config_rejects_non_object_bodies(server):
+    eng, base = server
+    # do_POST decodes any JSON value; each of these must be a clean 400 (not a 500 from
+    # the `in` membership checks) and must mutate nothing — including [] , which the `in`
+    # operator would otherwise wave through as an accidental read-back.
+    for body in (None, [], ["reasoning_budget"], "reasoning_budget", 5):
+        with pytest.raises(urllib.error.HTTPError) as e:
+            _post(base, "/admin/config", body)
+        assert e.value.code == 400
+    assert eng.default_think_budget is None
+
+
+def test_admin_config_empty_body_reads_back(server):
+    eng, base = server
+    eng.default_think_budget = 4096
+    assert _post(base, "/admin/config", {}) == {
+        "enable_thinking": None, "reasoning_budget": 4096,
+        "reasoning_budget_message": None}
+
+
+def _serve_handler(target):
+    httpd = ThreadingHTTPServer(("127.0.0.1", 0), S.make_handler(target, api_key=None))
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    return httpd, f"http://127.0.0.1:{httpd.server_address[1]}"
+
+
+def test_admin_config_reaches_inner_engine_through_holder_and_batch_wrapper():
+    inner = _FakeEngine()
+    batch = object.__new__(S.BatchEngine)   # real class (isinstance + __getattr__), no threads
+    batch.engine = inner
+    holder = S.EngineHolder(batch, {"default_think_budget": 8192})
+    httpd, base = _serve_handler(holder)
+    try:
+        _post(base, "/admin/config", {"reasoning_budget": 256, "enable_thinking": True})
+        # the INNERMOST engine mutated — and no shadowing attrs on the delegating wrappers,
+        # which would permanently break their __getattr__ forwarding
+        assert inner.default_think_budget == 256
+        assert inner.template_defaults["enable_thinking"] is True
+        assert "default_think_budget" not in batch.__dict__
+        assert "default_think_budget" not in holder.__dict__
+        # and the stored load kwargs carry the values into any later swap
+        assert holder._load_kwargs["default_think_budget"] == 256
+        assert holder._load_kwargs["enable_thinking"] is True
+    finally:
+        httpd.shutdown()
+
+
+def test_admin_config_no_model_updates_kwargs():
+    holder = S.EngineHolder(None, {"default_think_budget": 8192})
+    httpd, base = _serve_handler(holder)
+    try:
+        r = _post(base, "/admin/config", {"reasoning_budget": 512,
+                                          "reasoning_budget_message": "Go.",
+                                          "enable_thinking": False})
+        assert r == {"enable_thinking": False, "reasoning_budget": 512,
+                     "reasoning_budget_message": "Go."}
+        assert holder._load_kwargs["default_think_budget"] == 512
+        assert holder._load_kwargs["think_budget_message"] == "Go."
+        assert holder._load_kwargs["enable_thinking"] is False
+        # /health (no-model branch) reflects the stored values + the capability flag
+        h = _get(base, "/health")
+        assert h["status"] == "no_model" and h["admin_config"] is True
+        assert h["reasoning_budget"] == 512
+        assert h["reasoning_budget_message"] == "Go."
+        assert h["enable_thinking"] is False
+    finally:
+        httpd.shutdown()
+
+
+def test_health_reports_thinking_and_message_keys(server):
+    eng, base = server
+    h = _get(base, "/health")
+    assert h["admin_config"] is True
+    assert h["enable_thinking"] is None and h["reasoning_budget_message"] is None
+    eng.template_defaults["enable_thinking"] = True
+    eng.think_budget_message = "Answer."
+    h = _get(base, "/health")
+    assert h["enable_thinking"] is True and h["reasoning_budget_message"] == "Answer."
+
+
+def test_direct_batch_engine_callers_get_explicit_budget_enforcement():
+    # a library caller passing think_budget without knowing about the scheduler hint must
+    # queue an EXPLICIT job (enforced via the serial path), never an ambient one that a
+    # concurrent batch could silently skip
+    be = object.__new__(S.BatchEngine)
+
+    class _CaptureQ:
+        def __init__(self):
+            self.jobs = []
+
+        def put(self, job):
+            self.jobs.append(job)
+            job.result = "done"
+            job.done.set()
+
+    be._q = _CaptureQ()
+    be.generate([1, 2], max_tokens=5, temperature=0.0, think_budget=512)
+    assert be._q.jobs[0].params["budget_explicit"] is True
+    assert not S.BatchEngine._batchable_greedy(be._q.jobs[0])
+
+
+def test_batch_routing_explicit_budget_serial_ambient_budget_batches():
+    from types import SimpleNamespace
+
+    ok = {"presence_penalty": 0, "frequency_penalty": 0, "logprobs": None,
+          "temperature": 0.0, "think_budget": None, "budget_explicit": False}
+    assert S.BatchEngine._batchable_greedy(SimpleNamespace(params=ok))
+    # an EXPLICITLY requested budget forfeits batching for exact enforcement...
+    assert not S.BatchEngine._batchable_greedy(
+        SimpleNamespace(params={**ok, "think_budget": 512, "budget_explicit": True}))
+    # ...but the ambient server default must NOT disable --max-batch across the board
+    assert S.BatchEngine._batchable_greedy(
+        SimpleNamespace(params={**ok, "think_budget": 8192}))
+    be = object.__new__(S.BatchEngine)
+    be.engine = SimpleNamespace(mode="dspark")
+    routed = []
+    be._run_serial = lambda j: routed.append("serial")
+    be._run_session = lambda jobs: routed.append("session")
+    be._run_batched = lambda jobs, key: routed.append("batched")
+    jobs = [SimpleNamespace(params={**ok, "top_p": 1.0, "top_k": 0,
+                                    "think_budget": 512, "budget_explicit": True}),
+            SimpleNamespace(params={**ok, "top_p": 1.0, "top_k": 0, "think_budget": 8192}),
+            SimpleNamespace(params={**ok, "top_p": 1.0, "top_k": 0, "think_budget": 8192})]
+    be._run(jobs)
+    assert routed == ["serial", "session"]
 
 
 def test_race_reasoning_effort_param_validated_and_echoed(server):

@@ -198,13 +198,26 @@ def _split_muse(text: str) -> tuple[str, str]:
     return reasoning.strip(), answer.strip()
 
 
-def split_thinking(text: str) -> tuple[str, str]:
+def split_thinking(text: str, in_thinking: str | None = None) -> tuple[str, str]:
     """``(reasoning, answer)``. Handles the self-opened form, the prefilled one (output that
     closes a block it never opened), and muse_glimmer's recipient-tagged channels. Returns
-    ``("", text)`` when there's no reasoning, and treats an unterminated block as all-reasoning."""
+    ``("", text)`` when there's no reasoning, and treats an unterminated block as all-reasoning.
+
+    ``in_thinking`` is the closing marker to expect when the chat template *prefilled* the
+    opener (see :func:`prompt_opens_thinking`): the text then STARTS inside the block, so a
+    missing closer means it is ALL reasoning. Without the hint that case is undetectable —
+    a thinking block truncated by ``max_tokens`` has neither opener nor closer in the text
+    and would misread as all-answer, leaking the chain of thought into content (the
+    streaming splitters have taken this hint since they existed; this is its non-streaming
+    counterpart)."""
     if _MUSE_MSG in text:            # muse Onyx-ATEM channels (the marker is muse-only)
         return _split_muse(text)
     s = text.lstrip()
+    if in_thinking:
+        end = s.find(in_thinking)
+        if end == -1:                # truncated before the closer ever arrived
+            return s, ""
+        return s[:end], s[end + len(in_thinking):].lstrip()
     for open_, close in _THINK_PAIRS:
         if s.startswith(open_):
             body = s[len(open_):]
@@ -500,11 +513,13 @@ def stop_reason(finish_reason: str, has_tool_use: bool) -> str:
 
 def build_message(text: str, *, model: str, input_tokens: int, output_tokens: int,
                   finish_reason: str, msg_id: str | None = None,
-                  thinking: bool = True, schemas: dict | None = None) -> dict:
+                  thinking: bool = True, schemas: dict | None = None,
+                  in_thinking: str | None = None) -> dict:
     """A complete non-streaming ``Message``, with reasoning and tool calls lifted out of
     ``text`` into their own content blocks. ``thinking=False`` discards the reasoning instead
-    of emitting a block for it; ``schemas`` types the XML tool-call form (see ``tools.py``)."""
-    reasoning, text = split_thinking(text)
+    of emitting a block for it; ``schemas`` types the XML tool-call form (see ``tools.py``);
+    ``in_thinking`` is the prefilled-opener hint (see :func:`split_thinking`)."""
+    reasoning, text = split_thinking(text, in_thinking=in_thinking)
     calls, cleaned = parse_tool_calls(text, schemas)
     content: list[dict] = []
     if reasoning and thinking:

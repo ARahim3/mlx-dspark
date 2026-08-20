@@ -469,6 +469,34 @@ def test_split_thinking_self_opened_and_prefilled_and_absent():
     assert A.split_thinking("<think>cut off") == ("cut off", "")
 
 
+def test_split_thinking_in_thinking_hint_covers_the_truncated_prefill():
+    # terminated: same split with or without the hint
+    assert A.split_thinking("reasoning</think>\n\nanswer",
+                            in_thinking="</think>") == ("reasoning", "answer")
+    # TRUNCATED (max_tokens cut the thinking; no opener, no closer): only the hint can
+    # tell — with it the text is all reasoning...
+    cut = "half a thought, cut by max_tokens"
+    assert A.split_thinking(cut, in_thinking="</think>") == (cut, "")
+    # ...without it the old undetectable-case behavior stands (all-answer)
+    assert A.split_thinking(cut) == ("", cut)
+    # the hint carries the family-correct closer (Gemma-4)
+    assert A.split_thinking("weighing\n<channel|>Fixed.",
+                            in_thinking="<channel|>") == ("weighing\n", "Fixed.")
+    # no hint (None/""): every existing path is untouched
+    assert A.split_thinking("<think>r</think>\na", in_thinking=None) == ("r", "a")
+
+
+def test_build_message_in_thinking_truncated_becomes_a_thinking_block():
+    msg = A.build_message("half a thought", model="m", input_tokens=1, output_tokens=2,
+                          finish_reason="length", in_thinking="</think>")
+    assert msg["content"][0] == {"type": "thinking", "thinking": "half a thought",
+                                 "signature": "mlx-dspark"}
+    # thinking disabled discards it and still returns a (empty-text) block
+    msg = A.build_message("half a thought", model="m", input_tokens=1, output_tokens=2,
+                          finish_reason="length", thinking=False, in_thinking="</think>")
+    assert msg["content"] == [{"type": "text", "text": ""}]
+
+
 def test_prompt_opens_thinking_returns_the_matching_closer():
     assert A.prompt_opens_thinking("<|im_start|>assistant\n<think>\n") == "</think>"
     assert A.prompt_opens_thinking("<|im_start|>assistant\n") is None
@@ -605,6 +633,8 @@ class _FakeEngine:
     sampling_defaults = {}
     default_max_tokens = 2048
     max_tokens_cap = 32768
+    default_think_budget = None   # mirrors Engine (server default reasoning budget)
+    think_budget_message = None
     cap_controller = None
     context_window = None
     is_muse = False           # mirrors Engine.is_muse (muse_glimmer channel parsing off)
@@ -616,10 +646,13 @@ class _FakeEngine:
 
     def generate(self, prompt_ids, *, max_tokens, temperature, top_p=1.0, top_k=0,
                  presence_penalty=0.0, frequency_penalty=0.0, logprobs=None,
-                 stop=None, seed=None, on_text=None):
+                 stop=None, seed=None, think_budget=None, budget_message=None,
+                 budget_explicit=False, on_text=None):
         self.calls.append({"prompt_ids": prompt_ids, "max_tokens": max_tokens,
                                "temperature": temperature, "top_p": top_p, "top_k": top_k,
-                               "stop": stop, "seed": seed})
+                               "stop": stop, "seed": seed, "think_budget": think_budget,
+                               "budget_message": budget_message,
+                               "budget_explicit": budget_explicit})
         text = self.response_text
         if on_text:
             for i in range(0, len(text), 5):
@@ -694,6 +727,59 @@ def test_messages_accepts_the_beta_query_claude_code_sends(api):
     _, base = api
     r = _post(base, "/v1/messages?beta=true", {"max_tokens": 10, "messages": USER})
     assert r["type"] == "message"
+
+
+def test_messages_truncated_prefilled_thinking_becomes_a_thinking_block(api):
+    # non-streaming /v1/messages counterpart of the OpenAI-side fix: a prefilled opener
+    # (prompt tail ends with <think>) + max_tokens truncation must yield a thinking block,
+    # not assistant prose carrying the chain of thought
+    eng, base = api
+    eng.response_text = "half a thought"
+    r = _post(base, "/v1/messages",
+              {"max_tokens": 10, "messages": [{"role": "user", "content": "hi\n<think>"}]})
+    assert r["content"][0]["type"] == "thinking"
+    assert r["content"][0]["thinking"] == "half a thought"
+    assert all(b.get("text") != "half a thought" for b in r["content"])
+
+
+def test_messages_thinking_budget_tokens_is_honored(api):
+    eng, base = api
+    _post(base, "/v1/messages", {"max_tokens": 100, "messages": USER,
+                                 "thinking": {"type": "enabled", "budget_tokens": 2048}})
+    assert eng.calls[-1]["think_budget"] == 2048
+    assert eng.calls[-1]["budget_explicit"] is True
+    # streaming shares the same params
+    _post(base, "/v1/messages", {"max_tokens": 100, "messages": USER, "stream": True,
+                                 "thinking": {"type": "enabled", "budget_tokens": 512}},
+          raw=True)
+    assert eng.calls[-1]["think_budget"] == 512
+
+
+def test_messages_budget_default_and_disabled_precedence(api):
+    eng, base = api
+    _post(base, "/v1/messages", {"max_tokens": 100, "messages": USER})
+    assert eng.calls[-1]["think_budget"] is None       # no default configured
+    eng.default_think_budget = 8192
+    _post(base, "/v1/messages", {"max_tokens": 100, "messages": USER})
+    assert eng.calls[-1]["think_budget"] == 8192       # server default applies
+    assert eng.calls[-1]["budget_explicit"] is False   # ambient: batching keeps working
+    _post(base, "/v1/messages", {"max_tokens": 100, "messages": USER,
+                                 "thinking": {"type": "disabled"}})
+    assert eng.calls[-1]["think_budget"] is None       # thinking off: no budget either
+    eng.is_muse = True
+    _post(base, "/v1/messages", {"max_tokens": 100, "messages": USER,
+                                 "thinking": {"type": "enabled", "budget_tokens": 512}})
+    assert eng.calls[-1]["think_budget"] is None       # never on muse-format models
+
+
+def test_messages_malformed_budget_tokens_is_400(api):
+    _, base = api
+    with pytest.raises(urllib.error.HTTPError) as e:
+        _post(base, "/v1/messages", {"max_tokens": 100, "messages": USER,
+                                     "thinking": {"type": "enabled",
+                                                  "budget_tokens": "lots"}})
+    assert e.value.code == 400
+    assert "budget_tokens" in json.loads(e.value.read())["error"]["message"]
 
 
 def test_messages_streaming_event_sequence(api):

@@ -30,6 +30,7 @@ import mlx.core as mx
 
 from .generate import (
     GenResult,
+    ThinkBudget,
     _finish_reason,
     _make_target_cache,
     _pick,
@@ -158,6 +159,8 @@ def lookup_generate(
     seed: int | None = None,
     apply_chat_template: bool = True,
     stop: list[str] | None = None,
+    think_budget: int | None = None,
+    budget_message: str | None = None,
     on_text=None,
     on_round=None,
     on_prefill=None,
@@ -173,12 +176,18 @@ def lookup_generate(
     ``long_draft_tokens``: match-scaled long-draft ceiling — a deep context match (a real
     copy run) earns drafts up to this length; see :meth:`NGramIndex.propose`. Set equal to
     ``max_draft_tokens`` to disable.
+
+    ``think_budget`` caps reasoning (see :class:`~mlx_dspark.generate.ThinkBudget`): past
+    that many tokens inside a thinking block, ``budget_message`` + the closing marker are
+    force-fed through one verify round and generation continues into the answer.
     """
     if seed is not None:
         mx.random.seed(seed)
     eos_ids = eos_token_ids(tokenizer)
     ids = prompt_ids if prompt_ids is not None else encode_prompt(
         tokenizer, prompt, use_chat=apply_chat_template)
+    tb = (ThinkBudget(tokenizer, think_budget, budget_message,
+                      prompt_tail_ids=ids, eos_ids=eos_ids) if think_budget else None)
     if cache is None:
         cache = _make_target_cache(target_model)
         reuse_len = 0
@@ -204,6 +213,23 @@ def lookup_generate(
 
     st.update(out_ids)
     while len(out_ids) < max_new_tokens and pending not in eos_ids and not st.stopped:
+        if tb is not None and tb.note(out_ids):
+            forced = tb.take_forced_ids(max_new_tokens - len(out_ids))
+            if forced:
+                # ---- forced close (reasoning budget): one verify commits the whole close;
+                # forced[-1] becomes the new `pending` (committed, not yet in cache).
+                target_model.verify(mx.array([[pending] + forced[:-1]]), cache, None)
+                target_model.rollback(cache, 0, [])   # hybrid targets: clear capture stash
+                out_ids.extend(forced)
+                index.extend(forced)
+                pending = forced[-1]
+                target_forwards += 1
+                accept_lengths.append(len(forced))
+                if on_round is not None:
+                    on_round(drafted=0, accepted=0, committed=len(forced), cap=0,
+                             source="plain")
+                st.update(out_ids)
+                continue
         # clamp to the remaining budget: no verify width wasted past max_new_tokens
         draft = index.propose(
             long_draft=long_draft_tokens if gate.allowed else None,
@@ -271,4 +297,5 @@ def lookup_generate(
         target_forwards=target_forwards,
         seconds=secs,
         finish_reason=_finish_reason(out_ids, max_new_tokens, pending, eos_ids, st),
+        budget_forced=tb.fired if tb is not None else False,
     )

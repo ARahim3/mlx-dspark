@@ -81,6 +81,15 @@ def _reasoning_effort(value) -> str:
     return value.lower()
 
 
+def _think_budget(value, field: str = "reasoning_budget") -> int | None:
+    """Normalize a client reasoning-budget value: a non-negative integer, where 0 means
+    "explicitly disabled" (returned as None). Anything else — bool, float, string, negative —
+    raises ValueError so the handler can turn a malformed request into a 400, not a 500."""
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError(f"{field} must be a non-negative integer, got {value!r}")
+    return value or None
+
+
 def _target_config(target_repo: str) -> dict | None:
     """The target's ``config.json`` as a dict, or ``None`` when it can't be read."""
     try:
@@ -238,6 +247,8 @@ class Engine:
         sampling_defaults: dict | None = None,
         default_max_tokens: int = 2048,
         max_tokens_cap: int = 32768,
+        default_think_budget: int | None = None,
+        think_budget_message: str | None = None,
         prefix_cache_slots: int = 2,
         prefix_cache_rungs: int = 8192,
         lookup_drafts: bool = True,
@@ -268,6 +279,12 @@ class Engine:
         self.sampling_defaults = dict(sampling_defaults or {})
         self.default_max_tokens = default_max_tokens
         self.max_tokens_cap = max_tokens_cap
+        # Reasoning budget (LM Studio "Bionic"-style; see generate.ThinkBudget). 0/None =
+        # disabled server-wide; requests may override either way (reasoning_budget /
+        # Anthropic thinking.budget_tokens). Never applied to muse-format models.
+        # An empty message is meaningful (close the block with no message) — keep it.
+        self.default_think_budget = default_think_budget or None
+        self.think_budget_message = think_budget_message
         self.prefix_cache_slots = max(1, prefix_cache_slots)
         self.prefix_cache_rungs = max(0, prefix_cache_rungs)  # interior-snapshot spacing
         #   (tokens) for checkpoint-mode prefix caching; 0 disables rungs (see prefix_cache)
@@ -433,6 +450,8 @@ class Engine:
         prefix_cache_max_ram_mb: int = 0,
         default_max_tokens: int = 2048,
         max_tokens_cap: int = 32768,
+        default_think_budget: int | None = None,   # reasoning budget; 0/None = off
+        think_budget_message: str | None = None,   # text injected when the budget fires
         default_temperature: float | None = None,
         default_top_p: float | None = None,
         default_top_k: int | None = None,
@@ -450,6 +469,14 @@ class Engine:
     ) -> Engine:
         if mode != "auto" and mode not in MODES:
             raise ValueError(f"mode must be one of {MODES} or 'auto', got {mode!r}")
+        # Boundary-validate the budget knobs here so a bad value is a clear error at load
+        # time (CLI: argparse error; /admin/load: 400) — a negative default reaching
+        # ThinkBudget would force-close every thinking block instantly.
+        if default_think_budget is not None:
+            default_think_budget = _think_budget(default_think_budget,
+                                                 field="default_think_budget")
+        if think_budget_message is not None and not isinstance(think_budget_message, str):
+            raise ValueError("think_budget_message must be a string")
         # "auto" picks the best available speculation for this target (dspark -> dflash ->
         # drafter-free lookup), so any model repo serves without extra flags.
         mode, target_repo, drafter_repo = resolve_mode(model, mode=mode, drafter=drafter,
@@ -586,6 +613,8 @@ class Engine:
                    cap_controller=cap_controller,
                    sampling_defaults=sampling_defaults,
                    default_max_tokens=default_max_tokens, max_tokens_cap=max_tokens_cap,
+                   default_think_budget=default_think_budget,
+                   think_budget_message=think_budget_message,
                    prefix_cache_slots=prefix_cache_slots,
                    prefix_cache_rungs=prefix_cache_rungs, lookup_drafts=lookup_drafts,
                    lookup_long_draft=lookup_long_draft,
@@ -609,12 +638,20 @@ class Engine:
         logprobs: int | None = None,
         stop: list[str] | None,
         seed: int | None,
+        think_budget: int | None = None,
+        budget_message: str | None = None,
+        budget_explicit: bool = True,    # batching hint only (see BatchEngine._run). True by
+        #                                  default so a direct caller's think_budget is always
+        #                                  enforced; the HTTP handlers pass False for a budget
+        #                                  that came from the SERVER default, which batched
+        #                                  rows may skip rather than forfeit batching
         on_text=None,
     ) -> GenResult:
         # hop onto the single generation thread (keeps all MLX/cache work same-thread)
         return self._executor.submit(
             self._generate_impl, prompt_ids, max_tokens, temperature, top_p, top_k,
-            stop, seed, on_text, presence_penalty, frequency_penalty, logprobs).result()
+            stop, seed, on_text, presence_penalty, frequency_penalty, logprobs,
+            think_budget, budget_message).result()
 
     def _with_slow_round_log(self, inner, n_prompt: int):
         """Wrap a per-round callback with a stall detector: any gap over
@@ -639,7 +676,7 @@ class Engine:
 
     def _generate_impl(self, prompt_ids, max_tokens, temperature, top_p, top_k, stop, seed,
                        on_text, presence_penalty=0.0, frequency_penalty=0.0,
-                       logprobs=None) -> GenResult:
+                       logprobs=None, think_budget=None, budget_message=None) -> GenResult:
         on_round = self._with_slow_round_log(
             RoundRecorder(self.rounds, uuid.uuid4().hex[:8], self.mode), len(prompt_ids))
         # prefix caching: reuse the shared conversation prefix's KV (all modes; dflash is
@@ -702,6 +739,7 @@ class Engine:
                     temperature=temperature, top_p=top_p, top_k=top_k,
                     presence_penalty=presence_penalty, frequency_penalty=frequency_penalty,
                     logprobs=logprobs, seed=seed, stop=stop, on_text=on_text,
+                    think_budget=think_budget, budget_message=budget_message,
                     on_round=on_round, on_prefill=on_prefill, prefill_marks=prefill_marks,
                 )
             elif self.mode == "dflash":
@@ -711,8 +749,9 @@ class Engine:
                     max_new_tokens=max_tokens, max_draft_tokens=eff_cap,
                     cap_controller=self.cap_controller,
                     temperature=temperature, top_p=top_p, top_k=top_k,
-                    seed=seed, stop=stop, on_text=on_text, on_round=on_round,
-                    on_prefill=on_prefill, prefill_marks=prefill_marks,
+                    seed=seed, stop=stop, on_text=on_text,
+                    think_budget=think_budget, budget_message=budget_message,
+                    on_round=on_round, on_prefill=on_prefill, prefill_marks=prefill_marks,
                 )
             elif self.mode == "lookup":
                 res = lookup_generate(
@@ -721,8 +760,9 @@ class Engine:
                     max_new_tokens=max_tokens, max_draft_tokens=self.max_draft_tokens or 6,
                     long_draft_tokens=max(self.max_draft_tokens or 6, self.lookup_long_draft),
                     temperature=temperature, top_p=top_p, top_k=top_k,
-                    seed=seed, stop=stop, on_text=on_text, on_round=on_round,
-                    on_prefill=on_prefill, prefill_marks=prefill_marks,
+                    seed=seed, stop=stop, on_text=on_text,
+                    think_budget=think_budget, budget_message=budget_message,
+                    on_round=on_round, on_prefill=on_prefill, prefill_marks=prefill_marks,
                 )
             else:
                 res = greedy_generate(
@@ -731,8 +771,9 @@ class Engine:
                     max_new_tokens=max_tokens, temperature=temperature, top_p=top_p,
                     top_k=top_k, presence_penalty=presence_penalty,
                     frequency_penalty=frequency_penalty, logprobs=logprobs, seed=seed,
-                    stop=stop, on_text=on_text, on_round=on_round,
-                    on_prefill=on_prefill, prefill_marks=prefill_marks,
+                    stop=stop, on_text=on_text,
+                    think_budget=think_budget, budget_message=budget_message,
+                    on_round=on_round, on_prefill=on_prefill, prefill_marks=prefill_marks,
                 )
         except BaseException:                     # never leave a desynced cache behind
             if self.prefix is not None:
@@ -1149,12 +1190,15 @@ class BatchEngine:
     # --- public API (mirrors Engine.generate) ---
     def generate(self, prompt_ids, *, max_tokens, temperature, top_p=1.0, top_k=0,
                  presence_penalty=0.0, frequency_penalty=0.0, logprobs=None, stop=None,
-                 seed=None, on_text=None) -> GenResult:
+                 seed=None, think_budget=None, budget_message=None, budget_explicit=True,
+                 on_text=None) -> GenResult:
         job = _Job(prompt_ids,
                    {"max_tokens": max_tokens, "temperature": temperature,
                     "top_p": top_p, "top_k": top_k, "presence_penalty": presence_penalty,
                     "frequency_penalty": frequency_penalty, "logprobs": logprobs,
-                    "stop": stop or [], "seed": seed}, on_text)
+                    "stop": stop or [], "seed": seed,
+                    "think_budget": think_budget, "budget_message": budget_message,
+                    "budget_explicit": budget_explicit}, on_text)
         self._q.put(job)
         job.done.wait()
         if job.error is not None:
@@ -1201,8 +1245,14 @@ class BatchEngine:
         groups: dict = {}
         for j in batch:
             p = j.params
-            if p["presence_penalty"] or p["frequency_penalty"] or p["logprobs"] is not None:
-                self._run_serial(j)           # penalties/logprobs: serial (batched kernels lack them)
+            if (p["presence_penalty"] or p["frequency_penalty"] or p["logprobs"] is not None
+                    or (p.get("think_budget") and p.get("budget_explicit"))):
+                # penalties/logprobs: serial (batched kernels lack them). An EXPLICITLY
+                # requested reasoning budget is serial too — ragged per-row injection can't
+                # share a batched forward. The server-DEFAULT budget deliberately does NOT
+                # forfeit batching: batched rows just run without enforcement (a lone
+                # request still goes serial below, where the budget applies as usual).
+                self._run_serial(j)
                 continue
             key = (p["temperature"], p["top_p"], p["top_k"])
             groups.setdefault(key, []).append(j)
@@ -1221,7 +1271,8 @@ class BatchEngine:
     def _batchable_greedy(job: _Job) -> bool:
         p = job.params
         return (not p["presence_penalty"] and not p["frequency_penalty"]
-                and p["logprobs"] is None and not p["temperature"])
+                and p["logprobs"] is None and not p["temperature"]
+                and not (p.get("think_budget") and p.get("budget_explicit")))
 
     def _admit(self, slots, job: _Job) -> bool:
         try:
@@ -1300,7 +1351,8 @@ class BatchEngine:
             job.result = self.engine._generate_impl(
                 job.prompt_ids, p["max_tokens"], p["temperature"], p["top_p"], p["top_k"],
                 p["stop"], p["seed"], job.on_text, p["presence_penalty"], p["frequency_penalty"],
-                p["logprobs"])
+                p["logprobs"], think_budget=p.get("think_budget"),
+                budget_message=p.get("budget_message"))
             self.batch_stats["serial_requests"] += 1
         except BaseException as e:  # noqa: BLE001
             job.error = e
@@ -1358,6 +1410,37 @@ def maybe_batch_engine(engine: Engine, max_batch: int):
     if not ok(engine.target):
         return engine
     return BatchEngine(engine, max_batch=max_batch)
+
+
+def _resolve_engine(obj):
+    """The innermost Engine behind a BatchEngine wrapper. Reasoning-config writes must land
+    on the real Engine: a ``setattr`` on a delegating wrapper would create a shadowing
+    instance attribute that permanently breaks its ``__getattr__`` forwarding."""
+    return obj.engine if isinstance(obj, BatchEngine) else obj
+
+
+def _apply_reasoning_config(eng, patch: dict) -> None:
+    """Apply a validated /admin/config patch to a live engine. The request handlers read
+    these attributes per request, so the change is effective immediately — no reload."""
+    eng = _resolve_engine(eng)
+    if "enable_thinking" in patch:
+        v = patch["enable_thinking"]
+        if v is None:                # null clears the override: the template's own default
+            eng.template_defaults.pop("enable_thinking", None)
+        else:                        # explicit True/False both stored — True must WIN over
+            eng.template_defaults["enable_thinking"] = v   # a template that defaults off
+    if "reasoning_budget" in patch:
+        eng.default_think_budget = patch["reasoning_budget"]
+    if "reasoning_budget_message" in patch:
+        eng.think_budget_message = patch["reasoning_budget_message"]
+
+
+def _reasoning_config_of(eng) -> dict:
+    """The effective reasoning config of a live engine, in /admin/config response shape."""
+    eng = _resolve_engine(eng)
+    return {"enable_thinking": eng.template_defaults.get("enable_thinking"),
+            "reasoning_budget": eng.default_think_budget,
+            "reasoning_budget_message": eng.think_budget_message}
 
 
 class EngineHolder:
@@ -1431,6 +1514,33 @@ class EngineHolder:
                 if inner is not None and inner is not old and hasattr(inner, "close"):
                     inner.close()
             return self.status()
+
+    def configure(self, patch: dict) -> dict:
+        """Apply validated reasoning-config values (see the ``/admin/config`` handler) to the
+        stored load kwargs AND the live engine — no model reload; the request handlers read
+        these engine attributes per request, so the change is effective immediately. Works in
+        the no-model state too (kwargs only, so the next load carries the values).
+
+        Deliberately lock-free, matching the codebase: the kwargs write comes FIRST, so any
+        swap that starts after this call loads with the new values; a patch landing inside an
+        in-flight swap's copy-to-publish window can be missed by THAT engine (the next swap
+        still carries it). Accepted single-writer limitation — in practice the app is the
+        only writer, and it disables its Reasoning card while a load is in flight.
+        """
+        if "enable_thinking" in patch:
+            self._load_kwargs["enable_thinking"] = patch["enable_thinking"]
+        if "reasoning_budget" in patch:
+            self._load_kwargs["default_think_budget"] = patch["reasoning_budget"]
+        if "reasoning_budget_message" in patch:
+            self._load_kwargs["think_budget_message"] = patch["reasoning_budget_message"]
+        eng = self._engine
+        if eng is not None:
+            _apply_reasoning_config(eng, patch)
+            return _reasoning_config_of(eng)
+        kw = self._load_kwargs
+        return {"enable_thinking": kw.get("enable_thinking"),
+                "reasoning_budget": kw.get("default_think_budget"),
+                "reasoning_budget_message": kw.get("think_budget_message")}
 
     def swap(self, *, model: str, mode: str | None = None,
              max_draft: int | str | None = None,
@@ -1685,6 +1795,17 @@ def make_handler(engine: Engine, api_key: str | None):
                         # non-null while a first-time load is fetching weights:
                         # {repo, bytes_done, bytes_total} — cancel with /admin/load/cancel
                         "download": status.get("download"),
+                        # the configured reasoning defaults survive no-model/mid-swap states
+                        # (they live in the load kwargs, not on the engine)
+                        "reasoning_budget": (getattr(engine, "_load_kwargs", None)
+                                             or {}).get("default_think_budget"),
+                        "reasoning_budget_message": (getattr(engine, "_load_kwargs", None)
+                                                     or {}).get("think_budget_message"),
+                        "enable_thinking": (getattr(engine, "_load_kwargs", None)
+                                            or {}).get("enable_thinking"),
+                        # capability flag: this server accepts POST /admin/config (a client
+                        # must gate its reasoning controls on it — older engines 404)
+                        "admin_config": True,
                         "error": status["error"]})
                 # max_draft as a string ("auto" or the pinned/derived cap) so a client can
                 # show the configured knob, not just infer it from round telemetry.
@@ -1726,6 +1847,25 @@ def make_handler(engine: Engine, api_key: str | None):
                         getattr(engine, "supports_reasoning_effort", False)),
                     "reasoning_effort": getattr(engine, "template_defaults", {}).get(
                         "reasoning_effort"),
+                    # Whether the LOADED model honors reasoning budgets at all — muse-format
+                    # models don't (the request path skips think_budget for them), so a
+                    # client should gate a per-request budget control on this, not on
+                    # admin_config (which is about the server, not the model).
+                    "supports_reasoning_budget": not bool(getattr(engine, "is_muse",
+                                                                  False)),
+                    # Server-default reasoning budget (tokens of thinking before a forced
+                    # close; null = disabled). Requests override via `reasoning_budget`
+                    # (OpenAI) or `thinking.budget_tokens` (Anthropic).
+                    "reasoning_budget": getattr(engine, "default_think_budget", None),
+                    "reasoning_budget_message": getattr(engine, "think_budget_message",
+                                                        None),
+                    # Server-default thinking switch: true/false = an explicit override,
+                    # null = the chat template's own default.
+                    "enable_thinking": getattr(engine, "template_defaults", {}).get(
+                        "enable_thinking"),
+                    # capability flag: this server accepts POST /admin/config (a client
+                    # must gate its reasoning controls on it — older engines 404)
+                    "admin_config": True,
                 })
             if route == "/admin/status":
                 if isinstance(engine, EngineHolder):
@@ -1850,6 +1990,50 @@ def make_handler(engine: Engine, api_key: str | None):
                 return self._send_error(500, f"could not load {model!r}: "
                                              f"{type(e).__name__}: {e}", "api_error")
             return self._send_json(200, status)
+
+        def _config(self, req: dict):
+            """``POST /admin/config`` — set the server-default reasoning knobs on the LIVE
+            engine, no model reload (the generation handlers read them per request). Keys
+            (all optional; omitted = unchanged; an empty body is a plain read-back, which
+            doubles as a capability probe):
+
+              enable_thinking           true | false | null (null clears the override)
+              reasoning_budget          non-negative int; 0 disables
+              reasoning_budget_message  string | null (null = the engine's default text;
+                                        "" = close the thinking block with no message)
+
+            Values survive later ``/admin/load`` swaps and the no-model state (they are
+            written into the holder's stored load kwargs). The whole patch is validated
+            before anything is mutated, so a 400 never leaves a partial update.
+            """
+            # do_POST decodes any JSON value — a null/array/scalar body must be a clean 400
+            # here, not a TypeError-turned-500 from the `in` checks below.
+            if not isinstance(req, dict):
+                return self._send_error(400, "request body must be a JSON object")
+            patch: dict = {}
+            if "enable_thinking" in req:
+                v = req["enable_thinking"]
+                if v is not None and not isinstance(v, bool):
+                    return self._send_error(400, "'enable_thinking' must be a boolean, or "
+                                                 "null to clear the override (the template's "
+                                                 "own default then applies)")
+                patch["enable_thinking"] = v
+            if "reasoning_budget" in req:
+                try:
+                    patch["reasoning_budget"] = _think_budget(req["reasoning_budget"])
+                except ValueError as e:
+                    return self._send_error(400, str(e))
+            if "reasoning_budget_message" in req:
+                v = req["reasoning_budget_message"]
+                if v is not None and not isinstance(v, str):
+                    return self._send_error(400, "'reasoning_budget_message' must be a "
+                                                 "string, or null for the engine's default "
+                                                 "text ('' closes the block with no message)")
+                patch["reasoning_budget_message"] = v
+            if isinstance(engine, EngineHolder):
+                return self._send_json(200, engine.configure(patch))
+            _apply_reasoning_config(engine, patch)     # bare-Engine servers (tests)
+            return self._send_json(200, _reasoning_config_of(engine))
 
         def _race(self, req: dict):
             """Same prompt, several decode strategies, streamed as SSE.
@@ -2046,6 +2230,10 @@ def make_handler(engine: Engine, api_key: str | None):
                         return self._send_error(
                             501, "this server was not started with hot-swap support")
                     return self._send_json(200, engine.unload())
+                if route == "/admin/config":
+                    # Reasoning knobs are read live per request, so this needs no model —
+                    # it also works in the no-model state (updates the stored load kwargs).
+                    return self._config(req)
                 if not self._require_ready():
                     return
                 if route in ("/v1/chat/completions", "/chat/completions"):
@@ -2182,6 +2370,24 @@ def make_handler(engine: Engine, api_key: str | None):
             # emit it — silently discarding model output is the worse failure.
             th = req.get("thinking")
             want_thinking = not (isinstance(th, dict) and th.get("type") == "disabled")
+            # Reasoning budget: thinking.budget_tokens (the Anthropic field, honored as a
+            # per-request override) > the server default; type "disabled" means no budget
+            # (thinking is off entirely); never applied to muse-format models.
+            try:
+                budget, explicit = engine.default_think_budget, False
+                if isinstance(th, dict):
+                    if th.get("type") == "disabled":
+                        budget = None
+                    elif th.get("budget_tokens") is not None:
+                        budget = _think_budget(th.get("budget_tokens"),
+                                               field="thinking.budget_tokens")
+                        explicit = True
+            except ValueError as e:
+                return self._send_json(400, A.error_body(str(e)))
+            if budget and not engine.is_muse:
+                params["think_budget"] = budget
+                params["budget_message"] = engine.think_budget_message
+                params["budget_explicit"] = explicit
             # tool schemas type the XML tool-call form, whose values are raw text
             schemas = schema_types(req.get("tools"))
             if req.get("stream"):
@@ -2190,7 +2396,9 @@ def make_handler(engine: Engine, api_key: str | None):
             body = A.build_message(res.text, model=model, input_tokens=len(prompt_ids),
                                    output_tokens=res.num_tokens,
                                    finish_reason=res.finish_reason, thinking=want_thinking,
-                                   schemas=schemas)
+                                   schemas=schemas,
+                                   in_thinking=self._prompt_opens_thinking(prompt_ids)
+                                   or None)
             body["x_mlx_dspark"] = engine.spec_info(res)   # non-standard; clients ignore it
             self._send_json(200, body)
 
@@ -2282,6 +2490,25 @@ def make_handler(engine: Engine, api_key: str | None):
             else:
                 _lp = req.get("logprobs")
                 params["logprobs"] = int(_lp) if _lp is not None else None
+            # reasoning budget (extension fields): request > server default; an explicit 0
+            # disables for this request; never applied to muse-format models (their channel
+            # format has no <think> pair to force-close).
+            try:
+                rb = req.get("reasoning_budget")
+                budget = _think_budget(rb) if rb is not None else engine.default_think_budget
+                msg = req.get("reasoning_budget_message")
+                if msg is not None and not isinstance(msg, str):
+                    raise ValueError("reasoning_budget_message must be a string")
+            except ValueError as e:
+                return self._send_error(400, str(e))
+            if budget and not engine.is_muse:
+                params["think_budget"] = budget
+                # "" is a real choice (close the block with no message) — only None defers
+                params["budget_message"] = (msg if msg is not None
+                                            else engine.think_budget_message)
+                # explicit budgets keep exact enforcement under --max-batch (serial path);
+                # the ambient server default never forfeits batching
+                params["budget_explicit"] = rb is not None
             model = req.get("model") or engine.model_id
             stream = bool(req.get("stream", False))
             n = max(1, min(int(req.get("n") or 1), 8))
@@ -2315,13 +2542,18 @@ def make_handler(engine: Engine, api_key: str | None):
                 "total_tokens": len(prompt_ids) + gen_tokens,
             }
             choices = []
+            # A template that PREFILLS the thinking opener (Qwen3-2507/qwen3_5) starts the
+            # output inside the block — split_thinking needs the closer hint or a thinking
+            # block truncated by max_tokens (no closer ever emitted) misreads as all-answer
+            # and the chain of thought leaks into content. Streaming has always passed this.
+            in_think = (self._prompt_opens_thinking(prompt_ids) or None) if chat else None
             for i, res in enumerate(res_list):
                 if chat:
                     # split reasoning out of the text (Qwen `<think>`, Gemma thought channel,
                     # muse `to=self` analysis) so it rides in `reasoning_content` instead of
                     # leaking into content — and so tool calls parse from the answer, not the
                     # reasoning. split_thinking auto-detects the format; no reasoning -> ("", text).
-                    reasoning, content = A.split_thinking(res.text)
+                    reasoning, content = A.split_thinking(res.text, in_thinking=in_think)
                     finish, tool_calls = res.finish_reason, None
                     if want_tools:
                         parsed, cleaned = parse_tool_calls(content, schema_types(req.get("tools")))

@@ -126,9 +126,20 @@ def cmd_generate(argv: list[str]) -> None:
                          "up to this length (default 32 = the measured M-series verify-width "
                          "plateau); set to the base (6) to disable. Speed-only, output "
                          "unchanged")
+    ap.add_argument("--reasoning-budget", type=int, default=0, metavar="N",
+                    help="max tokens a thinking model may spend inside <think>…</think> "
+                         "before the budget message + closing tag are force-injected so it "
+                         "answers (LM Studio Bionic-style; default 0 = off, opt in with "
+                         "e.g. 8192). Round-granular and once per generation; no effect on "
+                         "non-thinking output")
+    ap.add_argument("--reasoning-budget-message", default=None, metavar="TEXT",
+                    help='text injected when the reasoning budget fires '
+                         '(default: "I have to answer now.")')
     ap.add_argument("--no-chat-template", action="store_true")
     ap.add_argument("--no-stream", action="store_true")
     args = ap.parse_args(argv)
+    if args.reasoning_budget < 0:
+        ap.error("--reasoning-budget must be >= 0 (0 disables)")
 
     try:
         mode, target_repo, drafter_repo = resolve_mode(
@@ -181,6 +192,7 @@ def cmd_generate(argv: list[str]) -> None:
 
     apply_wide_gemm(target, drafter, target_repo=target_repo, min_rows=args.wide_gemm_min)
     on_text = None if args.no_stream else _emit
+    think_budget = args.reasoning_budget or None    # 0 disables
     print("\n" + "=" * 64)
     print(f"  ▶  {label}   ·   {target_repo.split('/')[-1]}")
     print("=" * 64)
@@ -215,6 +227,7 @@ def cmd_generate(argv: list[str]) -> None:
             confidence_threshold=args.confidence_threshold,
             temperature=args.temperature, top_p=args.top_p, top_k=args.top_k, seed=args.seed,
             apply_chat_template=not args.no_chat_template, on_text=on_text,
+            think_budget=think_budget, budget_message=args.reasoning_budget_message,
         )
         extra = f" · accept {res.mean_accept_len:.2f}/round · {res.target_forwards} target fwds"
         if res.lookup_rounds:
@@ -227,6 +240,7 @@ def cmd_generate(argv: list[str]) -> None:
             cap_controller=cap_controller,
             temperature=args.temperature, top_p=args.top_p, top_k=args.top_k,
             seed=args.seed, apply_chat_template=not args.no_chat_template, on_text=on_text,
+            think_budget=think_budget, budget_message=args.reasoning_budget_message,
         )
         extra = f" · accept {res.mean_accept_len:.2f}/round · {res.target_forwards} target fwds"
     elif args.mode == "lookup":
@@ -238,6 +252,7 @@ def cmd_generate(argv: list[str]) -> None:
             long_draft_tokens=max(cap, args.lookup_long_draft),
             temperature=args.temperature, top_p=args.top_p, top_k=args.top_k, seed=args.seed,
             apply_chat_template=not args.no_chat_template, on_text=on_text,
+            think_budget=think_budget, budget_message=args.reasoning_budget_message,
         )
         extra = f" · accept {res.mean_accept_len:.2f}/round · {res.target_forwards} target fwds"
     else:
@@ -245,6 +260,7 @@ def cmd_generate(argv: list[str]) -> None:
             target, tok, args.prompt, max_new_tokens=args.max_new_tokens,
             temperature=args.temperature, top_p=args.top_p, top_k=args.top_k, seed=args.seed,
             apply_chat_template=not args.no_chat_template, on_text=on_text,
+            think_budget=think_budget, budget_message=args.reasoning_budget_message,
         )
         extra = ""
     if cap_controller is not None:
@@ -330,6 +346,16 @@ def cmd_serve(argv: list[str]) -> None:
                          "(Qwen3.8-class reasoning_effort; templates that don't know the kwarg "
                          "ignore it). Clients can override per-request; /health reports whether "
                          "the loaded model supports it")
+    ap.add_argument("--reasoning-budget", type=int, default=0, metavar="N",
+                    help="server-default reasoning budget: max tokens a thinking model may "
+                         "spend inside <think>…</think> before the budget message + closing "
+                         "tag are force-injected so it answers (LM Studio Bionic-style; "
+                         "default 0 = off, opt in with e.g. 8192). Requests override via "
+                         "'reasoning_budget' (OpenAI) or thinking.budget_tokens (Anthropic); "
+                         "/health reports the default")
+    ap.add_argument("--reasoning-budget-message", default=None, metavar="TEXT",
+                    help='text injected when the reasoning budget fires '
+                         '(default: "I have to answer now.")')
     ap.add_argument("--no-prefix-cache", action="store_true",
                     help="disable multi-turn prefix caching (reuse the shared conversation "
                          "prefix's KV; on by default for dspark/lookup/baseline on dense or "
@@ -376,6 +402,8 @@ def cmd_serve(argv: list[str]) -> None:
                     help="spill the prefix cache to --prefix-cache-dir once it exceeds this many MB "
                          "of RAM (0 = never spill; requires --prefix-cache-dir)")
     args = ap.parse_args(argv)
+    if args.reasoning_budget < 0:
+        ap.error("--reasoning-budget must be >= 0 (0 disables)")
 
     md = _parse_max_draft(args.max_draft, ap)
     if md is None or md == "auto":
@@ -396,6 +424,8 @@ def cmd_serve(argv: list[str]) -> None:
         "confidence_threshold": args.confidence_threshold,
         "enable_thinking": False if args.no_thinking else None,
         "reasoning_effort": args.reasoning_effort,
+        "default_think_budget": args.reasoning_budget or None,   # 0 disables
+        "think_budget_message": args.reasoning_budget_message,
         "prefix_cache": not args.no_prefix_cache,
         "prefix_cache_dir": args.prefix_cache_dir,
         "prefix_cache_max_ram_mb": args.prefix_cache_max_ram_mb,
