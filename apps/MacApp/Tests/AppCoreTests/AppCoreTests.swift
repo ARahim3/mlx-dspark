@@ -69,6 +69,40 @@ struct ServerSupervisorTests {
         let ports = try (0..<4).map { _ in try ServerSupervisor.freePort() }
         #expect(Set(ports).count > 1)
     }
+
+    @Test func freePortSupportsWildcardBinding() throws {
+        let port = try ServerSupervisor.freePort(host: "0.0.0.0")
+        #expect(port > 1024)
+        #expect(ServerSupervisor.portIsFree(port, host: "0.0.0.0"))
+    }
+
+    @Test func appPreferencesKeepLANAndAuthenticationIndependent() {
+        let combinations = [
+            (false, false, "127.0.0.1", nil),
+            (false, true, "127.0.0.1", "secret"),
+            (true, false, "0.0.0.0", nil),
+            (true, true, "0.0.0.0", "secret"),
+        ]
+        for (lan, auth, host, key) in combinations {
+            let config = ServerConfig.appPreferences(
+                serveOnLAN: lan, apiKeyEnabled: auth, apiKey: " secret ",
+                port: 8484, portIsExplicit: false)
+            #expect(config.host == host)
+            #expect(config.apiKey == key)
+        }
+    }
+
+    @Test func generatedAPIKeyIsStrongAndURLSafe() {
+        let first = ServerNetworking.generateAPIKey()
+        let second = ServerNetworking.generateAPIKey()
+        #expect(first.count == 43)
+        #expect(first != second)
+        #expect(first.allSatisfy { $0.isLetter || $0.isNumber || $0 == "-" || $0 == "_" })
+    }
+
+    @Test func lanAddressesExcludeLoopback() {
+        #expect(!ServerNetworking.lanIPv4Addresses().contains(where: { $0.hasPrefix("127.") }))
+    }
 }
 
 @Suite("Engine source resolution")

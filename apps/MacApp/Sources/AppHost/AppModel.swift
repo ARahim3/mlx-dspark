@@ -366,6 +366,12 @@ final class AppModel: ObservableObject {
     /// import, no weights). Returns false after calling `fail()` when even that can't start.
     private func spawnServer() async -> Bool {
         guard let engine = engineURL else { return false }
+        let config = ServerConfig.appPreferences(
+            serveOnLAN: Defaults.serveOnLAN,
+            apiKeyEnabled: Defaults.apiKeyEnabled,
+            apiKey: Defaults.apiKey,
+            port: Defaults.enginePort,
+            portIsExplicit: Defaults.enginePortIsExplicit)
         phase = .startingServer
         let supervisor = ServerSupervisor(engine: engine, logStore: logStore)
         self.supervisor = supervisor
@@ -374,10 +380,8 @@ final class AppModel: ObservableObject {
         }
         do {
             let port = try await supervisor.start(
-                config: ServerConfig(model: nil, mode: "auto", maxDraft: "auto",
-                                     port: Defaults.enginePort,
-                                     portIsExplicit: Defaults.enginePortIsExplicit))
-            return await connect(port: port)
+                config: config)
+            return await connect(port: port, apiKey: config.apiKey)
         } catch {
             // An engine below this app's floor doesn't know `--no-model`, and an offline
             // machine can't be force-upgraded to one that does — fall back to the classic
@@ -388,10 +392,14 @@ final class AppModel: ObservableObject {
                           + "(older engine?)")
             do {
                 let port = try await supervisor.start(
-                    config: ServerConfig(model: model, mode: "auto", maxDraft: "auto",
-                                         port: Defaults.enginePort,
-                                         portIsExplicit: Defaults.enginePortIsExplicit))
-                return await connect(port: port)
+                    config: ServerConfig.appPreferences(
+                        model: model,
+                        serveOnLAN: Defaults.serveOnLAN,
+                        apiKeyEnabled: Defaults.apiKeyEnabled,
+                        apiKey: Defaults.apiKey,
+                        port: Defaults.enginePort,
+                        portIsExplicit: Defaults.enginePortIsExplicit))
+                return await connect(port: port, apiKey: config.apiKey)
             } catch {
                 fail(error)
                 return false
@@ -399,8 +407,9 @@ final class AppModel: ObservableObject {
         }
     }
 
-    private func connect(port: Int) async -> Bool {
-        let client = APIClient(baseURL: URL(string: "http://127.0.0.1:\(port)")!)
+    private func connect(port: Int, apiKey: String?) async -> Bool {
+        let client = APIClient(baseURL: URL(string: "http://127.0.0.1:\(port)")!,
+                               apiKey: apiKey)
         self.apiClient = client
         currentHealth = try? await client.health()
         return true
@@ -1056,6 +1065,26 @@ enum Defaults {
     /// True when the user chose the port (any value, including 0 = automatic) — a taken
     /// user-chosen port is a hard error naming the fix; the app default falls back.
     static var enginePortIsExplicit: Bool { store.object(forKey: "enginePort") != nil }
+
+    /// Bind the engine to every IPv4 interface instead of loopback only.
+    static var serveOnLAN: Bool {
+        get { store.bool(forKey: "serveOnLAN") }
+        set { store.set(newValue, forKey: "serveOnLAN") }
+    }
+
+    /// Authentication is independent of the bind address: loopback and LAN can each run
+    /// with or without it. The key is intentionally retained when this is turned off.
+    static var apiKeyEnabled: Bool {
+        get { store.bool(forKey: "apiKeyEnabled") }
+        set { store.set(newValue, forKey: "apiKeyEnabled") }
+    }
+
+    /// Plain-text app preference by design: this protects a trusted LAN endpoint, not the
+    /// local account from itself. Keeping it here also makes backup/reset behavior obvious.
+    static var apiKey: String {
+        get { store.string(forKey: "apiKey") ?? "" }
+        set { store.set(newValue, forKey: "apiKey") }
+    }
 
     static var currentSession: UUID? {
         get { store.string(forKey: "currentSession").flatMap(UUID.init(uuidString:)) }

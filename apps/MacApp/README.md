@@ -85,6 +85,21 @@ deliberately.
 
 Delete `runtime/` to force a clean re-bootstrap.
 
+## Local network serving
+
+Settings → Local server can bind the engine to every IPv4 interface so another device on
+the LAN can use its OpenAI or Anthropic API. “Serve on LAN” and “Require API key” are
+independent: authentication can be used on loopback too, and a trusted LAN can be served
+without it. An unauthenticated LAN listener is reachable by every device that can connect to
+the selected port. API keys are stored as plain text in the app's preferences plist.
+
+The equivalent CLI invocation is:
+
+```bash
+mlx-dspark serve --host 0.0.0.0                         # unauthenticated LAN
+mlx-dspark serve --host 0.0.0.0 --api-key YOUR_KEY      # authenticated LAN
+```
+
 ## Distribution
 
 Ad-hoc signing (`codesign -s -`) is what `make_app.sh` does — enough to run locally. Shipping a

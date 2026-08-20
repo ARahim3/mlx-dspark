@@ -35,6 +35,27 @@ public struct ServerConfig: Equatable, Sendable {
         self.port = port
         self.portIsExplicit = portIsExplicit
     }
+
+    /// Translate the app's two independent preferences into the CLI launch contract.
+    public static func appPreferences(
+        model: String? = nil,
+        serveOnLAN: Bool,
+        apiKeyEnabled: Bool,
+        apiKey: String,
+        port: Int,
+        portIsExplicit: Bool
+    ) -> ServerConfig {
+        let key = apiKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        return ServerConfig(
+            model: model,
+            mode: "auto",
+            maxDraft: "auto",
+            host: serveOnLAN ? "0.0.0.0" : "127.0.0.1",
+            apiKey: apiKeyEnabled && !key.isEmpty ? key : nil,
+            port: port,
+            portIsExplicit: portIsExplicit
+        )
+    }
 }
 
 /// Owns the `mlx-dspark serve` child process.
@@ -87,10 +108,10 @@ public actor ServerSupervisor {
             } else {
                 logStore.note("default port \(config.port) is in use — "
                               + "starting on an automatic port instead")
-                chosenPort = try Self.freePort()
+                chosenPort = try Self.freePort(host: config.host)
             }
         } else {
-            chosenPort = try Self.freePort()
+            chosenPort = try Self.freePort(host: config.host)
         }
         port = chosenPort
 
@@ -133,7 +154,10 @@ public actor ServerSupervisor {
             Task { await self?.childExited(code: p.terminationStatus) }
         }
 
-        let client = APIClient(baseURL: URL(string: "http://\(config.host):\(chosenPort)")!,
+        // A wildcard is a listener address, never a client destination. Keep the app's
+        // control traffic on loopback even while other devices reach the same port via LAN.
+        let clientHost = config.host == "0.0.0.0" ? "127.0.0.1" : config.host
+        let client = APIClient(baseURL: URL(string: "http://\(clientHost):\(chosenPort)")!,
                                apiKey: config.apiKey)
         let deadline = Date().addingTimeInterval(readyTimeout)
         while Date() < deadline {
@@ -224,7 +248,7 @@ public actor ServerSupervisor {
     /// whatever else the user runs. There is an unavoidable race between closing this socket
     /// and the child binding it; the caller retries. (A *user-chosen* fixed port is different:
     /// it's opt-in, checked with ``portIsFree(_:host:)``, and fails with a named fix.)
-    public static func freePort() throws -> Int {
+    public static func freePort(host: String = "127.0.0.1") throws -> Int {
         let fd = socket(AF_INET, SOCK_STREAM, 0)
         guard fd >= 0 else { throw ShellError.launchFailed("socket", underlying: "unavailable") }
         defer { close(fd) }
@@ -234,7 +258,7 @@ public actor ServerSupervisor {
         var addr = sockaddr_in()
         addr.sin_family = sa_family_t(AF_INET)
         addr.sin_port = 0                                  // kernel picks
-        addr.sin_addr.s_addr = inet_addr("127.0.0.1")
+        addr.sin_addr.s_addr = inet_addr(host)
         let bound = withUnsafePointer(to: &addr) {
             $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
                 Darwin.bind(fd, $0, socklen_t(MemoryLayout<sockaddr_in>.size))

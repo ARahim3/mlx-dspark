@@ -418,15 +418,34 @@ struct ServerCard: View {
     // clamp rewrites the text under the cursor (see the Race max-tokens field).
     @State private var portText: String =
         Defaults.enginePort == 0 ? "" : String(Defaults.enginePort)
+    @State private var serveOnLAN = Defaults.serveOnLAN
+    @State private var apiKeyEnabled = Defaults.apiKeyEnabled
+    @State private var apiKeyText = Defaults.apiKey
+    @State private var validationError: String?
     @State private var restarting = false
 
     var body: some View {
         Card(title: "Local server",
-             subtitle: "OpenAI- and Anthropic-compatible, on this machine only.") {
+             subtitle: Defaults.serveOnLAN
+                ? "OpenAI- and Anthropic-compatible, available on your local network."
+                : "OpenAI- and Anthropic-compatible, on this machine only.") {
             VStack(alignment: .leading, spacing: 8) {
                 if case .ready(let port, let health) = model.serverState {
-                    endpoint("OpenAI", "http://127.0.0.1:\(port)/v1")
-                    endpoint("Anthropic", "http://127.0.0.1:\(port)")
+                    if Defaults.serveOnLAN {
+                        let addresses = ServerNetworking.lanIPv4Addresses()
+                        if addresses.isEmpty {
+                            Text("No active LAN address is available yet.")
+                                .font(.callout).foregroundStyle(.secondary)
+                        } else {
+                            ForEach(addresses, id: \.self) { address in
+                                endpoint("OpenAI", "http://\(address):\(port)/v1")
+                                endpoint("Anthropic", "http://\(address):\(port)")
+                            }
+                        }
+                    } else {
+                        endpoint("OpenAI", "http://127.0.0.1:\(port)/v1")
+                        endpoint("Anthropic", "http://127.0.0.1:\(port)")
+                    }
                     if let window = health.contextWindow {
                         Text("Context window \(window) tokens")
                             .font(.caption).foregroundStyle(.secondary)
@@ -439,6 +458,33 @@ struct ServerCard: View {
                 }
                 Divider()
                 portRow
+                Toggle("Serve on LAN", isOn: $serveOnLAN)
+                    .font(.callout)
+                Text("Listens on all IPv4 interfaces. Other devices use one of the LAN "
+                     + "addresses shown above after the engine restarts.")
+                    .font(.caption).foregroundStyle(.secondary)
+
+                Toggle("Require API key", isOn: $apiKeyEnabled)
+                    .font(.callout)
+                if apiKeyEnabled { apiKeyRow }
+
+                if serveOnLAN && !apiKeyEnabled {
+                    Label("Anyone who can reach this Mac on the local network can use the API.",
+                          systemImage: "exclamationmark.triangle.fill")
+                        .font(.caption).foregroundStyle(Theme.warning)
+                }
+                if let validationError {
+                    Label(validationError, systemImage: "xmark.circle.fill")
+                        .font(.caption).foregroundStyle(Theme.warning)
+                }
+
+                Button(restarting ? "Restarting…" : "Apply & restart engine") {
+                    guard commitSettings() else { return }
+                    restarting = true
+                    Task { await model.restartEngine(); restarting = false }
+                }
+                .font(.caption)
+                .disabled(restarting)
             }
         }
     }
@@ -453,13 +499,6 @@ struct ServerCard: View {
                 .textFieldStyle(.roundedBorder)
                 .frame(width: 92)
                 .onSubmit { commitPort() }
-            Button(restarting ? "Restarting…" : "Apply & restart engine") {
-                commitPort()
-                restarting = true
-                Task { await model.restartEngine(); restarting = false }
-            }
-            .font(.caption)
-            .disabled(restarting)
             Spacer()
         }
         Text("A fixed port keeps external clients' base URL stable across launches "
@@ -467,6 +506,45 @@ struct ServerCard: View {
              + "app falls back to an automatic port). Blank = always automatic. "
              + "Ports 1024–65535.")
             .font(.caption).foregroundStyle(.secondary)
+    }
+
+    @ViewBuilder private var apiKeyRow: some View {
+        HStack(spacing: 8) {
+            Text("API key").font(.callout).foregroundStyle(.secondary)
+                .frame(width: 78, alignment: .leading)
+            TextField("Required", text: $apiKeyText)
+                .textFieldStyle(.roundedBorder)
+                .font(.callout.monospaced())
+            Button("Generate") { apiKeyText = ServerNetworking.generateAPIKey() }
+                .buttonStyle(.link).font(.caption)
+            Button("Copy") {
+                NSPasteboard.general.clearContents()
+                NSPasteboard.general.setString(apiKeyText, forType: .string)
+            }
+            .buttonStyle(.link).font(.caption)
+            .disabled(apiKeyText.isEmpty)
+            Button("Clear") { apiKeyText = "" }
+                .buttonStyle(.link).font(.caption)
+                .disabled(apiKeyText.isEmpty)
+        }
+        Text("Clients may send Authorization: Bearer <key> or x-api-key: <key>. "
+             + "Stored as plain text in this app's preferences.")
+            .font(.caption).foregroundStyle(.secondary)
+    }
+
+    private func commitSettings() -> Bool {
+        let key = apiKeyText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !apiKeyEnabled || !key.isEmpty else {
+            validationError = "Enter or generate an API key before enabling authentication."
+            return false
+        }
+        validationError = nil
+        commitPort()
+        Defaults.serveOnLAN = serveOnLAN
+        Defaults.apiKeyEnabled = apiKeyEnabled
+        Defaults.apiKey = key
+        apiKeyText = key
+        return true
     }
 
     private func commitPort() {

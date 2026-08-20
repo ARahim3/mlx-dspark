@@ -317,10 +317,12 @@ def cmd_serve(argv: list[str]) -> None:
                          "An over-long request is refused with the message Claude Code "
                          "recognises as a context limit, so it compacts and retries instead "
                          "of failing; lower it to keep the KV cache inside your RAM budget.")
-    ap.add_argument("--host", default="127.0.0.1")
+    ap.add_argument("--host", default="127.0.0.1",
+                    help="address to bind (default: 127.0.0.1; use 0.0.0.0 to serve on LAN)")
     ap.add_argument("--port", type=int, default=8080)
     ap.add_argument("--api-key", default=None,
-                    help="if set, requests must send 'Authorization: Bearer <key>'")
+                    help="if set, every endpoint requires 'Authorization: Bearer <key>' "
+                         "or 'x-api-key: <key>'")
     ap.add_argument("--no-thinking", action="store_true",
                     help="default responses to non-thinking mode (Qwen3 enable_thinking=False); "
                          "clients can still override per-request")

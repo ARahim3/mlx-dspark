@@ -58,6 +58,8 @@ cat > "$APP/Contents/Info.plist" <<PLIST
     <key>CFBundleVersion</key>               <string>${VERSION}</string>
     <key>LSMinimumSystemVersion</key>        <string>${MIN_MACOS}</string>
     <key>NSHighResolutionCapable</key>       <true/>
+    <key>NSLocalNetworkUsageDescription</key>
+    <string>mlx-dspark can serve its model API to other devices on your local network.</string>
     <key>LSApplicationCategoryType</key>     <string>public.app-category.developer-tools</string>
 </dict>
 </plist>

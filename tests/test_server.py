@@ -86,8 +86,9 @@ def server():
     httpd.shutdown()
 
 
-def _get(base, path):
-    return json.loads(urllib.request.urlopen(base + path).read())
+def _get(base, path, headers=None):
+    req = urllib.request.Request(base + path, headers=headers or {})
+    return json.loads(urllib.request.urlopen(req).read())
 
 
 def _post(base, path, obj, stream=False, headers=None):
@@ -302,14 +303,39 @@ def test_auth_required():
     threading.Thread(target=httpd.serve_forever, daemon=True).start()
     base = f"http://127.0.0.1:{port}"
     try:
+        # Read-only discovery and telemetry are protected too.
+        with pytest.raises(urllib.error.HTTPError) as e:
+            _get(base, "/health")
+        assert e.value.code == 401
+        with pytest.raises(urllib.error.HTTPError) as e:
+            _get(base, "/health", {"Authorization": "Bearer wrong"})
+        assert e.value.code == 401
+
+        head = urllib.request.Request(base + "/", method="HEAD")
+        with pytest.raises(urllib.error.HTTPError) as e:
+            urllib.request.urlopen(head)
+        assert e.value.code == 401
+
         with pytest.raises(urllib.error.HTTPError) as e:
             _post(base, "/v1/chat/completions", {"messages": [{"role": "user", "content": "hi"}]})
         assert e.value.code == 401
-        # with the right key it works
+        assert _get(base, "/health", {"x-api-key": "secret"})["status"] == "ok"
+
+        authed_head = urllib.request.Request(
+            base + "/", headers={"Authorization": "Bearer secret"}, method="HEAD")
+        assert urllib.request.urlopen(authed_head).status == 200
+
+        # Both supported credential headers work.
         c = _post(base, "/v1/chat/completions",
                   {"messages": [{"role": "user", "content": "hi"}]},
                   headers={"Authorization": "Bearer secret"})
         assert c["object"] == "chat.completion"
+
+        preflight = urllib.request.Request(base + "/v1/chat/completions", method="OPTIONS")
+        response = urllib.request.urlopen(preflight)
+        assert response.status == 204
+        allowed = response.headers["Access-Control-Allow-Headers"].lower()
+        assert "authorization" in allowed and "x-api-key" in allowed
     finally:
         httpd.shutdown()
 

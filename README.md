@@ -208,6 +208,20 @@ mlx-dspark serve --model mlx-community/Qwen3-8B-8bit        # → http://127.0.0
 #                   confidence_threshold / context_window overrides
 ```
 
+To serve other devices on the local network, bind all IPv4 interfaces. Authentication is
+independent: omit `--api-key` only on a network where every reachable device is trusted.
+
+```bash
+# LAN, unauthenticated
+mlx-dspark serve --model mlx-community/Qwen3-8B-8bit --host 0.0.0.0
+
+# LAN, authenticated (Authorization: Bearer KEY or x-api-key: KEY)
+mlx-dspark serve --model mlx-community/Qwen3-8B-8bit --host 0.0.0.0 --api-key KEY
+```
+
+Clients must use the Mac's LAN address (for example `http://192.168.1.20:8080/v1`), not
+`0.0.0.0`. Traffic is plain HTTP; without an API key, anyone who can reach the port can use it.
+
 `--mode auto` picks the best available speculation for any target (a known DSpark drafter → else
 DFlash → else drafter-free n-gram **lookup**), so *any* repo serves with some speedup and no extra flags.
 

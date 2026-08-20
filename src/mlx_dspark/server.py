@@ -1589,8 +1589,9 @@ def make_handler(engine: Engine, api_key: str | None):
 
         def _cors(self):
             self.send_header("Access-Control-Allow-Origin", "*")
-            self.send_header("Access-Control-Allow-Headers", "Authorization, Content-Type")
-            self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+            self.send_header(
+                "Access-Control-Allow-Headers", "Authorization, x-api-key, Content-Type")
+            self.send_header("Access-Control-Allow-Methods", "GET, HEAD, POST, OPTIONS")
 
         def _send_json(self, status: int, obj: dict):
             body = json.dumps(obj).encode("utf-8")
@@ -1652,7 +1653,7 @@ def make_handler(engine: Engine, api_key: str | None):
 
         def do_HEAD(self):
             # Claude Code opens with a best-effort `HEAD /` connectivity probe.
-            self.send_response(200)
+            self.send_response(200 if self._authed() else 401)
             self.send_header("Content-Length", "0")
             self.send_header("Connection", "close")
             self._cors()
@@ -1673,6 +1674,8 @@ def make_handler(engine: Engine, api_key: str | None):
 
         def do_GET(self):
             route = self._route()
+            if not self._authed():
+                return self._send_error(401, "invalid api key", "authentication_error")
             if route == "/health":
                 # Answers even mid-swap so a client can poll the status through a model change.
                 # "loading" and "no_model" are distinct states: a client should wait through
