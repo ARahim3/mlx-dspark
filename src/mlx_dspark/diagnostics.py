@@ -19,6 +19,13 @@ import subprocess
 import sys
 
 from .load import REGISTRY
+from .roofline import (
+    REFERENCE_BANDWIDTH_GB_S,
+    bandwidth_scale,
+    ceiling_tps,
+    chip_info,
+    system_memory,
+)
 
 
 def _sysctl(name: str) -> str | None:
@@ -93,6 +100,42 @@ def environment() -> dict:
             if (ram_gb and ram_gb >= 16 and not wired_mb) else None
         ),
         "packages": _package_versions(),
+        # Chip family + theoretical bandwidth (the roofline's spec-sheet reference) and what
+        # the OS sees right now (pressure, swap). Both are a few sysctls / one ioreg read.
+        "chip": {**chip_info(device if metal_ok else None),
+                 "bandwidth_measured_gb_s": (bandwidth_info().get("measured_gb_s"))},
+        "memory": system_memory(),
+    }
+
+
+def bandwidth_info() -> dict:
+    """This Mac's bandwidth, as known *without measuring*: the cached microbench result if
+    the engine has ever loaded a model here, else the chip table. ``scale`` is this machine
+    relative to the M4 Pro every stamped registry speedup was measured on — a client can
+    multiply a stamped tok/s by it for a rough local figure (an estimate, labelled so)."""
+    device = None
+    measured = None
+    try:
+        import mlx.core as mx
+
+        device = mx.device_info().get("device_name")
+        from .calibrate import cached_bandwidth
+
+        entry = cached_bandwidth()
+        measured = float(entry["gb_s"]) if entry else None
+    except Exception:  # noqa: BLE001 — no mlx / no cache
+        pass
+    chip = chip_info(device)
+    theoretical = chip.get("bandwidth_gb_s")
+    best = measured or theoretical
+    return {
+        "measured_gb_s": measured,
+        "theoretical_gb_s": theoretical,
+        "gb_s": best,
+        "source": "measured" if measured else ("theoretical" if theoretical else "unknown"),
+        "reference_gb_s": REFERENCE_BANDWIDTH_GB_S,
+        # like-for-like vs the reference M4 Pro: 1.0 on an M4 Pro, ~2.2 on a top M5 Max
+        "scale": bandwidth_scale(theoretical, measured),
     }
 
 
@@ -258,27 +301,56 @@ def disk_usage(rows: list[dict] | None = None, *, hub_dir: str | None = None,
     return {"total_bytes": total, "total": _human_size(total)}
 
 
-def _is_local(repo: str | None) -> bool:
-    """Whether a repo's weights are already on disk — no download, no network.
+def _local_dir(repo: str | None) -> str | None:
+    """Where a repo's weights already sit on disk, or None — no download, no network.
 
     Checks the plain-dir cache that ``_resolve`` prefers and the HF hub cache layout directly;
     calling ``_resolve`` itself would *start a download*, which is exactly what this must not do.
     """
     if not repo:
-        return False
+        return None
     if repo.startswith("gguf:"):
         repo = repo[len("gguf:"):].rsplit("/", 1)[0]
     if os.path.isdir(repo):
-        return True
+        return repo
     # Both hand-download naming conventions: bare basename and org-prefixed "<org>_<name>"
     # (see load._resolve — these two must agree, one answers "installed?" and the other "where").
     models = os.path.expanduser("~/.cache/mlx_dspark/models")
     stripped = repo.rstrip("/")
     for name in (os.path.basename(stripped), stripped.replace("/", "_")):
-        if os.path.isdir(os.path.join(models, name)):
-            return True
-    hub = os.path.expanduser("~/.cache/huggingface/hub")
-    return os.path.isdir(os.path.join(hub, "models--" + repo.replace("/", "--")))
+        path = os.path.join(models, name)
+        if os.path.isdir(path):
+            return path
+    hub = os.path.join(os.path.expanduser("~/.cache/huggingface/hub"),
+                       "models--" + repo.replace("/", "--"))
+    return hub if os.path.isdir(hub) else None
+
+
+def _is_local(repo: str | None) -> bool:
+    """Whether a repo's weights are already on disk (see :func:`_local_dir`)."""
+    return _local_dir(repo) is not None
+
+
+def local_weight_bytes(repo: str | None) -> int | None:
+    """Bytes of ``*.safetensors`` a local repo holds — the dense roofline denominator a picker
+    can use *before* loading. Follows the hub's snapshot symlinks (``stat``, not ``lstat``:
+    here we want the weight bytes the GPU will read, not the on-disk accounting); None when
+    the repo isn't local or has no safetensors (e.g. a GGUF-only drafter source)."""
+    root = _local_dir(repo)
+    if root is None:
+        return None
+    total = 0
+    for dirpath, dirs, files in os.walk(root):
+        # hub layout: only the snapshot refs/main points at counts; blobs/ holds the bytes
+        # the snapshot links resolve to — walking both would double count.
+        if os.path.basename(dirpath) == "blobs":
+            dirs[:] = []
+            continue
+        for name in files:
+            if name.endswith(".safetensors"):
+                with contextlib.suppress(OSError):
+                    total += os.stat(os.path.join(dirpath, name)).st_size
+    return total or None
 
 
 _DETECT = object()      # distinguishes "measure this machine" from "RAM is genuinely unknown"
@@ -293,12 +365,21 @@ def model_inventory(ram_gb: float | None = _DETECT) -> list[dict]:  # type: igno
     """
     if ram_gb is _DETECT:
         ram_gb = total_ram_gb()
+    bw = bandwidth_info().get("gb_s")
     rows = []
     for entry in REGISTRY:
         need = _parse_ram_gb(entry.get("ram", ""))
         best_mode = entry.get("mode") or ("dspark" if entry.get("dspark") else "dflash")
         drafter = entry.get(best_mode) or entry.get("dspark") or entry.get("dflash")
+        # Dense single-stream ceiling for an already-downloaded target, from its safetensors
+        # bytes and this Mac's bandwidth — the physics a picker can quote before loading
+        # ("~8 tok/s plain on this Mac"). None until the weights are local. A MoE row's figure
+        # is conservative (total, not active, bytes — the loaded engine's /machine is exact).
+        weight_bytes = local_weight_bytes(entry["target"])
+        ceiling = ceiling_tps(bw, weight_bytes) if weight_bytes else None
         rows.append({
+            "weight_bytes": weight_bytes,
+            "ceiling_tps": round(ceiling, 1) if ceiling else None,
             "id": entry["id"],
             "target": entry["target"],
             # the mode `--mode auto` (and the app) resolves for this row — its measured best

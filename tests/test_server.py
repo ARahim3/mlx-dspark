@@ -41,6 +41,11 @@ class _FakeEngine:
     max_tokens_cap = 32768
     cap_controller = None
     is_muse = False           # mirrors Engine.is_muse (muse_glimmer channel parsing off)
+    # Borrow the real Engine's reasoning-effort logic (pure over self.tokenizer) so the
+    # server's map_reasoning_effort wiring is exercised against the real behavior.
+    supports_reasoning_effort = S.Engine.supports_reasoning_effort
+    reasoning_effort_vocab = S.Engine.reasoning_effort_vocab
+    map_reasoning_effort = S.Engine.map_reasoning_effort
 
     def __init__(self):
         self.tokenizer = _FakeTok()
@@ -505,6 +510,55 @@ def test_reasoning_effort_normalization():
             S._reasoning_effort(bad)
 
 
+def test_map_effort_to_vocab():
+    """Unsupported-but-valid effort maps to the nearest supported value, ties round DOWN
+    (issue #19: 'high' -> 'medium' on a Qwen3.8-style {low, medium, xhigh} template)."""
+    qwen = frozenset({"low", "medium", "xhigh"})
+    assert S._map_effort_to_vocab("high", qwen) == "medium"     # tie -> less thinking
+    assert S._map_effort_to_vocab("medium", qwen) == "medium"   # supported -> unchanged
+    assert S._map_effort_to_vocab("xhigh", qwen) == "xhigh"
+    assert S._map_effort_to_vocab("low", qwen) == "low"
+    assert S._map_effort_to_vocab("high", None) == "high"       # template ignores effort
+    assert S._map_effort_to_vocab("high", frozenset()) == "high"
+    sparse = frozenset({"low", "xhigh"})                        # nearest by distance, no tie
+    assert S._map_effort_to_vocab("high", sparse) == "xhigh"    # high(2): xhigh d1 < low d2
+    assert S._map_effort_to_vocab("medium", sparse) == "low"    # medium(1): low d1 < xhigh d2
+
+
+class _Qwen38Tok(_FakeTok):
+    """A template that accepts {low, medium, xhigh} and REJECTS 'high' like Qwen3.8's does —
+    via a non-ValueError raise (encode_messages only retries TypeError/ValueError, so a real
+    template's raise_exception propagates), so the vocab probe genuinely excludes 'high'."""
+
+    chat_template = "{% if reasoning_effort %}hint{% endif %}"
+    SUPPORTED = {"low", "medium", "xhigh"}
+
+    def __init__(self):
+        self.template_kwargs = []
+
+    def apply_chat_template(self, messages, add_generation_prompt=True, **kw):
+        eff = kw.get("reasoning_effort")
+        if eff is not None and eff not in self.SUPPORTED:
+            raise RuntimeError(f"Unexpected reasoning effort {eff}")
+        self.template_kwargs.append(kw)
+        return [1, 2, 3]
+
+
+def test_reasoning_effort_maps_unsupported_instead_of_400(server):
+    """issue #19: a client's 'high' on a {low,medium,xhigh} model reaches the template as
+    'medium' (not a 400), while a supported value passes through unchanged."""
+    eng, base = server
+    eng.tokenizer = _Qwen38Tok()
+    if hasattr(eng, "_effort_vocab"):
+        del eng._effort_vocab                       # probe freshly against this tokenizer
+    _post(base, "/v1/chat/completions",
+          {"messages": [{"role": "user", "content": "hi"}], "reasoning_effort": "high"})
+    assert eng.tokenizer.template_kwargs[-1]["reasoning_effort"] == "medium"
+    _post(base, "/v1/chat/completions",
+          {"messages": [{"role": "user", "content": "hi"}], "reasoning_effort": "xhigh"})
+    assert eng.tokenizer.template_kwargs[-1]["reasoning_effort"] == "xhigh"
+
+
 def test_reasoning_effort_reaches_the_template(server):
     eng, base = server
     tok = _EffortTok()
@@ -749,6 +803,49 @@ def test_health_reports_small_m(server):
     assert _get(base, "/health")["small_m"] is True
 
 
+# --- on-load warmup: kernels are primed before "ready" so the first request is fast --------
+
+
+def test_health_reports_warmup(server):
+    """/health carries whether the load ran a warmup pass, so a client can see --no-warmup
+    took effect (default on)."""
+    eng, base = server
+    assert _get(base, "/health")["warmup"] is False     # fake engine: attribute absent
+    eng.warmup_enabled = True
+    assert _get(base, "/health")["warmup"] is True
+
+
+def test_holder_status_reports_load_phase():
+    """status() distinguishes the weights stage from the warmup stage while loading, and
+    carries no phase once ready — so the app can show "Warming up…" only when it's true."""
+    holder = S.EngineHolder(_CloseableEngine(), load_kwargs={})
+    assert "phase" not in holder.status()               # ready: no phase key
+    holder._loading = True
+    holder._load_phase = "warming_up"
+    assert holder.status()["phase"] == "warming_up"
+    holder._load_phase = None                            # loading weights, warmup not reached
+    assert holder.status()["phase"] == "loading"         # defaults to "loading", never null
+
+
+def test_health_loading_reports_phase(holder_server):
+    """/health surfaces the load phase mid-load so a polling client (the app) can say
+    'Warming up…' on the last stage instead of a bar that looks stuck."""
+    holder, base = holder_server
+    holder._loading = True
+    holder._load_phase = "warming_up"
+    h = _get(base, "/health")
+    assert h["status"] == "loading" and h["phase"] == "warming_up"
+
+
+def test_admin_load_rejects_bad_warmup(holder_server):
+    _holder, base = holder_server
+    for bad in ("yes", 1, 0):
+        with pytest.raises(urllib.error.HTTPError) as e:
+            _post(base, "/admin/load", {"model": "repo", "warmup": bad})
+        assert e.value.code == 400, bad
+        assert "warmup" in json.loads(e.value.read())["error"]["message"]
+
+
 class _SlowStreamEngine(_FakeEngine):
     """Generation that emits a piece every ``delay`` seconds, honouring StopStreaming the
     way the real loops do (stop at the next boundary, return a normal partial result)."""
@@ -982,3 +1079,145 @@ def test_tools_stream_reasoning_and_pretool_text_stream_incrementally(server):
                if c["choices"][0]["delta"].get("reasoning_content")
                or c["choices"][0]["delta"].get("content")) \
         < next(i for i, c in enumerate(chunks) if c["choices"][0]["delta"].get("tool_calls"))
+
+
+# --------------------------------------------------------------------------- roofline surfaces
+
+
+def test_health_carries_a_warnings_list(server):
+    """Memory-pressure / load notes reach clients as {code, level, message, action} rows."""
+    _, base = server
+    h = _get(base, "/health")
+    assert isinstance(h["warnings"], list)
+    for row in h["warnings"]:
+        assert {"code", "level", "message", "action"} <= set(row)
+
+
+def test_metrics_reports_system_memory_and_verdict(server):
+    _, base = server
+    mt = _get(base, "/metrics")
+    assert "pressure" in mt["system"] and "swap_used_bytes" in mt["system"]
+    assert "verdict" in mt                       # None for a fake engine, a dict for a real one
+
+
+def test_machine_answers_for_any_engine(server):
+    """/machine falls back to chip + bandwidth + memory when the engine has no report
+    (fakes, engines built directly) — the shape a client needs to scale its estimates."""
+    _, base = server
+    m = _get(base, "/machine")
+    assert set(m) >= {"chip", "bandwidth", "memory", "model", "roofline", "baseline", "verdict"}
+    assert m["bandwidth"]["reference_gb_s"] == 273.0
+    assert "allocator" in m["memory"] and "pressure" in m["memory"]
+    assert m["model"] is None
+
+
+def test_admin_models_reports_bandwidth_scale(server):
+    _, base = server
+    bw = _get(base, "/admin/models")["bandwidth"]
+    assert bw["reference_gb_s"] == 273.0 and bw["source"] in ("measured", "theoretical", "unknown")
+    if bw["theoretical_gb_s"]:
+        assert bw["scale"] == pytest.approx(bw["theoretical_gb_s"] / 273.0, rel=1e-3)
+
+
+class TestEngineSpecInfoTiles:
+    """The per-request tiles spec_info adds — pure over a stamped GenResult."""
+
+    def _engine(self, machine=None):
+        eng = S.Engine.__new__(S.Engine)
+        eng.mode = "dspark"
+        eng.cap_controller = None
+        eng._last_cap = 4
+        eng.machine = machine or {}
+        eng.memory_guard = None
+        eng.context_window = 4096
+        eng.target_repo, eng.drafter_repo = "org/T", "org/D"
+        eng.calibration = lambda: {"available": False}
+        return eng
+
+    def _result(self, **kw):
+        base = {"text": "x", "token_ids": [1] * 40, "num_tokens": 40, "num_rounds": 10,
+                "accept_lengths": [4] * 10, "target_forwards": 10, "seconds": 2.5,
+                "prefill_seconds": 0.5, "prompt_tokens": 1200, "reused_tokens": 1000,
+                "ttft_seconds": 0.55}
+        base.update(kw)
+        return GenResult(**base)
+
+    def test_timing_tiles(self):
+        info = self._engine().spec_info(self._result())
+        assert info["prompt_tokens"] == 1200 and info["cached_tokens"] == 1000
+        assert info["completion_tokens"] == 40 and info["context_tokens"] == 1240
+        assert info["prefill_seconds"] == 0.5 and info["ttft_seconds"] == 0.55
+        assert info["decode_seconds"] == 2.0
+        assert info["prefill_tokens_per_sec"] == 400.0     # 200 fresh tokens / 0.5 s
+        assert "decay_ratio" not in info and "cold" not in info and "swap_delta_bytes" not in info
+        assert "ceiling_tokens_per_sec" not in info         # no machine facts -> no roofline
+
+    def test_optional_tiles_appear_when_measured(self):
+        info = self._engine().spec_info(self._result(decay_ratio=0.7, cold=True,
+                                                     swap_delta_bytes=300_000_000))
+        assert info["decay_ratio"] == 0.7 and info["cold"] is True
+        assert info["swap_delta_bytes"] == 300_000_000
+
+    def test_roofline_ratio_from_machine_facts(self):
+        # 10 GB active weights, 64 KB/token KV, 250 GB/s -> ceiling at ctx 1240
+        machine = {"bandwidth": {"gb_s": 250.0}, "kv_bytes_per_token": 65536,
+                   "target": {"active_bytes": 10 * 10**9, "active_is_estimate": False}}
+        eng = self._engine(machine)
+        res = self._result()
+        info = eng.spec_info(res)
+        bpt = 10 * 10**9 + 65536 * 1240
+        assert info["ceiling_tokens_per_sec"] == pytest.approx(250e9 / bpt, rel=1e-3)
+        assert info["roofline_ratio"] == pytest.approx(res.decode_tokens_per_sec / (250e9 / bpt),
+                                                       rel=1e-2)
+        # and the same facts drive the verdict + machine report
+        v = eng._verdict_for(res)
+        assert v["level"] in ("info", "healthy", "ok", "attention", "problem")
+        eng.last_verdict, eng._last_context = v, 1240
+        report = eng.machine_report()
+        assert report["model"]["target_weights"]["active_bytes"] == 10 * 10**9
+        assert report["roofline"]["at_zero"]["ceiling_tps"] == pytest.approx(25.0)
+        assert report["roofline"]["at_context_window"]["context"] == 4096
+        assert report["baseline"] is None                 # no calibration -> no step time
+
+
+# --- memory-pressure guard: state on /health, /machine, /metrics; /admin/load override -------
+
+
+def test_health_reports_memory_guard_state(server):
+    _, base = server
+    assert _get(base, "/health")["memory_guard"] == {"enabled": False}   # fake: no guard
+    assert _get(base, "/metrics")["memory_guard"] == {"enabled": False}
+
+
+def test_admin_load_rejects_bad_memory_guard(holder_server):
+    _, base = holder_server
+    with pytest.raises(urllib.error.HTTPError) as e:
+        _post(base, "/admin/load", {"model": "repo", "memory_guard": "yes"})
+    assert e.value.code == 400
+    assert "memory_guard" in json.loads(e.value.read())["error"]["message"]
+
+
+def test_health_warnings_include_a_recent_guard_shed(server):
+    """A shed shows up as a /health warning row so a client can explain the re-prefill."""
+    from mlx_dspark.memory_guard import MemoryGuard
+
+    eng, base = server
+    guard = MemoryGuard(prefix=None, submit=None, is_busy=lambda: False,
+                        clear_cache=lambda: None, allocator_bytes=lambda: 0, log=lambda m: None)
+    guard.shed("warn")
+    eng.memory_guard = guard
+    try:
+        h = _get(base, "/health")
+        assert h["memory_guard"]["sheds"] == 1
+        assert any(w["code"] == "memory_guard" for w in h["warnings"])
+    finally:
+        del eng.memory_guard
+
+
+class TestEngineMachineReportGuard:
+    def test_guard_block_present(self):
+        eng = S.Engine.__new__(S.Engine)
+        eng.mode, eng.machine, eng.memory_guard = "dspark", {}, None
+        eng.last_verdict = None
+        eng.target_repo = eng.drafter_repo = None
+        assert eng.machine_report()["guard"] == {"enabled": False}

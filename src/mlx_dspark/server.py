@@ -47,6 +47,19 @@ from .generate import (
 from .load import apply_wired_limit, load_dflash, load_drafter, load_target, resolve_mode
 from .lookup import lookup_generate
 from .prefix_cache import PrefixCache, _lcp, target_cache_reusable
+from .roofline import (
+    REFERENCE_BANDWIDTH_GB_S,
+    baseline_mbu,
+    chip_info,
+    roofline,
+    swap_usage,
+    system_memory,
+    system_warnings,
+    weight_footprint,
+)
+from .roofline import (
+    verdict as roofline_verdict,
+)
 from .telemetry import RoundLog, RoundRecorder
 from .tools import normalize_tool_messages, parse_tool_calls, schema_types
 
@@ -79,6 +92,21 @@ def _reasoning_effort(value) -> str:
         raise ValueError(
             f"reasoning_effort must be one of {', '.join(REASONING_EFFORTS)}, got {value!r}")
     return value.lower()
+
+
+def _map_effort_to_vocab(e: str, vocab) -> str:
+    """Map a union effort ``e`` to the nearest value THIS template supports.
+
+    ``vocab`` (None, or the template's supported set) unchanged returns ``e`` when it's
+    None/empty or already contains ``e``. Otherwise pick the nearest on the
+    low<medium<high<xhigh ordinal scale, ties -> the LOWER index (less thinking / faster):
+    'high' -> 'medium' for a {low, medium, xhigh} template (issue #19). Pure so it's
+    unit-testable model-free."""
+    if not vocab or e in vocab:
+        return e
+    want = REASONING_EFFORTS.index(e)
+    return min(vocab, key=lambda s: (abs(REASONING_EFFORTS.index(s) - want),
+                                     REASONING_EFFORTS.index(s)))
 
 
 def _target_config(target_repo: str) -> dict | None:
@@ -186,6 +214,83 @@ def _context_ram_warning(kv_per_token: int | None, context_window: int | None,
     return msg
 
 
+def _device_name() -> str | None:
+    try:
+        import mlx.core as mx
+
+        return mx.device_info().get("device_name")
+    except Exception:  # noqa: BLE001 — no mlx / no Metal
+        return None
+
+
+def _param_bytes(model) -> list[tuple[str, int]]:
+    """``[(name, nbytes)]`` for every parameter — reads sizes only, evaluates nothing."""
+    from mlx.utils import tree_flatten
+
+    return [(name, int(getattr(arr, "nbytes", 0) or 0))
+            for name, arr in tree_flatten(model.parameters())]
+
+
+def _machine_facts(target, drafter, cfg: dict | None, kv_per_token: int | None,
+                   mode: str) -> dict:
+    """The load-time facts behind ``/machine`` and the per-request roofline ratio.
+
+    Runs on the MLX thread: the bandwidth microbench allocates arrays (once per chip x mlx,
+    then cached); the weight footprint only reads ``.nbytes`` of already-loaded params.
+    Bandwidth falls back to the chip table (labelled ``theoretical``) if the microbench
+    fails, so the ceiling is still reported — just against the flattering number.
+    """
+    from .calibrate import bandwidth
+
+    chip = chip_info(_device_name())
+    facts: dict = {"chip": chip, "kv_bytes_per_token": kv_per_token, "mode": mode}
+    try:
+        facts["bandwidth"] = {**bandwidth(verbose=True), "source": "measured"}
+    except Exception:  # noqa: BLE001 — a microbench failure must never block a load
+        facts["bandwidth"] = ({"gb_s": chip["bandwidth_gb_s"], "source": "theoretical"}
+                              if chip.get("bandwidth_gb_s") else None)
+    model = getattr(target, "model", target)
+    facts["target"] = weight_footprint(_param_bytes(model), cfg)
+    if drafter is not None:
+        # Informational only (RAM), never part of the single-stream ceiling. Reuse-head
+        # drafters (DFlash, Muse) hold references to the target's embed/lm_head, so a
+        # naive sum can include those — labelled as such.
+        facts["drafter"] = {**weight_footprint(_param_bytes(drafter)),
+                            "may_include_bound_target_tensors": True}
+    return facts
+
+
+def _machine_basics() -> dict:
+    """``/machine`` with no model loaded: chip, cached bandwidth (never measured here), and
+    what the OS sees — enough for a picker to scale its estimates."""
+    from .calibrate import cached_bandwidth
+    from .diagnostics import memory_info
+
+    chip = chip_info(_device_name())
+    bw = None
+    with contextlib.suppress(Exception):
+        bw = cached_bandwidth()
+    return {
+        "chip": chip,
+        "bandwidth": ({**bw, "source": "measured"} if bw else
+                      {"gb_s": chip.get("bandwidth_gb_s"), "source": "theoretical"}
+                      ) | {"reference_gb_s": REFERENCE_BANDWIDTH_GB_S},
+        "memory": {**system_memory(), "allocator": memory_info()},
+        "model": None, "roofline": None, "baseline": None, "verdict": None,
+    }
+
+
+def _engine_warnings(engine) -> list[dict]:
+    """``/health.warnings``: live pressure + load notes + a recent memory-guard shed."""
+    rows = system_warnings(system_memory(), getattr(engine, "load_notes", None))
+    guard = getattr(engine, "memory_guard", None)
+    if guard is not None:
+        row = guard.warning()
+        if row:
+            rows.append(row)
+    return rows
+
+
 def _generation_defaults(target_repo: str) -> dict:
     """Sampling defaults from the model's ``generation_config.json`` — what the model
     authors recommend (e.g. Qwen3 ships 0.6 / top_p 0.95 / top_k 20). Applied only when a
@@ -245,6 +350,7 @@ class Engine:
         wired_limit: bool = False,
         context_window: int | None = None,
         small_m: bool = False,
+        sdpa_split: bool = False,
         executor: ThreadPoolExecutor | None = None,
         depth_capper=None,
     ):
@@ -275,9 +381,24 @@ class Engine:
         self.lookup_drafts = lookup_drafts                 # hybrid n-gram drafts in dspark mode
         self.lookup_long_draft = lookup_long_draft         # match-scaled long-draft ceiling
         self.context_window = context_window               # target's trained positions, if known
+        self.sdpa_split = sdpa_split                        # wide-verify SDPA split active (long-ctx)
         self.small_m = small_m                             # small-M MMA verify kernel active
         #   (i.e. the per-shape probe admitted ≥1 shape AND it wasn't forced off) — reported
         #   in /health so a client can see the knob, and so issue-#14-style A/Bs are possible
+        self.warmup_enabled = False                        # set by load(); drives the `cold` flag
+        # Load-time notes that used to reach only stderr (the context-window RAM estimate) —
+        # served in /health.warnings so a client can show them.
+        self.load_notes: list[str] = []
+        # Machine + model facts behind /machine (chip, measured bandwidth, weight footprint,
+        # KV bytes/token) — filled by load(); {} for engines built directly (tests, library).
+        self.machine: dict = {}
+        self.last_verdict: dict | None = None              # roofline verdict of the last request
+        self._last_context: int = 0                        # prompt+completion of the last request
+        # Memory-pressure guard (memory_guard.py): started by load(), stopped by close().
+        # None = off (library engines, serve --no-memory-guard). `_busy` tells it whether a
+        # generation is in flight so it knows to defer to a round boundary.
+        self.memory_guard = None
+        self._busy = False
         if wired_limit:                                    # opt-in: see apply_wired_limit
             apply_wired_limit()
         # chat-template kwargs applied to every request unless the request overrides them
@@ -301,7 +422,8 @@ class Engine:
             "requests": 0,
             "prompt_tokens": 0,
             "completion_tokens": 0,
-            "generation_seconds": 0.0,
+            "generation_seconds": 0.0,   # end-to-end wall (prefill + decode)
+            "decode_seconds": 0.0,       # decode-only wall (prompt-eval excluded) -> decode tok/s
             "sum_accept_len": 0.0,   # accept-len weighted by tokens, for a token-weighted mean
         }
 
@@ -406,6 +528,42 @@ class Engine:
         return bool(template) and "reasoning_effort" in str(template)
 
     @property
+    def reasoning_effort_vocab(self) -> frozenset[str] | None:
+        """The ``reasoning_effort`` values THIS template actually accepts — probed once by
+        rendering with each union value and keeping the ones that don't raise. ``None`` when
+        the template ignores reasoning_effort entirely (nothing to clamp). Qwen3.8, e.g.,
+        yields ``{low, medium, xhigh}`` — note NO ``high`` (issue #19)."""
+        cached = getattr(self, "_effort_vocab", False)
+        if cached is not False:
+            return cached
+        vocab = None
+        if self.supports_reasoning_effort:
+            ok = set()
+            for e in REASONING_EFFORTS:
+                try:
+                    encode_messages(self.tokenizer, [{"role": "user", "content": "hi"}],
+                                    enable_thinking=True, reasoning_effort=e)
+                    ok.add(e)
+                except Exception:  # noqa: BLE001 — a rejected effort just isn't in the vocab
+                    pass
+            vocab = frozenset(ok) or None
+        self._effort_vocab = vocab
+        return vocab
+
+    def map_reasoning_effort(self, effort) -> str:
+        """Normalize a client's ``reasoning_effort`` to one THIS template accepts.
+
+        Clients hardcode values a given model lacks — WorkBuddy / pi send ``"high"``, which
+        the Qwen3.8 template (low/medium/xhigh) rejects with a template raise -> a 400 for a
+        question it could have answered (issue #19). Rather than error, map an
+        unsupported-but-valid effort to the NEAREST supported value on the
+        low<medium<high<xhigh scale, ties rounding DOWN (toward LESS thinking): "high" ->
+        "medium" on Qwen3.8. Dropping it instead would fall back to the template's own default
+        — which is ``xhigh`` = the *most* thinking, the opposite of what a capped client wants.
+        Still raises ValueError for a value outside the union (a real typo -> clear 400)."""
+        return _map_effort_to_vocab(_reasoning_effort(effort), self.reasoning_effort_vocab)
+
+    @property
     def is_muse(self) -> bool:
         """True for muse_glimmer targets, whose "Onyx ATEM" harmony output needs the recipient-
         channel parser (analysis `to=self` -> thinking, `to=user` -> answer, `<atem:invoke>` ->
@@ -447,6 +605,10 @@ class Engine:
         wide_gemm_min: int | None = None,        # prefill wide-GEMM: None=calibrate, 0=off, N=forced
         small_m: bool | None = None,             # small-M MMA verify kernel: None=probe-gated
         #                                          default, False=force off (serve-side A/B)
+        sdpa_split: bool | None = None,          # wide-verify SDPA split: None=probe-gated, False=off
+        warmup: bool = True,                     # run a throwaway generation on load to warm kernels
+        on_warmup=None,                          # zero-arg callback fired right before the warmup pass
+        memory_guard: bool = True,               # shed prefix cache + allocator cache under OS pressure
     ) -> Engine:
         if mode != "auto" and mode not in MODES:
             raise ValueError(f"mode must be one of {MODES} or 'auto', got {mode!r}")
@@ -493,11 +655,15 @@ class Engine:
             # probe proves faster on this machine, `small_m=False` forces it off (the
             # serve-side A/B issue #14 asked for). MUST precede calibrate()/static_cap —
             # cap curves are measured under the same kernel dispatch generation uses.
-            from .calibrate import apply_small_m
+            from .calibrate import apply_sdpa_split, apply_small_m
 
             smm_ids = apply_small_m(tgt, draft, target_repo=target_repo,
                                     drafter_repo=drafter_repo,
                                     enabled=False if small_m is False else None)
+            # wide-verify SDPA split (see sdpa_split.py): dodge mlx's multi-row cliff on the
+            # long-context verify. Also before calibrate() so the verify curve reflects it.
+            sdpa_cfg = apply_sdpa_split(tgt, target_repo=target_repo,
+                                        enabled=False if sdpa_split is False else None)
             # --max-draft auto: measure this machine+pair's cost curves once (disk-cached)
             # and let a CapController pick the cap per round. Only meaningful with a drafter.
             ctrl = None
@@ -511,9 +677,9 @@ class Engine:
             from .calibrate import apply_wide_gemm
 
             apply_wide_gemm(tgt, draft, target_repo=target_repo, min_rows=wide_gemm_min)
-            return tgt, tok, draft, ctrl, bool(smm_ids)
+            return tgt, tok, draft, ctrl, bool(smm_ids), sdpa_cfg is not None
 
-        tgt, tok, draft, cap_controller, small_m_active = \
+        tgt, tok, draft, cap_controller, small_m_active, sdpa_split_active = \
             executor.submit(_load_models).result()
         user_pinned_cap = isinstance(max_draft_tokens, int)
         if max_draft_tokens == "auto":
@@ -566,34 +732,67 @@ class Engine:
         # model's own maximum, and on a big model that KV budget can silently exhaust the
         # machine. A warning, not a changed default — behaviour stays predictable.
         window = context_window or _context_window(target_repo)
+        load_notes: list[str] = []
+        machine: dict = {}
         try:
             import mlx.core as mx
 
             cfg = _target_config(target_repo)
+            kv_per_token = _kv_bytes_per_token(cfg, kv_bits) if cfg else None
             warn = _context_ram_warning(
-                _kv_bytes_per_token(cfg, kv_bits) if cfg else None, window,
+                kv_per_token, window,
                 mx.get_active_memory(),
                 mx.device_info().get("max_recommended_working_set_size"))
             if warn:
                 print(warn, file=sys.stderr, flush=True)
+                load_notes.append(warn)
+            # Roofline facts: exact loaded bytes per tensor (MoE-active, gather-aware) + this
+            # machine's measured bandwidth (one-time microbench, cached like the curves). On
+            # the MLX thread — the microbench allocates arrays; the footprint only reads
+            # .nbytes of already-evaluated params.
+            machine = executor.submit(
+                _machine_facts, tgt, draft, cfg, kv_per_token, mode).result()
         except Exception:  # noqa: BLE001 — an estimate must never block a load
             pass
-        return cls(tgt, tok, draft, mode=mode, model_id=model_id, target_repo=target_repo,
-                   drafter_repo=drafter_repo, max_draft_tokens=max_draft_tokens,
-                   confidence_threshold=confidence_threshold, template_defaults=template_defaults,
-                   prefix_cache=prefix_cache, prefix_cache_dir=prefix_cache_dir,
-                   prefix_cache_max_ram_mb=prefix_cache_max_ram_mb,
-                   cap_controller=cap_controller,
-                   sampling_defaults=sampling_defaults,
-                   default_max_tokens=default_max_tokens, max_tokens_cap=max_tokens_cap,
-                   prefix_cache_slots=prefix_cache_slots,
-                   prefix_cache_rungs=prefix_cache_rungs, lookup_drafts=lookup_drafts,
-                   lookup_long_draft=lookup_long_draft,
-                   wired_limit=wired_limit,
-                   context_window=window,
-                   small_m=small_m_active,
-                   executor=executor,
-                   depth_capper=depth_capper)
+        eng = cls(tgt, tok, draft, mode=mode, model_id=model_id, target_repo=target_repo,
+                  drafter_repo=drafter_repo, max_draft_tokens=max_draft_tokens,
+                  confidence_threshold=confidence_threshold, template_defaults=template_defaults,
+                  prefix_cache=prefix_cache, prefix_cache_dir=prefix_cache_dir,
+                  prefix_cache_max_ram_mb=prefix_cache_max_ram_mb,
+                  cap_controller=cap_controller,
+                  sampling_defaults=sampling_defaults,
+                  default_max_tokens=default_max_tokens, max_tokens_cap=max_tokens_cap,
+                  prefix_cache_slots=prefix_cache_slots,
+                  prefix_cache_rungs=prefix_cache_rungs, lookup_drafts=lookup_drafts,
+                  lookup_long_draft=lookup_long_draft,
+                  wired_limit=wired_limit,
+                  context_window=window,
+                  small_m=small_m_active,
+                  sdpa_split=sdpa_split_active,
+                  executor=executor,
+                  depth_capper=depth_capper)
+        eng.warmup_enabled = warmup
+        eng.load_notes = load_notes
+        eng.machine = machine
+        if warmup:
+            # Warm the Metal kernels + ramp the clock BEFORE we report ready, so the first
+            # real request doesn't eat the ~2 s cold-start (which otherwise lands entirely in
+            # prefill — see NOTES "Decode-only tok/s"). on_warmup lets the holder flip its
+            # /health phase to "warming_up" so a client can say so; a phase-signal failure
+            # must never block the load.
+            if on_warmup is not None:
+                with contextlib.suppress(Exception):  # a phase signal must never fail a load
+                    on_warmup()
+            eng.warmup()
+        if memory_guard:
+            # After the warmup so the first shed can't land inside it. Polls macOS's own
+            # pressure level; sheds on the MLX thread (idle: now; generating: at a round
+            # boundary via _with_slow_round_log). See memory_guard.py.
+            from .memory_guard import MemoryGuard
+
+            eng.memory_guard = MemoryGuard(prefix=eng.prefix, submit=eng._executor.submit,
+                                           is_busy=lambda: eng._busy).start()
+        return eng
 
     # --- generation ---
     def generate(
@@ -634,14 +833,40 @@ class Engine:
                       f"ctx~{n_prompt + state['n']})", file=sys.stderr, flush=True)
             if inner is not None:
                 inner(**kw)
+            if self.memory_guard is not None:
+                self.memory_guard.on_round()      # a pending shed lands here, between rounds
 
         return wrapped
 
-    def _generate_impl(self, prompt_ids, max_tokens, temperature, top_p, top_k, stop, seed,
-                       on_text, presence_penalty=0.0, frequency_penalty=0.0,
-                       logprobs=None) -> GenResult:
-        on_round = self._with_slow_round_log(
-            RoundRecorder(self.rounds, uuid.uuid4().hex[:8], self.mode), len(prompt_ids))
+    def _generate_impl(self, *args, **kwargs) -> GenResult:
+        # `_busy` is what the memory guard reads to decide "shed now" vs "wait for a round
+        # boundary"; it brackets every path that generates (requests, batch rows, warmup).
+        self._busy = True
+        try:
+            return self._generate_impl_inner(*args, **kwargs)
+        finally:
+            self._busy = False
+
+    def _generate_impl_inner(self, prompt_ids, max_tokens, temperature, top_p, top_k, stop,
+                             seed, on_text, presence_penalty=0.0, frequency_penalty=0.0,
+                             logprobs=None) -> GenResult:
+        recorder = RoundRecorder(self.rounds, uuid.uuid4().hex[:8], self.mode)
+        on_round = self._with_slow_round_log(recorder, len(prompt_ids))
+        # Per-request facts for spec_info: TTFT (first streamed text, engine-side — the
+        # queue wait is not in it), swap growth across the request (the fits-but-swaps
+        # cliff), and whether this is a cold first request. A wrapper on on_text, never a
+        # change to the loops.
+        t_req = time.perf_counter()
+        ttft = [0.0]
+        if on_text is not None:
+            _inner_on_text = on_text
+
+            def on_text(piece, _cb=_inner_on_text):
+                if not ttft[0]:
+                    ttft[0] = time.perf_counter() - t_req
+                _cb(piece)
+        swap_before = swap_usage()["used_bytes"]
+        cold = self.stats["requests"] == 0 and not self.warmup_enabled
         # prefix caching: reuse the shared conversation prefix's KV (all modes; dflash is
         # checkpoint-only); `cache is None` means prefix caching is disabled.
         cache = ctx = None
@@ -747,15 +972,142 @@ class Engine:
         self.stats["prompt_tokens"] += len(prompt_ids)
         self.stats["completion_tokens"] += res.num_tokens
         self.stats["generation_seconds"] += res.seconds
+        self.stats["decode_seconds"] += res.decode_seconds
         self.stats["sum_accept_len"] += res.mean_accept_len * res.num_tokens
+        # Stamp the per-request facts (all additive; the loops never see them).
+        res.prompt_tokens = len(prompt_ids)
+        res.reused_tokens = int(reuse_len)
+        res.ttft_seconds = ttft[0] or res.prefill_seconds
+        res.decay_ratio = self.rounds.decay_ratio(recorder.request_id)
+        res.swap_delta_bytes = swap_usage()["used_bytes"] - swap_before
+        res.cold = cold
+        self._last_context = len(prompt_ids) + res.num_tokens
+        self.last_verdict = self._verdict_for(res)
         return res
+
+    # --- roofline ---
+
+    def _roofline_at(self, context: int) -> dict | None:
+        """Ceiling/bytes-per-token at ``context`` from the load-time machine facts, or None."""
+        m = self.machine
+        if not m or not m.get("target"):
+            return None
+        return roofline(bandwidth_gb_s=(m.get("bandwidth") or {}).get("gb_s"),
+                        active_bytes=m["target"]["active_bytes"],
+                        kv_bytes_per_token=m.get("kv_bytes_per_token"), context=context)
+
+    def _baseline_health(self) -> dict | None:
+        """Baseline MBU from the calibration's measured width-1 step — no new measurement.
+        Memoized: the curves don't change after load and /machine is polled."""
+        cached = getattr(self, "_baseline_cache", None)
+        if cached is not None:
+            return cached or None
+        out = self._baseline_health_uncached()
+        self._baseline_cache = out if out is not None else {}
+        return out
+
+    def _baseline_health_uncached(self) -> dict | None:
+        try:
+            cal = self.calibration()
+            step = float(cal["verify_ms"]["1"]) if cal.get("available") else None
+        except Exception:  # noqa: BLE001 — never let a report fail a request
+            step = None
+        from .calibrate import CTX_LEN
+
+        roof = self._roofline_at(CTX_LEN)
+        if roof is None:
+            return None
+        return baseline_mbu(step, roof["bytes_per_token"],
+                            (self.machine.get("bandwidth") or {}).get("gb_s"))
+
+    def _verdict_for(self, res: GenResult) -> dict:
+        roof = self._roofline_at(res.prompt_tokens + res.num_tokens)
+        ceiling = roof["ceiling_tps"] if roof else None
+        health = self._baseline_health()
+        return roofline_verdict(
+            mbu=health["mbu"] if health else None,
+            ratio_to_ceiling=(res.decode_tokens_per_sec / ceiling) if ceiling else None,
+            mode=self.mode, accept_len=res.mean_accept_len,
+            decode_tps=res.decode_tokens_per_sec,
+            context_tokens=res.prompt_tokens + res.num_tokens,
+            context_window=self.context_window,
+            pressure=system_memory().get("pressure"),
+            swap_delta_bytes=res.swap_delta_bytes, decay_ratio=res.decay_ratio,
+            cold=res.cold,
+            is_moe_estimate=bool((self.machine.get("target") or {}).get("active_is_estimate")))
+
+    def machine_report(self) -> dict:
+        """``GET /machine``: chip, measured bandwidth, what the OS sees, the loaded model's
+        footprint, the single-stream roofline at several depths, the baseline-health MBU and
+        the last request's verdict. Everything here is read from load-time facts + a few
+        sysctls — nothing is measured on the request."""
+        from .diagnostics import memory_info
+
+        m = self.machine
+        out = {
+            "chip": m.get("chip") or chip_info(_device_name()),
+            "bandwidth": {**(m.get("bandwidth") or {}),
+                          "reference_gb_s": REFERENCE_BANDWIDTH_GB_S},
+            "memory": {**system_memory(), "allocator": memory_info()},
+            "model": None, "roofline": None, "baseline": None,
+            "verdict": self.last_verdict,
+            "guard": (self.memory_guard.info() if self.memory_guard is not None
+                      else {"enabled": False}),
+        }
+        if m.get("target"):
+            out["model"] = {
+                "target": self.target_repo, "drafter": self.drafter_repo, "mode": self.mode,
+                "target_weights": m["target"], "drafter_weights": m.get("drafter"),
+                "kv_bytes_per_token": m.get("kv_bytes_per_token"),
+                "context_window": self.context_window,
+            }
+            depths = {"at_zero": 0, "at_last_request": self._last_context}
+            if self.context_window:
+                depths["at_context_window"] = int(self.context_window)
+            out["roofline"] = {k: self._roofline_at(v) for k, v in depths.items()}
+            out["baseline"] = self._baseline_health()
+        return out
+
+    def warmup(self, max_tokens: int = 12) -> None:
+        """Run one tiny throwaway generation so the model is HOT before the first real
+        request — compiling the Metal kernels the real path uses and ramping the GPU clock,
+        which otherwise costs ~2 s on the first forward (and lands in prefill, see NOTES
+        "Decode-only tok/s"). Runs on the generation thread (MLX arrays are thread-affine)
+        and keeps NOTHING: the prefix cache, round log, /metrics stats and the auto-cap
+        controller are all bypassed and restored (see :meth:`_warmup_impl`). Best-effort —
+        any failure is logged and swallowed so it can never block a load."""
+        try:
+            ids = encode_messages(self.tokenizer, [{"role": "user", "content": "hi"}],
+                                  **self.template_defaults)
+            self._executor.submit(self._warmup_impl, ids, max_tokens).result()
+        except Exception as e:  # noqa: BLE001 — a warmup is an optimization, never a gate
+            print(f"[serve] warmup skipped ({type(e).__name__}: {e})",
+                  file=sys.stderr, flush=True)
+
+    def _warmup_impl(self, prompt_ids, max_tokens) -> None:
+        # Swap out every stateful surface so the throwaway generation leaves no trace: no
+        # prefix-cache slot, no round telemetry, no /metrics accounting. Nulling the auto-cap
+        # controller keeps it pristine AND makes the loop use the full-block eff_cap, which
+        # warms the WIDEST verify kernels the real path can hit. Restored in the finally.
+        saved = (self.prefix, self.rounds, self.stats, self.cap_controller)
+        self.prefix, self.rounds = None, RoundLog()
+        self.stats, self.cap_controller = dict(self.stats), None
+        # …and the per-request roofline verdict/context: a throwaway "hi" must not be what
+        # /machine reports as "the last request".
+        saved_verdict = (self.last_verdict, self._last_context)
+        try:
+            self._generate_impl(prompt_ids, max_tokens, 0.0, 1.0, 0, None, None, None)
+        finally:
+            (self.prefix, self.rounds, self.stats, self.cap_controller) = saved
+            self.last_verdict, self._last_context = saved_verdict
 
     def spec_info(self, res: GenResult) -> dict:
         """The non-standard block we attach so the spec-decode benefit is visible."""
         info = {
             "mode": self.mode,
             "accept_len": round(res.mean_accept_len, 3),
-            "tokens_per_sec": round(res.tokens_per_sec, 1),
+            "tokens_per_sec": round(res.tokens_per_sec, 1),          # end-to-end (prefill+decode)
+            "decode_tokens_per_sec": round(res.decode_tokens_per_sec, 1),  # decode-only (prompt-eval excluded)
             "target_forwards": res.target_forwards,
         }
         if self.cap_controller is not None:
@@ -765,6 +1117,32 @@ class Engine:
             #                                          after any depth-aware refinement
         if res.lookup_rounds:
             info["lookup_rounds"] = res.lookup_rounds
+        # Per-request timing tiles (all additive): where the wall clock went, how much of the
+        # prompt the prefix cache served, and how the decode compares with this Mac's
+        # single-stream roofline at this context depth.
+        info.update({
+            "prompt_tokens": int(res.prompt_tokens),
+            "cached_tokens": int(res.reused_tokens),
+            "completion_tokens": int(res.num_tokens),
+            "context_tokens": int(res.prompt_tokens + res.num_tokens),
+            "prefill_seconds": round(res.prefill_seconds, 3),
+            "decode_seconds": round(res.decode_seconds, 3),
+            "ttft_seconds": round(res.ttft_seconds, 3),
+        })
+        fresh = max(res.prompt_tokens - res.reused_tokens, 0)
+        if res.prefill_seconds > 0 and fresh >= 16:
+            # a rate over a handful of fresh tokens (a cache-hit repeat prefills 1) is noise
+            info["prefill_tokens_per_sec"] = round(fresh / res.prefill_seconds, 1)
+        if res.decay_ratio is not None:
+            info["decay_ratio"] = res.decay_ratio
+        if res.swap_delta_bytes:
+            info["swap_delta_bytes"] = int(res.swap_delta_bytes)
+        if res.cold:
+            info["cold"] = True
+        roof = self._roofline_at(res.prompt_tokens + res.num_tokens)
+        if roof and roof.get("ceiling_tps"):
+            info["ceiling_tokens_per_sec"] = round(roof["ceiling_tps"], 1)
+            info["roofline_ratio"] = round(res.decode_tokens_per_sec / roof["ceiling_tps"], 3)
         return info
 
     def metrics(self) -> dict:
@@ -779,6 +1157,8 @@ class Engine:
             "mean_accept_len": round(s["sum_accept_len"] / ct, 3) if ct else 0.0,
             "mean_tokens_per_sec": round(ct / s["generation_seconds"], 1)
             if s["generation_seconds"] else 0.0,
+            "mean_decode_tokens_per_sec": round(ct / s["decode_seconds"], 1)
+            if s.get("decode_seconds") else 0.0,
             "prefix_cache": self.prefix.info() if self.prefix is not None else {"enabled": False},
             "auto_cap": self.cap_controller.info() if self.cap_controller is not None else None,
             # per-round aggregates, incl. position acceptance (d_0, d_1, …) — the drafter
@@ -796,6 +1176,9 @@ class Engine:
         """
         import mlx.core as mx
 
+        if self.memory_guard is not None:
+            self.memory_guard.stop()
+            self.memory_guard = None
         self._executor.shutdown(wait=True)
         if self.prefix is not None:
             self.prefix.reset()
@@ -1058,7 +1441,8 @@ class Engine:
         key, entry = cached_curve_entry(
             self.mode, self.target_repo, self.drafter_repo,
             kv_bits=getattr(self.target, "kv_bits", None),
-            smm_live=bool(_gen.SMALL_M_IDS))
+            smm_live=bool(_gen.SMALL_M_IDS),
+            sdps_live=_gen.SDPA_SPLIT_CFG is not None)
         if entry is None:
             return {"available": False, "key": key,
                     "reason": "not calibrated yet on this machine — loading the pair without "
@@ -1288,6 +1672,7 @@ class BatchEngine:
                     j.error = e
                     j.done.set()
         eng.stats["generation_seconds"] += time.time() - t0
+        eng.stats["decode_seconds"] += time.time() - t0   # batch wall has no separate prefill split -> decode==e2e here
         self.batch_stats["batched_requests"] += admitted
         self.batch_stats["batches"] += 1
         self.batch_stats["max_batch_seen"] = max(self.batch_stats["max_batch_seen"], peak)
@@ -1334,6 +1719,7 @@ class BatchEngine:
         s["prompt_tokens"] += sum(len(j.prompt_ids) for j in jobs)
         s["completion_tokens"] += sum(r.num_tokens for r in res)
         s["generation_seconds"] += res[0].seconds
+        s["decode_seconds"] += res[0].decode_seconds
         s["sum_accept_len"] += sum(r.mean_accept_len * r.num_tokens for r in res)
         self.batch_stats["batched_requests"] += len(jobs)
         self.batch_stats["batches"] += 1
@@ -1384,6 +1770,7 @@ class EngineHolder:
         self._max_batch = max_batch
         self._swap_lock = threading.Lock()
         self._loading = False
+        self._load_phase: str | None = None       # "loading" | "warming_up" while _loading
         self._load_error: str | None = None
 
     def __getattr__(self, name):
@@ -1408,6 +1795,9 @@ class EngineHolder:
                "model": self._engine.model_id if self._engine is not None else None,
                "error": self._load_error}
         if self._loading:
+            # Which stage: "loading" (fetching/loading weights) or "warming_up" (the
+            # post-load warmup generation) — a client shows "Warming up…" for the latter.
+            out["phase"] = self._load_phase or "loading"
             # Live download progress while a first-time load fetches weights — lets a
             # client draw a real progress bar and offer Cancel (POST /admin/load/cancel).
             from .download import progress
@@ -1438,7 +1828,10 @@ class EngineHolder:
              confidence_threshold: float | None = None,
              context_window: int | None = None,
              small_m: bool | None = None,
-             kv_bits: int | None = None) -> dict:
+             sdpa_split: bool | None = None,
+             kv_bits: int | None = None,
+             warmup: bool | None = None,
+             memory_guard: bool | None = None) -> dict:
         """Release the current model and load ``model`` in its place. Returns the new status.
 
         Serialized by ``_swap_lock`` so two concurrent loads can't race. Raises ``ValueError``
@@ -1446,6 +1839,7 @@ class EngineHolder:
         """
         with self._swap_lock:
             self._loading = True
+            self._load_phase = "loading"
             self._load_error = None
             old = self._engine
             self._engine = None                   # `ready` is False from here until success
@@ -1479,8 +1873,18 @@ class EngineHolder:
                     kwargs["confidence_threshold"] = confidence_threshold
                 if small_m is not None:
                     kwargs["small_m"] = small_m
+                if sdpa_split is not None:
+                    kwargs["sdpa_split"] = sdpa_split
                 if kv_bits is not None:
                     kwargs["kv_bits"] = kv_bits or None    # 0 -> full precision
+                if warmup is not None:
+                    kwargs["warmup"] = warmup
+                if memory_guard is not None:
+                    kwargs["memory_guard"] = memory_guard
+                # Flip the /health phase to "warming_up" once weights are resident and the
+                # warmup generation starts, so a polling client can say "Warming up…" instead
+                # of showing a load bar that looks stuck.
+                kwargs["on_warmup"] = lambda: setattr(self, "_load_phase", "warming_up")
                 engine = Engine.load(**kwargs)
                 engine = maybe_batch_engine(engine, self._max_batch)
                 self._engine = engine
@@ -1489,6 +1893,7 @@ class EngineHolder:
                 raise
             finally:
                 self._loading = False
+                self._load_phase = None
             # After the finally, so the returned status reflects the settled state (ready=True),
             # not the mid-load snapshot.
             return self.status()
@@ -1682,9 +2087,16 @@ def make_handler(engine: Engine, api_key: str | None):
                     return self._send_json(200, {
                         "status": "loading" if status["loading"] else "no_model",
                         "model": status["model"], "loading": status["loading"],
+                        # which stage of the load this is: "loading" (weights) or
+                        # "warming_up" (the throwaway warmup generation after the weights
+                        # are resident) — so a client can show "Warming up…" instead of a
+                        # loading bar that looks stuck. Null when not loading.
+                        "phase": status.get("phase"),
                         # non-null while a first-time load is fetching weights:
                         # {repo, bytes_done, bytes_total} — cancel with /admin/load/cancel
                         "download": status.get("download"),
+                        # memory-pressure etc. — the OS-level warnings apply with no model too
+                        "warnings": system_warnings(system_memory()),
                         "error": status["error"]})
                 # max_draft as a string ("auto" or the pinned/derived cap) so a client can
                 # show the configured knob, not just infer it from round telemetry.
@@ -1711,6 +2123,14 @@ def make_handler(engine: Engine, api_key: str | None):
                     # with serve --no-small-m / the /admin/load "small_m" override so a
                     # kernel-vs-stock A/B no longer needs a version downgrade (issue #14)
                     "small_m": bool(getattr(engine, "small_m", False)),
+                    # whether the wide-verify SDPA split is live (a per-chip probe found
+                    # mlx's multi-row cliff and it wasn't forced off) — pairs with serve
+                    # --no-sdpa-split / the /admin/load "sdpa_split" override
+                    "sdpa_split": bool(getattr(engine, "sdpa_split", False)),
+                    # whether this load ran a warmup pass (throwaway generation to compile
+                    # kernels + ramp the clock so the first real request is warm). On by
+                    # default; serve --no-warmup / the /admin/load "warmup" override turn it off.
+                    "warmup": bool(getattr(engine, "warmup_enabled", False)),
                     "context_window": getattr(engine, "context_window", None),
                     # KV-cache quantization for the loaded target: 0 = full precision,
                     # 4/8 = quantized. Always present (0 when off) so a client can gate its
@@ -1718,6 +2138,15 @@ def make_handler(engine: Engine, api_key: str | None):
                     # "kv_bits" override (< 0.13.1) also lacks this key (issue #17).
                     "kv_bits": int(getattr(getattr(engine, "target", None),
                                            "kv_bits", 0) or 0),
+                    # {code, level, message, action} rows a client shows as a banner: live
+                    # macOS memory pressure + the engine's load-time notes (the context-
+                    # window RAM estimate used to reach only stderr). Empty when all is well.
+                    "warnings": _engine_warnings(engine),
+                    # the memory-pressure guard's state (enabled, current level, last shed) —
+                    # serve --no-memory-guard / the /admin/load "memory_guard" override
+                    "memory_guard": (engine.memory_guard.info()
+                                     if getattr(engine, "memory_guard", None) is not None
+                                     else {"enabled": False}),
                     "max_output_tokens": engine.max_tokens_cap,
                     # Whether the loaded template reads `reasoning_effort`, and the server's
                     # default when one was configured — so a client only offers the control
@@ -1744,10 +2173,24 @@ def make_handler(engine: Engine, api_key: str | None):
                 installed = installed_models()
                 loaded = (engine.target_repo
                           if not isinstance(engine, EngineHolder) or engine.ready else None)
+                from .diagnostics import bandwidth_info
+
                 return self._send_json(200, {"models": model_inventory(),
                                              "installed": installed,
                                              "disk": disk_usage(installed),
-                                             "loaded": loaded})
+                                             "loaded": loaded,
+                                             # this Mac's bandwidth vs the M4 Pro every
+                                             # stamped speedup was measured on — a client
+                                             # scales badges by `scale` (labelled estimate)
+                                             "bandwidth": bandwidth_info()})
+            if route == "/machine":
+                # Chip, measured bandwidth, OS memory view, the loaded model's footprint and
+                # its single-stream roofline. Answers model-less too (chip/bandwidth/memory
+                # only) so a picker can scale estimates before anything is loaded.
+                report = getattr(engine, "machine_report", None)
+                if (isinstance(engine, EngineHolder) and not engine.ready) or report is None:
+                    return self._send_json(200, _machine_basics())
+                return self._send_json(200, report())
             if not self._require_ready():
                 return
             if route in ("/v1/models", "/models"):
@@ -1760,6 +2203,12 @@ def make_handler(engine: Engine, api_key: str | None):
                 # actually holds resident — added handler-side so every engine (incl.
                 # BatchEngine) reports it without owning the concern.
                 payload["memory"] = memory_info()
+                # What the OS sees (pressure, swap, free %) — the "mysteriously half speed"
+                # diagnostics; a few sysctls, so a client can poll it with the allocator.
+                payload["system"] = system_memory()
+                payload["verdict"] = getattr(engine, "last_verdict", None)
+                guard = getattr(engine, "memory_guard", None)
+                payload["memory_guard"] = guard.info() if guard is not None else {"enabled": False}
                 return self._send_json(200, payload)
             if route == "/calibration":
                 return self._send_json(200, engine.calibration())
@@ -1830,6 +2279,11 @@ def make_handler(engine: Engine, api_key: str | None):
                 return self._send_error(400, "'small_m' must be a boolean (false forces the "
                                              "stock verify kernel; omit it to use the "
                                              "server's setting)")
+            sdpa_split = req.get("sdpa_split")
+            if sdpa_split is not None and not isinstance(sdpa_split, bool):
+                return self._send_error(400, "'sdpa_split' must be a boolean (false forces the "
+                                             "single wide SDPA call; omit it to use the "
+                                             "server's setting)")
             # KV-cache quantization for the target (issue #17 — the app had no way to set
             # --kv-bits). 0 = explicitly full precision; omit = keep the server's setting.
             kv_bits = req.get("kv_bits")
@@ -1837,12 +2291,26 @@ def make_handler(engine: Engine, api_key: str | None):
                                         or kv_bits not in (0, 4, 8)):
                 return self._send_error(400, "'kv_bits' must be 0 (full precision), 4, or 8 "
                                              "(omit it to keep the server's setting)")
+            # Whether this load runs the warmup pass (a throwaway generation to warm the
+            # kernels so the first real request is fast). Omit = the server's default (on).
+            warmup = req.get("warmup")
+            if warmup is not None and not isinstance(warmup, bool):
+                return self._send_error(400, "'warmup' must be a boolean (false skips the "
+                                             "on-load warmup generation; omit it to use the "
+                                             "server's setting)")
+            # Whether this load runs the memory-pressure guard (sheds prefix-cache snapshots
+            # and the allocator's retained buffers when macOS reports pressure).
+            memory_guard = req.get("memory_guard")
+            if memory_guard is not None and not isinstance(memory_guard, bool):
+                return self._send_error(400, "'memory_guard' must be a boolean (omit it to "
+                                             "use the server's setting)")
             try:
                 status = engine.swap(model=model, mode=mode, max_draft=max_draft,
                                      lookup_drafts=lookup_drafts,
                                      confidence_threshold=confidence,
                                      context_window=context_window,
-                                     small_m=small_m, kv_bits=kv_bits)
+                                     small_m=small_m, sdpa_split=sdpa_split, kv_bits=kv_bits,
+                                     warmup=warmup, memory_guard=memory_guard)
             except ValueError as e:                 # unknown model / unresolvable drafter
                 return self._send_error(400, str(e))
             except Exception as e:  # noqa: BLE001 — load failed; report, server stays up
@@ -1921,7 +2389,7 @@ def make_handler(engine: Engine, api_key: str | None):
             effort = req.get("reasoning_effort")
             if effort is not None:
                 try:
-                    template_kwargs["reasoning_effort"] = _reasoning_effort(effort)
+                    template_kwargs["reasoning_effort"] = engine.map_reasoning_effort(effort)
                 except ValueError as e:
                     return self._send_error(400, str(e))
             try:
@@ -2105,13 +2573,14 @@ def make_handler(engine: Engine, api_key: str | None):
             if "enable_thinking" in req:
                 tkw["enable_thinking"] = bool(req["enable_thinking"])
             if req.get("reasoning_effort") is not None:
-                # Top-level shortcut (the OpenAI field name); validated here so a typo is a
-                # clear 400 rather than a Jinja raise_exception message. Templates that don't
-                # know the kwarg ignore it. NOTE: the effort hint lands at the head of the
-                # prompt (a system-block instruction), so changing it mid-conversation is a
-                # full prefix-cache miss — clients should treat it as per-conversation.
+                # Top-level shortcut (the OpenAI field name). Mapped to what THIS template
+                # accepts (issue #19: clients hardcode "high", which Qwen3.8 lacks -> map to
+                # "medium" rather than 400); a value outside the union is still a clear 400.
+                # NOTE: the effort hint lands at the head of the prompt (a system-block
+                # instruction), so changing it mid-conversation is a full prefix-cache miss —
+                # clients should treat it as per-conversation.
                 try:
-                    tkw["reasoning_effort"] = _reasoning_effort(req["reasoning_effort"])
+                    tkw["reasoning_effort"] = engine.map_reasoning_effort(req["reasoning_effort"])
                 except ValueError as e:
                     return self._send_error(400, str(e))
             if req.get("tools"):                      # let the template render the tool schemas
@@ -2557,10 +3026,14 @@ def run_server(engine, *, host: str = "127.0.0.1", port: int = 8080,
             print(f"  prefix cache: on{'  (+SSD spill)' if engine.prefix.l2_dir else ''}")
         else:
             print("  prefix cache: off (not reusable for this mode/target)")
+        guard = getattr(engine, "memory_guard", None)
+        print(f"  memory guard: {'on (sheds caches under macOS memory pressure)' if guard else 'off'}")
         # Stated up front so a serve session's kernel arm is on record (benchmark prints
         # the same); forced off via --no-small-m, per-swap via /admin/load {"small_m": ...}.
         print(f"  small-M verify kernel: "
               f"{'on (probe-verified shapes)' if getattr(engine, 'small_m', False) else 'off'}")
+        print(f"  sdpa split (long-ctx verify): "
+              f"{'on (cliff measured)' if getattr(engine, 'sdpa_split', False) else 'off'}")
         if isinstance(engine, BatchEngine):
             print(f"  batching: micro-batch up to {engine.max_batch} concurrent "
                   f"({engine.mode}; serial fallback for temp>0 dspark / lone requests)")

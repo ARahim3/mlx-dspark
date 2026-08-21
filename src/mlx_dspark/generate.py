@@ -22,6 +22,7 @@ import mlx.core as mx
 from mlx.utils import tree_flatten
 
 from .sampling import sample_probs, truncate_probs
+from .sdpa_split import sdpa_split as _sdpa_split_scope
 from .small_m_qmm import small_m_matmul
 from .wide_gemm import wide_matmul
 
@@ -33,6 +34,11 @@ SMALL_M_IDS = None  # QuantizedLinear instances (by id) routed through the small
 # must not silently change numerics class — and the CLI/server set it from
 # calibrate.apply_small_m()'s measured per-shape gate.
 
+SDPA_SPLIT_CFG = None  # sdpa_split.SplitConfig routing wide-verify SDPA (q_len in the cliff
+# window, long KV) through <=5-row sub-calls to dodge mlx's multi-row cliff (see
+# sdpa_split.py). None disables. Same doctrine as SMALL_M_IDS: library default off, the
+# CLI/server set it from calibrate.apply_sdpa_split()'s per-chip measured window.
+
 
 def _with_small_m(fn):
     """Run a generation loop inside :func:`small_m_matmul` (a no-op when SMALL_M_IDS is
@@ -41,6 +47,18 @@ def _with_small_m(fn):
     @functools.wraps(fn)
     def wrapper(*args, **kwargs):
         with small_m_matmul(SMALL_M_IDS):
+            return fn(*args, **kwargs)
+    return wrapper
+
+
+def _with_sdpa_split(fn):
+    """Run a generation loop inside :func:`sdpa_split` (a no-op when SDPA_SPLIT_CFG is
+    None). The gate (q_len window + min KV) makes it fire only on wide-verify forwards, so
+    wrapping the whole function leaves prefill and q_len-1 decode untouched. Read at call
+    time so hot swaps re-resolve, exactly like :func:`_with_small_m`."""
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        with _sdpa_split_scope(SDPA_SPLIT_CFG):
             return fn(*args, **kwargs)
     return wrapper
 
@@ -57,6 +75,17 @@ class GenResult:
     finish_reason: str = "stop"  # "stop" (eos/stop-string) | "length" (hit max_new_tokens)
     lookup_rounds: int = 0       # rounds whose draft came from the free n-gram lookup
     logprobs: list | None = None  # per-token [{token_id, logprob, top:[(id, logprob), …]}], if requested
+    prefill_seconds: float = 0.0  # wall time in prompt-eval (prefill); decode = seconds - this.
+    #                               0.0 (the default for any un-instrumented caller) means "not
+    #                               measured" -> decode rate collapses to the end-to-end rate.
+    # Per-request facts the *server* stamps after generation (the loops never set these) so
+    # ``spec_info`` can be a pure function of the result — all optional, all additive.
+    prompt_tokens: int = 0        # prompt length in tokens
+    reused_tokens: int = 0        # of those, served from the prefix cache (reuse_len; PR #9's name)
+    ttft_seconds: float = 0.0     # time to the first streamed text at the engine (0 = unmeasured)
+    decay_ratio: float | None = None   # late/early decode rate within this request (RoundLog)
+    swap_delta_bytes: int | None = None  # macOS swap growth during this request
+    cold: bool = False            # first request since load with warmup off (kernel compile)
 
     @property
     def mean_accept_len(self) -> float:
@@ -64,7 +93,22 @@ class GenResult:
 
     @property
     def tokens_per_sec(self) -> float:
+        """End-to-end throughput: tokens / (prefill + decode). Semantics unchanged — this is
+        the pessimistic, prefill-inclusive number every existing surface has always reported."""
         return self.num_tokens / max(self.seconds, 1e-9)
+
+    @property
+    def decode_seconds(self) -> float:
+        """Wall time generating tokens, with prompt-eval excluded. Falls back to the full
+        window when prefill was not separately measured (``prefill_seconds == 0.0``)."""
+        return max(self.seconds - self.prefill_seconds, 1e-9)
+
+    @property
+    def decode_tokens_per_sec(self) -> float:
+        """Decode-only rate (prompt-eval excluded) — the number other local runtimes
+        (LM Studio, oMLX, …) report. Always >= :attr:`tokens_per_sec`; equal when prefill is
+        unmeasured. Ratios are unaffected either way; this only makes the absolute figure honest."""
+        return self.num_tokens / self.decode_seconds
 
 
 def _ids_from_template_result(r) -> list[int] | None:
@@ -451,6 +495,8 @@ def greedy_generate(
         on_mark=(lambda p: on_prefill(cache, None, p)) if on_prefill else None)
     if on_prefill is not None:
         on_prefill(cache, None, len(ids))   # caches hold exactly `ids` right now
+    mx.eval(logits)                          # settle prompt-eval so the prefill/decode timing split is
+    t_prefill = time.time()                  # honest (values are unchanged; this only fixes the clock)
     out_ids: list[int] = []
     pen = _Penalizer(presence_penalty, frequency_penalty)
     lp_list: list | None = [] if logprobs is not None else None
@@ -508,11 +554,13 @@ def greedy_generate(
         accept_lengths=[1] * len(out_ids),
         target_forwards=len(out_ids),
         seconds=secs,
+        prefill_seconds=t_prefill - t0,
         finish_reason=_finish_reason(out_ids, max_new_tokens, nxt, eos_ids, st),
         logprobs=lp_list,
     )
 
 
+@_with_sdpa_split
 @_with_small_m
 def dflash_generate(
     target_model,
@@ -526,6 +574,9 @@ def dflash_generate(
     reuse_len: int = 0,
     max_new_tokens: int = 128,
     max_draft_tokens: int | None = None,
+    lookup_drafts: bool = False,
+    lookup_max_draft: int = 6,
+    lookup_long_draft: int = 32,
     cap_controller=None,
     temperature: float = 0.0,
     top_p: float = 1.0,
@@ -560,6 +611,13 @@ def dflash_generate(
     instead of per-slot argmax/sampling. Greedy stays single-sync; T>0 scatters the
     selector's sparse q dense for the same ``_spec_sample_accept``. Same block/verify
     conventions otherwise — the verify side cannot tell the two apart.
+
+    ``lookup_drafts`` (off by default): hybrid n-gram copy drafting, ported from the dspark
+    loop. On a 4-gram+ suffix match a free verbatim continuation (up to ``lookup_long_draft``
+    on a deep copy run, else ``lookup_max_draft``) is verified INSTEAD of the DFlash drafter
+    that round — the win on grounded re-emission that DFlash's learned drafter can't guarantee.
+    A copy round skips the draft call, so its committed ctx rides ``pending_ctx`` (concatenated)
+    for the next drafter round to append. Lossless (the target verifies every copied token).
     """
     if seed is not None:
         mx.random.seed(seed)
@@ -657,6 +715,8 @@ def dflash_generate(
         marks=prefill_marks, on_mark=_mark if on_prefill is not None else None)
     if on_prefill is not None:
         _mark(len(ids))                # caches hold exactly `ids` (stable == n templates)
+    mx.eval(logits)                    # settle prompt-eval so the prefill/decode timing split is honest
+    t_prefill = time.time()
     pending_ctx = _fused_all()         # the first draft call appends the suffix's ctx
     if trimmed["dropped"]:
         # Rows the bound discarded would have been skipped inside append_ctx anyway; its
@@ -669,8 +729,73 @@ def dflash_generate(
     accept_lengths: list[int] = []
     target_forwards = 1
 
+    index = None
+    lookup_rounds = 0
+    if lookup_drafts:
+        from .lookup import LongDraftGate, NGramIndex  # deferred: lookup.py imports this module
+
+        # Same 4-gram-minimum hybrid drafting as the dspark loop: on a copy run a free
+        # n-gram continuation is verified INSTEAD of running the DFlash drafter this round.
+        # 4 is load-bearing (trigrams fire spuriously on chat, forgoing a productive block).
+        index = NGramIndex(min_n=4, max_n=5, max_draft=max(1, lookup_max_draft))
+        index.extend(ids + [pending])
+        lk_gate = LongDraftGate()
+
     st.update(out_ids)
     while len(out_ids) < max_new_tokens and pending not in eos_ids and not st.stopped:
+        # ---- free copy draft (a 4-gram+ suffix match extends an earlier occurrence): verify
+        # that continuation instead of running the DFlash drafter this round. DFlash caches
+        # ctx KV only (advanced inside the draft call from pending_ctx), so a copy round —
+        # which skips the draft call — rides its committed ctx on pending_ctx: the concat
+        # below keeps the positions contiguous, and the next drafter round appends the whole
+        # accumulated window (sliding heads trim it on append, so it self-bounds). Lossless:
+        # the target verifies every copied token; a bad copy just costs acceptance.
+        lk_draft = index.propose(
+            long_draft=lookup_long_draft if lk_gate.allowed else None,
+        )[: max_new_tokens - len(out_ids)] if index is not None else []
+        if lk_draft:
+            lookup_rounds += 1
+            if temperature > 0.0:
+                verify_ids = mx.array([[pending] + lk_draft])
+                v_logits, v_fused = target_model.verify(verify_ids, cache, tap)
+                mx.eval(v_logits, v_fused)
+                vocab = v_logits.shape[-1]           # point-mass proposal: q one-hot per token
+                q_probs = (mx.arange(vocab)[None, :]
+                           == mx.array(lk_draft)[:, None]).astype(mx.float32)
+                n, repl = _spec_sample_accept(
+                    v_logits[0], lk_draft, q_probs, temperature, top_p, top_k)
+                committed = lk_draft[:n] + [repl]
+            else:
+                draft_arr = mx.array(lk_draft)
+                verify_ids = mx.concatenate(
+                    [mx.array([pending], dtype=draft_arr.dtype), draft_arr]).reshape(1, -1)
+                v_logits, v_fused = target_model.verify(verify_ids, cache, tap)
+                tt_arr = mx.argmax(v_logits[0], axis=-1)
+                match = (draft_arr
+                         == tt_arr[: len(lk_draft)].astype(draft_arr.dtype)).astype(mx.int32)
+                n_arr = mx.cumprod(match).sum()
+                mx.eval(n_arr, tt_arr)
+                n = int(n_arr.item())
+                tt = tt_arr.tolist()
+                committed = lk_draft[:n] + [tt[n]]
+            lk_gate.update(len(lk_draft), n, max(1, lookup_max_draft))
+            target_forwards += 1
+            accept_lengths.append(len(committed))
+            if on_round is not None:
+                on_round(drafted=len(lk_draft), accepted=n, committed=len(committed),
+                         cap=cap, source="lookup")
+            target_model.rollback(cache, len(lk_draft) - n, lk_draft[:n])
+            pending_ctx = mx.concatenate([pending_ctx, v_fused[:, : n + 1, :]], axis=1)
+            appended = []
+            for tok in committed:
+                out_ids.append(tok)
+                appended.append(tok)
+                if tok in eos_ids:
+                    break
+            index.extend(appended)
+            pending = out_ids[-1]
+            st.update(out_ids)
+            continue
         # ---- draft full-width block; feeding pending_ctx appends exactly the just-
         # committed positions to the draft KV cache (DFlash caches only ctx KV, never
         # block KV) -> correct absolute RoPE offsets, no trim needed.
@@ -743,10 +868,14 @@ def dflash_generate(
         target_model.rollback(cache, len(drafted) - n, drafted[:n])
         pending_ctx = v_fused[:, : n + 1, :]             # [anchor, accepted] -> next draft ctx
 
+        appended = []
         for tok in committed:
             out_ids.append(tok)
+            appended.append(tok)
             if tok in eos_ids:
                 break
+        if index is not None:
+            index.extend(appended)                       # keep the copy index current
         pending = out_ids[-1]        # eos mid-committed ends the loop (not committed[-1])
         st.update(out_ids)
     st.flush()
@@ -761,6 +890,8 @@ def dflash_generate(
         accept_lengths=accept_lengths,
         target_forwards=target_forwards,
         seconds=secs,
+        prefill_seconds=t_prefill - t0,
+        lookup_rounds=lookup_rounds,
         finish_reason=_finish_reason(out_ids, max_new_tokens, pending, eos_ids, st),
     )
 
@@ -918,6 +1049,7 @@ def _spec_sample_accept(v_logits, draft, q_probs, temperature, top_p=1.0, top_k=
     return n, repl
 
 
+@_with_sdpa_split
 @_with_small_m
 def speculative_generate(
     target_model,
@@ -1033,6 +1165,8 @@ def speculative_generate(
         on_mark=(lambda p: on_prefill(cache, ctx_caches, p)) if on_prefill else None)
     if on_prefill is not None:
         on_prefill(cache, ctx_caches, len(ids))   # caches hold exactly `ids` right now
+    mx.eval(logits)                    # settle prompt-eval so the prefill/decode timing split is honest
+    t_prefill = time.time()
     n_cached = len(ids)
     pending = _pick(logits[0, -1], temperature, top_p, top_k)  # first committed token
     mx.async_eval([c.k for c in ctx_caches])   # schedule; round 1's sync will wait on it
@@ -1310,6 +1444,7 @@ def speculative_generate(
         accept_lengths=accept_lengths,
         target_forwards=target_forwards,
         seconds=secs,
+        prefill_seconds=t_prefill - t0,
         finish_reason=_finish_reason(out_ids, max_new_tokens, pending, eos_ids, st),
         lookup_rounds=lookup_rounds,
         logprobs=lp_list,

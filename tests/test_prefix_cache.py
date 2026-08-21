@@ -537,3 +537,44 @@ def test_failed_generation_drops_pending_rungs():
     _feed(cache2, 19)
     pc.checkpoint(cache2, None, 19, list(range(300, 320)))
     assert "rungs" not in pc.info()["slots"][0]
+
+
+def _fill(pc, n_convs=2):
+    convs = [list(range(i * 100, i * 100 + 20)) for i in range(1, n_convs + 1)]
+    for conv in convs:
+        c, x, _ = pc.acquire(conv)
+        for layer in c:
+            layer.offset = len(conv)
+        pc.store(c, x, conv, [7, 8])
+    return convs
+
+
+def test_shed_warn_drops_rungs_but_keeps_every_slot():
+    """The memory guard's WARN action: rungs (the big fp32 interior snapshots) go, every
+    conversation keeps its boundary checkpoint — dropping one measured as a 36 s re-prefill
+    on a 27B under pressure, for 0.6 GB."""
+    pc = PrefixCache(_mk_cache, _mk_ctx, min_reuse=4, slots=2)
+    convs = _fill(pc)
+    pc._slots[0].rungs = {8: [], 16: []}         # pretend the newest slot carries a ladder
+    out = pc.shed("warn")
+    assert out["action"] == "rungs dropped, slots kept" and out["slots_dropped"] == 0
+    assert out["rungs_dropped"] == 2
+    assert len(pc.info()["slots"]) == 2 and not any(s.rungs for s in pc._slots)
+    assert pc.acquire(convs[1] + [9])[2] > 0      # both conversations still hit
+    assert pc.acquire(convs[0] + [9])[2] > 0
+
+
+def test_shed_critical_empties_everything():
+    pc = PrefixCache(_mk_cache, _mk_ctx, min_reuse=4, slots=2)
+    convs = _fill(pc)
+    out = pc.shed("critical")
+    assert out["action"] == "emptied" and out["slots_dropped"] == 2
+    assert pc.info()["slots"] == []
+    assert pc.acquire(convs[1] + [9])[2] == 0
+
+
+def test_shed_on_an_empty_cache_is_a_noop():
+    pc = PrefixCache(_mk_cache, _mk_ctx, min_reuse=4, slots=2)
+    out = pc.shed("warn")
+    assert out["slots_dropped"] == 0 and out["prefix_bytes_freed"] == 0
+    assert pc.shed("critical")["action"] == "emptied"

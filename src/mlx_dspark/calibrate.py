@@ -35,6 +35,9 @@ import time
 
 import mlx.core as mx
 
+# Real SDPA kernel, captured before any sdpa-split patch, for the cliff probe below.
+_ORIG_SDPA_FOR_PROBE = mx.fast.scaled_dot_product_attention
+
 CACHE_DIR = os.path.expanduser("~/.cache/mlx_dspark")
 CACHE_FILE = "calibration.json"
 SCHEMA = 4   # 2: verify curve includes width 1; adds the measured per-round overhead
@@ -666,6 +669,7 @@ def _cache_key(mode: str, target_repo: str, drafter_repo: str | None,
 
 def cached_curve_entry(mode: str, target_repo: str, drafter_repo: str | None, *,
                        kv_bits: int | None = None, smm_live: bool = False,
+                       sdps_live: bool = False,
                        cache_dir: str | None = None) -> tuple[str, dict | None]:
     """``(key, entry)`` for this pair's cost curves, or ``(key, None)`` if never measured.
 
@@ -677,7 +681,16 @@ def cached_curve_entry(mode: str, target_repo: str, drafter_repo: str | None, *,
     The returned key names which variant was found, so a client can tell.
     """
     base = _cache_key(mode, target_repo, drafter_repo, kv_bits=kv_bits)
-    for key in ((base + "|smm", base) if smm_live else (base, base + "|smm")):
+    # Try the key matching the live (small-M, sdpa-split) state first; then fall back across
+    # the other tag combinations so a report still finds a differently-tagged cached entry.
+    live = ("|smm" if smm_live else "") + ("|sdps" if sdps_live else "")
+    cands, seen = [], set()
+    for suf in (live, "", "|smm", "|sdps", "|smm|sdps"):
+        k = base + suf
+        if k not in seen:
+            seen.add(k)
+            cands.append(k)
+    for key in cands:
         entry = load_cached(key, cache_dir)
         if entry is not None:
             return key, entry
@@ -704,6 +717,73 @@ def save_cached(key: str, entry: dict, cache_dir: str | None = None) -> None:
     data[key] = entry
     with open(path, "w") as f:
         json.dump(data, f, indent=1)
+
+
+# --------------------------------------------------------------------------- bandwidth
+
+_BW_MEMO: dict[str, dict] = {}
+
+
+def measure_bandwidth_gb_s(mb: int = 512, iters: int = 10) -> float:
+    """This machine's *achievable* memory bandwidth: a ~512 MB fp16 matvec streams weights
+    exactly the way a batch-1 decode step does, far past any on-chip cache, median of
+    ``iters``. Lands at ~70–90% of the spec-sheet figure (M4 Pro: ~219 of 273 GB/s) — the
+    honest denominator for "% of roofline", where the spec sheet flatters."""
+    dim = int((mb * 1024 * 1024 / 2) ** 0.5)
+    dim -= dim % 64
+    w = mx.random.normal((dim, dim), dtype=mx.float16)
+    x = mx.random.normal((dim,), dtype=mx.float16)
+    mx.eval(w, x)
+    for _ in range(3):
+        mx.eval(w @ x)
+    mx.synchronize()
+    times = []
+    for _ in range(iters):
+        t0 = time.perf_counter()
+        mx.eval(w @ x)
+        mx.synchronize()
+        times.append(time.perf_counter() - t0)
+    times.sort()
+    bw = w.nbytes / times[len(times) // 2] / 1e9
+    del w, x
+    mx.clear_cache()
+    return bw
+
+
+def _bandwidth_key() -> str:
+    dev = mx.device_info().get("device_name", "unknown")
+    return f"v{SCHEMA}|{dev}|mlx{mx.__version__}|bw"
+
+
+def cached_bandwidth(cache_dir: str | None = None) -> dict | None:
+    """The cached bandwidth entry for this chip x mlx, or None. Never measures."""
+    key = _bandwidth_key()
+    if key in _BW_MEMO:
+        return _BW_MEMO[key]
+    entry = load_cached(key, cache_dir)
+    if entry is not None:
+        _BW_MEMO[key] = entry
+    return entry
+
+
+def bandwidth(cache_dir: str | None = None, *, refresh: bool = False,
+              verbose: bool = False, measure=None) -> dict:
+    """``{"gb_s", "measured_at", "method"}`` — measured once per (chip, mlx version) and
+    cached in ``calibration.json`` like the cost curves. MUST run on the MLX thread (it
+    allocates and evaluates arrays). ``measure`` is injectable for tests."""
+    key = _bandwidth_key()
+    if not refresh:
+        entry = cached_bandwidth(cache_dir)
+        if entry is not None:
+            return entry
+    if verbose:
+        print("  measuring memory bandwidth (one-time, ~1 s)…", flush=True)
+    gb_s = (measure or measure_bandwidth_gb_s)()
+    entry = {"gb_s": round(float(gb_s), 1), "measured_at": time.time(),
+             "method": "fp16 matvec, 512 MB weights, median of 10", "source": "measured"}
+    save_cached(key, entry, cache_dir)
+    _BW_MEMO[key] = entry
+    return entry
 
 
 def wide_gemm_min_rows(target, drafter=None, *, target_repo: str,
@@ -760,17 +840,38 @@ def apply_wide_gemm(target, drafter=None, *, target_repo: str,
     return _gen.WIDE_GEMM_MIN_ROWS
 
 
+def _gpu_gen() -> int | None:
+    """Apple GPU generation from ``mx.device_info()['architecture']`` ('applegpu_g16s' -> 16),
+    or ``None`` if it can't be read. M1=g13, M2=g14, M3=g15, M4=g16, M5=g17."""
+    import re
+
+    m = re.search(r"applegpu_g(\d+)", str(mx.device_info().get("architecture", "")))
+    return int(m.group(1)) if m else None
+
+
+# The small-M MMA verify kernel is verified only on M4 (g16, where it was developed) and
+# STALLS on M5 (g17): a ~105 s mid-generation hang, mode-independent, confirmed by three
+# M5 datapoints (issue #19 A/B: small_m ON 105.1 s vs OFF 0.6 s; the issue #14 wedge; the
+# #7 thread). The per-shape race CANNOT catch it — the microbench never stalls, only the
+# sustained real workload does — so this is a HARDWARE gate, not a probe verdict. A newer
+# GPU generation must re-earn the kernel by end-to-end verification; bump this or set
+# MLX_DSPARK_FORCE_SMALL_M=1 to override once verified.
+_SMALL_M_MAX_GEN = 16
+
+
 def small_m_qmm_shapes(target, drafter=None, *, target_repo: str,
                        drafter_repo: str | None = None,
                        cache_dir: str | None = None,
                        refresh: bool = False,
                        verbose: bool = True) -> list[str]:
     """Weight shapes whose verify-window forwards should run on the small-M MMA kernel
-    (see :mod:`.small_m_qmm`), or ``[]`` when it never pays on this machine.
+    (see :mod:`.small_m_qmm`), or ``[]`` when it never pays (or is unsafe) on this machine.
 
     Same doctrine as the cap and the wide-GEMM crossover: the win is a property of
     (chip x mlx version x shape), so each shape is raced and numerics-checked once
-    (~2-4 s total) and the verdict cached under a device+mlx key.
+    (~2-4 s total) and the verdict cached under a device+mlx key. EXCEPT M5+ (g17+), where
+    the kernel stalls and is gated off in hardware (see ``_SMALL_M_MAX_GEN``) — the race
+    can't see a stall, so that gate runs before any measurement or cache lookup.
 
     ``refresh=True`` re-measures and overwrites the cached entry — used by
     :func:`apply_small_m` to self-heal a cache written before a ``shape_key`` format
@@ -778,6 +879,15 @@ def small_m_qmm_shapes(target, drafter=None, *, target_repo: str,
     kernel with no error). The cache key carries the SCHEMA but not the shape-key format,
     so this is the backstop for that; keep it."""
     from .small_m_qmm import measure_shapes
+
+    gen = _gpu_gen()
+    if (gen is not None and gen > _SMALL_M_MAX_GEN
+            and os.environ.get("MLX_DSPARK_FORCE_SMALL_M", "").lower() not in ("1", "true")):
+        if verbose:
+            print(f"  small-M qmm: OFF — the kernel stalls on this GPU (applegpu_g{gen}, M5+); "
+                  "gated in hardware (issue #19). Set MLX_DSPARK_FORCE_SMALL_M=1 to override.",
+                  flush=True)
+        return []
 
     key = _cache_key("smallm", target_repo, drafter_repo)
     entry = None if refresh else load_cached(key, cache_dir)
@@ -829,6 +939,113 @@ def apply_small_m(target, drafter=None, *, target_repo: str,
     return _gen.SMALL_M_IDS
 
 
+def _attn_dims(target):
+    """Best-effort (n_q_heads, n_kv_heads, head_dim) for the target's full-attention layers,
+    for the SDPA-split cliff probe. Returns None if the config can't be read (the caller then
+    falls back to the conservative default window). Covers mlx-lm dense, qwen3_5 hybrid,
+    mlx-vlm (muse) and nemotron layouts."""
+    m = getattr(target, "model", target)
+    cands = [m,
+             getattr(m, "model", None),
+             getattr(m, "language_model", None),
+             getattr(getattr(m, "language_model", None), "model", None)]
+    for c in cands:
+        a = getattr(c, "args", None) or getattr(c, "config", None)
+        hq = getattr(a, "num_attention_heads", None)
+        if hq:
+            hk = getattr(a, "num_key_value_heads", None) or hq
+            d = getattr(a, "head_dim", None) or (getattr(a, "hidden_size", hq) // hq)
+            return int(hq), int(hk), int(d)
+    return None
+
+
+_SDPA_SPLIT_KEY = "sdpa_split_window"
+
+
+def measure_split_window(hq, hk, d, *, cache_dir=None, refresh=False, verbose=True):
+    """Measure this (chip x mlx x attention-shape) SDPA cliff and return the split window
+    ``{min_q,max_q,min_kv,max_chunk}`` where splitting a wide-q verify into <=5-row sub-calls
+    beats the single call, or ``None`` if there is no cliff (self-disables on such chips).
+
+    Probes single-call SDPA cost for q=1..16 at a long KV, predicts the balanced-split cost
+    from the same sweep (conservative: the real split KV-slices earlier chunks, so it is
+    faster than predicted), and takes the contiguous q>=6 band that wins by >5%."""
+    dev = mx.device_info().get("device_name", "unknown")
+    key = f"v{SCHEMA}|{dev}|mlx{mx.__version__}|smpv|{hq}x{hk}x{d}"
+    if not refresh:
+        hit = load_cached(key, cache_dir)
+        if hit is not None:
+            return hit.get("window")
+
+    import time as _t
+    scale = 1.0 / (d ** 0.5)
+    L = 16384
+    MAXC = 5
+
+    def _t_single(q, reps=5):
+        ts = []
+        for _ in range(reps):
+            qy = mx.random.normal((1, hq, q, d)).astype(mx.bfloat16)
+            k = mx.random.normal((1, hk, L, d)).astype(mx.bfloat16)
+            v = mx.random.normal((1, hk, L, d)).astype(mx.bfloat16)
+            mx.eval(qy, k, v)
+            t0 = _t.perf_counter()
+            o = _ORIG_SDPA_FOR_PROBE(qy, k, v, scale=scale, mask="causal")
+            mx.eval(o)
+            ts.append(_t.perf_counter() - t0)
+        ts.sort()
+        return ts[len(ts) // 2]
+
+    cost = {q: _t_single(q) for q in range(1, 17)}
+
+    def split_cost(q):
+        n = max(1, -(-q // MAXC))         # ceil
+        base, rem = divmod(q, n)
+        sizes = [base + 1] * rem + [base] * (n - rem)
+        return sum(cost[s] for s in sizes)
+
+    wins = [q for q in range(6, 16) if split_cost(q) < 0.95 * cost[q]]
+    window = None
+    if wins:
+        window = {"min_q": min(wins), "max_q": max(wins), "min_kv": 4096, "max_chunk": MAXC}
+    if verbose:
+        if window:
+            r = {q: round(cost[q] / split_cost(q), 2) for q in wins}
+            print(f"  sdpa-split: cliff at q>={min(wins)} ({hq}x{hk}x{d}); window {window['min_q']}-{window['max_q']}, predicted {r}", flush=True)
+        else:
+            print(f"  sdpa-split: no cliff on this chip/mlx for {hq}x{hk}x{d} -> disabled", flush=True)
+    save_cached(key, {"window": window}, cache_dir)
+    return window
+
+
+def apply_sdpa_split(target, *, target_repo=None, enabled=None, cache_dir=None, verbose=True):
+    """Turn the verify-window SDPA split on for this process (``generate.SDPA_SPLIT_CFG``) and
+    return the :class:`SplitConfig` used, or ``None`` when off. ``enabled=None`` measures the
+    per-chip window (and caches it); ``False`` disables; ``True`` forces the default window
+    without measuring. Call BEFORE :func:`calibrate`/:func:`static_cap` so the verify curve is
+    measured with the split live and the cap controller prices the flattened cliff. Sets a
+    process-wide global, not a library default (same reason as small-M/wide-GEMM)."""
+    from . import generate as _gen
+    from .sdpa_split import SplitConfig
+
+    if enabled is False:
+        _gen.SDPA_SPLIT_CFG = None
+        return None
+    if enabled is True:
+        _gen.SDPA_SPLIT_CFG = SplitConfig()
+        return _gen.SDPA_SPLIT_CFG
+    dims = _attn_dims(target)
+    if dims is None:
+        if verbose:
+            print("  sdpa-split: could not read attention dims -> conservative default window", flush=True)
+        _gen.SDPA_SPLIT_CFG = SplitConfig()
+        return _gen.SDPA_SPLIT_CFG
+    win = measure_split_window(*dims, cache_dir=cache_dir, verbose=verbose)
+    _gen.SDPA_SPLIT_CFG = SplitConfig(**win) if win else None
+    return _gen.SDPA_SPLIT_CFG
+
+
+
 # --------------------------------------------------------------------------- entry point
 
 
@@ -862,19 +1079,25 @@ def calibrate(target, drafter, *, mode: str, target_repo: str, drafter_repo: str
     # kernel enabled (apply_small_m, before this), 4-bit verify is flat at widths 6-8 —
     # measured outside the context the controller would price wide caps ~1.5x too high.
     from . import generate as _gen
+    from .sdpa_split import sdpa_split
     from .small_m_qmm import small_m_matmul
     smm_ids = _gen.SMALL_M_IDS
+    sdps_cfg = _gen.SDPA_SPLIT_CFG            # the verify DEPTH SLOPE is measured under the
+    #   split (it fires at the inflated KV depth, not the ctx-512 base curve), so the
+    #   depth-aware capper prices the flattened cliff and stops shrinking wide caps at depth.
 
     key = _cache_key(mode, target_repo, drafter_repo,
                      kv_bits=getattr(target, "kv_bits", None))
     if smm_ids:
         key += "|smm"
+    if sdps_cfg is not None:
+        key += "|sdps"          # split-on and split-off curves must not collide (see |smm)
     entry = load_cached(key, cache_dir)
     tap = list(cfg.target_layer_ids)
     if entry is None:
         if verbose:
             print(f"calibrating {mode} cap for this machine (one-time, cached)…", flush=True)
-        with small_m_matmul(smm_ids):
+        with small_m_matmul(smm_ids), sdpa_split(sdps_cfg):
             verify = measure_verify_curve(target, tap, widths)
             if mode == "dspark":
                 drafter_ms: dict | float = measure_dspark_drafter_curve(drafter, caps)
@@ -902,7 +1125,7 @@ def calibrate(target, drafter, *, mode: str, target_repo: str, drafter_repo: str
         if verbose:
             print(f"calibrating batched verify grid (B={want_bs}, one-time, cached)…",
                   flush=True)
-        with small_m_matmul(smm_ids):
+        with small_m_matmul(smm_ids), sdpa_split(sdps_cfg):
             grid = measure_batch_verify_grid(target, list(cfg.target_layer_ids), want_bs, widths)
         vg = entry.setdefault("verify_grid", {})
         for B, row in grid.items():
@@ -922,7 +1145,7 @@ def calibrate(target, drafter, *, mode: str, target_repo: str, drafter_repo: str
             avail = sorted(int(k) for k in entry["verify"])
             wsel = sorted({avail[0], avail[len(avail) // 2], avail[-1]})
             base = {w: float(entry["verify"][str(w)]) for w in wsel}
-            with small_m_matmul(smm_ids):
+            with small_m_matmul(smm_ids), sdpa_split(sdps_cfg):
                 slope = measure_verify_depth_slope(target, tap, wsel, base_curve=base)
             if slope is None:
                 vd["unsupported"] = True

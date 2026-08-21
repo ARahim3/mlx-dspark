@@ -117,9 +117,11 @@ lookup speculation via `--mode auto`.
 
 Everything below is also available as a **native Mac app** — chat with saved sessions, a model
 manager that answers "will this fit my Mac?" before you download, live speculative-decoding
-telemetry (per-round acceptance, this machine's measured cost curves), a decoder **Race** with a
-checked lossless verdict, one-click coding-agent setup, and a menu-bar gauge with live tok/s and
-model memory.
+telemetry (per-round acceptance, this machine's measured cost curves), a **"This Mac"** roofline
+view (your measured memory bandwidth, the plain-decode ceiling for the loaded model and how far
+above it speculation runs, macOS memory pressure and swap), a decoder **Race** with a checked
+lossless verdict, one-click coding-agent setup, and a menu-bar gauge with live tok/s and model
+memory.
 
 ```bash
 brew tap ARahim3/mlx-dspark https://github.com/ARahim3/mlx-dspark
@@ -205,7 +207,10 @@ mlx-dspark serve --model mlx-community/Qwen3-8B-8bit        # → http://127.0.0
 #                   A first-time load reports download progress in /health and is
 #                   cancellable (POST /admin/load/cancel — partials resume by default);
 #                   /admin/load also takes per-swap mode / max_draft / lookup_drafts /
-#                   confidence_threshold / context_window overrides
+#                   confidence_threshold / context_window / kv_bits / memory_guard overrides
+#   --no-memory-guard   keep caches even when macOS reports memory pressure (default: on WARN
+#                   the engine returns its retained buffers + prefix-cache rungs; conversations
+#                   stay cached). --no-warmup skips the on-load warmup generation.
 ```
 
 `--mode auto` picks the best available speculation for any target (a known DSpark drafter → else
@@ -230,12 +235,15 @@ interop — mlx-dspark runs MLX weights natively — but the HTTP surface is sha
 part those tools actually talk to.)
 
 The server speaks the OpenAI API: `POST /v1/chat/completions` (streaming **and** non-streaming,
-multi-turn), `POST /v1/completions`, `GET /v1/models`, `GET /health`, `GET /metrics`. It supports
+multi-turn), `POST /v1/completions`, `GET /v1/models`, `GET /health` (incl. a `warnings` list —
+memory pressure, context-window RAM notes), `GET /metrics`, and `GET /machine` (this Mac's measured
+bandwidth, the loaded model's bytes per token, the plain-decode ceiling and a verdict). It supports
 `temperature`, `top_p`, `top_k`, `max_tokens`, `stop`, `seed`, `presence_penalty` / `frequency_penalty`,
 `logprobs` / `top_logprobs`, **tool calling** (`tools` / `tool_calls`), a per-request thinking toggle
 (`enable_thinking`), and per-request `reasoning_effort` on models whose template supports it (Qwen3.8-class;
-`GET /health` reports `supports_reasoning_effort`). Each response carries an `x_mlx_dspark` block (accept length + tok/s) so the
-spec-decode gain is visible. **Continuous batching** (`--max-batch N`) serves concurrent requests in one
+`GET /health` reports `supports_reasoning_effort`). Each response carries an `x_mlx_dspark` block — accept length, decode and
+end-to-end tok/s, time to first token, prompt tokens served from the prefix cache, and the decode rate as a multiple of this
+Mac's single-stream roofline — so the spec-decode gain is visible and "why was this turn fast/slow" has an answer. **Continuous batching** (`--max-batch N`) serves concurrent requests in one
 batched forward for ~2.5× aggregate throughput (see [Concurrent throughput](#concurrent-throughput));
 **prefix caching** (on by default) reuses the conversation prefix so multi-turn chat and agents don't
 re-prefill each turn — measured on an ~8k-token context: first token in ~62 s cold vs **0.2–1 s** on
@@ -892,7 +900,7 @@ identical acceptance; 4-bit is simply fastest).
 
 ### Long context
 
-**The verify width now adapts to context depth** (2026-08-20, unreleased). Verify cost is not
+**The verify width now adapts to context depth** (v0.14.0). Verify cost is not
 depth-flat: with 2–8 rows Metal's attention kernel re-reads the whole KV cache once *per row*, so a
 wide verify that is free at chat depth gets expensive at agent depth — measured on Qwen3.8-27B-4bit
 (M4 Pro, decode-only, same accept), the fixed cap-7 configs fell from 1.17–1.41× at 2k context to
@@ -902,7 +910,10 @@ measures each pair's per-width *depth slope* (one-time, cached), and both the de
 shrink the verify width automatically. A cap you set explicitly is never overridden. (History: before
 v0.3.1 the *drafter* also had a depth-scaling bug — redundant GQA/KV tiling — fixed bit-identically;
 the 2026-08-20 finding is the verify side, and it explains "slows down a lot on large context" reports
-with DFlash 2/DSpark at coding-agent context sizes.)
+with DFlash 2/DSpark at coding-agent context sizes.) Since v0.15.0 the wide verify itself is also cheaper at
+depth: Metal's attention has a cliff at 6–15 query rows, so a wide verify is split into ≤5-row calls that
+each stay on the fast path (`--sdpa-split`, on where a one-time probe finds the cliff; lossless). On
+high-acceptance long content that lets the adaptive cap stay wide — ~1.3× at ~14k tokens of context.
 
 Two things do still grow with a longer prompt, for **every** decoder (baseline, `mlx-lm`, this) — not the
 speculative speedup: **time-to-first-token** (reading an *L*-token prompt is inherent work) and **per-token
@@ -920,7 +931,12 @@ models table. When RAM is the constraint, cap it with `--context-window N` (also
 agent clients like Claude Code auto-compact on, instead of a swap-storm. Since v0.12.3 `serve` does this
 math for you at load — the window defaults to the model's own maximum (262144 on Qwen3.8-27B ≈ 16 GB of
 KV on top of ~29 GB of weights), and if weights + full-window KV would overrun your GPU working set it
-prints a warning with a `--context-window` value that fits.
+prints a warning with a `--context-window` value that fits (also on `/health.warnings`). And since
+v0.15.0 a **memory-pressure guard** (on by default, `--no-memory-guard`) watches macOS's own pressure
+level: at WARN it hands back the allocator's retained buffers and the prefix cache's interior snapshots
+(~1.7 GB measured on a 27B) while keeping every conversation's cached prefix; at CRITICAL it empties the
+prefix cache. It buys headroom before the OS starts paging the weights — it cannot make a swapping model
+fast again, so the `--context-window` cap is still the real fix for a model that nearly fills RAM.
 
 ### DSpark vs DFlash (head-to-head)
 

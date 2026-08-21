@@ -202,3 +202,33 @@ class TestRoundRecorder:
         rec = RoundRecorder(log, "r", "dspark")
         rec(drafted=6, accepted=6, committed=7, cap=6, source="lookup")
         assert log.snapshot()[0]["source"] == "lookup"
+
+
+class TestDecayRatio:
+    def _log_with(self, early_ms, late_ms, n=16):
+        log = RoundLog()
+        rec = RoundRecorder(log, "reqA", "dspark")
+        # round 0 carries prefill in its ms and must be skipped — give it an absurd value
+        log.record({"req": "reqA", "i": 0, "drafted": 2, "accepted": 2, "committed": 3, "ms": 5000.0})
+        for i in range(1, 2 * n + 1):
+            ms = early_ms if i <= n else late_ms
+            log.record({"req": "reqA", "i": i, "drafted": 2, "accepted": 2, "committed": 3,
+                        "ms": ms})
+        assert rec.request_id == "reqA"
+        return log
+
+    def test_steady_run_is_one(self):
+        assert self._log_with(10.0, 10.0).decay_ratio("reqA") == pytest.approx(1.0)
+
+    def test_slowing_run_is_below_one_and_ignores_round_zero(self):
+        assert self._log_with(10.0, 20.0).decay_ratio("reqA") == pytest.approx(0.5)
+
+    def test_too_short_is_none(self):
+        log = RoundLog()
+        for i in range(10):
+            log.record({"req": "r", "i": i, "drafted": 1, "accepted": 1, "committed": 2, "ms": 1.0})
+        assert log.decay_ratio("r") is None
+
+    def test_scoped_to_the_request(self):
+        log = self._log_with(10.0, 20.0)
+        assert log.decay_ratio("other") is None

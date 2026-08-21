@@ -120,6 +120,12 @@ def cmd_generate(argv: list[str]) -> None:
                          "--no-small-m disables. Output stays greedy-correct "
                          "(verify-checked); ids can differ from the stock kernel at fp "
                          "ties, like the batched path")
+    ap.add_argument("--sdpa-split", action=argparse.BooleanOptionalAction, default=None,
+                    help="split a wide-verify attention (q_len in mlx's multi-row SDPA "
+                         "cliff, long KV) into <=5-row sub-calls that each stay on the fast "
+                         "path, then concatenate. ~1.5-2x on the long-context verify "
+                         "attention; per-row-equivalent (fp-tie, verify-checked). Unset = on "
+                         "where a one-time per-chip probe finds a cliff; --no-sdpa-split off.")
     ap.add_argument("--lookup-long-draft", type=int, default=32,
                     help="match-scaled long-draft ceiling for lookup drafts (dspark hybrid "
                          "+ lookup mode): a deep context match (real copy run) earns drafts "
@@ -158,10 +164,14 @@ def cmd_generate(argv: list[str]) -> None:
     # small-M MMA verify kernel: amortize the 4-bit weight read across verify rows 6-8
     # (see small_m_qmm.py). Must run BEFORE calibrate()/static_cap below — the cap
     # curves have to be measured with the same kernel dispatch generation will use.
-    from .calibrate import apply_small_m
+    from .calibrate import apply_sdpa_split, apply_small_m
 
     apply_small_m(target, drafter, target_repo=target_repo, drafter_repo=drafter_repo,
                   enabled=False if args.small_m is False else None)
+    # sdpa-split: dodge mlx's wide-q SDPA cliff on the long-context verify (see sdpa_split.py).
+    # Also before calibrate() so the verify curve is measured with the split live.
+    apply_sdpa_split(target, target_repo=target_repo,
+                     enabled=False if args.sdpa_split is False else None)
 
     max_draft = _parse_max_draft(args.max_draft, ap)
     cap_controller = None
@@ -254,7 +264,8 @@ def cmd_generate(argv: list[str]) -> None:
 
     print("\n" + "-" * 64)
     print(f"  {res.num_tokens} tokens · {res.seconds:.2f}s · "
-          f"\033[1m{res.tokens_per_sec:.1f} tok/s\033[0m{extra}")
+          f"\033[1m{res.tokens_per_sec:.1f} tok/s\033[0m end-to-end · "
+          f"{res.decode_tokens_per_sec:.1f} tok/s decode{extra}")
     print("-" * 64)
 
 
@@ -370,6 +381,22 @@ def cmd_serve(argv: list[str]) -> None:
                          "--no-small-m forces the stock kernel — the serve-side A/B that "
                          "previously required downgrading. /health reports the live state; "
                          "/admin/load takes a per-swap `small_m` boolean override.")
+    ap.add_argument("--sdpa-split", action=argparse.BooleanOptionalAction, default=None,
+                    help="wide-verify SDPA split (see `mlx-dspark generate --help`). Unset = "
+                         "on where a per-chip probe finds mlx's multi-row cliff; "
+                         "--no-sdpa-split forces the single call. /health reports the state.")
+    ap.add_argument("--warmup", action=argparse.BooleanOptionalAction, default=True,
+                    help="on load, run a tiny throwaway generation to compile the Metal "
+                         "kernels and ramp the GPU clock so the FIRST real request is warm "
+                         "instead of eating the ~2 s cold-start. On by default; --no-warmup "
+                         "skips it. /health reports 'warming_up' during the pass and a "
+                         "'warmup' flag once ready; /admin/load takes a per-swap boolean.")
+    ap.add_argument("--memory-guard", action=argparse.BooleanOptionalAction, default=True,
+                    help="when macOS reports memory pressure, free the prefix cache's snapshots "
+                         "(WARN: rungs + older slots; CRITICAL: everything) and return MLX's "
+                         "retained buffers to the OS, at the next round boundary — trading a "
+                         "re-prefill for not swapping the model. On by default; /health reports "
+                         "'memory_guard'; /admin/load takes a per-swap boolean.")
     ap.add_argument("--prefix-cache-dir", default=None,
                     help="directory for the L2 SSD spill tier (enables spilling the cache to disk)")
     ap.add_argument("--prefix-cache-max-ram-mb", type=int, default=0,
@@ -411,6 +438,9 @@ def cmd_serve(argv: list[str]) -> None:
         "wired_limit": args.wired_limit,
         "wide_gemm_min": args.wide_gemm_min,
         "small_m": args.small_m,                 # None = probe-gated default, False = off
+        "sdpa_split": args.sdpa_split,            # None = probe-gated default, False = off
+        "warmup": args.warmup,                   # warm the kernels on load (first request fast)
+        "memory_guard": args.memory_guard,       # shed caches when macOS reports memory pressure
         "batch_widths": (sorted({2, args.max_batch}) if args.max_batch > 1 else None),
         "kv_bits": args.kv_bits or None,
         "context_window": args.context_window,
@@ -612,6 +642,10 @@ def cmd_benchmark(argv: list[str]) -> None:
                          "Unset = on where the cached probe proves it faster; "
                          "--no-small-m forces the stock kernel for A/B. The setting "
                          "prints in the header so arms can't be conflated.")
+    ap.add_argument("--sdpa-split", action=argparse.BooleanOptionalAction, default=None,
+                    help="wide-verify SDPA split (see `mlx-dspark generate --help`). Unset = "
+                         "on where the per-chip probe finds a cliff; --no-sdpa-split off. "
+                         "Prints in the header.")
     ap.add_argument("--json", default=None, help="also write results to this JSON file")
     args = ap.parse_args(argv)
 
@@ -639,9 +673,12 @@ def cmd_benchmark(argv: list[str]) -> None:
         lk_note = f"{'on' if lookup_drafts else 'OFF'} (forced)"
     smm_note = ("OFF (forced)" if args.small_m is False
                 else "on where probe-verified (default)")
+    sdpa_note = ("OFF (forced)" if args.sdpa_split is False
+                 else "on where a cliff is measured (default)")
     print(f"target: {target_repo}\n"
           f"hybrid lookup drafts: {lk_note}\n"
           f"small-M qmm kernel: {smm_note}\n"
+          f"sdpa split (long-ctx verify): {sdpa_note}\n"
           f"loading + warming up…")
     target, tok = load_target(
         target_repo, require_tap=any(m in ("dspark", "dflash") for m in modes))
@@ -657,22 +694,26 @@ def cmd_benchmark(argv: list[str]) -> None:
 
         per: dict[str, dict] = {}
         for name, p in BENCH_PROMPTS.items():
-            tp, ac = [], []
+            tp, dtp, ac = [], [], []
             for _ in range(max(1, args.trials)):
                 r = fn(p)
                 tp.append(r.tokens_per_sec)
+                dtp.append(r.decode_tokens_per_sec)
                 ac.append(r.mean_accept_len)
             per[name] = {"tok_s": round(_st.median(tp), 1),
+                         "decode_tok_s": round(_st.median(dtp), 1),
                          "accept": round(_st.median(ac), 2)}
         n = len(BENCH_PROMPTS)
         row = {"run": label,
                "tok_s": round(sum(v["tok_s"] for v in per.values()) / n, 1),
+               "decode_tok_s": round(sum(v["decode_tok_s"] for v in per.values()) / n, 1),
                "accept": round(sum(v["accept"] for v in per.values()) / n, 2),
                "per_prompt": per}
         results["runs"].append(row)
         base_row = results["runs"][0]
         speedup = f"  ({row['tok_s'] / base_row['tok_s']:.2f}x)" if label != "baseline" else ""
-        print(f"  {label:<22} {row['tok_s']:>7.1f} tok/s   accept {row['accept']:.2f}{speedup}")
+        print(f"  {label:<22} {row['tok_s']:>7.1f} tok/s e2e · {row['decode_tok_s']:>7.1f} decode   "
+              f"accept {row['accept']:.2f}{speedup}")
         detail = []
         for name, v in per.items():
             sp = (f" {v['tok_s'] / base_row['per_prompt'][name]['tok_s']:.2f}x"
@@ -702,10 +743,12 @@ def cmd_benchmark(argv: list[str]) -> None:
             drafter.bind(target.model)
         # small-M MMA verify kernel (see small_m_qmm.py) — before calibrate() so any
         # auto-cap arm prices caps against the curve generation will actually run
-        from .calibrate import apply_small_m
+        from .calibrate import apply_sdpa_split, apply_small_m
 
         apply_small_m(target, drafter, target_repo=target_repo, drafter_repo=drafter_repo,
                       enabled=False if args.small_m is False else None, verbose=False)
+        apply_sdpa_split(target, target_repo=target_repo,
+                         enabled=False if args.sdpa_split is False else None, verbose=False)
         for cap in caps:
             ctrl = None
             md: int | None = None
@@ -803,6 +846,23 @@ def cmd_doctor(argv: list[str]) -> None:
     if env["ram_gb"]:
         check("System RAM", env["ram_gb"] >= 15,
               f"{env['ram_gb']:.0f} GB (gemma4 preset ~15 GB, qwen3 ~8 GB)")
+
+    chip = env.get("chip") or {}
+    if chip.get("family"):
+        bw = chip.get("bandwidth_gb_s")
+        measured = chip.get("bandwidth_measured_gb_s")
+        cores = f"{chip['gpu_cores']}-core GPU, " if chip.get("gpu_cores") else ""
+        line = f"{chip.get('name') or chip['family']} — {cores}"
+        line += (f"{bw:.0f} GB/s theoretical" if bw else "bandwidth unknown")
+        if measured:
+            line += f", {measured:.0f} GB/s measured"
+        print(f"  · {line}")
+    mem = env.get("memory") or {}
+    if mem.get("pressure") in ("warn", "critical"):
+        swap = (mem.get("swap_used_bytes") or 0) / 1024 ** 3
+        print(f"  · \033[33mmemory pressure {mem['pressure'].upper()}\033[0m"
+              f"{f' ({swap:.1f} GB swapped)' if swap else ''} — generation will run "
+              "slower until it clears")
 
     # gemma4 preset compat: mlx-vlm 0.6.4's Gemma4UnifiedProcessor breaks under
     # transformers>=5.12 (issue #4, upstream Blaizzy/mlx-vlm#1578); load_target shims it.

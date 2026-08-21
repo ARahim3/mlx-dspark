@@ -308,3 +308,84 @@ def test_depth_pricing_shrinks_the_cap_at_agent_context():
     # an entry without slope data behaves exactly as before
     bare = CapController(verify, 25.0, max_cap=7)
     assert bare.depth_adjusted_cap(32768, 7, STATIC_PRIOR_P) == 7
+
+
+def test_gpu_gen_parses_architecture(monkeypatch):
+    """_gpu_gen extracts the Apple GPU generation from the architecture string."""
+    import mlx.core as mx
+
+    from mlx_dspark.calibrate import _gpu_gen
+
+    cases = {"applegpu_g16s": 16, "applegpu_g17": 17, "applegpu_g17s": 17,
+             "applegpu_g13": 13, "": None, "something_else": None}
+    for arch, want in cases.items():
+        monkeypatch.setattr(mx, "device_info", lambda a=arch: {"architecture": a})
+        assert _gpu_gen() == want
+
+
+def test_small_m_gated_off_on_m5(monkeypatch):
+    """The small-M kernel is hardware-gated off on M5 (g17+): the gate runs BEFORE any
+    measurement (issue #19 — the stall the per-shape race can't see). On M4 (g16) it does
+    NOT fire, so measurement proceeds. MLX_DSPARK_FORCE_SMALL_M=1 bypasses the gate."""
+    import sys
+
+    import mlx.core as mx
+
+    # `mlx_dspark.calibrate` the attribute is the re-exported calibrate() function, so reach
+    # the module through sys.modules (it's registered there under the full dotted name).
+    calib = sys.modules["mlx_dspark.calibrate"]
+    smm = sys.modules["mlx_dspark.small_m_qmm"]
+
+    monkeypatch.setattr(calib, "load_cached", lambda *a, **k: None)   # force the measure path
+
+    def _sentinel(*a, **k):
+        raise RuntimeError("measured")                               # measure_shapes was reached
+    monkeypatch.setattr(smm, "measure_shapes", _sentinel)
+
+    def run(arch):
+        monkeypatch.setattr(mx, "device_info", lambda: {"architecture": arch})
+        return calib.small_m_qmm_shapes(object(), target_repo="x", verbose=False)
+
+    # M5: gated off, short-circuits before measure_shapes -> [] (no RuntimeError)
+    monkeypatch.delenv("MLX_DSPARK_FORCE_SMALL_M", raising=False)
+    assert run("applegpu_g17") == []
+    assert run("applegpu_g18d") == []            # a newer generation is gated too, by default
+
+    # M4: gate does not fire -> reaches the (sentinel) measurement
+    import pytest
+    with pytest.raises(RuntimeError, match="measured"):
+        run("applegpu_g16s")
+
+    # override: force the kernel on M5 for a paired A/B -> reaches measurement
+    monkeypatch.setenv("MLX_DSPARK_FORCE_SMALL_M", "1")
+    with pytest.raises(RuntimeError, match="measured"):
+        run("applegpu_g17")
+
+
+class TestBandwidthCache:
+    """The bandwidth microbench is measured once per chip x mlx and cached like the curves."""
+
+    def test_measures_once_then_reads_the_cache(self, tmp_path, monkeypatch):
+        import importlib
+        C = importlib.import_module("mlx_dspark.calibrate")
+        monkeypatch.setattr(C, "_BW_MEMO", {})
+        calls = []
+
+        def fake_measure():
+            calls.append(1)
+            return 218.76
+
+        first = C.bandwidth(str(tmp_path), measure=fake_measure)
+        assert first["gb_s"] == 218.8 and first["source"] == "measured"
+        second = C.bandwidth(str(tmp_path), measure=fake_measure)
+        assert second == first and len(calls) == 1
+        assert C.cached_bandwidth(str(tmp_path))["gb_s"] == 218.8
+        # refresh re-measures and overwrites
+        C.bandwidth(str(tmp_path), refresh=True, measure=lambda: 230.0)
+        assert C.cached_bandwidth(str(tmp_path))["gb_s"] == 230.0
+
+    def test_unmeasured_machine_reads_none(self, tmp_path, monkeypatch):
+        import importlib
+        C = importlib.import_module("mlx_dspark.calibrate")
+        monkeypatch.setattr(C, "_BW_MEMO", {})
+        assert C.cached_bandwidth(str(tmp_path)) is None

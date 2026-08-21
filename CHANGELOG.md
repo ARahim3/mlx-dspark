@@ -2,6 +2,112 @@
 
 All notable changes to `mlx-dspark`. Versions follow [SemVer](https://semver.org/) (pre-1.0: minor-ish features land as patch bumps).
 
+## [0.15.0] — 2026-08-21 — roofline telemetry, memory-pressure guard, long-context SDPA split
+
+### Fixed
+- **Streamed Anthropic (Claude Code) answers lost their last 20 characters** — the tool gate's
+  held-back lookahead was never released at finish for answers that reached the gate leading
+  with whitespace (every Qwen3-style streamed turn). Reported, diagnosed and fixed by
+  @Griffin-Thomas in #13.
+- **The small-M verify kernel is gated off on M5 (`applegpu_g17`+) — it stalls there** (issue
+  #19). On M5 the kernel hangs ~105 s mid-generation (reporter A/B on an M5 Pro: kernel on =
+  105.1 s inter-chunk gap, off = 0.6 s; mode-independent — both dspark and dflash). It's the
+  third M5 datapoint (after the #14 wedge and the #7 thread). The gate is by GPU architecture,
+  before any probe or cache, because the per-shape race can't detect a stall (a microbench never
+  hangs; only the sustained workload does). `MLX_DSPARK_FORCE_SMALL_M=1` overrides it for a
+  paired A/B. The kernel is verified only on M4 (g16, where it was developed); a newer generation
+  must re-earn it. This also removes the need for a UI opt-out — the server default is now empty
+  on M5, so app users get the fix through the engine bootstrapper with no app update.
+- **`reasoning_effort: "high"` no longer 400s on models that don't define it** (issue #19).
+  Agent clients (WorkBuddy, pi) hardcode `"high"`, which the Qwen3.8 template (low/medium/xhigh,
+  no `high`) rejected outright. An unsupported-but-valid effort now maps to the nearest value the
+  loaded template accepts on the low<medium<high<xhigh scale, ties rounding down toward less
+  thinking — so `"high"` becomes `medium` on Qwen3.8. (Mapping, not dropping: dropping would fall
+  back to the template's own default, which is `xhigh` = the *most* thinking — the opposite of
+  what a rate-limited client wants.) A value outside the union is still a clear 400.
+
+### Added
+- **Memory-pressure guard** (`serve --memory-guard`, default on; `--no-memory-guard`;
+  `/admin/load {"memory_guard": bool}`; state on `/health.memory_guard`, `/machine.guard`,
+  `/metrics.memory_guard`, plus a `/health.warnings` row after a shed). When macOS reports
+  memory pressure (`kern.memorystatus_vm_pressure_level`), the engine gives memory back *before*
+  the OS swaps the model: at **WARN** it returns the MLX allocator's retained buffers
+  (`mx.clear_cache()` — ~1.3–1.5 GB after a long 27B prefill, free to re-acquire) and drops the
+  prefix cache's interior rungs (~150 MB fp32 each on a hybrid), **keeping every conversation's
+  boundary checkpoint**; at **CRITICAL** it empties the prefix cache. Edge-triggered with a
+  120 s re-arm; the shed runs on the generation thread — immediately when idle, at the next
+  round boundary when generating (WARN waits ≤60 s for the request to finish; CRITICAL takes the
+  next round). A/B on Qwen3.8-27B-8bit under real WARN pressure: 1.66 GB freed with the prefix
+  hit preserved (TTFT 4.2 s vs 4.7–7.1 s in the OFF arms). The first policy (drop older
+  conversation slots at WARN) was measured and rejected — it cost a 36 s re-prefill to free
+  0.6 GB. Decode under pressure is unchanged by design — the OS paging 29 GB of weights is what
+  sets it; the guard buys headroom. See NOTES "Memory-pressure guard".
+- **Roofline + machine telemetry — "is this Mac actually saturated?"** (borrowed from the
+  author's unpublished `inferviz` roofline dashboard; all reporting, lossless, additive). The
+  engine now measures this Mac's *achievable* memory bandwidth once (512 MB fp16 matvec, cached
+  in `calibration.json` per chip × mlx; M4 Pro: 226 of 273 GB/s) and knows the loaded model's
+  exact byte footprint (per-tensor loaded bytes; MoE counts routed experts at `top_k / n`, the
+  embedding gather is excluded; KV bytes/token from the config), so it can report the
+  single-stream decode ceiling `bandwidth ÷ bytes-per-token` and how far *above* it speculation
+  is taking the live rate. New module `roofline.py` (pure, mlx-free, sysctl via ctypes — no
+  psutil). Surfaces:
+  - **`GET /machine`**: chip (family, GPU cores, spec bandwidth), measured bandwidth, what macOS
+    sees (**memory pressure level**, swap, free %, wired limit) + the MLX allocator, the model's
+    footprint, ceilings at zero / last-request / full context-window depth, **baseline MBU**
+    from the calibration's already-measured width-1 step (no new measurement — Qwen3-4B-8bit:
+    92% of measured bandwidth, ceiling 52.9 tok/s ≈ the known 52 tok/s baseline), and a
+    data-driven **verdict** (`level · headline · findings · levers`: memory-cliff first, then the
+    roofline reading, then the speculative-decoding reading, then decay / cold / context-fill).
+    Answers model-less too (chip/bandwidth/memory only).
+  - **`/health.warnings[]`** — `{code, level, message, action}` rows a client shows as a banner:
+    live macOS memory pressure, and the engine's load-time notes (the context-window RAM
+    estimate, which used to reach only stderr).
+  - **`spec_info` per-request tiles** (`x_mlx_dspark`): `prompt_tokens`, `cached_tokens` (prefix-
+    cache reuse — why turn 2 is fast), `completion_tokens`, `context_tokens`, `prefill_seconds`,
+    `decode_seconds`, `ttft_seconds`, `prefill_tokens_per_sec` (≥16 fresh tokens), `decay_ratio`
+    (late/early decode rate within the request, from the round log), `swap_delta_bytes` (the
+    fits-but-swaps cliff), `cold`, `ceiling_tokens_per_sec`, `roofline_ratio`.
+  - **`/metrics.system`** (pressure/swap/free) + **`/metrics.verdict`**; `/doctor` gains `chip` +
+    `memory` (the `doctor` CLI prints chip, spec + measured bandwidth, and a pressure warning);
+    **`/admin/models`** gains `bandwidth` (this Mac vs the reference M4 Pro, like-for-like —
+    `scale` 1.0 on an M4 Pro) and per-row `weight_bytes` / `ceiling_tps` for installed targets
+    (the plain-decode physics a picker can quote before loading).
+  The OpenAI `usage` block is untouched (PRs #9/#24 cover `prompt_tokens_details.cached_tokens`).
+  Warmup restores the verdict as it restores everything else. 3 new test files' worth of
+  model-free coverage (roofline math, footprint, verdict ladder, sysctl readers, decay ratio,
+  bandwidth cache, spec_info tiles, /machine); validated live on Qwen3-4B-8bit.
+- **Decode-only tok/s reporting.** Every throughput surface was end-to-end (prefill + decode) —
+  the pessimistic number, and not comparable to other local runtimes ((LM Studio, oMLX and others))
+  which report decode-only. `GenResult` keeps `tokens_per_sec` (end-to-end) and gains
+  `prefill_seconds` / `decode_seconds` / `decode_tokens_per_sec` (always ≥ end-to-end — the
+  visible number goes up, never down). Exposed in `spec_info` (`decode_tokens_per_sec`),
+  `/metrics` (`mean_decode_tokens_per_sec`), and the `benchmark` / `generate` CLI. Purely
+  additive — lossless, existing keys unchanged.
+- **SDPA verify-split for the long-context cliff** (`--sdpa-split`, default on where a per-chip
+  probe finds a cliff). mlx's attention re-reads the whole KV cache once per query row at q_len
+  ~6–15 (a cliff: q5 2.48 ms → q6 7.09 ms at 32k on an M4 Pro), so wide verify at agent-depth
+  context is a net loss. A wide-verify SDPA is split into ≤5-row sub-calls that each stay on the
+  fast path (per-row equivalent — fp-tie, the target verifies every token). The verify depth
+  slope is re-measured under the split so `--max-draft auto` prices the flattened cliff. Measured
+  cap-7 ~6.6k-ctx decode 13.6 → 15.2 tok/s (1.11×); on high-accept long content the auto-capper
+  goes wide (cap 2 → 7) for ~1.30× at ~14k. `--no-sdpa-split` forces off; `/health` +
+  `/admin/load` report/override it.
+- **Hybrid n-gram copy drafting for DFlash mode** (`dflash_generate` `lookup_drafts=`, default
+  OFF). Ports the dspark copy path to the DFlash block loop. Lossless; measured a net loss on the
+  strong-drafter Qwen3.8 + DFlash 2 pair (copy pays for weak drafters, not strong ones), so it
+  stays off and library-only.
+- **On-load warmup so the first request is fast** (`serve --warmup`, default on). After a model
+  loads (server startup, `/admin/load` hot-swap, or a model-less server's first load) the engine
+  runs one tiny throwaway generation through the real decode path — priming the Metal kernels and
+  ramping the GPU clock — before it reports `ready`. Otherwise that ~2 s cold-start lands on the
+  user's first message (and shows up entirely in prefill — see the decode-only tok/s note). The
+  warmup keeps nothing: prefix cache, round log (`/events`/`/rounds`), `/metrics` stats and the
+  auto-cap controller are all bypassed and restored. `/health` reports `phase: "warming_up"` while
+  it runs (so a client can show "Warming up…" instead of a load bar that looks stuck) and a
+  `warmup` flag once ready; `--no-warmup` / `/admin/load {"warmup": false}` disable it per-load.
+  Adds ~1.5 s to a load; the payoff is on a genuinely cold process (fresh boot / first-ever run /
+  post-mlx-upgrade) — on an already-warm machine the first request is fast either way.
+
 ## [0.14.0] — 2026-08-20 — depth-aware verify caps: long-context decode fixed
 
 ### Fixed

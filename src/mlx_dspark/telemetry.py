@@ -105,6 +105,25 @@ class RoundLog:
             events = list(self._events)
         return events[-limit:] if limit else events
 
+    def decay_ratio(self, request_id: str, n: int = 16) -> float | None:
+        """Late-run / early-run decode rate for one request: the committed-tokens-per-ms of
+        its last ``n`` rounds over its first ``n``. < 0.85 means the generation slowed
+        noticeably within itself (growing-context cost or thermals). None with fewer than
+        ``2n`` rounds — too short to say. Round 0 is skipped: its ``ms`` includes prefill."""
+        with self._lock:
+            evs = [e for e in self._events if e.get("req") == request_id and e.get("i", 0) > 0]
+        if len(evs) < 2 * n:
+            return None
+
+        def rate(chunk):
+            ms = sum(float(e.get("ms", 0.0)) for e in chunk)
+            return (sum(int(e.get("committed", 0)) for e in chunk) / ms) if ms > 0 else None
+
+        early, late = rate(evs[:n]), rate(evs[-n:])
+        if not early or late is None:
+            return None
+        return round(late / early, 4)
+
     def position_acceptance(self) -> list[float]:
         """d₀, d₁, d₂ … — the fraction of drafts accepted at each block position."""
         with self._lock:

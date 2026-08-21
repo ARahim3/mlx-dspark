@@ -234,3 +234,41 @@ class TestDoctor:
         assert "environment" in report
         assert "models" in report
         assert len(report["models"]) > 0
+
+
+class TestBandwidthAndCeilings:
+    def test_bandwidth_info_shape(self):
+        bw = diagnostics.bandwidth_info()
+        assert bw["reference_gb_s"] == 273.0
+        assert bw["source"] in ("measured", "theoretical", "unknown")
+        if bw["theoretical_gb_s"]:
+            assert abs(bw["scale"] - bw["theoretical_gb_s"] / 273.0) < 1e-3
+
+    def test_environment_reports_chip_and_memory(self):
+        env = diagnostics.environment()
+        assert "bandwidth_gb_s" in env["chip"] and "family" in env["chip"]
+        assert "pressure" in env["memory"]
+
+    def test_local_weight_bytes_follows_hub_snapshot_links(self, tmp_path, monkeypatch):
+        hub = tmp_path / "hub" / "models--org--Tiny"
+        blobs = hub / "blobs"
+        snap = hub / "snapshots" / "abc"
+        blobs.mkdir(parents=True)
+        snap.mkdir(parents=True)
+        (blobs / "b1").write_bytes(b"x" * 1000)
+        (blobs / "b2").write_bytes(b"y" * 500)
+        os.symlink(blobs / "b1", snap / "model-00001.safetensors")
+        os.symlink(blobs / "b2", snap / "model-00002.safetensors")
+        (snap / "config.json").write_text("{}")
+        monkeypatch.setattr(diagnostics, "_local_dir", lambda repo: str(hub))
+        assert diagnostics.local_weight_bytes("org/Tiny") == 1500   # links followed, blobs skipped
+
+    def test_local_weight_bytes_none_when_absent(self, monkeypatch):
+        monkeypatch.setattr(diagnostics, "_local_dir", lambda repo: None)
+        assert diagnostics.local_weight_bytes("org/Nope") is None
+
+    def test_inventory_rows_carry_ceiling_keys(self):
+        for row in diagnostics.model_inventory(ram_gb=64):
+            assert "weight_bytes" in row and "ceiling_tps" in row
+            if row["ceiling_tps"] is not None:
+                assert row["weight_bytes"] and row["ceiling_tps"] > 0

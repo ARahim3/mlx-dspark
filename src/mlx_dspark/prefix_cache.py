@@ -427,6 +427,40 @@ class PrefixCache:
         self._anchor = 0
         self._clear_spill_files()
 
+    def shed(self, level: str = "warn") -> dict:
+        """Give memory back under OS pressure (see :mod:`~mlx_dspark.memory_guard`).
+
+        ``"warn"`` drops the interior rungs (and anything staged) but keeps every slot's
+        boundary checkpoint / trim cache; ``"critical"`` empties the cache. Slots are kept at
+        WARN on purpose: the A/B (NOTES "Memory-pressure guard") measured dropping a 27B
+        conversation's checkpoint as a 36 s re-prefill under pressure to free 0.6 GB, while the
+        allocator-cache clear the guard does alongside freed 1.3 GB for nothing. Returns an
+        estimate of the bytes released and what was done, for the guard's log. Callers hold
+        the generation thread; a slot an in-flight request already acquired is not in
+        ``_slots`` (acquire removes it; ``store`` re-validates), so nothing live is touched.
+        """
+        def slot_bytes(s) -> int:
+            if s.snapshot is not None:
+                return _snapshot_ram_bytes(s.snapshot) + _rung_ram_bytes(s.rungs)
+            return _cache_ram_bytes(s.cache) if s.cache is not None else 0
+
+        before = sum(slot_bytes(s) for s in self._slots) + _rung_ram_bytes(self._pending_rungs)
+        slots_before = len(self._slots)
+        rungs_before = sum(len(s.rungs) for s in self._slots)
+        if level == "critical":
+            self.reset()
+            action = "emptied"
+        else:
+            for s in self._slots:
+                s.rungs = {}
+            self._pending_rungs = {}
+            self._anchor = 0
+            action = "rungs dropped, slots kept"
+        after = sum(slot_bytes(s) for s in self._slots)
+        return {"action": action, "prefix_bytes_freed": max(before - after, 0),
+                "slots_dropped": slots_before - len(self._slots),
+                "rungs_dropped": rungs_before - sum(len(s.rungs) for s in self._slots)}
+
     def info(self) -> dict:
         newest = self._slots[0] if self._slots else None
         return {"enabled": True,
