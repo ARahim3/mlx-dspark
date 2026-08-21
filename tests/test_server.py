@@ -122,6 +122,7 @@ def test_chat_non_stream(server):
     assert c["choices"][0]["finish_reason"] == "stop"
     assert c["usage"]["completion_tokens"] == 5 and c["usage"]["prompt_tokens"] > 0
     assert c["usage"]["total_tokens"] == c["usage"]["prompt_tokens"] + 5
+    assert c["usage"]["prompt_tokens_details"]["cached_tokens"] == 0
     assert "x_mlx_dspark" in c
 
 
@@ -139,6 +140,7 @@ def test_chat_stream_sse(server):
     assert content == "Hello world from mlx dspark "
     assert chunks[-1]["choices"][0]["finish_reason"] == "stop"
     assert chunks[-1]["usage"]["completion_tokens"] == 5
+    assert chunks[-1]["usage"]["prompt_tokens_details"]["cached_tokens"] == 0
 
 
 def test_stop_forwarded(server):

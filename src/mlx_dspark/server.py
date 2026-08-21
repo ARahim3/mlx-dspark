@@ -743,6 +743,10 @@ class Engine:
             # drafter ctx window can't serve trim-mode reuse, so a post-generation trim
             # slot would be a broken promise on a dense target (see _build_prefix_cache).
             self.prefix.store(cache, ctx, prompt_ids, res.token_ids)
+        # Expose the per-request prefix-cache reuse so the OpenAI usage block can
+        # report prompt_tokens_details.cached_tokens (OpenAI-compatible clients
+        # measure cache hits from there).
+        res.cache_read = reuse_len
         self.stats["requests"] += 1
         self.stats["prompt_tokens"] += len(prompt_ids)
         self.stats["completion_tokens"] += res.num_tokens
@@ -2313,6 +2317,7 @@ def make_handler(engine: Engine, api_key: str | None):
                 "prompt_tokens": len(prompt_ids),
                 "completion_tokens": gen_tokens,
                 "total_tokens": len(prompt_ids) + gen_tokens,
+                "prompt_tokens_details": {"cached_tokens": res_list[0].cache_read},
             }
             choices = []
             for i, res in enumerate(res_list):
@@ -2413,6 +2418,7 @@ def make_handler(engine: Engine, api_key: str | None):
                     "prompt_tokens": len(prompt_ids),
                     "completion_tokens": res.num_tokens,
                     "total_tokens": len(prompt_ids) + res.num_tokens,
+                    "prompt_tokens_details": {"cached_tokens": res.cache_read},
                 }
             final["x_mlx_dspark"] = engine.spec_info(res)
             self._sse(final)

@@ -57,6 +57,7 @@ class GenResult:
     finish_reason: str = "stop"  # "stop" (eos/stop-string) | "length" (hit max_new_tokens)
     lookup_rounds: int = 0       # rounds whose draft came from the free n-gram lookup
     logprobs: list | None = None  # per-token [{token_id, logprob, top:[(id, logprob), …]}], if requested
+    cache_read: int = 0          # prefix-cache tokens reused for this request (set by the engine)
 
     @property
     def mean_accept_len(self) -> float:
