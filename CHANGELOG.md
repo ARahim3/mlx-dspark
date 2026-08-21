@@ -2,6 +2,20 @@
 
 All notable changes to `mlx-dspark`. Versions follow [SemVer](https://semver.org/) (pre-1.0: minor-ish features land as patch bumps).
 
+## [Unreleased]
+
+### Added
+- **OpenAI Responses API** (`POST /v1/responses`, streaming and non-streaming) — the dialect
+  [Codex](https://github.com/openai/codex) requires once its provider is configured with
+  `wire_api = "responses"` (Codex dropped Chat Completions support, so an OpenAI-compatible
+  server without this endpoint is invisible to it — see #138). `input` accepts a bare string
+  or the structured item list (`message`, `function_call`, `function_call_output`); `tools`
+  are accepted in the Responses API's flat shape and translated to whatever the loaded
+  model's own chat template expects, same as the Chat Completions and Anthropic dialects.
+  Stateless, like Ollama's implementation — no `previous_response_id` / server-side
+  conversation store, since a client resubmits its own history each request (Codex already
+  does this). New `responses_api.py` module, pure and model-free like `anthropic_api.py`.
+
 ## [0.17.1] — 2026-08-25 — LM Studio no double download + cached_tokens in usage
 
 ### Added

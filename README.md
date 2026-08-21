@@ -295,6 +295,20 @@ syntax (Hermes JSON, Gemma-4, and the XML `<function=>` form) — and a reasonin
 `<|channel>thought` output is lifted into proper Anthropic `thinking` blocks rather than leaking as
 prose.
 
+### Use it from Codex
+
+The server also speaks OpenAI's **Responses API**, the dialect [Codex](https://github.com/openai/codex)
+requires once its provider is configured with `wire_api = "responses"` (Codex dropped Chat Completions
+support). Point a `model_providers` entry in `~/.codex/config.toml` at the running server's `/v1` base
+URL and Codex talks to whatever's loaded, same as any other OpenAI-compatible client.
+
+Endpoints: `POST /v1/responses` (streaming and non-streaming). `input` accepts either a bare string
+or the structured item list (`message`, `function_call`, `function_call_output`), `tools` are accepted
+in the Responses API's flat shape, and multi-turn tool use round-trips through the same tool-syntax
+translation the Chat Completions and Anthropic dialects already use. This is a **stateless** Responses
+implementation, like Ollama's — no `previous_response_id` / server-side conversation store, since a
+client resubmits its own history each request (Codex does this already, so nothing is lost).
+
 **Measured** — each of these ran a real Claude Code session that read a buggy file and fixed it with
 the `Edit` tool (M4 Pro, `--no-thinking`, identical task):
 

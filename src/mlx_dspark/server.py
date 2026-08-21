@@ -16,7 +16,9 @@ Design choices (deliberate):
     (accept length, tok/s) and at ``GET /metrics``.
 
 Endpoints: ``POST /v1/chat/completions`` (stream + non-stream), ``POST /v1/completions``,
-``GET /v1/models``, ``GET /health``, ``GET /metrics``.
+``POST /v1/messages`` (Anthropic — see ``anthropic_api.py``), ``POST /v1/responses`` (OpenAI
+Responses API — see ``responses_api.py``), ``GET /v1/models``, ``GET /health``,
+``GET /metrics``.
 """
 
 from __future__ import annotations
@@ -36,6 +38,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlsplit
 
 from . import anthropic_api as A
+from . import responses_api as R
 from .generate import (
     GenResult,
     StopStreaming,
@@ -2597,6 +2600,8 @@ def make_handler(engine: Engine, api_key: str | None):
                     return self._messages(req)
                 if route in ("/v1/messages/count_tokens", "/messages/count_tokens"):
                     return self._count_tokens(req)
+                if route in ("/v1/responses", "/responses"):
+                    return self._responses(req)
                 if route == "/admin/race":
                     return self._race(req)
             except (BrokenPipeError, ConnectionResetError):
@@ -2815,6 +2820,132 @@ def make_handler(engine: Engine, api_key: str | None):
             if prompt_ids is None:
                 return err
             self._send_json(200, {"input_tokens": len(prompt_ids)})
+
+        # -- OpenAI Responses API (the dialect Codex speaks once wire_api = "responses") --
+        def _responses(self, req: dict):
+            input_ = req.get("input")
+            if input_ is None:
+                return self._send_json(400, R.error_body("'input' is required"))
+            tools = R.convert_tools(req.get("tools"))
+            messages = R.convert_input(input_, req.get("instructions"))
+            if not messages:
+                return self._send_json(
+                    400, R.error_body("'input' must be a non-empty string or list"))
+            tkw = dict(engine.template_defaults)
+            if tools:
+                tkw["tools"] = tools
+            reasoning = req.get("reasoning")
+            if isinstance(reasoning, dict) and reasoning.get("effort"):
+                try:
+                    tkw["reasoning_effort"] = _reasoning_effort(reasoning["effort"])
+                except ValueError as e:
+                    return self._send_json(400, R.error_body(str(e)))
+            try:
+                prompt_ids = encode_messages(
+                    engine.tokenizer, normalize_tool_messages(messages), **tkw)
+            except Exception as e:  # noqa: BLE001 — any template failure is a 400, not a crash
+                return self._send_json(400, R.error_body(f"could not apply chat template: {e}"))
+            window = getattr(engine, "context_window", None)
+            if window and len(prompt_ids) >= window:
+                return self._send_json(400, R.error_body(
+                    f"prompt is {len(prompt_ids)} tokens, this model's context window is "
+                    f"{window}"))
+            temperature, top_p, top_k = _sampling(req, engine.sampling_defaults)
+            params = {
+                "max_tokens": _clamp_tokens(req.get("max_output_tokens"),
+                                            engine.default_max_tokens, engine.max_tokens_cap),
+                "temperature": temperature, "top_p": top_p, "top_k": top_k,
+                "stop": [], "seed": None,
+            }
+            model = req.get("model") or engine.model_id
+            resp_id = "resp_" + uuid.uuid4().hex
+            created = int(time.time())
+            if req.get("stream"):
+                return self._responses_stream(prompt_ids, params, model, len(prompt_ids),
+                                              tools, resp_id, created)
+            res = engine.generate(prompt_ids, on_text=None, **params)
+            reasoning_text, content = A.split_thinking(res.text)
+            tool_calls = None
+            if tools:
+                parsed, cleaned = parse_tool_calls(content, schema_types(tools))
+                if parsed:
+                    tool_calls, content = parsed, cleaned
+            body = R.build_response(
+                resp_id=resp_id, model=model, content=content, reasoning=reasoning_text,
+                tool_calls=tool_calls, input_tokens=len(prompt_ids),
+                output_tokens=res.num_tokens, finish_reason=res.finish_reason, created=created)
+            body["x_mlx_dspark"] = engine.spec_info(res)
+            self._send_json(200, body)
+
+        def _responses_stream(self, prompt_ids, params, model, input_tokens, tools,
+                              resp_id, created):
+            stream = R.ResponseStream(model=model, input_tokens=input_tokens, resp_id=resp_id,
+                                      created=created)
+            self._sse_start()
+            for name, payload in stream.start():
+                self._sse(payload, name)
+
+            # Same keep-alive / disconnect-detection shape as the Anthropic and Chat
+            # Completions streaming paths — see their comments (STREAM_KEEPALIVE_S) for why.
+            done = threading.Event()
+            gone = threading.Event()
+
+            def _heartbeat():
+                while not done.wait(STREAM_KEEPALIVE_S):
+                    try:
+                        self._sse_comment("keepalive")
+                    except OSError:
+                        gone.set()
+                        return
+
+            threading.Thread(target=_heartbeat, daemon=True).start()
+
+            # Reasoning is stripped rather than streamed as its own item (see
+            # responses_api.py's module docstring for why); a tool-call gate holds back
+            # partial markup the same way the Chat Completions `want_tools` path does —
+            # incremental tool-call streaming isn't reliable to reconstruct.
+            splitter = A.ThinkingStreamSplitter(
+                in_thinking=self._prompt_opens_thinking(prompt_ids))
+            gate = A._ToolGate()
+
+            def on_text(piece: str):
+                if gone.is_set():
+                    raise StopStreaming()
+                try:
+                    for kind, text in splitter.feed(piece):
+                        if kind == "reasoning" or not text:
+                            continue
+                        safe = gate.feed(text)
+                        if safe:
+                            for name, payload in stream.delta(safe):
+                                self._sse(payload, name)
+                except (BrokenPipeError, ConnectionResetError) as e:
+                    raise StopStreaming() from e
+
+            try:
+                res = engine.generate(prompt_ids, on_text=on_text, **params)
+            finally:
+                done.set()
+            if gone.is_set():
+                print(f"[serve] client disconnected mid-stream; generation stopped early "
+                      f"after {res.num_tokens} tokens", file=sys.stderr, flush=True)
+                return
+            for kind, text in splitter.feed("", final=True):
+                if kind == "reasoning" or not text:
+                    continue
+                safe = gate.feed(text)
+                if safe:
+                    for name, payload in stream.delta(safe):
+                        self._sse(payload, name)
+            tail = gate.buf[gate.sent:]
+            parsed, cleaned = parse_tool_calls(tail, schema_types(tools))
+            if cleaned:
+                for name, payload in stream.delta(cleaned):
+                    self._sse(payload, name)
+            for name, payload in stream.finish(finish_reason=res.finish_reason,
+                                               output_tokens=res.num_tokens,
+                                               tool_calls=parsed):
+                self._sse(payload, name)
 
         def _run(self, req: dict, prompt_ids: list[int], *, chat: bool):
             # request value > model's generation_config recommendation > library default —
