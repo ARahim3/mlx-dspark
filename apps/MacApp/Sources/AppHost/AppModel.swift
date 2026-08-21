@@ -549,7 +549,7 @@ final class AppModel: ObservableObject {
     /// speed changes.
     func applyEngineSettings(mode: String?, cap: String?, confidence: Double? = nil,
                              contextWindow: Int? = nil, lookupDrafts: Bool? = nil,
-                             kvBits: Int? = nil) async {
+                             kvBits: Int? = nil, enableThinking: Bool? = nil) async {
         guard let client = apiClient else { return }
         generationTask?.cancel()
         modelSwitchError = nil
@@ -571,7 +571,8 @@ final class AppModel: ObservableObject {
                                            confidence: confidence,
                                            contextWindow: contextWindow,
                                            lookupDrafts: lookupDrafts,
-                                           kvBits: kvBits)
+                                           kvBits: kvBits,
+                                           enableThinking: enableThinking)
             currentHealth = try? await client.health()
             startTelemetry()
             startMemoryPolling()

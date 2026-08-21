@@ -134,6 +134,8 @@ struct DecodingControls: View {
     @State private var contextWindow: String = "default"
     @State private var lookupDrafts: Bool = true
     @State private var kvBits: String = "default"
+    /// "on" / "off" — the engine's thinking default for API requests that don't specify it.
+    @State private var apiThinking: String = "on"
     @State private var applying = false
 
     /// Context presets as (tag, label, tokens). "default" = the model's own maximum.
@@ -212,6 +214,12 @@ struct DecodingControls: View {
                             Spacer(minLength: 0)
                         }
                     }
+                    if model.health?.thinkingDefault != nil {
+                        HStack(spacing: 14) {
+                            apiThinkingPicker
+                            Spacer(minLength: 0)
+                        }
+                    }
                     HStack(spacing: 8) {
                         applyControl
                         if !applying, isDirty {
@@ -236,6 +244,9 @@ struct DecodingControls: View {
                         if model.health?.lookupDrafts != nil {
                             lookupToggle
                         }
+                        if model.health?.thinkingDefault != nil {
+                            apiThinkingPicker
+                        }
                         applyControl
                         Spacer(minLength: 0)
                     }
@@ -252,7 +263,25 @@ struct DecodingControls: View {
             contextWindow = Self.contextTag(model.health?.contextWindow)
             lookupDrafts = model.health?.lookupDrafts ?? true
             kvBits = Self.kvTag(model.health?.kvBits)
+            apiThinking = model.health?.thinkingDefault ?? "on"
         }
+    }
+
+    /// The engine's thinking default for *API* requests that don't say (issue #19): the
+    /// app's own chat sends its "Allow thinking" choice per request, but DSH / WorkBuddy /
+    /// Claude Code have no reasoning toggle for local models and get whatever this is.
+    /// Rendered only when `/health` reports the field (older engines lack the override).
+    @ViewBuilder private var apiThinkingPicker: some View {
+        Picker("Thinking (API clients)", selection: $apiThinking) {
+            Text("On").tag("on")
+            Text("Off").tag("off")
+        }
+        .fixedSize()
+        .help("What requests from other apps get when they don't specify thinking "
+              + "(DSH, WorkBuddy, Claude Code, pi — most have no reasoning toggle for local "
+              + "models). Off stops the long think-before-answer on every agent turn; a "
+              + "request that asks for thinking explicitly still gets it. The app's own chat "
+              + "keeps its per-chat Allow thinking setting. Sticks across model changes.")
     }
 
     @ViewBuilder private var modeCapPickers: some View {
@@ -336,6 +365,7 @@ struct DecodingControls: View {
             || contextWindow != Self.contextTag(model.health?.contextWindow)
             || lookupDrafts != (model.health?.lookupDrafts ?? lookupDrafts)
             || kvBits != Self.kvTag(model.health?.kvBits)
+            || apiThinking != (model.health?.thinkingDefault ?? apiThinking)
     }
 
     private func apply() {
@@ -351,7 +381,10 @@ struct DecodingControls: View {
                 // Same: unchanged -> nil (keep the server's setting); "default" -> explicit
                 // 0 (full precision). Gated on health reporting the field at all.
                 kvBits: kvBits == Self.kvTag(model.health?.kvBits) ? nil
-                        : (kvBits == "default" ? 0 : Int(kvBits)))
+                        : (kvBits == "default" ? 0 : Int(kvBits)),
+                // Unchanged -> nil (keep); "on" -> true = the model's own default.
+                enableThinking: apiThinking == model.health?.thinkingDefault ? nil
+                        : (apiThinking == "on"))
             applying = false
         }
     }

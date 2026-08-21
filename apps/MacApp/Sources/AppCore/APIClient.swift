@@ -58,9 +58,15 @@ public struct HealthInfo: Decodable, Sendable, Equatable {
     /// (e.g. "this context window's KV cache can't fit alongside the weights"). Optional:
     /// older engines don't report it.
     public let warnings: [EngineWarning]?
+    /// What API requests that don't specify thinking get: `"on"` (the model's default) or
+    /// `"off"` (`--no-thinking` / the `/admin/load` override). Issue #19: clients like DSH and
+    /// WorkBuddy have no reasoning toggle for local models, so this server default is what
+    /// they live with. Optional: presence = the override exists on this engine.
+    public let thinkingDefault: String?
 
     enum CodingKeys: String, CodingKey {
         case status, model, mode, target, drafter, download, phase, warnings
+        case thinkingDefault = "thinking_default"
         case maxDraft = "max_draft"
         case contextWindow = "context_window"
         case maxOutputTokens = "max_output_tokens"
@@ -264,7 +270,8 @@ public struct APIClient: Sendable {
                           confidence: Double? = nil,
                           contextWindow: Int? = nil,
                           lookupDrafts: Bool? = nil,
-                          kvBits: Int? = nil) async throws -> LoadStatus {
+                          kvBits: Int? = nil,
+                          enableThinking: Bool? = nil) async throws -> LoadStatus {
         var payload: [String: Any] = ["model": target]
         if let mode { payload["mode"] = mode }
         if let maxDraft {
@@ -279,6 +286,9 @@ public struct APIClient: Sendable {
         // KV-cache quantization (issue #17): 0 = explicitly full precision, 4/8 = quantized;
         // nil = keep the server's setting. The caller gates on /health.kv_bits presence.
         if let kvBits { payload["kv_bits"] = kvBits }
+        // Thinking default for API clients (issue #19): false = off unless a request asks,
+        // true = the model's own default; nil = keep. Sticky across later swaps server-side.
+        if let enableThinking { payload["enable_thinking"] = enableThinking }
         let body = try JSONSerialization.data(withJSONObject: payload)
         var req = request("admin/load", method: "POST", body: body)
         req.timeoutInterval = 1800        // a first-time load downloads weights
