@@ -2,7 +2,7 @@
 #
 # Build a distributable .dmg from the assembled .app.
 #
-#   ./packaging/make_dmg.sh            build/mlx-dspark-<version>.dmg
+#   ./packaging/make_dmg.sh            build.noindex/mlx-dspark-<version>.dmg
 #   APP_VERSION=0.2.0 ./packaging/make_dmg.sh
 #
 # Produces a compressed disk image with the app and a drag-to-Applications shortcut, and prints
@@ -21,8 +21,8 @@ cd "$(dirname "$0")/.."
 
 APP_NAME="mlx-dspark"
 VERSION="${APP_VERSION:-0.8.1}"
-APP="build/${APP_NAME}.app"
-DMG="build/${APP_NAME}-${VERSION}.dmg"
+APP="build.noindex/${APP_NAME}.app"
+DMG="build.noindex/${APP_NAME}-${VERSION}.dmg"
 VOLNAME="${APP_NAME} ${VERSION}"
 
 # 1. Build the app (release) unless one is already staged.
@@ -33,7 +33,7 @@ fi
 
 # 2. Stage exactly what the DMG should contain: the app plus an /Applications shortcut, so the
 #    window reads "drag this there".
-STAGE="build/dmg-stage"
+STAGE="build.noindex/dmg-stage"
 rm -rf "$STAGE"; mkdir -p "$STAGE"
 cp -R "$APP" "$STAGE/"
 ln -s /Applications "$STAGE/Applications"

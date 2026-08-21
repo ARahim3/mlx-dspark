@@ -13,6 +13,7 @@ checkpoints/
 # demo recording working files (the final docs/demo.gif is committed)
 *.mp4
 *.mov
+/make_social_demo.sh
 /overlay.png
 scratch/
 drafts/
@@ -23,3 +24,4 @@ NOTES.md
 # Mac app build artifacts
 apps/MacApp/.build/
 apps/MacApp/build/
+apps/MacApp/build.noindex/

@@ -24,13 +24,13 @@ Needs only **Command Line Tools** — no Xcode.
 
 ```bash
 swift build                       # or: swift build -c release
-./packaging/make_app.sh --debug   # assemble + ad-hoc sign build/mlx-dspark.app
+./packaging/make_app.sh --debug   # assemble + ad-hoc sign "build.noindex/mlx-dspark (dev).app"
 ```
 
 Run against a local working tree instead of PyPI:
 
 ```bash
-open -n --env MLXDSPARK_ENGINE_SOURCE=/path/to/dspark ./build/mlx-dspark.app
+open -n --env MLXDSPARK_ENGINE_SOURCE=/path/to/dspark "./build.noindex/mlx-dspark (dev).app"
 ```
 
 `open --env` is required — a Finder-launched app inherits no shell environment, and running

@@ -25,12 +25,20 @@ MIN_MACOS="14.0"
 CONFIG="release"
 [[ "${1:-}" == "--debug" ]] && CONFIG="debug"
 
+# Output goes under a `.noindex` folder: Spotlight skips folders with that suffix, so a dev
+# bundle here never shows up next to the installed /Applications copy in search. The debug
+# bundle is ALSO named "(dev)" so a leftover can't be mistaken for the real app (the menu bar
+# and Dock show the name). Release builds keep the plain name — that's what the DMG ships.
+BUILD_DIR="build.noindex"
+BUNDLE_NAME="$APP_NAME"
+[[ "$CONFIG" == "debug" ]] && BUNDLE_NAME="${APP_NAME} (dev)"
+
 echo "==> Building ($CONFIG)"
 swift build -c "$CONFIG"
 BUILT="$(swift build -c "$CONFIG" --show-bin-path)/$EXECUTABLE"
 [[ -f "$BUILT" ]] || { echo "error: no executable at $BUILT" >&2; exit 1; }
 
-APP="build/${APP_NAME}.app"
+APP="${BUILD_DIR}/${BUNDLE_NAME}.app"
 echo "==> Assembling $APP"
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources/bin"
@@ -48,8 +56,8 @@ cat > "$APP/Contents/Info.plist" <<PLIST
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-    <key>CFBundleName</key>                  <string>${APP_NAME}</string>
-    <key>CFBundleDisplayName</key>           <string>${APP_NAME}</string>
+    <key>CFBundleName</key>                  <string>${BUNDLE_NAME}</string>
+    <key>CFBundleDisplayName</key>           <string>${BUNDLE_NAME}</string>
     <key>CFBundleIdentifier</key>            <string>${BUNDLE_ID}</string>
     <key>CFBundleExecutable</key>            <string>${EXECUTABLE}</string>
     <key>CFBundleIconFile</key>              <string>AppIcon</string>
@@ -87,6 +95,6 @@ codesign --force --deep -s - "$APP"
 
 echo
 echo "Built $APP"
-echo "  open $APP"
+echo "  open \"$APP\""
 echo "  # develop against this working tree instead of PyPI:"
-echo "  MLXDSPARK_ENGINE_SOURCE=$(cd ../.. && pwd) open -n $APP"
+echo "  MLXDSPARK_ENGINE_SOURCE=$(cd ../.. && pwd) open -n \"$APP\""
