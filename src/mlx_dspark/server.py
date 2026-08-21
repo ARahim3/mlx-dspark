@@ -1831,7 +1831,9 @@ class EngineHolder:
              sdpa_split: bool | None = None,
              kv_bits: int | None = None,
              warmup: bool | None = None,
-             memory_guard: bool | None = None) -> dict:
+             memory_guard: bool | None = None,
+             enable_thinking: bool | None = None,
+             reasoning_effort: str | None = None) -> dict:
         """Release the current model and load ``model`` in its place. Returns the new status.
 
         Serialized by ``_swap_lock`` so two concurrent loads can't race. Raises ``ValueError``
@@ -1861,6 +1863,14 @@ class EngineHolder:
                     # confidence) stay per-swap: omitted, they re-resolve to the pair's
                     # measured defaults, which IS their reset semantics.
                     self._load_kwargs["context_window"] = context_window or None
+                # The thinking default for API clients is a *server* setting (issue #19 part 2:
+                # DSH/WorkBuddy can't send enable_thinking, so the engine default is what they
+                # get) — sticky across swaps like context_window, so setting it once in the app
+                # covers every model change. True = the template's own default (thinking on).
+                if enable_thinking is not None:
+                    self._load_kwargs["enable_thinking"] = None if enable_thinking else False
+                if reasoning_effort is not None:
+                    self._load_kwargs["reasoning_effort"] = reasoning_effort
                 kwargs = dict(self._load_kwargs)
                 kwargs["model"] = model
                 if mode is not None:
@@ -2153,6 +2163,11 @@ def make_handler(engine: Engine, api_key: str | None):
                     # for models where it does something.
                     "supports_reasoning_effort": bool(
                         getattr(engine, "supports_reasoning_effort", False)),
+                    # What requests that don't say get: "off" = serve --no-thinking (or the
+                    # /admin/load enable_thinking=false override), "on" = the model's own
+                    # default. Presence of the key = the override is available.
+                    "thinking_default": ("off" if getattr(engine, "template_defaults", {}).get(
+                        "enable_thinking") is False else "on"),
                     "reasoning_effort": getattr(engine, "template_defaults", {}).get(
                         "reasoning_effort"),
                 })
@@ -2304,13 +2319,28 @@ def make_handler(engine: Engine, api_key: str | None):
             if memory_guard is not None and not isinstance(memory_guard, bool):
                 return self._send_error(400, "'memory_guard' must be a boolean (omit it to "
                                              "use the server's setting)")
+            # The thinking default for requests that don't say (API clients without a
+            # reasoning toggle — issue #19 part 2). false = serve --no-thinking; true = the
+            # model's own default; omit = keep. Sticky across later swaps.
+            enable_thinking = req.get("enable_thinking")
+            if enable_thinking is not None and not isinstance(enable_thinking, bool):
+                return self._send_error(400, "'enable_thinking' must be a boolean (false = "
+                                             "thinking off by default for API clients; omit "
+                                             "it to keep the server's setting)")
+            effort = req.get("reasoning_effort")
+            if effort is not None and (not isinstance(effort, str)
+                                       or effort.lower() not in REASONING_EFFORTS):
+                return self._send_error(400, "'reasoning_effort' must be one of "
+                                             f"{', '.join(REASONING_EFFORTS)}")
             try:
                 status = engine.swap(model=model, mode=mode, max_draft=max_draft,
                                      lookup_drafts=lookup_drafts,
                                      confidence_threshold=confidence,
                                      context_window=context_window,
                                      small_m=small_m, sdpa_split=sdpa_split, kv_bits=kv_bits,
-                                     warmup=warmup, memory_guard=memory_guard)
+                                     warmup=warmup, memory_guard=memory_guard,
+                                     enable_thinking=enable_thinking,
+                                     reasoning_effort=effort.lower() if effort else None)
             except ValueError as e:                 # unknown model / unresolvable drafter
                 return self._send_error(400, str(e))
             except Exception as e:  # noqa: BLE001 — load failed; report, server stays up

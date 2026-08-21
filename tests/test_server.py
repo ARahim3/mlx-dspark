@@ -1221,3 +1221,49 @@ class TestEngineMachineReportGuard:
         eng.last_verdict = None
         eng.target_repo = eng.drafter_repo = None
         assert eng.machine_report()["guard"] == {"enabled": False}
+
+
+# --- thinking default for API clients (issue #19 part 2) ------------------------------------
+
+
+def test_health_reports_thinking_default(server):
+    eng, base = server
+    assert _get(base, "/health")["thinking_default"] == "on"
+    eng.template_defaults = {"enable_thinking": False}
+    try:
+        assert _get(base, "/health")["thinking_default"] == "off"
+    finally:
+        eng.template_defaults = {}
+
+
+def test_admin_load_validates_thinking_overrides(holder_server):
+    _, base = holder_server
+    for body in ({"model": "repo", "enable_thinking": "no"},
+                 {"model": "repo", "reasoning_effort": "maximum"}):
+        with pytest.raises(urllib.error.HTTPError) as e:
+            _post(base, "/admin/load", body)
+        assert e.value.code == 400
+        msg = json.loads(e.value.read())["error"]["message"]
+        assert "enable_thinking" in msg or "reasoning_effort" in msg
+
+
+def test_swap_makes_thinking_default_sticky(monkeypatch):
+    """enable_thinking=false on one swap carries into the next (like context_window);
+    true restores the model's own default."""
+    seen = []
+
+    class _E:
+        model_id = "m"
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(S.Engine, "load", staticmethod(lambda **kw: seen.append(kw) or _E()))
+    monkeypatch.setattr(S, "maybe_batch_engine", lambda e, n: e)
+    holder = S.EngineHolder(None, {"mode": "auto"})
+    holder.swap(model="a", enable_thinking=False, reasoning_effort="low")
+    holder.swap(model="b")
+    holder.swap(model="c", enable_thinking=True)
+    assert seen[0]["enable_thinking"] is False and seen[0]["reasoning_effort"] == "low"
+    assert seen[1]["enable_thinking"] is False and seen[1]["reasoning_effort"] == "low"
+    assert seen[2]["enable_thinking"] is None

@@ -2,6 +2,19 @@
 
 All notable changes to `mlx-dspark`. Versions follow [SemVer](https://semver.org/) (pre-1.0: minor-ish features land as patch bumps).
 
+## [0.15.1] — 2026-08-22 — thinking default for API clients
+
+### Added
+- **A server-side thinking default that API clients inherit** (issue #19, part 2). Clients like
+  DSH, WorkBuddy, pi and Claude Code have no reasoning toggle for local models, so every request
+  got the engine default — thinking on — and a simple question could spend 13k tokens reasoning.
+  `/admin/load` now takes `enable_thinking` (`false` = off for requests that don't specify it, the
+  same as `serve --no-thinking`; `true` = the model's own default) and `reasoning_effort`
+  (low/medium/high/xhigh), both **sticky across later model swaps** like `context_window`, and
+  `/health` reports `thinking_default` (`on`/`off`; the key's presence is the capability gate). A
+  request that asks for thinking explicitly still gets it. The Mac app exposes it as "Thinking
+  (API clients)" in Settings → Decoding.
+
 ## [0.15.0] — 2026-08-21 — roofline telemetry, memory-pressure guard, long-context SDPA split
 
 ### Fixed

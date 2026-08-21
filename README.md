@@ -207,7 +207,9 @@ mlx-dspark serve --model mlx-community/Qwen3-8B-8bit        # → http://127.0.0
 #                   A first-time load reports download progress in /health and is
 #                   cancellable (POST /admin/load/cancel — partials resume by default);
 #                   /admin/load also takes per-swap mode / max_draft / lookup_drafts /
-#                   confidence_threshold / context_window / kv_bits / memory_guard overrides
+#                   confidence_threshold / context_window / kv_bits / memory_guard /
+#                   enable_thinking / reasoning_effort overrides (the last two are the thinking
+#                   default API clients without a reasoning toggle inherit; sticky across swaps)
 #   --no-memory-guard   keep caches even when macOS reports memory pressure (default: on WARN
 #                   the engine returns its retained buffers + prefix-cache rungs; conversations
 #                   stay cached). --no-warmup skips the on-load warmup generation.
