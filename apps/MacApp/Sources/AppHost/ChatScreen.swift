@@ -52,6 +52,12 @@ struct ChatScreen: View {
             if let error = model.chatError {
                 ChatErrorBanner(message: error) { model.chatError = nil }
             }
+            // Engine-side conditions worth knowing before the next message: macOS memory
+            // pressure (the usual "mysteriously half speed"), or a context window whose KV
+            // cache can't fit alongside the weights. Each row says what to do about it.
+            ForEach(model.engineWarnings) { warning in
+                EngineWarningBanner(warning: warning)
+            }
 
             Divider()
             Composer()
@@ -283,6 +289,28 @@ struct ChatSettingsPanel: View {
     }
 }
 
+struct EngineWarningBanner: View {
+    let warning: EngineWarning
+
+    var body: some View {
+        HStack(alignment: .firstTextBaseline, spacing: 8) {
+            Image(systemName: warning.level == "problem"
+                  ? "exclamationmark.octagon.fill" : "exclamationmark.triangle.fill")
+                .foregroundStyle(warning.level == "problem" ? .red : Theme.warning)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(warning.message).font(.callout)
+                if let action = warning.action {
+                    Text(action).font(.caption).foregroundStyle(.secondary)
+                }
+            }
+            .textSelection(.enabled)
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .padding(.horizontal, 14).padding(.vertical, 8)
+        .background((warning.level == "problem" ? Color.red : Theme.warning).opacity(0.10))
+    }
+}
+
 struct ChatErrorBanner: View {
     let message: String
     let dismiss: () -> Void
@@ -314,14 +342,21 @@ struct EmptyChat: View {
         VStack(alignment: .leading, spacing: 10) {
             if model.isModelLoading {
                 // The window is up while the model loads; this is where the wait shows.
+                // The final stage is a warmup pass (`/health.phase == "warming_up"`) — call
+                // it out so a fast cached load doesn't read as stuck on the last second.
+                let warming = model.loadPhase == "warming_up"
+                let name = model.model.components(separatedBy: "/").last ?? model.model
                 HStack(spacing: 10) {
                     ProgressView().controlSize(.small)
-                    Text("Loading \(model.model.components(separatedBy: "/").last ?? model.model)")
+                    Text(warming ? "Warming up \(name)" : "Loading \(name)")
                         .font(.title3.weight(.medium))
                 }
-                Text(model.loadingDetail
-                     ?? "The first time a model runs, it downloads first — this can take a "
-                        + "few minutes. After that it's cached and starts in seconds.")
+                Text(warming
+                     ? "Almost ready — priming the model so your first message runs at "
+                       + "full speed."
+                     : (model.loadingDetail
+                        ?? "The first time a model runs, it downloads first — this can take a "
+                           + "few minutes. After that it's cached and starts in seconds."))
                     .foregroundStyle(.secondary)
                 if let dl = model.downloadProgress {
                     DownloadProgressRow(progress: dl)
@@ -465,12 +500,27 @@ struct StatsStrip: View {
 
     var body: some View {
         HStack(spacing: 14) {
-            item(String(format: "%.1f", stats.tokensPerSec), "tok/s", tint: Theme.spark)
+            item(String(format: "%.1f", stats.displayTokensPerSec), "tok/s", tint: Theme.spark)
             item(String(format: "%.2f", stats.acceptLen), "per round")
             if let cap = stats.cap { item("\(cap)", "cap") }
             item("\(stats.targetForwards)", "verifies")
             if let lookup = stats.lookupRounds, lookup > 0 {
                 item("\(lookup)", "free drafts", tint: Theme.lookup)
+            }
+            // Where the wall clock went, and how much of the prompt the cache served —
+            // the two facts that explain "why was this turn fast/slow".
+            if let ttft = stats.ttftSeconds, ttft > 0 {
+                item(ttft < 10 ? String(format: "%.2f s", ttft) : String(format: "%.0f s", ttft),
+                     "to first token")
+            }
+            if let cached = stats.cachedTokens, let prompt = stats.promptTokens, prompt > 0 {
+                item("\(cached)/\(prompt)", "cached", tint: cached > 0 ? Theme.verified : nil)
+            }
+            // Decode ÷ this Mac's single-stream roofline at this context depth: > 1 is
+            // speculation beating physics' one-token-per-weight-read limit.
+            if let ratio = stats.rooflineRatio {
+                item(String(format: "%.1f×", ratio), "roofline",
+                     tint: ratio >= 1.0 ? Theme.spark : Theme.warning)
             }
             Text(stats.mode.uppercased())
                 .font(.caption2.weight(.semibold))

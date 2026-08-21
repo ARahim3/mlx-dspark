@@ -36,6 +36,11 @@ public struct HealthInfo: Decodable, Sendable, Equatable {
     /// the Lab's cap+conf bundle chip. An engine without it would silently drop the field
     /// and the lane label would lie, so the chip only shows when this is true.
     public let raceArmConfidence: Bool?
+    /// While `status == "loading"`: which stage the load is in — `"loading"` (fetching /
+    /// loading weights) or `"warming_up"` (a short throwaway generation after the weights are
+    /// resident, so the first real request is warm). Lets the loading screen say "Warming up…"
+    /// instead of a bar that looks stuck. Nil when not loading / on older engines.
+    public let phase: String?
     /// While `status == "loading"` and the engine is fetching weights: live download
     /// progress (`/health.download`). Nil once the fetch is done, on hot swaps of cached
     /// models, and on older engines.
@@ -49,9 +54,13 @@ public struct HealthInfo: Decodable, Sendable, Equatable {
     /// `/admin/load` override, so the picker hides then (a control that silently does
     /// nothing is worse than none).
     public let kvBits: Int?
+    /// Banner-worthy conditions: live macOS memory pressure and the engine's load-time notes
+    /// (e.g. "this context window's KV cache can't fit alongside the weights"). Optional:
+    /// older engines don't report it.
+    public let warnings: [EngineWarning]?
 
     enum CodingKeys: String, CodingKey {
-        case status, model, mode, target, drafter, download
+        case status, model, mode, target, drafter, download, phase, warnings
         case maxDraft = "max_draft"
         case contextWindow = "context_window"
         case maxOutputTokens = "max_output_tokens"
@@ -88,18 +97,57 @@ public struct DownloadProgress: Decodable, Sendable, Equatable {
 public struct SpecInfo: Codable, Sendable, Equatable {
     public let mode: String
     public let acceptLen: Double
-    public let tokensPerSec: Double
+    public let tokensPerSec: Double                  // end-to-end (prefill + decode)
+    public let decodeTokensPerSec: Double?           // decode-only; nil on older engines that omit it
     public let targetForwards: Int
     public let cap: Int?
     public let lookupRounds: Int?
+    // Per-request timing tiles (engines ≥ the roofline batch; nil before, and in sessions
+    // saved by older builds — all optional so nothing stored ever fails to decode).
+    public let promptTokens: Int?
+    /// Prompt tokens the prefix cache served — why turn 2 is fast and turn 1 isn't.
+    public let cachedTokens: Int?
+    public let completionTokens: Int?
+    public let contextTokens: Int?
+    public let prefillSeconds: Double?
+    public let decodeSeconds: Double?
+    /// Time to the first streamed token, at the engine.
+    public let ttftSeconds: Double?
+    public let prefillTokensPerSec: Double?
+    /// Late/early decode rate within the request (< 0.85 = it slowed as it went).
+    public let decayRatio: Double?
+    public let swapDeltaBytes: Int?
+    public let cold: Bool?
+    /// This Mac's single-stream roofline at this request's context depth …
+    public let ceilingTokensPerSec: Double?
+    /// … and decode ÷ that. > 1 is speculative decoding beating physics' one-token-per-
+    /// weight-read limit; the number the whole project is about.
+    public let rooflineRatio: Double?
+
+    /// The rate to show the user: decode-only when the engine reports it (the honest,
+    /// comparable number other local runtimes show), else the end-to-end value from
+    /// older engines. Always >= `tokensPerSec`.
+    public var displayTokensPerSec: Double { decodeTokensPerSec ?? tokensPerSec }
 
     enum CodingKeys: String, CodingKey {
-        case mode
+        case mode, cap, cold
         case acceptLen = "accept_len"
         case tokensPerSec = "tokens_per_sec"
+        case decodeTokensPerSec = "decode_tokens_per_sec"
         case targetForwards = "target_forwards"
-        case cap
         case lookupRounds = "lookup_rounds"
+        case promptTokens = "prompt_tokens"
+        case cachedTokens = "cached_tokens"
+        case completionTokens = "completion_tokens"
+        case contextTokens = "context_tokens"
+        case prefillSeconds = "prefill_seconds"
+        case decodeSeconds = "decode_seconds"
+        case ttftSeconds = "ttft_seconds"
+        case prefillTokensPerSec = "prefill_tokens_per_sec"
+        case decayRatio = "decay_ratio"
+        case swapDeltaBytes = "swap_delta_bytes"
+        case ceilingTokensPerSec = "ceiling_tokens_per_sec"
+        case rooflineRatio = "roofline_ratio"
     }
 }
 

@@ -134,6 +134,12 @@ final class AppModel: ObservableObject {
     @Published var calibration: Calibration?
     /// MLX allocator state — what the loaded model holds resident, polled from `/metrics`.
     @Published var memory: EngineMemory?
+    /// The roofline view of this Mac (`/machine`): measured bandwidth, the loaded model's
+    /// byte footprint, plain-decode ceilings by context depth, macOS memory pressure, and the
+    /// last request's verdict. Polled with the memory gauge; nil on engines without it.
+    @Published var machine: MachineReport?
+    /// This Mac vs the reference M4 Pro the registry badges were measured on (`/admin/models`).
+    @Published var bandwidth: BandwidthInfo?
 
     /// The loaded model's self-description. Fetched from `/health` on start and after every hot
     /// swap, so it stays correct across a model change — the supervisor's own cached health
@@ -179,6 +185,10 @@ final class AppModel: ObservableObject {
     /// Live weight-download progress while a first-time load fetches from the hub
     /// (`/health.download`, polled during the load). Nil for cached models and old engines.
     @Published var downloadProgress: DownloadProgress?
+    /// The load stage `/health` reports while loading: `"loading"` (weights) or `"warming_up"`
+    /// (the throwaway warmup generation that primes the kernels). Drives the "Warming up…"
+    /// line so a fast cached load doesn't just look stuck. Nil when not loading / old engines.
+    @Published var loadPhase: String?
     /// A cancel has been requested and the load is unwinding — disables the cancel buttons
     /// so a slow unwind can't collect duplicate requests.
     @Published var isCancellingLoad = false
@@ -427,7 +437,10 @@ final class AppModel: ObservableObject {
         let poll = Task { [weak self] in
             while !Task.isCancelled {
                 let health = try? await client.health()
-                await MainActor.run { self?.downloadProgress = health?.download }
+                await MainActor.run {
+                    self?.downloadProgress = health?.download
+                    self?.loadPhase = health?.phase
+                }
                 try? await Task.sleep(nanoseconds: 1_000_000_000)
             }
         }
@@ -436,6 +449,7 @@ final class AppModel: ObservableObject {
             isModelLoading = false
             loadingDetail = nil
             downloadProgress = nil
+            loadPhase = nil
             isCancellingLoad = false
         }
         do {
@@ -661,15 +675,24 @@ final class AppModel: ObservableObject {
         }
     }
 
-    /// Poll the allocator numbers behind the memory gauge. Cheap on the server side (it reads
-    /// the allocator, never the GPU), so a relaxed cadence is plenty.
+    /// Poll the numbers behind the memory gauge and the Machine tab. `/machine` carries the
+    /// allocator state plus what macOS sees (pressure, swap) and the roofline; it is a few
+    /// sysctls on the server side, so a relaxed cadence is plenty. Older engines have no
+    /// `/machine` — then the allocator half still comes from `/metrics`.
     private func startMemoryPolling() {
         guard let client, isServerReady else { return }    // /metrics 503s with no model
         memoryTask?.cancel()
         memoryTask = Task { [weak self] in
+            var hasMachine = true
             while !Task.isCancelled {
-                if let memory = try? await client.engineMemory() {
-                    self?.memory = memory
+                if hasMachine, let report = try? await client.machine() {
+                    self?.machine = report
+                    if let allocator = report.memory.allocator { self?.memory = allocator }
+                } else {
+                    hasMachine = false
+                    if let memory = try? await client.engineMemory() {
+                        self?.memory = memory
+                    }
                 }
                 try? await Task.sleep(nanoseconds: 5_000_000_000)
             }
@@ -686,6 +709,7 @@ final class AppModel: ObservableObject {
             models = inventory.models
             installedModels = inventory.installed ?? []
             diskUsage = inventory.disk
+            bandwidth = inventory.bandwidth
         }
         calibration = await curves
     }
@@ -784,9 +808,11 @@ final class AppModel: ObservableObject {
                     case .finished(let info):
                         flush(force: true)
                         // The turn's true mean rate, replacing the smoothed live estimate.
+                        // Decode-only when the engine reports it (prompt-eval excluded — the
+                        // honest number; falls back to end-to-end on older engines).
                         if let info {
-                            self.liveTokensPerSec = info.tokensPerSec
-                            self.rateEWMA = info.tokensPerSec
+                            self.liveTokensPerSec = info.displayTokensPerSec
+                            self.rateEWMA = info.displayTokensPerSec
                         }
                         if let messageID,
                            let i = self.messages.firstIndex(where: { $0.id == messageID }) {
@@ -980,6 +1006,42 @@ final class AppModel: ObservableObject {
     var memoryLine: String? {
         guard let gb = memory?.activeGB, gb > 0.05 else { return nil }
         return String(format: "%.1f GB", gb)
+    }
+
+    /// What the banner shows: the engine's load-time notes (from `/health`, fixed per load)
+    /// plus *live* macOS memory pressure from the `/machine` poll — composed here so a
+    /// pressure change between health fetches still surfaces within seconds.
+    var engineWarnings: [EngineWarning] {
+        var rows = (health?.warnings ?? [])
+            .filter { $0.code != "memory_pressure" && $0.code != "memory_guard" }
+        // A recent memory-guard shed (last 10 min) from the live poll — it explains why the
+        // next turn re-prefills, and that the fix is freeing memory, not the model.
+        if let shed = machine?.memoryGuard?.lastShed, Date().timeIntervalSince1970 - shed.at < 600 {
+            let freed = ByteFormat.gb(shed.freedBytes) ?? "memory"
+            rows.append(EngineWarning(
+                code: "memory_guard", level: "attention",
+                message: "Memory guard freed \(freed) when macOS reported "
+                    + "\(shed.level.uppercased()) pressure — the prefix cache was "
+                    + "\(shed.level == "critical" ? "emptied" : "trimmed"), so the next turn re-prefills.",
+                action: "Free memory (close apps, lower the context window, smaller quant) so it stops recurring."))
+        }
+        if let memory = machine?.memory, memory.isUnderPressure, let pressure = memory.pressure {
+            let swap = ByteFormat.gb(memory.swapUsedBytes).map { " (\($0) swapped)" } ?? ""
+            rows.insert(EngineWarning(
+                code: "memory_pressure",
+                level: pressure == "critical" ? "problem" : "attention",
+                message: "macOS memory pressure is \(pressure.uppercased())\(swap) — "
+                    + "generation will be slower until it clears.",
+                action: "Close other apps, lower the context window, or use a smaller model/quant."),
+                at: 0)
+        }
+        return rows
+    }
+
+    /// "ceiling 53 tok/s" — this Mac's plain-decode roofline at zero context, for the chrome.
+    var ceilingLine: String? {
+        guard let ceiling = machine?.roofline?.atZero?.ceilingTps else { return nil }
+        return String(format: "ceiling %.0f tok/s", ceiling)
     }
 
     /// Rounds from the most recent request only — what the live charts should show.

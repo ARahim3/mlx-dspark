@@ -51,6 +51,11 @@ struct MenuBarPanel: View {
                     if let memory = model.memoryLine {
                         row("Memory", memory)
                     }
+                    if let pressure = model.machine?.memory.pressure,
+                       model.machine?.memory.isUnderPressure == true {
+                        row("Pressure", pressure.uppercased())
+                            .foregroundStyle(pressure == "critical" ? .red : Theme.warning)
+                    }
                 }
 
                 Divider()
@@ -64,13 +69,18 @@ struct MenuBarPanel: View {
                         .animation(.easeOut(duration: 0.2), value: model.liveTokensPerSec)
                     Text("tok/s").foregroundStyle(.secondary)
                     Spacer()
-                    if let stats = model.stats, stats.rounds > 0 {
-                        VStack(alignment: .trailing, spacing: 1) {
+                    VStack(alignment: .trailing, spacing: 1) {
+                        if let stats = model.stats, stats.rounds > 0 {
                             Text("accept \(stats.meanAcceptLen, specifier: "%.2f")")
                             Text("\(stats.rounds) rounds").foregroundStyle(.secondary)
                         }
-                        .font(.caption)
+                        // The physics next to the live number: a plain decode on this Mac
+                        // can't beat this; speculation is what does.
+                        if let ceiling = model.ceilingLine {
+                            Text(ceiling).foregroundStyle(.secondary)
+                        }
                     }
+                    .font(.caption)
                 }
 
                 AcceptRibbon(rounds: model.rounds, maxTicks: 60)

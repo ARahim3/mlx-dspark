@@ -368,6 +368,17 @@ struct MachineCard: View {
                 if let ram = report.environment.ramGB {
                     row("Memory", String(format: "%.0f GB", ram))
                 }
+                if let chip = report.environment.chip, let spec = chip.bandwidthGBs {
+                    // The number that governs decode speed on a Mac — spec sheet next to
+                    // what a microbench actually achieves here (~80–90% of spec is normal).
+                    let measured = chip.bandwidthMeasuredGBs
+                        .map { String(format: " · %.0f GB/s measured", $0) } ?? ""
+                    row("Bandwidth", String(format: "%.0f GB/s spec", spec) + measured)
+                }
+                if let pressure = report.environment.memory?.pressure, pressure != "unknown" {
+                    row("Pressure", pressure == "normal" ? "normal"
+                        : pressure.uppercased() + " — generation runs slower until it clears")
+                }
                 row("macOS", report.environment.osVersion ?? "—")
                 row("Engine", report.environment.version)
                 let versions = ["mlx", "mlx_lm", "mlx_vlm"]

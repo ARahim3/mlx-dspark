@@ -12,7 +12,7 @@ struct LabScreen: View {
     @State private var tab: Tab = Tab(rawValue: Defaults.labTab) ?? .live
 
     enum Tab: String, CaseIterable, Identifiable {
-        case race = "Race", live = "Live", curves = "Curves"
+        case race = "Race", live = "Live", curves = "Curves", machine = "This Mac"
         var id: String { rawValue }
     }
 
@@ -24,7 +24,7 @@ struct LabScreen: View {
                 }
                 .pickerStyle(.segmented)
                 .labelsHidden()
-                .frame(width: 280)
+                .frame(width: 360)
 
                 // Quick presentation controls, right where a recording happens: content text
                 // size (also Cmd+/Cmd−) and a light/dark pin (also the View menu). They act
@@ -67,6 +67,7 @@ struct LabScreen: View {
                     case .race:   RaceTab()
                     case .live:   LiveTab()
                     case .curves: CurvesTab()
+                    case .machine: MachineTab()
                     }
                 }
                 .padding(16)

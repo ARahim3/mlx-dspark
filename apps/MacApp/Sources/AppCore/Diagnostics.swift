@@ -24,9 +24,29 @@ public struct DoctorReport: Decodable, Sendable {
         /// slowdown, so this is worth surfacing rather than burying.
         public let wiredLimitHint: String?
         public let packages: [String: String?]
+        /// Chip family + spec-sheet bandwidth (+ the measured figure once a model has ever
+        /// loaded here). Optional: older engines don't report it.
+        public let chip: Chip?
+        /// What macOS sees right now (pressure, swap). Optional, same reason.
+        public let memory: MachineReport.Memory?
+
+        public struct Chip: Decodable, Sendable {
+            public let name: String?
+            public let family: String?
+            public let gpuCores: Int?
+            public let bandwidthGBs: Double?
+            public let bandwidthMeasuredGBs: Double?
+
+            enum CodingKeys: String, CodingKey {
+                case name, family
+                case gpuCores = "gpu_cores"
+                case bandwidthGBs = "bandwidth_gb_s"
+                case bandwidthMeasuredGBs = "bandwidth_measured_gb_s"
+            }
+        }
 
         enum CodingKeys: String, CodingKey {
-            case version, platform, machine, device, packages
+            case version, platform, machine, device, packages, chip, memory
             case osVersion = "os_version"
             case appleSilicon = "apple_silicon"
             case metalOK = "metal_ok"
@@ -57,9 +77,16 @@ public struct ModelRow: Decodable, Sendable, Identifiable {
     public let drafterInstalled: Bool
     /// Runnable right now, with nothing left to download.
     public let ready: Bool
+    /// Safetensors bytes of an already-downloaded target, and the plain-decode ceiling they
+    /// imply at this Mac's bandwidth — the physics a picker can quote before loading. Nil
+    /// until the weights are local (and on older engines).
+    public let weightBytes: Int?
+    public let ceilingTps: Double?
 
     enum CodingKeys: String, CodingKey {
         case id, target, ram, fits, ready, speedup
+        case weightBytes = "weight_bytes"
+        case ceilingTps = "ceiling_tps"
         case dsparkDrafter = "dspark_drafter"
         case dflashDrafter = "dflash_drafter"
         case ramGB = "ram_gb"
@@ -121,4 +148,6 @@ public struct ModelInventory: Decodable, Sendable {
     public let installed: [InstalledModel]?
     public let disk: DiskUsage?
     public let loaded: String?
+    /// This Mac vs the reference M4 Pro (optional: older engines don't report it).
+    public let bandwidth: BandwidthInfo?
 }

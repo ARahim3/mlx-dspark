@@ -109,6 +109,16 @@ struct ModelsScreen: View {
             Text("Switching swaps the model in place — the server and its port stay up, so "
                  + "connected agents keep working.")
                 .font(.caption).foregroundStyle(.secondary)
+
+            // The badges are M4 Pro measurements. Say how this Mac compares instead of
+            // letting an M5 Max owner read them as a ceiling (or an M1 owner as a promise).
+            if let bw = model.bandwidth, let scale = bw.scale, abs(scale - 1.0) > 0.05 {
+                Text(String(format: "Speedup badges were measured on an M4 Pro (273 GB/s). "
+                            + "This Mac's memory bandwidth is %.1f× that, so absolute tok/s "
+                            + "scale roughly with it; the ratios carry over.", scale))
+                    .font(.caption).foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
         }
     }
 
@@ -238,6 +248,15 @@ struct ModelRowView: View {
                           tint: row.ready ? Theme.verified : .secondary)
                     if let ram = row.ram {
                         Text(ram).font(.caption).foregroundStyle(.secondary)
+                    }
+                    // Physics, not a promise: bandwidth ÷ weight bytes is the most a plain
+                    // decode of these weights can do on this Mac. Speculation multiplies it.
+                    if let ceiling = row.ceilingTps {
+                        Text(String(format: "~%.0f tok/s plain ceiling here", ceiling))
+                            .font(.caption).foregroundStyle(.secondary)
+                            .help("This Mac's memory bandwidth divided by the model's weight "
+                                  + "bytes — the single-stream roofline. Speculative decoding "
+                                  + "is what beats it.")
                     }
                 }
             }

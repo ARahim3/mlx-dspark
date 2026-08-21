@@ -4,17 +4,19 @@ A native SwiftUI app for the mlx-dspark engine. It does **not** link Python: it 
 app-owned runtime, launches `mlx-dspark serve`, and drives it over HTTP + SSE — the same CLI a
 terminal user would run.
 
-> Status: **feature-complete for a first release, unreleased.** Chat (sessions, markdown +
-> syntax highlighting, collapsible reasoning), Lab (Race with lossless verdict, live
-> acceptance decay, this Mac's cost curves), Models (measured pairs with speedups, anything
-> on disk, any HF repo, hot swap via `/admin/load`), Agents (per-client config + round-trip
-> test), menu bar with live rate/memory/accept ribbon, DMG + Homebrew cask tooling.
+> Status: **released** — `app-v*` tags (Homebrew cask + DMG; see the root README). Chat
+> (sessions, markdown + syntax highlighting, collapsible reasoning, per-turn timing tiles),
+> Lab (Race with lossless verdict, Live acceptance decay, this Mac's cost curves, and **This
+> Mac** — measured bandwidth, plain-decode ceiling, roofline verdict, memory pressure), Models
+> (measured pairs with speedups and per-machine ceilings, anything on disk, any HF repo, hot
+> swap via `/admin/load`), Agents (per-client config + round-trip test), Settings (decoding
+> controls, fixed engine port), engine-warning banners, menu bar with live rate/memory/accept
+> ribbon.
 >
 > **Engine version:** the bootstrapper installs the **latest PyPI release** at launch (no
-> pin; it rebuilds the runtime when a newer release exists, and offline launches keep the
-> working install). Note the app's Lab/Models/telemetry endpoints have not shipped to PyPI
-> yet — until the next engine release, run against this working tree (below) for the full
-> feature set.
+> pin; it upgrades in place when a newer release exists, and offline launches keep the
+> working install). To develop against this working tree instead, see below
+> (`MLXDSPARK_ENGINE_SOURCE`).
 
 ## Build
 
