@@ -559,6 +559,43 @@ def test_reasoning_effort_maps_unsupported_instead_of_400(server):
     assert eng.tokenizer.template_kwargs[-1]["reasoning_effort"] == "xhigh"
 
 
+def test_anthropic_output_config_effort_overrides_and_clamps(server):
+    """issue #25: Claude Code ships /effort (and --effort) in `output_config.effort`, NOT in
+    `thinking`. It must reach the template as a per-request override of the server default,
+    clamped to what THIS template accepts, degrade to the default on a bad value, and be
+    skipped when thinking is disabled."""
+    eng, base = server
+    eng.tokenizer = _Qwen38Tok()
+    eng.template_defaults = {"reasoning_effort": "low"}   # server default, to be overridden
+    if hasattr(eng, "_effort_vocab"):
+        del eng._effort_vocab                             # probe freshly against this tokenizer
+
+    def eff():
+        return eng.tokenizer.template_kwargs[-1].get("reasoning_effort")
+
+    def msg(**extra):
+        return {"model": "x", "max_tokens": 64,
+                "messages": [{"role": "user", "content": "hi"}], **extra}
+
+    # 'high' (not in this template's vocab) -> clamped to 'medium', overriding the 'low' default
+    _post(base, "/v1/messages", msg(output_config={"effort": "high"}))
+    assert eff() == "medium"
+    # 'xhigh' passes through
+    _post(base, "/v1/messages", msg(output_config={"effort": "xhigh"}))
+    assert eff() == "xhigh"
+    # a bogus value keeps the server default rather than 400ing
+    _post(base, "/v1/messages", msg(output_config={"effort": "bogus"}))
+    assert eff() == "low"
+    # output_config with only `format` (Claude Code's internal JSON tasks) touches nothing
+    _post(base, "/v1/messages", msg(output_config={"format": {"type": "json_schema"}}))
+    assert eff() == "low"
+    # thinking disabled -> effort is NOT re-injected (stays the default, not the xhigh override)
+    _post(base, "/v1/messages",
+          msg(output_config={"effort": "xhigh"}, thinking={"type": "disabled"}))
+    kw = eng.tokenizer.template_kwargs[-1]
+    assert kw.get("enable_thinking") is False and kw.get("reasoning_effort") == "low"
+
+
 def test_reasoning_effort_reaches_the_template(server):
     eng, base = server
     tok = _EffortTok()

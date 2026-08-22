@@ -2,6 +2,29 @@
 
 All notable changes to `mlx-dspark`. Versions follow [SemVer](https://semver.org/) (pre-1.0: minor-ish features land as patch bumps).
 
+## [0.16.0] — 2026-08-22 — LiquidAI LFM2.5 family (conv+attention hybrid — first conv recurrence)
+
+### Added
+- **LiquidAI LFM2.5-DSpark support** — three community drafters + their targets, registered and
+  measured on M4 Pro (decode tok/s, greedy, lossless — fp ties only). Auto-resolving registry rows
+  (`lfm2.5-2.6b` / `lfm2.5-1.2b` / `lfm2.5-8b-a1b`), quant-agnostic — `--model
+  LiquidAI/LFM2.5-2.6B-MLX-bf16` (or `-8bit`) picks the drafter with no `--drafter`:
+  - **LFM2.5-2.6B** (bf16) — 2.62× suite / 2.79× code, 3.41× math, 2.22× chat (cap 5–6, baseline ~43 tok/s)
+  - **LFM2.5-1.2B-Instruct** (bf16) — 3.30× suite / 3.70× code, 3.78× math (cap 7, ~101 → 345 tok/s)
+  - **LFM2.5-8B-A1B** (MoE `lfm2_moe`) — supported + lossless with **zero extra model code**; registered on **bf16**, where the drafter pays (cap 4 = 1.26× suite / 1.67× math), matching LiquidAI's M4 Max ~1.18×. At 8-bit it's a net loss (the ~1B-active step is too cheap for the drafter) — and 8-bit-at-baseline is still the fastest way to run the model, so it's kept out of the hook/results tables.
+
+### Fixed
+- **Claude Code's `/effort` (and `--effort`) now takes effect** (issue #25). Claude Code ships the reasoning level in `output_config.effort`, not `thinking`; `_encode_anthropic` now reads it as a per-request override, clamped to what the template accepts (`high` → `medium` on Qwen3.8, from #19) and degrading to the server default on an unknown value. Skipped when thinking is disabled. Thanks to the reporter for capturing the exact request.
+- **First conv-recurrence target** (`model_type` lfm2 / lfm2_moe — LiquidAI's short-conv + attention
+  hybrid). New `shortconv` recurrence in `target.py` (tap + conv-window capture + rollback) — the
+  cheapest of the three recurrences (a kernel-3 causal FIR, no SSM state). The 8B MoE (`lfm2_moe`)
+  loaded with **zero extra model code** (structurally identical to `lfm2` for the tap).
+- **Fifth checkpoint packaging** (`config.py`): LiquidAI's `Lfm2DSparkDraftModel` nests
+  `target_layer_ids` / `mask_token_id` in `dflash_config` with no `projector_type` tag — hoisted.
+- **`rope_traditional` knob** honoring `rope_is_neox_style`: these heads use **interleaved** rope
+  (~2× acceptance vs neox, measured). Absent = family-default neox, so every existing head is
+  unchanged.
+
 ## [0.15.1] — 2026-08-22 — thinking default for API clients
 
 ### Added

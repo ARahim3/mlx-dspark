@@ -238,6 +238,22 @@ RADIXARK_SPECFORGE = {  # RadixArk/Qwen3.8-27B-DSpark shape: the SpecForge (SGLa
                       "target_layer_ids": [0, 1]},
 }
 
+LFM2_DSPARK = {  # LiquidAI/LFM2.5-2.6B-DSpark shape: the LiquidAI packaging (the fifth). A plain
+    # qwen3-backbone DSpark head (architectures ["Lfm2DSparkDraftModel"]) for an LFM2 conv+attn
+    # target. Distinguishers vs SpecForge: target_layer_ids/mask_token_id/num_target_layers live
+    # ONLY inside `dflash_config` but with NO projector_type tag; the block is bidirectional
+    # full-attention (anchor-as-pos0, logits_start 0); the rope is INTERLEAVED (rope_is_neox_style
+    # false -> mlx traditional=True, measured ~2x acceptance vs neox); full vocab; and the
+    # checkpoint ships neither embed_tokens nor lm_head (reuses both from the tied LFM2 target).
+    "architectures": ["Lfm2DSparkDraftModel"], "model_type": "qwen3",
+    "hidden_size": 16, "vocab_size": 32, "num_hidden_layers": 1, "intermediate_size": 32,
+    "num_attention_heads": 2, "num_key_value_heads": 1, "head_dim": 8,
+    "rope_theta": 10000000.0, "rms_norm_eps": 1e-05,
+    "layer_types": ["full_attention"], "block_size": 9, "rope_is_neox_style": False,
+    "markov_rank": 4, "markov_head_type": "vanilla", "enable_confidence_head": True,
+    "dflash_config": {"mask_token_id": 3, "target_layer_ids": [0, 1], "num_target_layers": 2},
+}
+
 
 def _cfg_path(tmp_path, cfg: dict) -> str:
     p = tmp_path / "config.json"
@@ -499,6 +515,41 @@ def test_load_drafter_reuses_target_embed_and_head_when_absent(tmp_path):
         drafter.embed(mx.array([[1, 2, 3]]))
     with pytest.raises(RuntimeError, match="bind_lm_head"):
         drafter.compute_logits(mx.zeros((1, cfg.hidden_size)))
+
+
+def test_lfm2_dspark_config_parses(tmp_path):
+    """LiquidAI LFM2.5-DSpark packaging: hoist target_layer_ids / mask_token_id /
+    num_target_layers out of dflash_config (no projector_type tag), sample the anchor slot
+    (logits_start 0), take interleaved rope from rope_is_neox_style, full vocab, plain qwen3."""
+    cfg = DSparkConfig.from_json(_cfg_path(tmp_path, LFM2_DSPARK))
+    assert cfg.family == "qwen3"
+    assert cfg.block_size == 9
+    assert cfg.mask_token_id == 3            # hoisted from dflash_config
+    assert cfg.target_layer_ids == [0, 1]    # hoisted
+    assert cfg.num_target_layers == 2        # hoisted
+    assert cfg.logits_start == 0             # anchor-as-pos0 ("ceiling is 10" at block 9)
+    assert cfg.rope_traditional is True      # rope_is_neox_style: false -> interleaved
+    assert cfg.rope_dims is None             # full head_dim
+    assert cfg.draft_vocab_size is None      # full vocab
+
+
+def test_lfm2_dspark_reuse_both_roundtrips(tmp_path):
+    """The LFM2 DSpark head ships neither embed_tokens nor lm_head (reuses the tied target's for
+    both) — load detects that from the weights and builds the bind-at-runtime drafter."""
+    weights = _reference_weights(LFM2_DSPARK)
+    weights.pop("embed_tokens.weight", None)
+    weights.pop("lm_head.weight", None)
+    path = _write_drafter_ckpt(tmp_path, weights, LFM2_DSPARK)
+    drafter, cfg = load_drafter(path, quantize=False)
+    assert cfg.has_own_embed is False and cfg.has_own_lm_head is False
+    assert drafter.logits_start == 0 and drafter.max_draft == 9
+    assert drafter.draft_width(2) == cfg.block_size  # bidirectional: backbone stays full-width
+
+
+def test_plain_qwen3_keeps_neox_rope_without_the_flag(tmp_path):
+    """A config without rope_is_neox_style keeps the family default (neox / traditional=False),
+    so every existing head is untouched by the new interleaved-rope knob."""
+    assert DSparkConfig.from_json(_cfg_path(tmp_path, QWEN3_MIN)).rope_traditional is False
 
 
 def test_speculators_reduced_draft_vocab_sizes_only_the_output_heads(tmp_path):

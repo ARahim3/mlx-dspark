@@ -178,6 +178,13 @@ class DSparkConfig:
     # qwen3_5 drafters rope only the first rope_dims of head_dim (partial rotary);
     # None = full head_dim (all other families).
     rope_dims: int | None = None
+    # rope convention. mlx's traditional=False is the NeoX / split-half rope (Llama / Qwen3 /
+    # gemma-4 — the family default here); traditional=True is the interleaved GPT-J rope.
+    # A drafter config that explicitly declares ``rope_is_neox_style: false`` (LiquidAI's LFM2
+    # DSpark heads) wants the interleaved rope. Honored only when the field is PRESENT
+    # (deepcopy-noise doctrine: absent -> the family default neox), so every existing head is
+    # untouched.
+    rope_traditional: bool = False
     # YaRN scaling for the drafter's own rope (SpecForge heads, e.g. RadixArk's Qwen3.8-27B
     # head: factor 32 over an 8192-token original window). None = unscaled rope (every other
     # family). Keys follow initialize_rope's yarn schema: factor / beta_fast / beta_slow /
@@ -321,6 +328,24 @@ class DSparkConfig:
                 if k not in c and _sf.get(k) is not None:
                     c[k] = _sf[k]
             c.setdefault("logits_start", 0)
+
+        # LiquidAI LFM2.5-DSpark packaging (the fifth). A plain qwen3-backbone DSpark head
+        # (architectures ["Lfm2DSparkDraftModel"]) for an LFM2 conv+attention target. Like
+        # SpecForge it nests target_layer_ids / mask_token_id / num_target_layers inside
+        # ``dflash_config`` — but with NO ``projector_type`` tag and no top-level DSpark fields —
+        # so hoist them for the required-field check below. The ``target_layer_ids not in c``
+        # guard keeps this off the Nemotron head (architectures "Qwen3DSparkModel"), which carries
+        # those ids at TOP level. The block is bidirectional full-attention (layer_types all
+        # full_attention, no sliding window / dflash_query_causal) and samples the anchor slot
+        # (block_size 9 -> 9 predictions; the card's "ceiling is 10" = 9 drafts + the target's
+        # bonus token, i.e. logits_start 0 — confirmed by the drafter's own accept length).
+        arch = " ".join(c.get("architectures") or [])
+        if (not specforge and "DSpark" in arch and "target_layer_ids" not in c
+                and _sf.get("target_layer_ids") is not None):
+            for k in ("target_layer_ids", "mask_token_id", "num_target_layers"):
+                if k not in c and _sf.get(k) is not None:
+                    c[k] = _sf[k]
+            c.setdefault("logits_start", 0)
         if "block_size" not in c and any(k.startswith("dspark_") for k in c):
             raise ValueError(
                 f"{path}: this looks like a full target model with an embedded DSpark drafter "
@@ -409,6 +434,10 @@ class DSparkConfig:
                 if "original_max_position_embeddings" in rp:
                     yarn["original_max_position_embeddings"] = int(
                         rp["original_max_position_embeddings"])
+            # rope convention: honor an explicit rope_is_neox_style (LiquidAI LFM2 DSpark head
+            # declares it false = interleaved GPT-J rope = mlx traditional=True). Absent -> the
+            # qwen3 family default (neox, traditional=False). See DSparkConfig.rope_traditional.
+            rope_trad = (not bool(c["rope_is_neox_style"])) if "rope_is_neox_style" in c else False
             if "logits_start" in c:
                 logits_start = int(c["logits_start"])
             elif "sample_from_anchor" in c:
@@ -439,6 +468,7 @@ class DSparkConfig:
                 rope_type="default",
                 rope_yarn=yarn,
                 rope_dims=(rope_dims if rope_dims != head_dim else None),
+                rope_traditional=rope_trad,
                 gated_q_proj=gated_q,
                 offset_rms_norm=offset_norms,
                 causal_block=causal_block, sliding_window=swa,

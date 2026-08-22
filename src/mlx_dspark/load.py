@@ -215,6 +215,39 @@ REGISTRY = [
     {"id": "muse-glimmer-30b", "target": "mlx-community/Muse-Glimmer-30B-4bit",
      "dspark": "DaoCloud/Muse-Glimmer-30B-DSpark", "lookup_drafts": False,
      "ram": "~26 GB (4-bit) / ~40 GB (8-bit)", "speedup": "~1.7× (8-bit: ~2.5×)"},
+    # LiquidAI LFM2.5-DSpark — the first conv-recurrence targets here (model_type lfm2 / lfm2_moe:
+    # Liquid AI's short-conv + attention hybrid). The drafters are plain qwen3-backbone DSpark heads
+    # in a FIFTH packaging (target_layer_ids/mask_token_id nested in dflash_config, NO projector_type
+    # tag) that reuse the target's tied embed AND lm_head (ship neither), block_size 9, INTERLEAVED
+    # rope (rope_is_neox_style:false -> mlx traditional=True; ~2x accept vs neox, MEASURED) and
+    # anchor-as-pos0. The conv state (a kernel-3 causal FIR window) is a new recurrence in target.py
+    # (_capture/_rollback_shortconv) — the cheapest of the three (a pure FIR, no SSM accumulation).
+    # Flat per-quant repos exist so one id resolves any quant; bf16 is the sweet spot (mlx 0.32.1's
+    # gemv_wide makes wide-cap bf16 verify cheap, and these are bandwidth-light targets). Measured
+    # M4 Pro, decode tok/s, 3-trial medians (see NOTES "LiquidAI LFM2.5-DSpark"):
+    #   2.6B bf16: baseline ~43 tok/s; cap 5-6 = 2.79x code / 3.41x math / 2.22x chat (accept 3.75/4.55/3.03)
+    #   1.2B bf16: baseline ~100 tok/s; cap 5-6 = 4.42x code / 3.14x math / 1.95x chat (accept 6.70/4.76/3.11)
+    {"id": "lfm2.5-2.6b", "target": "LiquidAI/LFM2.5-2.6B-MLX-bf16",
+     "dspark": "LiquidAI/LFM2.5-2.6B-DSpark",
+     "ram": "~7 GB", "speedup": "~2.8×"},
+    {"id": "lfm2.5-1.2b", "target": "LiquidAI/LFM2.5-1.2B-Instruct-MLX-bf16",
+     "dspark": "LiquidAI/LFM2.5-1.2B-Instruct-DSpark",
+     "ram": "~4 GB", "speedup": "~3.1× (4.4× code)"},
+    # 8B-A1B is MoE (lfm2_moe: 32 experts, ~1B active) — loaded with ZERO extra model code (its
+    # ShortConv / decoder layout matches lfm2; the MoE only swaps the FFN inside the layer, invisible
+    # to the tap), lossless. **Registered on BF16, not 8-bit** — the drafter only pays where the
+    # target step is expensive enough to amortize the dense 327M drafter, and this MoE's ~1B-active
+    # step is very cheap. Measured (M4 Pro, greedy, benchmark suite): bf16 baseline ~65 tok/s ->
+    # cap 4 = 1.26x (1.44x math / 1.30x code / 1.04x chat; per-content probe peaks 1.67x math);
+    # 8bit is a NET LOSS (baseline ~114 tok/s, 0.90–0.97x every cap — the ~1B step is too cheap).
+    # Confirms LiquidAI's own card (M4 Max bf16 mean 1.18x; our per-token accept ~69% matches theirs)
+    # — the ratio is bounded by the MoE verify curve, not the drafter. **Absolute-speed caveat:
+    # 8bit-at-baseline (~114 tok/s) is still faster than bf16+spec (~82) — so this pair is a win for
+    # bf16-quality users, not the fastest way to run the model.** Kept OUT of the README hook table
+    # (modest + that caveat). lookup off (MoE). The quant-agnostic id still resolves the 8bit target.
+    {"id": "lfm2.5-8b-a1b", "target": "LiquidAI/LFM2.5-8B-A1B-MLX-bf16",
+     "dspark": "LiquidAI/LFM2.5-8B-A1B-DSpark", "lookup_drafts": False,
+     "ram": "~19 GB", "speedup": "~1.3× (MoE, bf16)"},
 ]
 
 # legacy `--family` / load_pair("qwen3") values -> a concrete target repo (deprecated).

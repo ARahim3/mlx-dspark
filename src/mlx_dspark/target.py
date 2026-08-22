@@ -50,6 +50,14 @@ class Target:
             self._recurrence = "gated_delta"
         elif not self.is_vlm and any(getattr(ly, "block_type", None) == "M" for ly in _layers):
             self._recurrence = "mamba2"
+        elif not self.is_vlm and any(
+                (not getattr(ly, "is_attention_layer", True)) and hasattr(ly, "conv")
+                for ly in _layers):
+            # LFM2 (model_type lfm2): short-conv blocks (a kernel-3 causal FIR with an
+            # ArraysCache window) interleaved with full-attention blocks. The conv state is
+            # non-trimmable like the other recurrences, so it needs capture/rollback — but it
+            # is a pure FIR (no SSM accumulation), so rollback is just the conv-window slice.
+            self._recurrence = "shortconv"
         else:
             self._recurrence = None
         self.is_hybrid = self._recurrence is not None
@@ -80,6 +88,12 @@ class Target:
                                  if getattr(layer, "is_linear", False)]
             for m in self._gdn_modules:
                 m.conv1d._mlx_dspark_capture = True
+        elif self._recurrence == "shortconv":
+            # The class whose __call__ we hook to capture each round's conv inputs. All conv
+            # blocks share one ShortConv class, so a class-method hook records every conv call
+            # in layer order (the same order the non-trimmable caches appear in the cache list).
+            self._shortconv_cls = type(
+                next(ly.conv for ly in model.layers if not ly.is_attention_layer))
         # hybrid spec-verify state (see verify()/rollback()); per-generation, reset by
         # reset_spec() at loop start so a served Target never leaks state across requests.
         self.reset_spec()
@@ -115,6 +129,8 @@ class Target:
             return out.logits, mx.concatenate(out.hidden_states, axis=-1)
         if self._recurrence == "mamba2":
             return self._run_nemotron(ids, cache, tap)
+        if self._recurrence == "shortconv":
+            return self._run_lfm2(ids, cache, tap)
         if self.is_hybrid:
             return self._run_hybrid(ids, cache, tap)
         return self._run_mlxlm(ids, cache, tap)
@@ -185,6 +201,34 @@ class Target:
 
     def _run_nemotron(self, ids, cache, tap):
         hn, fused = self._body_nemotron(ids, cache, tap)
+        return self._head_mlxlm(hn), fused
+
+    def _body_lfm2(self, ids, cache, tap):
+        """Replicates mlx-lm's LFM2 text forward (short-conv / full-attention hybrid) with the
+        residual-stream capture. Differs from the qwen3_5 hybrid path only in surface detail the
+        generic loops can't absorb: the final norm is ``.embedding_norm`` (not ``.norm``); layers
+        are typed by ``is_attention_layer`` (not ``is_linear``); the per-layer mask is the causal
+        attention mask for attention layers and the SSM mask for conv layers; and the cache list
+        is NOT compacted (one entry per layer — KVCache for attention, ArraysCache for conv), so
+        it indexes by layer position exactly like the dense path. Faithfulness is proven by
+        :meth:`verify_tap` at load."""
+        from mlx_lm.models.base import create_attention_mask, create_ssm_mask
+
+        mm = self._inner.model   # Lfm2Model
+        tapset = set(tap) if tap is not None else ()
+        h = mm.embed_tokens(ids)
+        attn_mask = create_attention_mask(h, cache[mm.fa_idx])
+        conv_mask = create_ssm_mask(h, cache[mm.conv_idx])
+        captured = []
+        for i, (layer, c) in enumerate(zip(mm.layers, cache)):
+            mask = attn_mask if layer.is_attention_layer else conv_mask
+            h = layer(h, mask=mask, cache=c)
+            if i in tapset:
+                captured.append(h)
+        return mm.embedding_norm(h), (mx.concatenate(captured, axis=-1) if tap is not None else None)
+
+    def _run_lfm2(self, ids, cache, tap):
+        hn, fused = self._body_lfm2(ids, cache, tap)
         return self._head_mlxlm(hn), fused
 
     def _head_mlxlm(self, hn):
@@ -298,6 +342,7 @@ class Target:
             head = lm.logits_from_hidden
         else:
             body = (self._body_nemotron if self._recurrence == "mamba2"
+                    else self._body_lfm2 if self._recurrence == "shortconv"
                     else self._body_hybrid if self.is_hybrid else self._body_mlxlm)
             hn, fused = body(ids, cache, tap)
             head = self._head_mlxlm
@@ -421,6 +466,27 @@ class Target:
             nmod.ssm_update = orig_ssm
             mix_cls._conv = orig_conv
 
+    @contextmanager
+    def _capture_shortconv(self):
+        """Scoped hook recording each LFM2 short-conv block's input ``x`` and its pre-round conv
+        window (``cache[0]``, read BEFORE the call overwrites it), for the forward built inside the
+        context. Pure pass-through — verify_tap() runs with it active, so a semantic drift fails
+        loudly at load. Conv blocks share one ShortConv class and run in layer order, so the
+        recorded list is in the same order the non-trimmable caches appear in the cache list."""
+        cls = self._shortconv_cls
+        orig = cls.__call__
+        rec = []
+
+        def rec_call(conv_self, x, mask=None, cache=None):
+            rec.append((conv_self, x, None if cache is None else cache[0], mask))
+            return orig(conv_self, x, mask=mask, cache=cache)
+
+        cls.__call__ = rec_call
+        try:
+            yield rec
+        finally:
+            cls.__call__ = orig
+
     def verify(self, ids: mx.array, cache, tap: list[int] | None):
         """Spec-round verify forward: ``ids`` [1, 1+m] = [anchor] + m draft tokens.
         Returns (logits [1, 1+m, V], fused [1, 1+m, n_tap*H]) at those rows.
@@ -440,6 +506,7 @@ class Target:
             # no drafts (lookup miss / plain step): fully committed, nothing to capture
             return fwd(ids)
         capture = (self._capture_mamba if self._recurrence == "mamba2"
+                   else self._capture_shortconv if self._recurrence == "shortconv"
                    else self._capture_linear)
         with capture() as stash:
             logits, fused = fwd(ids)
@@ -465,6 +532,8 @@ class Target:
             keep = self._spec_width - n_rejected     # anchor + accepted drafts, >= 1
             if self._recurrence == "mamba2":
                 self._rollback_mamba(cache, keep)
+            elif self._recurrence == "shortconv":
+                self._rollback_shortconv(cache, keep)
             else:
                 self._rollback_gated_delta(cache, keep)
         self._stash = None
@@ -521,6 +590,34 @@ class Target:
             c[1] = new_state
             li += 1
 
+    def _rollback_shortconv(self, cache, keep: int) -> None:
+        """Rebuild each LFM2 short-conv cache at the accept point (``keep`` = anchor + accepted
+        drafts). Attention layers KV-trim the rejected tail; each conv layer's only state is the
+        window ``cache[0]`` = the last (L_cache-1) rows of ``[pre-round window ‖ Bx]``, where
+        ``Bx = (B·x)`` is per-position (each row depends only on that token's residual, which for
+        the accepted prefix is causally identical to a committed forward). So the committed-``keep``
+        window is the last (L_cache-1) rows of ``[pre-round window ‖ Bx[:keep]]``. Re-running the
+        block's ``in_proj`` over ``x[:keep]`` reproduces ``Bx[:keep]`` bit-for-bit (same op,
+        position-wise) — the FIR carries no accumulated state, so no recurrence re-run is needed."""
+        rec = self._stash
+        li = 0
+        for c in cache:
+            if self._is_trimmable(c):
+                c.trim(self._spec_width - keep)
+                continue
+            conv, x, state0, mask = rec[li]
+            BCx = conv.in_proj(x[:, :keep, :])
+            B, _C, xs = mx.split(BCx, 3, axis=-1)
+            Bx = B * xs
+            if mask is not None:                      # None in the batch-1 spec path
+                Bx = mx.where(mask[:, :keep, None], Bx, 0)
+            n_keep = conv.L_cache - 1
+            if state0 is None:                        # first conv call had an empty window
+                state0 = mx.zeros((Bx.shape[0], n_keep, Bx.shape[-1]), dtype=Bx.dtype)
+            padded = mx.concatenate([state0, Bx], axis=1)
+            c[0] = mx.contiguous(padded[:, -n_keep:, :])
+            li += 1
+
     @staticmethod
     def _is_trimmable(c) -> bool:
         fn = getattr(c, "is_trimmable", None)
@@ -547,7 +644,10 @@ class Target:
         args = getattr(self.model, "args", None)
         mt = getattr(args, "model_type", None) or getattr(self.model, "model_type", "?")
         layer_types = getattr(args, "layer_types", None) or []
-        windowed = (any(t not in ("full_attention", "linear_attention") for t in layer_types)
+        # "conv" = LFM2 short-conv blocks: a recurrence with its own replicated path + rollback
+        # (like linear_attention), not windowed attention, so it is allowed, not refused.
+        windowed = (any(t not in ("full_attention", "linear_attention", "conv")
+                        for t in layer_types)
                     or (getattr(args, "use_sliding_window", False)
                         and getattr(args, "sliding_window", None)))
         if windowed:

@@ -43,6 +43,8 @@ chat/code/math), the Muse row per-content best (footnoted); full tables, baselin
 | target | best measured speedup | speed (chat → best) |
 |---|---|---|
 | **Qwen3.8-27B** (8-bit, DFlash 2)[^q38] | **4.06×** math · **4.05×** code · **2.79×** chat | ~24–34 tok/s |
+| **LFM2.5-1.2B** (bf16, conv-hybrid)[^lfm2] | **3.78×** math · **3.70×** code · **2.44×** chat | **~245–380 tok/s** |
+| **LFM2.5-2.6B** (bf16, conv-hybrid)[^lfm2] | **3.37×** math · **2.39×** code · **2.11×** chat | ~93–148 tok/s |
 | **Muse-Glimmer-30B** (8-bit, dense)[^muse] | **3.27×** math · **2.50×** code · **2.22×** chat | ~18–26 tok/s |
 | **Gemma-4 12B** (8-bit) | **3.09×** math · **2.63×** chat · **2.61×** code | ~46–55 tok/s |
 | **Qwen3.6-27B** (8-bit) | **2.67×** math · **2.26×** chat · 1.96× code | ~16–22 tok/s |
@@ -438,7 +440,7 @@ mlx-dspark generate --model mlx-community/Qwen3-32B-8bit \
 
 ### Bring your own drafter — what runs and what doesn't
 
-New DSpark/DFlash drafters keep landing on HF in **three different packagings**; here is the honest
+New DSpark/DFlash drafters keep landing on HF in **several different packagings**; here is the honest
 compatibility contract (loaders refuse incompatible checkpoints with an error naming the reason, never
 a silent mis-load):
 
@@ -449,6 +451,7 @@ a silent mis-load):
 | **DFlash 2** (Inco AI: candidate selector + dynamic convs) | `incoai/Qwen3.8-27B-DFlash2` | ✅ runs via `--mode dflash --drafter`; the Qwen3.8-27B heads are measured *and* registered (auto-resolve, and `--mode auto` picks them as that target's best) |
 | **PrismML dspark GGUF** (Bonsai-27B) | `prism-ml/Ternary-Bonsai-27B-gguf` → `*-dspark-bf16.gguf` | ✅ pre-converted repacks auto-resolve (`Rahim/*-dspark`); any future GGUF-only drop runs via `--drafter gguf:<repo>/<file>.gguf` (converted locally, once) |
 | **vLLM "speculators" format** (`dspark` algorithm) | `makora-ai/gemma4-26b-a4b-dspark`, `mgoin/Qwen3-8B-speculator.dspark` | ✅ runs via `--drafter` — the config schema is translated on load (the tensor names are already DeepSpec's). Includes EAGLE-3-style **reduced draft vocabularies** (`draft_vocab_size` + a `d2t` table). Other speculators algorithms (eagle/eagle3) are refused by name. `makora-ai/gemma4-26b-a4b-dspark` (Google's 26B/4B-active MoE) measures **1.27×** on `mlx-community/gemma-4-26b-a4b-it-8bit` (`--max-draft 2 --no-lookup-drafts`: 1.38× code / 1.37× math / 1.06× chat, 46.9→59.5 tok/s) — not registered for auto-resolution while the ratio is under review |
+| **LiquidAI LFM2.5-DSpark** (`Lfm2DSparkDraftModel`, for the lfm2 / lfm2_moe conv+attention hybrid targets) | `LiquidAI/LFM2.5-2.6B-DSpark` | ✅ measured *and* registered (auto-resolves, any quant). A plain qwen3 backbone in a fifth packaging (taps nested in `dflash_config`, no `projector_type`), reusing the target's tied embed+head with interleaved rope. LFM2 is the first conv-recurrence target (a new `shortconv` capture/rollback). The 2.6B/1.2B are strong wins; the 8B-A1B MoE is a modest win at bf16 (~1.3×, net loss at 8bit — the MoE verify ceiling) |
 | **Full model with embedded drafter** | `deepseek-ai/DeepSeek-V4-Pro-DSpark` (893 GB, MLA+MoE) | ❌ different architecture & packaging — out of scope for consumer Macs |
 | **DFlash+Markov community hybrids** | `Hikari07jp/DSpark-Gemma-4-31B-draft` | ❌ hybrid head — not yet |
 
@@ -600,8 +603,10 @@ curves.
 
 | target | cap | accept len | baseline | mlx-dspark | speedup | chat / code / math |
 |---|---|---|---|---|---|---|
+| **LFM2.5-1.2B** (bf16, conv-hybrid)[^lfm2] | 7 | 5.33 | 100.7 tok/s | 332.8 tok/s | **3.30×** | 2.44× / 3.70× / 3.78× |
 | **Gemma-4 12B** | 4 | 3.95 | 17.8 tok/s | 49.4 tok/s | **2.78×** | 2.63× / 2.61× / 3.09× |
 | **Qwen3.8-27B** (8-bit, hybrid)[^community][^q38] | 7 | 4.05 | 8.3 tok/s | 22.6 tok/s | **2.72×** | 1.95× / 2.84× / 3.37× |
+| **LFM2.5-2.6B** (bf16, conv-hybrid)[^lfm2] | 6 | 3.70 | 43.9 tok/s | 115.2 tok/s | **2.62×** | 2.11× / 2.39× / 3.37× |
 | **Muse-Glimmer-30B** (8-bit, dense)[^muse] | 4 | 3.31 | 8.2 tok/s | 20.2 tok/s | **2.47×** | 1.97× / 2.45× / 2.99× |
 | **Ornith-1.0-9B** (hybrid)[^community] | 4 | 3.64 | 26.7 tok/s | 64.2 tok/s | **2.40×** | 2.21× / 2.53× / 2.48× |
 | **Qwen3.6-27B** (8-bit, hybrid)[^community][^q27] | 4 | 3.15 | 8.4 tok/s | 19.2 tok/s | **2.29×** | 2.26× / 1.96× / 2.67× |
@@ -1168,6 +1173,32 @@ are bundled.
     **cap 3 beats cap 4** — suite chat at cap 4 is a slight net loss (0.83×), which is why
     auto-cap's pick of 3 is the right default there. Like the other MoE, the ratio is bounded by
     the verify-width cost of routed experts, not the drafter.
+
+[^lfm2]: **LFM2.5** — LiquidAI's short-**conv**olution + attention hybrid (`model_type` lfm2 /
+    lfm2_moe), the project's first conv recurrence: a kernel-3 causal FIR whose 2-row state gets an
+    exact capture-and-rollback (the cheapest of the three recurrences — a pure FIR, no SSM state).
+    The DSpark drafters are plain qwen3-backbone heads (block-9) that reuse the target's tied
+    embed **and** lm_head, in a fifth checkpoint packaging (taps nested in `dflash_config`, no
+    `projector_type`). Two knobs are load-bearing and were pinned by A/B: they use **interleaved**
+    rope (`rope_is_neox_style:false` → mlx `traditional=True`; ~2× acceptance vs neox) and sample
+    the anchor slot (block-9 → ceiling 10). Measured M4 Pro, decode tok/s, greedy, lossless (fp
+    ties only): **2.6B bf16** cap 6 = 2.39× code / 3.37× math / 2.11× chat (accept 3.70, baseline
+    ~44 tok/s; per-content probe peaks higher — 2.79× code at cap 5); **1.2B bf16** cap 7 = 3.70×
+    code / 3.78× math / 2.44× chat (accept 5.33, baseline ~101 tok/s — the small target is easy to
+    draft and cheap to verify). bf16 targets are the sweet spot: mlx 0.32.1's `gemv_wide` makes the
+    wide verify widths (cap 5–7) cheap. Any quant of the target auto-resolves the drafter.
+    The **8B-A1B** (MoE `lfm2_moe`, ~1B active) is **supported and lossless with zero extra model
+    code**, and **only pays at bf16** — the registry points there. On **8-bit** it's a net loss
+    (M4 Pro, greedy: 0.90–0.97× every cap, baseline ~114 tok/s) because a ~1B-active step is too
+    cheap for the dense 327M drafter + experts-per-verify-row to beat. **bf16 flips it positive**
+    (baseline ~65 tok/s → cap 4 = **1.26×** suite: 1.44× math / 1.30× code / 1.04× chat; per-content
+    probe peaks **1.67× math**) — the costlier bf16 step amortizes the drafter, the same lever behind
+    the dense 2.6B/1.2B wins. This **confirms LiquidAI's own card** (M4 Max bf16 mean **1.18×**, only
+    1.21× even at accept 8.27 vs 3.18× on H100) — our per-token accept matches theirs (~69%), so the
+    ratio is bounded by the MoE verify curve, not the drafter. **Absolute-speed caveat:**
+    8-bit-at-baseline (~114 tok/s) still beats bf16+spec (~82), so the drafter is a win for
+    bf16-quality users, not the fastest way to run this model — which is why it's kept out of the
+    tables above. Lossless at both quants.
 
 [^community]: **Community-drafter rows.** Qwen3.6-27B runs the **8-bit** target with
     `satgeze/Qwen3.6-27B-DSpark` — a block-15 head (vs 7 everywhere else) trained against the

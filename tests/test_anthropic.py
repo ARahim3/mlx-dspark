@@ -631,6 +631,11 @@ class _FakeEngine:
     cap_controller = None
     context_window = None
     is_muse = False           # mirrors Engine.is_muse (muse_glimmer channel parsing off)
+    # Borrow the real Engine's reasoning-effort logic (pure over self.tokenizer) so the
+    # server's output_config.effort wiring (issue #25) is exercised against real behavior.
+    supports_reasoning_effort = S.Engine.supports_reasoning_effort
+    reasoning_effort_vocab = S.Engine.reasoning_effort_vocab
+    map_reasoning_effort = S.Engine.map_reasoning_effort
 
     def __init__(self, response_text="Hello world"):
         self.tokenizer = _FakeTok()

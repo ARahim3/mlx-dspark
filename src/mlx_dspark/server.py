@@ -2647,6 +2647,19 @@ def make_handler(engine: Engine, api_key: str | None):
                 # output: a reasoning model that isn't asked to think is also much faster,
                 # which is what a client disabling thinking is actually after.
                 tkw["enable_thinking"] = False
+            # Claude Code ships /effort (and --effort) in `output_config.effort`, NOT in
+            # `thinking` — values low/medium/high/xhigh (issue #25). Honor it as a per-request
+            # override of the server's reasoning_effort default. Skip it when thinking is off
+            # (effort is moot — the Qwen3.8 template nests reasoning_effort inside the
+            # enable_thinking branch anyway). map_reasoning_effort clamps to what THIS template
+            # accepts (Claude Code may send "high"; Qwen3.8 -> "medium", issue #19) and an
+            # unknown value keeps the server default rather than 400ing.
+            oc = req.get("output_config")
+            if (isinstance(oc, dict) and oc.get("effort") is not None
+                    and tkw.get("enable_thinking") is not False):
+                # unknown effort (ValueError) falls through -> the server-side default stands
+                with contextlib.suppress(ValueError):
+                    tkw["reasoning_effort"] = engine.map_reasoning_effort(oc["effort"])
             conv = normalize_tool_messages(A.convert_messages(messages, req.get("system")))
             return encode_messages(engine.tokenizer, conv, **tkw)
 

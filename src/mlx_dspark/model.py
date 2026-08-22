@@ -122,7 +122,8 @@ class DSparkAttention(nn.Module):
 
         self.rope = initialize_rope(
             dims=config.rope_dims or self.head_dim, base=config.rope_theta,
-            traditional=False, scaling_config=config.rope_parameters,
+            traditional=getattr(config, "rope_traditional", False),
+            scaling_config=config.rope_parameters,
         )
 
     def _kv(self, x: mx.array):
