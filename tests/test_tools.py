@@ -50,6 +50,58 @@ def test_no_tool_call():
     assert tcs == [] and cleaned == "just a normal answer"
 
 
+def test_lfm2_single():
+    text = 'Let me check.<|tool_call_start|>[get_weather(city="Paris", days=3, live=true)]<|tool_call_end|>'
+    tcs, cleaned = parse_tool_calls(text)
+    assert len(tcs) == 1 and tcs[0]["function"]["name"] == "get_weather"
+    # `true` is not valid Python; the model emits Python literals (`True`) — but be tolerant of
+    # either since some templates echo JSON booleans. `days`/`city` must always parse.
+    args = json.loads(tcs[0]["function"]["arguments"])
+    assert args["city"] == "Paris" and args["days"] == 3
+    assert cleaned == "Let me check."
+
+
+def test_lfm2_python_literals():
+    text = '<|tool_call_start|>[f(flag=True, none=None, ratio=0.5)]<|tool_call_end|>'
+    tcs, _ = parse_tool_calls(text)
+    assert json.loads(tcs[0]["function"]["arguments"]) == {"flag": True, "none": None, "ratio": 0.5}
+
+
+def test_lfm2_multiple_calls_in_list():
+    text = '<|tool_call_start|>[a(), b(x=1)]<|tool_call_end|>'
+    tcs, cleaned = parse_tool_calls(text)
+    assert [t["function"]["name"] for t in tcs] == ["a", "b"]
+    assert json.loads(tcs[1]["function"]["arguments"]) == {"x": 1}
+    assert cleaned == ""
+
+
+def test_lfm2_comma_inside_string():
+    # The whole point of ast over a regex: a quoted comma must not split arguments.
+    text = '<|tool_call_start|>[say(msg="hello, world", n=2)]<|tool_call_end|>'
+    tcs, _ = parse_tool_calls(text)
+    assert json.loads(tcs[0]["function"]["arguments"]) == {"msg": "hello, world", "n": 2}
+
+
+def test_lfm2_nested_collection_arg():
+    text = '<|tool_call_start|>[q(filters={"tag": "x", "ids": [1, 2]})]<|tool_call_end|>'
+    tcs, _ = parse_tool_calls(text)
+    assert json.loads(tcs[0]["function"]["arguments"]) == {"filters": {"tag": "x", "ids": [1, 2]}}
+
+
+def test_lfm2_positional_mapped_by_schema():
+    text = '<|tool_call_start|>[get_weather("Paris", 3)]<|tool_call_end|>'
+    schemas = {"get_weather": {"location": "string", "days": "integer"}}
+    tcs, _ = parse_tool_calls(text, schemas)
+    assert json.loads(tcs[0]["function"]["arguments"]) == {"location": "Paris", "days": 3}
+
+
+def test_lfm2_truncated_call_no_raise():
+    # Cut off at max_tokens mid-argument: no exception, no raw markup leaks into the text.
+    text = 'ok<|tool_call_start|>[get_weather(city="Par'
+    tcs, cleaned = parse_tool_calls(text)
+    assert tcs == [] and cleaned == "ok"
+
+
 def test_normalize_arguments_string_to_dict():
     msgs = [{"role": "assistant", "content": None,
              "tool_calls": [{"type": "function",

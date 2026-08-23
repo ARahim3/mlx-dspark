@@ -1,6 +1,6 @@
 """Tool-calling glue: translate between OpenAI ``tool_calls`` and each model's native syntax.
 
-Two output formats are parsed (detected by markers, so it doesn't matter which model is
+Five output formats are parsed (detected by markers, so it doesn't matter which model is
 loaded — it also covers any model that borrows one of these conventions):
 
   * **Hermes / JSON** (Qwen3, DeepSpec drafters' targets, many others)::
@@ -45,6 +45,16 @@ loaded — it also covers any model that borrows one of these conventions):
     when that fails (a bare unquoted string, code, file contents). No schema needed; the format
     types its own scalars. See NOTES "Muse-Glimmer-30B".
 
+  * **LFM2 / pythonic** (LiquidAI LFM2.5)::
+
+        <|tool_call_start|>[get_weather(location="Paris", days=3)]<|tool_call_end|>
+
+    A Python-style list of function calls between LFM2's ``<|tool_call_start|>`` /
+    ``<|tool_call_end|>`` tokens (both emitted as *non-special* tokens, so they survive
+    detokenization). Parsed with :mod:`ast` (not a regex — a quoted comma or a nested list/dict
+    would defeat one): each call's keyword arguments carry their own Python types, and a rare
+    positional argument is mapped to the request's tool-schema parameter order.
+
 :func:`parse_tool_calls` returns OpenAI ``tool_calls`` (``function.arguments`` serialized to a
 JSON string, per the OpenAI schema) plus the assistant text with the call blocks removed.
 :func:`normalize_tool_messages` goes the other way for inbound history: it turns an OpenAI
@@ -54,6 +64,7 @@ template (which iterates a mapping) renders prior tool calls correctly.
 
 from __future__ import annotations
 
+import ast
 import contextlib
 import json
 import re
@@ -75,6 +86,11 @@ _XML_PARAM = re.compile(r"<parameter=\s*([^>\s]+?)\s*>\n?(.*?)\n?</parameter>", 
 _ATEM = re.compile(r'<atem:invoke\b[^>]*?\bname="([^"]+)"\s*>(.*?)(?:</atem:invoke>|\Z)', re.DOTALL)
 _ATEM_PARAM = re.compile(r'<atem:parameter\b[^>]*?\bname="([^"]+)"[^>]*?>(.*?)</atem:parameter>',
                          re.DOTALL)
+# LFM2 (LiquidAI): <|tool_call_start|>[func_name(key="v", n=3)]<|tool_call_end|>. The body is a
+# Python-style call list, so it's parsed with `ast` (below), not a regex. `<|tool_call_start|>`
+# is emitted as a NON-special token (it survives detokenization), which is what makes it
+# parseable at all. The closing token is optional so a call truncated at max_tokens still parses.
+_LFM = re.compile(r"<\|tool_call_start\|>\s*(.*?)\s*(?:<\|tool_call_end\|>|\Z)", re.DOTALL)
 
 
 def _coerce(raw: str):
@@ -171,6 +187,65 @@ def _parse_atem_args(body: str) -> dict:
     return {m.group(1): _atem_value(m.group(2)) for m in _ATEM_PARAM.finditer(body)}
 
 
+def _lfm_call_name(func) -> str:
+    """Name of the called function in an LFM2 pythonic call — a bare ``Name`` (``f``) or a
+    dotted ``Attribute`` (``mod.f``, which we join back to ``mod.f``)."""
+    if isinstance(func, ast.Name):
+        return func.id
+    if isinstance(func, ast.Attribute):
+        base = _lfm_call_name(func.value)
+        return f"{base}.{func.attr}" if base else func.attr
+    return ""
+
+
+def _lfm_value(node):
+    """A pythonic-call argument node -> its Python value. ``ast.literal_eval`` covers every JSON
+    scalar/collection (str, int, float, bool, None, list, dict, tuple); anything else (a bare
+    identifier, an expression) falls back to its source text so the argument is never dropped."""
+    try:
+        return ast.literal_eval(node)
+    except (ValueError, SyntaxError, TypeError):
+        try:
+            return ast.unparse(node)
+        except Exception:  # noqa: BLE001 — a best-effort string beats losing the argument
+            return None
+
+
+def _parse_pythonic_calls(body: str, schemas: dict[str, dict[str, str]] | None = None
+                          ) -> list[tuple[str, dict]]:
+    """Parse an LFM2 tool-call body — ``[func_name(key="v", n=3), other(x=1)]`` — into
+    ``(name, args)`` pairs. Uses `ast` rather than a regex so quoted commas, nested lists/dicts
+    and mixed scalar types parse correctly. Keyword args are used by name; the rare positional
+    arg is mapped to the tool schema's parameter order when a schema is available (else dropped,
+    since OpenAI ``tool_calls`` arguments are named). A syntactically invalid body (e.g. a call
+    truncated mid-argument) yields no calls rather than raising."""
+    body = body.strip()
+    if not body:
+        return []
+    try:
+        tree = ast.parse(body, mode="eval").body
+    except SyntaxError:
+        return []
+    nodes = tree.elts if isinstance(tree, (ast.List, ast.Tuple)) else [tree]
+    out: list[tuple[str, dict]] = []
+    for node in nodes:
+        if not isinstance(node, ast.Call):
+            continue
+        name = _lfm_call_name(node.func)
+        if not name:
+            continue
+        args: dict = {}
+        params = list((schemas or {}).get(name, {}).keys())
+        for i, a in enumerate(node.args):          # positional -> schema param order
+            if i < len(params):
+                args[params[i]] = _lfm_value(a)
+        for kw in node.keywords:                   # keyword args win over positional
+            if kw.arg is not None:
+                args[kw.arg] = _lfm_value(kw.value)
+        out.append((name, args))
+    return out
+
+
 def _as_openai(name: str, args) -> dict:
     if not isinstance(args, str):
         args = json.dumps(args, ensure_ascii=False)
@@ -213,9 +288,13 @@ def parse_tool_calls(text: str, schemas: dict[str, dict[str, str]] | None = None
         cleaned = _ATEM.sub("", cleaned)
         # the invokes are wrapped in a <atem:function_calls> block; drop the now-empty wrapper
         cleaned = re.sub(r"</?atem:function_calls>\s*", "", cleaned)
+    if "<|tool_call_start|>" in cleaned:
+        for m in _LFM.finditer(cleaned):
+            calls.extend(_parse_pythonic_calls(m.group(1), schemas))
+        cleaned = _LFM.sub("", cleaned)
     # A generation cut off at max_tokens mid-call leaves an unclosed opener; everything from
     # it onward is an aborted call, not prose, so drop it rather than render raw markup.
-    for opener in ("<tool_call>", "<atem:invoke", "<atem:function_calls>"):
+    for opener in ("<tool_call>", "<atem:invoke", "<atem:function_calls>", "<|tool_call_start|>"):
         dangling = cleaned.find(opener)
         if dangling != -1:
             cleaned = cleaned[:dangling]

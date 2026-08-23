@@ -56,8 +56,9 @@ from .tools import parse_tool_calls
 # Native tool-call openers we must not stream to the client as prose. Only the *opening*
 # markers matter: once one appears, everything after it is buffered for `parse_tool_calls`.
 # muse_glimmer wraps its calls in `<atem:function_calls>` then `<atem:invoke …>`; gate on both
-# so a call is caught whichever the round boundary lands on.
-_TOOL_MARKERS = ("<tool_call>", "<|tool_call>", "<atem:function_calls>", "<atem:invoke")
+# so a call is caught whichever the round boundary lands on. `<|tool_call_start|>` is LFM2's.
+_TOOL_MARKERS = ("<tool_call>", "<|tool_call>", "<atem:function_calls>", "<atem:invoke",
+                 "<|tool_call_start|>")
 _MAX_MARKER = max(len(m) for m in _TOOL_MARKERS)
 
 # Reasoning models wrap their chain of thought in these. Anthropic carries reasoning as
