@@ -2,6 +2,18 @@
 
 All notable changes to `mlx-dspark`. Versions follow [SemVer](https://semver.org/) (pre-1.0: minor-ish features land as patch bumps).
 
+## [0.16.1] — 2026-08-23 — LFM2.5 tool-calling + thinking-off
+
+### Added
+- **LFM2 tool-call parsing** — the 5th native tool-call format the server understands. LiquidAI LFM2.5 emits `<|tool_call_start|>[func(arg="v", n=3)]<|tool_call_end|>` (a Python-style call list; both tokens are non-special, so they survive detokenization). Parsed with `ast` rather than a regex — quoted commas, nested lists/dicts and mixed scalar types all parse correctly; keyword arguments go by name and a rare positional argument is mapped to the request's tool-schema parameter order; a call truncated at `max_tokens` yields no call rather than raising. Wired into `parse_tool_calls`, so every surface gets it (OpenAI streaming + non-streaming, Anthropic / Claude Code), and `<|tool_call_start|>` is held back by the streaming tool-gate.
+- **`scripts/prefill.py`** — a small CLI to measure prompt-processing (prefill) throughput for any target (registry id / HF repo / local path): warms up, then reports median prefill tok/s (and decode tok/s as a cross-check) per prompt length.
+
+### Fixed
+- **`enable_thinking=false` now takes effect on LFM2.5-2.6B** (and any reasoning template that hard-prefills `<think>` and ignores the flag). LFM2.5-2.6B is a pure-reasoning model whose chat template always ends the prompt with `<think>` and has no `enable_thinking` variable — so "thinking off" (the `--no-thinking` / `/admin/load {"enable_thinking": false}` / app toggle) was silently a no-op and the model reasoned anyway. `encode_messages` now force-closes an open reasoning block with an empty `<think></think>` when thinking is requested off — the same mechanism Qwen3's own template uses. It is a no-op where the template already closes the block (Qwen3.8) or never opens one (LFM2.5-1.2B-Instruct, 8B-A1B). On-device verified: 2.6B returns a direct answer with no leaked tags.
+
+### Docs
+- README "Prompt processing (prefill)" table gains the three LFM2.5 rows (bf16, M4 Pro, median of 3): 1.2B ~3240 tok/s · 8B-A1B MoE ~2170 · 2.6B ~1420 — the MoE prefills faster than the dense 2.6B (prefill tracks *active* params). "Target precision" refreshed to mlx 0.32 (Gemma-4 12B 2.78×, Qwen3-4B 1.82×) and the stale "a bf16 target is not a win" corrected (bf16-native LFM2.5 are among the biggest wins via `gemv_wide`). Small-M kernel: the M5 hardware gate is now documented in both the ceiling and Tuning sections.
+
 ## [0.16.0] — 2026-08-22 — LiquidAI LFM2.5 family (conv+attention hybrid — first conv recurrence)
 
 ### Added
