@@ -4,7 +4,7 @@
 
 <p align="center">
   <b>DeepSeek's DSpark <i>and</i> z-lab's DFlash speculative decoding — native on Apple Silicon via <a href="https://github.com/ml-explore/mlx">MLX</a>.</b>
-  <br>Lossless drafters (same output, just faster) for <b>Gemma-4, Qwen3, Muse-Glimmer, Ornith-1.0, Qwen3.6, Qwen3.8, Nemotron, and Bonsai</b> targets —
+  <br>Lossless drafters (same output, just faster) for <b>Gemma-4, Qwen3, LFM2.5, Muse-Glimmer, Ornith-1.0, Qwen3.6, Qwen3.8, Nemotron, and Bonsai</b> targets —
   <br>plus any matched DSpark / DFlash checkpoint. Run them at the CLI, from Python, serve an <b>OpenAI-compatible API</b> to LM Studio / any local tool,
   <br>or drive <b>Claude Code</b> with a model on your own Mac.
 </p>
@@ -65,7 +65,7 @@ chat/code/math), the Muse row per-content best (footnoted); full tables, baselin
 > DFlash successor: a candidate path selector + dynamic convs that lift acceptance at the *same*
 > verify width). Measured paired, same session, identical width 8: **8-bit 3.63× mean** (4.06×
 > math · 4.05× code · 2.79× chat, accept 5.53) vs the DSpark head's 2.92×; **4-bit 2.30×**
-> (accept 5.14, **33.8 tok/s — the fastest decode in this project**) vs 2.01×. Chat gains the
+> (accept 5.14, **33.8 tok/s — the fastest decode among the project's 27B-class targets**) vs 2.01×. Chat gains the
 > most (+40% at 8-bit). Greedy-lossless like everything here, and prefix caching covers this
 > mode too. **No flags needed**: `--mode auto` — the default, and what the Mac app uses —
 > resolves each row's measured-best mode, which is DFlash 2 here:
@@ -547,7 +547,7 @@ and caps are this M4 Pro's — yours are derived fresh on first run):
   drafter**, 4.06× on math — `--mode auto` picks it) or `Muse-Glimmer-30B-8bit` (the strongest
   DSpark chat ratio, 2.2×+). Both ~29–40 GB resident.
 - **~24–36 GB** — `Qwen3.8-27B-4bit` (27B quality in ~18 GB at **~25–38 tok/s, the fastest
-  decode here** — DFlash 2 via `--mode auto`, no cap flag needed), `gemma-4-12B-it-8bit`
+  decode among the 27B-class targets** — DFlash 2 via `--mode auto`, no cap flag needed), `gemma-4-12B-it-8bit`
   (big ratio *and* real speed: ~46–55 tok/s), or `Qwen3.6-27B-8bit`.
 - **~16 GB** — `Ornith-1.0-9B-8bit` (2.4× at ~59–68 tok/s, the mid-size sweet spot),
   `Qwen3-8B-8bit`, or `Qwen3-4B-8bit` (~87–101 tok/s, fits ~8 GB).
@@ -727,6 +727,9 @@ Measured on an M4 Pro, ~3.2–3.7k-token prompt, median of 3, default settings:
 
 | target | prefill | a 20k-token prompt takes |
 |---|---|---|
+| **LFM2.5-1.2B** (bf16) | **3240 tok/s** | ~6 s |
+| **LFM2.5-8B-A1B** (bf16, MoE) | **2170 tok/s** | ~9 s |
+| **LFM2.5-2.6B** (bf16) | **1420 tok/s** | ~14 s |
 | **Qwen3.6-35B-A3B** (4-bit, MoE) | **960 tok/s** | ~21 s |
 | **Qwen3-4B** (8-bit) | **761 tok/s** | ~26 s |
 | **Qwen3-8B** (8-bit) | **438 tok/s** | ~46 s |
@@ -734,10 +737,12 @@ Measured on an M4 Pro, ~3.2–3.7k-token prompt, median of 3, default settings:
 | **Qwen3.8-27B** (8-bit) | **133 tok/s** | ~151 s |
 | **Qwen3.6-27B** (8-bit) | **126 tok/s** | ~159 s |
 
-The MoE tops this table despite being the largest model in it: prefill is compute-bound, and an
-A3B model does only ~3.8B parameters' worth of arithmetic per token no matter how many experts
-it stores. The same fact shows up on Qwen3.8-27B the other way: its 4-bit quant prefills at the
-same 135 tok/s as the 8-bit — weight bits change decode speed (bandwidth-bound), not prefill.
+Total model size barely predicts this ranking: prefill is compute-bound, so the small dense
+LFM2.5-1.2B leads, and both MoE rows punch far above their total-parameter weight — an A3B model
+does only ~3.8B parameters' worth of arithmetic per token, and the LFM2.5-8B-A1B only ~1B, no
+matter how many experts they store (which is why that 8B MoE prefills faster than the dense 2.6B).
+The same fact shows up on Qwen3.8-27B the other way: its 4-bit quant prefills at the same 135 tok/s
+as the 8-bit — weight bits change decode speed (bandwidth-bound), not prefill.
 
 Since 0.7.0 mlx-dspark skips the prefill logits every caller discards and dequantizes wide weights
 once instead of per output tile, which is worth **1.07–1.15×** here — **bit-identical**, no extra
@@ -901,7 +906,10 @@ NOTICE) that reads each 4/8-bit weight group once and reuses it across all rows:
 drop to ~width-5 cost (measured 1.3–1.7× per matmul, flat in width). That is what pushed
 Qwen3.8-27B-8bit to **2.72×** at a derived cap of 7 and its 4-bit sibling past 2× on code — and per
 project doctrine it is gated per shape by a one-time on-device probe, so on a machine or mlx version
-where it doesn't win, it silently stays off. The binding limiter remains acceptance
+where it doesn't win, it silently stays off — and on **M5 and newer** (`applegpu_g17`+) it is
+force-disabled outright by an architecture gate: it wins the microbench yet stalls a sustained
+generation ~105 s there, a failure the per-shape probe cannot see (`MLX_DSPARK_FORCE_SMALL_M=1`
+overrides). The binding limiter remains acceptance
 length (set by the drafter↔target match) — **not** drafter quantization (4-bit / 8-bit / bf16 give
 identical acceptance; 4-bit is simply fastest).
 
@@ -1029,17 +1037,21 @@ numbers because greedy is the strictest possible accept rule (not a bug).
 
 ### Target precision
 
-Since verify dominates, target precision is a speed/quality knob (mlx-0.31.2-era sweep — the 8-bit
-column is higher on 0.32, see [Results at a glance](#results-at-a-glance); the qualitative trade-off
-is unchanged):
+Since verify dominates, target precision is a speed/quality knob (M4 Pro, mlx 0.32, each model at its
+own measured cap — the 8-bit absolutes below are the [Results at a glance](#results-at-a-glance) rows):
 
 | target | 8-bit (default) | 4-bit |
 |---|---|---|
-| Gemma-4 12B | greedy 17.5 → spec 30 tok/s (**1.73×**) | greedy 30.6 → spec 34–38 tok/s (1.1–1.25×) |
-| Qwen3-4B    | greedy 49.8 → spec 73 tok/s (**1.45×**) | greedy 82 → spec 96–103 tok/s (1.17–1.26×) |
+| Gemma-4 12B | greedy 17.8 → spec 49.4 tok/s (**2.78×**) | **~1.45×** (faster raw tok/s, smaller ratio) |
+| Qwen3-4B    | greedy 50.9 → spec 92.4 tok/s (**1.82×**) | smaller ratio, higher raw tok/s |
 
-**8-bit** for the biggest spec benefit + best quality; **4-bit** for max absolute throughput or small RAM
-(`--model …-it-4bit`). The drafter stays 4-bit; a bf16 target is *not* a win (verify roughly doubles).
+**8-bit** gives the biggest spec ratio *and* the best quality; **4-bit** trades ratio for max absolute
+throughput and low RAM (`--model …-it-4bit`) — the 4-bit verify curve rises from a narrower width, so
+the multiplier shrinks even as raw tok/s climbs (Ornith-1.0-9B is 2.40× at 8-bit but 1.38× at 4-bit).
+The drafter stays 4-bit. A bf16 target used to be a losing trade (the narrow-width verify cliff roughly
+doubled cost), but mlx 0.32.1's `gemv_wide` removed that cliff — so **bf16-native families like LFM2.5
+are among the biggest wins here** (up to 3.30×); where a model ships an 8-bit quant, 8-bit still gives
+the best ratio.
 
 ### Tuning
 
@@ -1055,7 +1067,10 @@ is unchanged):
   read per row at verify widths 2–8; a vendored `simdgroup_matrix` kernel dequantizes each 4/8-bit
   weight group once and reuses it across rows, making widths 6–8 cost ~width-5. It is enabled per shape
   only after a one-time cached probe proves it faster *and* numerically sane **on your machine**
-  (the wide-GEMM doctrine); everything else stays on the stock kernel. `--no-small-m` forces it off
+  (the wide-GEMM doctrine); everything else stays on the stock kernel. On **M5 and newer**
+  (`applegpu_g17`+) it is force-disabled outright — it wins the probe's microbench but can stall a
+  sustained generation ~105 s, which a microbench can't detect (`MLX_DSPARK_FORCE_SMALL_M=1` bypasses
+  for an A/B). `--no-small-m` forces it off
   for A/B runs — on `generate`, `benchmark` **and (v0.12.3) `serve`**, where `/health` reports the live
   state (`small_m`) and `/admin/load` takes a per-swap `small_m` boolean. Output stays greedy-correct
   (the target verifies every token); ids can differ from the stock kernel at floating-point ties, same
