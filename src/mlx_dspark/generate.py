@@ -155,10 +155,36 @@ def encode_messages(tokenizer, messages: list[dict], add_generation_prompt: bool
             r = tokenizer.apply_chat_template(messages, add_generation_prompt=add_generation_prompt)
         ids = _ids_from_template_result(r)
         if ids is not None:
+            if add_generation_prompt and template_kwargs.get("enable_thinking") is False:
+                ids = _force_close_thinking(tokenizer, ids)
             return ids
     # No template: best-effort flat concat (rare for the instruct targets we ship).
     text = "\n".join(str(m.get("content", "")) for m in messages)
     return list(tokenizer.encode(text))
+
+
+def _force_close_thinking(tokenizer, ids: list[int]) -> list[int]:
+    """Make ``enable_thinking=False`` stick on templates that *ignore* it.
+
+    Some reasoning-model templates hard-prefill a ``<think>`` opener at the generation prompt
+    and never reference ``enable_thinking`` (LFM2.5 is the first here: its template ends every
+    prompt with ``…assistant\\n<think>``). On those, ``enable_thinking=False`` renders an *open*
+    reasoning block and the model reasons anyway. If the caller asked for no thinking but the
+    prompt still opens a block, close it with an empty ``<think></think>`` so the model answers
+    directly — the same mechanism Qwen3's own template uses when thinking is off. Templates that
+    honor the flag already leave the block closed (or emit none), so :func:`prompt_opens_thinking`
+    returns ``None`` there and this is a no-op — including Gemma-4, which prefills the whole
+    closed pair. Prompt construction only; generation and losslessness are unaffected."""
+    from .anthropic_api import prompt_opens_thinking
+
+    closer = prompt_opens_thinking(tokenizer.decode(ids[-8:]))
+    if closer is None:
+        return ids
+    try:
+        extra = tokenizer.encode(closer + "\n\n", add_special_tokens=False)
+    except TypeError:                                   # a tokenizer without the kwarg
+        extra = tokenizer.encode(closer + "\n\n")
+    return ids + list(extra)
 
 
 def encode_prompt(tokenizer, prompt: str, use_chat: bool = True) -> list[int]:

@@ -258,3 +258,76 @@ def test_prefill_plain_splits_chunks_at_marks_and_reports_positions():
     # on_mark fires with the caches holding exactly the first `pos` tokens (offset is
     # suffix-relative here: 3 and 9 of the 12)
     assert seen == [(8, 3), (14, 9)]
+
+
+# ------------------------------------------------------- enable_thinking force-close (LFM2.5)
+
+
+class _CharTemplateTok:
+    """Chat-template stub with a 1-char-per-token scheme so decode/encode round-trip.
+
+    ``suffix(enable_thinking)`` decides the generation-prompt tail; subclasses override it to
+    model each template family (LFM2.5 always opens ``<think>``; Qwen3 closes it; instruct
+    emits none)."""
+
+    chat_template = "present"
+
+    def suffix(self, enable_thinking):
+        return "<think>"                                        # LFM2.5: always opens, ignores flag
+
+    def apply_chat_template(self, messages, add_generation_prompt=True, **kw):
+        text = "u:" + messages[-1]["content"] + "\na\n"
+        if add_generation_prompt:
+            text += self.suffix(kw.get("enable_thinking"))
+        return [ord(c) for c in text]
+
+    def decode(self, ids):
+        return "".join(chr(i) for i in ids)
+
+    def encode(self, text, add_special_tokens=True):
+        return [ord(c) for c in text]
+
+
+def _decode_all(tok, ids):
+    return "".join(chr(i) for i in ids)
+
+
+def test_force_close_thinking_fires_on_open_think():
+    tok = _CharTemplateTok()
+    msgs = [{"role": "user", "content": "hi"}]
+    a = g.encode_messages(tok, msgs)                            # thinking on (default)
+    b = g.encode_messages(tok, msgs, enable_thinking=False)     # force-close
+    assert _decode_all(tok, a).endswith("<think>")             # template always opens
+    assert _decode_all(tok, b).endswith("<think></think>\n\n")  # closed by the fix
+    assert _decode_all(tok, b).count("</think>") == 1
+
+
+def test_force_close_thinking_noop_when_template_closes():
+    class _Qwen3Like(_CharTemplateTok):
+        def suffix(self, enable_thinking):
+            return "<think>\n\n</think>\n\n" if enable_thinking is False else "<think>\n"
+
+    tok = _Qwen3Like()
+    b = g.encode_messages(tok, [{"role": "user", "content": "hi"}], enable_thinking=False)
+    # template already closed the block -> the fix must NOT append a second </think>
+    assert _decode_all(tok, b).count("</think>") == 1
+
+
+def test_force_close_thinking_noop_when_no_think():
+    class _Instruct(_CharTemplateTok):
+        def suffix(self, enable_thinking):
+            return ""                                          # instruct: never opens a block
+
+    tok = _Instruct()
+    msgs = [{"role": "user", "content": "hi"}]
+    a = g.encode_messages(tok, msgs)
+    b = g.encode_messages(tok, msgs, enable_thinking=False)
+    assert a == b                                              # no-op, identical prompts
+
+
+def test_force_close_thinking_skipped_without_generation_prompt():
+    # Rendering history (add_generation_prompt=False) must never inject a closer.
+    tok = _CharTemplateTok()
+    ids = g.encode_messages(tok, [{"role": "user", "content": "hi"}],
+                            add_generation_prompt=False, enable_thinking=False)
+    assert "</think>" not in _decode_all(tok, ids)
