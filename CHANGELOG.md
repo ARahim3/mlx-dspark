@@ -2,6 +2,16 @@
 
 All notable changes to `mlx-dspark`. Versions follow [SemVer](https://semver.org/) (pre-1.0: minor-ish features land as patch bumps).
 
+## [0.17.0] — 2026-08-25 — CPU co-prefill + security hardening (#26, #27)
+
+### Security
+- **Model-supplied code is no longer executed on load (issue #26).** mlx-lm imports a checkpoint's `config.json: model_file` as Python and loads tokenizers with `trust_remote_code=True`, so a crafted repo or local path given to `/admin/load` (or `--model`) could run code as the serving user. `load_target` now scans `config.json` / `tokenizer_config.json` / processor configs (including nested `text_config`) for `model_file` / `auto_map` and refuses the checkpoint with the offending keys named; the tokenizer is loaded with `trust_remote_code=False`. Opt in per process with `--trust-remote-code` or `MLX_DSPARK_TRUST_REMOTE_CODE=1` — deliberately no per-request override. A refused hot swap of a local path is caught before the running model is released. No registry / mlx-community checkpoint carries such markers. Thanks to @cryptedx for the report.
+- **Every route but `GET /health` now requires the `--api-key` when one is set (issue #27).** The admin GET routes — `/admin/integrations` in particular, which returns agent configurations containing the key — were unauthenticated. The Mac app already authenticates all its calls. Added `SECURITY.md` with the threat model and the private reporting channel.
+
+### Added
+- **CPU co-prefill** — prefill now uses the CPU's matrix units as a second GEMM engine alongside the GPU. Above a calibrated row count, every wide quantized matmul dequantizes its weight once on the GPU (the existing wide-GEMM transient) and hands a measured fraction of its rows to MLX's CPU stream, which runs concurrently in the same thread with no copy and no new dependency. Measured on an M4 Pro with Qwen3.8-27B-4bit, 2048-token prompt: **130 → 184 tok/s prefill (1.41×; 1.32× over the previous wide-GEMM path)**, +0.4 GB peak; 8k-token prompt 1.19–1.26×. Numerics are the same fp-tie class as chunked prefill (Δlogit band identical; 64-token greedy continuation token-identical), so the CLI/server enable it and the library API leaves it off (`generate.CPU_SPLIT`). The fraction is a real optimum with a cliff, so it is measured once per machine+model (`wide_gemm.measure_cpu_split`, ~15 s, cached) rather than guessed. New: `--cpu-split FRAC` on `generate` / `serve` / `benchmark` (0 disables; unset = calibrated), `/health.cpu_split`, `/admin/load {"cpu_split": 0|fraction}`, the serve banner and benchmark header state it, and `generate` prints prefill seconds. Not yet applied to bf16 targets (`nn.Linear`) or MoE expert matmuls.
+- **Apple Neural Engine assessed and documented** (NOTES "CPU co-prefill … why the ANE lost the audition"): measured through CoreML on the 27B MLP shapes, its throughput tracks the weight format (fp16 2.3 TF → int4/LUT 8.4 TF), but no ANE-placeable format holds mlx's K-grouped affine weights exactly, the exact fp16 form needs a 34 GB copy, one program owns the ANE, and it has an fp16-accumulate floor. Not integrated.
+
 ## [0.16.1] — 2026-08-23 — LFM2.5 tool-calling + thinking-off
 
 ### Added

@@ -725,6 +725,60 @@ def _shim_gemma4_unified_processor(cls=None) -> bool:
     return True
 
 
+# Model-supplied Python is refused unless the user opts in (issue #26). mlx-lm imports a
+# checkpoint's ``config.json: model_file`` as a module, and transformers honors ``auto_map``
+# (custom tokenizer / processor / model classes) when ``trust_remote_code`` is set — which
+# mlx-lm sets by default. A crafted repo passed to ``/admin/load`` would therefore run code
+# as the serving user. Set by ``--trust-remote-code`` or ``MLX_DSPARK_TRUST_REMOTE_CODE=1``;
+# deliberately a process-wide policy with no per-request override.
+TRUST_REMOTE_CODE = os.environ.get("MLX_DSPARK_TRUST_REMOTE_CODE", "").strip() == "1"
+
+_REMOTE_CODE_FILES = ("config.json", "tokenizer_config.json", "processor_config.json",
+                      "preprocessor_config.json", "generation_config.json")
+
+
+def remote_code_markers(path: str) -> list[str]:
+    """``["config.json:model_file", "tokenizer_config.json:auto_map", …]`` — every place a
+    checkpoint asks a loader to import its own Python. Empty for every stock mlx-community /
+    registry checkpoint. Read-only; never imports anything."""
+    import json
+
+    found: list[str] = []
+    for name in _REMOTE_CODE_FILES:
+        fp = os.path.join(path, name)
+        if not os.path.isfile(fp):
+            continue
+        try:
+            with open(fp) as f:
+                cfg = json.load(f)
+        except (OSError, ValueError):
+            continue
+        if not isinstance(cfg, dict):
+            continue
+        for key in ("model_file", "auto_map"):
+            if cfg.get(key):
+                found.append(f"{name}:{key}")
+        for sub in ("text_config", "vision_config", "audio_config"):
+            inner = cfg.get(sub)
+            if isinstance(inner, dict):
+                for key in ("model_file", "auto_map"):
+                    if inner.get(key):
+                        found.append(f"{name}:{sub}.{key}")
+    return found
+
+
+def refuse_remote_code(path: str, repo_or_path: str) -> None:
+    """Raise ``ValueError`` if the checkpoint at ``path`` carries remote-code markers and
+    the process has not opted in (see :data:`TRUST_REMOTE_CODE`)."""
+    markers = remote_code_markers(path)
+    if markers and not TRUST_REMOTE_CODE:
+        raise ValueError(
+            f"{repo_or_path}: this checkpoint asks the loader to import its own Python "
+            f"({', '.join(markers)}), which would run code as this user. Refused. If you "
+            f"trust it, start with --trust-remote-code (or MLX_DSPARK_TRUST_REMOTE_CODE=1)."
+        )
+
+
 def load_target(repo_or_path: str = DEFAULT_TARGET, *, require_tap: bool = False,
                 kv_bits: int | None = None, kv_group_size: int = 64):
     """Return (Target, tokenizer). Routes text models to mlx-lm and multimodal/unified
@@ -763,10 +817,14 @@ def load_target(repo_or_path: str = DEFAULT_TARGET, *, require_tap: bool = False
             f"cannot load (mx.quantize supports 2/3/4/5/6/8).{hint}"
         )
 
+    refuse_remote_code(path, repo_or_path)
     if _route_target(cfg) == "mlx_lm":
         from mlx_lm import load as lm_load
 
-        model, tokenizer = lm_load(path)
+        # tokenizer_config overrides mlx-lm's default {"trust_remote_code": True}: even a
+        # checkpoint that slipped past the marker check gets no custom tokenizer code
+        model, tokenizer = lm_load(
+            path, tokenizer_config={"trust_remote_code": TRUST_REMOTE_CODE})
     else:
         from mlx_vlm import load as vlm_load
 

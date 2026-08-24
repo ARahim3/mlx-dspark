@@ -182,3 +182,110 @@ def test_unquantized_model_has_no_crossover():
     mx.eval(model.parameters())
     assert widest_quantized_linear(model) is None
     assert measure_crossover(model) is None      # nothing to dequantize -> path stays off
+
+
+# ------------------------------------------------------------------ CPU co-prefill split
+
+from mlx_dspark.wide_gemm import (  # noqa: E402
+    cpu_rows,
+    frac_for,
+    measure_cpu_split,
+)
+
+
+def _split_cfg(min_rows=64, **fracs):
+    return {"min_rows": min_rows, "fracs": {int(k): v for k, v in fracs.items()}}
+
+
+def test_frac_for_picks_widest_calibrated_width_not_above_rows():
+    cfg = _split_cfg(512, **{"512": 0.15, "1024": 0.2, "2048": 0.3})
+    assert frac_for(cfg, 256) == 0.0           # below min_rows: no split
+    assert frac_for(cfg, 512) == 0.15
+    assert frac_for(cfg, 1500) == 0.2
+    assert frac_for(cfg, 4096) == 0.3
+    assert frac_for(None, 4096) == 0.0
+    assert frac_for({"min_rows": 64, "fracs": {}}, 4096) == 0.0
+
+
+def test_cpu_rows_is_tile_rounded_and_never_everything():
+    assert cpu_rows(2048, 0.3) == 640          # 614.4 -> nearest 64-multiple
+    assert cpu_rows(2048, 0.3) % 64 == 0
+    assert cpu_rows(64, 0.3) == 0              # would round to 0 tiles
+    assert cpu_rows(128, 0.9) == 0             # would be everything -> no split
+
+
+def test_split_matches_plain_path_within_bf16_and_restores():
+    """The CPU rows are a different accumulation order (fp-tie class), so agreement is
+    'within bf16 rounding', not bit-identity — that is exactly why the library leaves
+    this off and the CLI turns it on, like the last-row head."""
+    mx.random.seed(3)
+    lin = _qlinear(bits=4)
+    x = mx.random.normal((ROWS, K)).astype(mx.bfloat16)
+    ref = _orig_call(lin, x)
+    with wide_matmul(0, None, cpu_split=_split_cfg(64, **{"64": 0.25})):
+        assert active()
+        y = lin(x)
+    assert not active() and nn.QuantizedLinear.__call__ is _orig_call
+    mx.eval(ref, y)
+    assert y.shape == ref.shape and y.dtype == ref.dtype
+    d = mx.abs(y.astype(mx.float32) - ref.astype(mx.float32))
+    scale = float(mx.abs(ref.astype(mx.float32)).max())
+    assert float(d.max()) <= 0.02 * scale      # a few bf16 ulps of the output scale
+    # the GPU rows (the first ones) are bit-identical to the dequant+GEMM path
+    n_cpu = cpu_rows(ROWS, 0.25)
+    wide = x @ mx.dequantize(lin["weight"], lin["scales"], lin["biases"],
+                             group_size=64, bits=4).T
+    mx.eval(wide)
+    assert float(mx.abs(y[:-n_cpu].astype(mx.float32)
+                        - wide[:-n_cpu].astype(mx.float32)).max()) == 0.0
+
+
+def test_split_respects_min_rows_and_leading_dims_and_bias():
+    lin = _qlinear(bits=8, bias=True)
+    narrow = mx.random.normal((1, 32, K)).astype(mx.bfloat16)
+    wide = mx.random.normal((2, ROWS // 2, K)).astype(mx.bfloat16)   # 256 rows over 2 dims
+    with wide_matmul(0, None, cpu_split=_split_cfg(128, **{"128": 0.25})):
+        y_narrow = lin(narrow)
+        y_wide = lin(wide)
+    mx.eval(y_narrow, y_wide)
+    assert float(mx.abs(y_narrow - _orig_call(lin, narrow)).max()) == 0.0   # untouched
+    assert y_wide.shape == (2, ROWS // 2, N)
+    ref = _orig_call(lin, wide)
+    assert float(mx.abs(y_wide.astype(mx.float32) - ref.astype(mx.float32)).max()) \
+        <= 0.02 * float(mx.abs(ref.astype(mx.float32)).max())
+
+
+def test_split_and_wide_path_coexist():
+    """Wide path for rows in [min_rows, split.min_rows), split above."""
+    lin = _qlinear(bits=8)
+    mid = mx.random.normal((ROWS, K)).astype(mx.bfloat16)
+    with wide_matmul(ROWS, None, cpu_split=_split_cfg(ROWS * 2, **{str(ROWS * 2): 0.25})):
+        y_mid = lin(mid)
+    wide = mid @ mx.dequantize(lin["weight"], lin["scales"], lin["biases"],
+                               group_size=64, bits=8).T
+    mx.eval(y_mid, wide)
+    assert float(mx.abs(y_mid.astype(mx.float32) - wide.astype(mx.float32)).max()) == 0.0
+
+
+def test_split_config_floor_and_empty_fracs_disable():
+    lin = _qlinear(bits=8)
+    with wide_matmul(0, None, cpu_split={"min_rows": 64, "fracs": {}}):
+        assert not active()                    # nothing to split with -> no-op
+    x = mx.random.normal((128, K)).astype(mx.bfloat16)
+    with wide_matmul(0, None, cpu_split=_split_cfg(1, **{"1": 0.5})):
+        y = lin(x)                             # floor raised to SAFE_MIN_ROWS (256)
+    mx.eval(y)
+    assert float(mx.abs(y - _orig_call(lin, x)).max()) == 0.0
+
+
+def test_measure_cpu_split_returns_sane_structure_or_none():
+    lin = _qlinear(out_features=1024, in_features=1024, bits=4)
+    got = measure_cpu_split(lin, widths=(256, 512), fracs=(0.2, 0.3), iters=1)
+    if got is not None:
+        assert got["min_rows"] in (256, 512)
+        assert all(0 < f < 1 for f in got["fracs"].values())
+        assert all(int(w) >= got["min_rows"] for w in got["fracs"])
+        assert all(v > 1.0 for v in got["speedup"].values())
+    class _Bare(nn.Module):
+        pass
+    assert measure_cpu_split(_Bare()) is None

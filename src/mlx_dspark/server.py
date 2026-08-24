@@ -351,6 +351,7 @@ class Engine:
         context_window: int | None = None,
         small_m: bool = False,
         sdpa_split: bool = False,
+        cpu_split: dict | None = None,
         executor: ThreadPoolExecutor | None = None,
         depth_capper=None,
     ):
@@ -383,6 +384,7 @@ class Engine:
         self.context_window = context_window               # target's trained positions, if known
         self.sdpa_split = sdpa_split                        # wide-verify SDPA split active (long-ctx)
         self.small_m = small_m                             # small-M MMA verify kernel active
+        self.cpu_split = cpu_split                         # prefill CPU co-prefill config (None = off)
         #   (i.e. the per-shape probe admitted ≥1 shape AND it wasn't forced off) — reported
         #   in /health so a client can see the knob, and so issue-#14-style A/Bs are possible
         self.warmup_enabled = False                        # set by load(); drives the `cold` flag
@@ -603,6 +605,7 @@ class Engine:
         kv_bits: int | None = None,              # quantize the target KV cache (4/8)
         context_window: int | None = None,       # override the target's own limit
         wide_gemm_min: int | None = None,        # prefill wide-GEMM: None=calibrate, 0=off, N=forced
+        cpu_split: float | None = None,          # prefill CPU co-prefill: None=calibrate, 0=off, f=forced
         small_m: bool | None = None,             # small-M MMA verify kernel: None=probe-gated
         #                                          default, False=force off (serve-side A/B)
         sdpa_split: bool | None = None,          # wide-verify SDPA split: None=probe-gated, False=off
@@ -677,9 +680,14 @@ class Engine:
             from .calibrate import apply_wide_gemm
 
             apply_wide_gemm(tgt, draft, target_repo=target_repo, min_rows=wide_gemm_min)
-            return tgt, tok, draft, ctrl, bool(smm_ids), sdpa_cfg is not None
+            # prefill CPU co-prefill (see wide_gemm.py): a measured fraction of each wide
+            # matmul's rows on the CPU stream, concurrently with the GPU. Same rails.
+            from .calibrate import apply_cpu_split
 
-        tgt, tok, draft, cap_controller, small_m_active, sdpa_split_active = \
+            split_cfg = apply_cpu_split(tgt, draft, target_repo=target_repo, frac=cpu_split)
+            return tgt, tok, draft, ctrl, bool(smm_ids), sdpa_cfg is not None, split_cfg
+
+        tgt, tok, draft, cap_controller, small_m_active, sdpa_split_active, split_cfg = \
             executor.submit(_load_models).result()
         user_pinned_cap = isinstance(max_draft_tokens, int)
         if max_draft_tokens == "auto":
@@ -769,6 +777,7 @@ class Engine:
                   context_window=window,
                   small_m=small_m_active,
                   sdpa_split=sdpa_split_active,
+                  cpu_split=split_cfg,
                   executor=executor,
                   depth_capper=depth_capper)
         eng.warmup_enabled = warmup
@@ -1829,6 +1838,7 @@ class EngineHolder:
              context_window: int | None = None,
              small_m: bool | None = None,
              sdpa_split: bool | None = None,
+             cpu_split: float | None = None,
              kv_bits: int | None = None,
              warmup: bool | None = None,
              memory_guard: bool | None = None,
@@ -1840,6 +1850,14 @@ class EngineHolder:
         with the reason if the new model can't be loaded — the caller turns that into a 4xx/5xx.
         """
         with self._swap_lock:
+            # A local path can be vetted for model-supplied Python BEFORE the running model
+            # is released (issue #26): a refused swap must not leave the server model-less.
+            # Hub repos are checked after download, inside load_target, like everything else.
+            local = os.path.expanduser(str(model))
+            if os.path.isdir(local):
+                from .load import refuse_remote_code
+
+                refuse_remote_code(local, str(model))     # ValueError -> 400, engine untouched
             self._loading = True
             self._load_phase = "loading"
             self._load_error = None
@@ -1885,6 +1903,8 @@ class EngineHolder:
                     kwargs["small_m"] = small_m
                 if sdpa_split is not None:
                     kwargs["sdpa_split"] = sdpa_split
+                if cpu_split is not None:
+                    kwargs["cpu_split"] = cpu_split       # 0 -> off, float -> forced fraction
                 if kv_bits is not None:
                     kwargs["kv_bits"] = kv_bits or None    # 0 -> full precision
                 if warmup is not None:
@@ -2088,6 +2108,12 @@ def make_handler(engine: Engine, api_key: str | None):
 
         def do_GET(self):
             route = self._route()
+            # With --api-key set, every route but /health needs the key (issue #27: the
+            # admin GET routes — /admin/integrations in particular, which returns agent
+            # configs CONTAINING the key — were unauthenticated). /health stays open so
+            # a client can probe readiness before it has a credential to send.
+            if route != "/health" and not self._authed():
+                return self._send_error(401, "invalid api key", "authentication_error")
             if route == "/health":
                 # Answers even mid-swap so a client can poll the status through a model change.
                 # "loading" and "no_model" are distinct states: a client should wait through
@@ -2137,6 +2163,10 @@ def make_handler(engine: Engine, api_key: str | None):
                     # mlx's multi-row cliff and it wasn't forced off) — pairs with serve
                     # --no-sdpa-split / the /admin/load "sdpa_split" override
                     "sdpa_split": bool(getattr(engine, "sdpa_split", False)),
+                    # prefill CPU co-prefill: the calibrated {min_rows, fracs} in force, or
+                    # null when off — pairs with serve --cpu-split / the /admin/load
+                    # "cpu_split" override (0 = off) for a prefill A/B without a restart
+                    "cpu_split": getattr(engine, "cpu_split", None),
                     # whether this load ran a warmup pass (throwaway generation to compile
                     # kernels + ramp the clock so the first real request is warm). On by
                     # default; serve --no-warmup / the /admin/load "warmup" override turn it off.
@@ -2294,6 +2324,14 @@ def make_handler(engine: Engine, api_key: str | None):
                 return self._send_error(400, "'small_m' must be a boolean (false forces the "
                                              "stock verify kernel; omit it to use the "
                                              "server's setting)")
+            cpu_split = req.get("cpu_split")
+            if cpu_split is not None and (isinstance(cpu_split, bool)
+                                          or not isinstance(cpu_split, (int, float))
+                                          or not 0 <= cpu_split < 1):
+                return self._send_error(400, "'cpu_split' must be a number in [0, 1): 0 forces "
+                                             "prefill CPU co-prefill off, a fraction pins the "
+                                             "CPU row share; omit it to use the server's "
+                                             "calibrated setting")
             sdpa_split = req.get("sdpa_split")
             if sdpa_split is not None and not isinstance(sdpa_split, bool):
                 return self._send_error(400, "'sdpa_split' must be a boolean (false forces the "
@@ -2337,7 +2375,8 @@ def make_handler(engine: Engine, api_key: str | None):
                                      lookup_drafts=lookup_drafts,
                                      confidence_threshold=confidence,
                                      context_window=context_window,
-                                     small_m=small_m, sdpa_split=sdpa_split, kv_bits=kv_bits,
+                                     small_m=small_m, sdpa_split=sdpa_split, cpu_split=cpu_split,
+                                     kv_bits=kv_bits,
                                      warmup=warmup, memory_guard=memory_guard,
                                      enable_thinking=enable_thinking,
                                      reasoning_effort=effort.lower() if effort else None)
@@ -3077,6 +3116,12 @@ def run_server(engine, *, host: str = "127.0.0.1", port: int = 8080,
               f"{'on (probe-verified shapes)' if getattr(engine, 'small_m', False) else 'off'}")
         print(f"  sdpa split (long-ctx verify): "
               f"{'on (cliff measured)' if getattr(engine, 'sdpa_split', False) else 'off'}")
+        split = getattr(engine, "cpu_split", None)
+        print("  prefill CPU co-prefill: " + (
+            f"on from M={split['min_rows']} (CPU row fraction "
+            + ", ".join(f"{k}:{v:.2f}" for k, v in sorted(split["fracs"].items(),
+                                                          key=lambda kv: int(kv[0])))
+            + ")" if split else "off"))
         if isinstance(engine, BatchEngine):
             print(f"  batching: micro-batch up to {engine.max_batch} concurrent "
                   f"({engine.mode}; serial fallback for temp>0 dspark / lone requests)")

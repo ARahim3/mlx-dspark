@@ -111,6 +111,18 @@ def cmd_generate(argv: list[str]) -> None:
                          "(mlx re-dequantizes per output tile, which is redundant at prefill "
                          "widths). Default: calibrate the crossover for this machine+model "
                          "once and cache it; 0 disables. Bit-identical, ~1.09x prefill")
+    ap.add_argument("--trust-remote-code", action="store_true",
+                    help="allow a checkpoint to ship Python the loader imports (config.json "
+                         "model_file / auto_map). Refused by default: a crafted model repo "
+                         "would run code as you. Also MLX_DSPARK_TRUST_REMOTE_CODE=1")
+    ap.add_argument("--cpu-split", type=float, default=None, metavar="FRAC",
+                    help="prefill only: hand this fraction of every wide QuantizedLinear's "
+                         "rows to the CPU stream, concurrently with the GPU (the CPU's "
+                         "matrix units are a second GEMM engine prefill never used). "
+                         "Default: measure the best fraction per width for this "
+                         "machine+model once and cache it; 0 disables. Not bit-identical "
+                         "(fp-tie class, like chunked prefill); 1.41x prefill on an M4 Pro "
+                         "with Qwen3.8-27B-4bit")
     ap.add_argument("--small-m", action=argparse.BooleanOptionalAction, default=None,
                     help="small-M MMA verify kernel: dequantize each weight group once "
                          "and reuse it across verify rows 6-8, where stock "
@@ -135,6 +147,10 @@ def cmd_generate(argv: list[str]) -> None:
     ap.add_argument("--no-chat-template", action="store_true")
     ap.add_argument("--no-stream", action="store_true")
     args = ap.parse_args(argv)
+    if args.trust_remote_code:
+        from . import load as _load
+
+        _load.TRUST_REMOTE_CODE = True
 
     try:
         mode, target_repo, drafter_repo = resolve_mode(
@@ -190,6 +206,11 @@ def cmd_generate(argv: list[str]) -> None:
     from .calibrate import apply_wide_gemm
 
     apply_wide_gemm(target, drafter, target_repo=target_repo, min_rows=args.wide_gemm_min)
+    # prefill CPU co-prefill: a measured fraction of each wide matmul's rows runs on the
+    # CPU stream concurrently with the GPU (see wide_gemm.py)
+    from .calibrate import apply_cpu_split
+
+    apply_cpu_split(target, drafter, target_repo=target_repo, frac=args.cpu_split)
     on_text = None if args.no_stream else _emit
     print("\n" + "=" * 64)
     print(f"  ▶  {label}   ·   {target_repo.split('/')[-1]}")
@@ -263,9 +284,12 @@ def cmd_generate(argv: list[str]) -> None:
         print(res.text)
 
     print("\n" + "-" * 64)
+    pre = f" · prefill {res.prefill_seconds:.2f}s" if res.prefill_seconds else ""
+    if pre and res.prompt_tokens:      # stamped by the server path; the loops don't count
+        pre += f" ({res.prompt_tokens / res.prefill_seconds:.0f} tok/s)"
     print(f"  {res.num_tokens} tokens · {res.seconds:.2f}s · "
           f"\033[1m{res.tokens_per_sec:.1f} tok/s\033[0m end-to-end · "
-          f"{res.decode_tokens_per_sec:.1f} tok/s decode{extra}")
+          f"{res.decode_tokens_per_sec:.1f} tok/s decode{pre}{extra}")
     print("-" * 64)
 
 
@@ -375,6 +399,15 @@ def cmd_serve(argv: list[str]) -> None:
     ap.add_argument("--wide-gemm-min", type=int, default=None, metavar="N",
                     help="prefill wide-GEMM crossover row count (default: calibrated once and "
                          "cached; 0 disables — see `mlx-dspark generate -h`)")
+    ap.add_argument("--trust-remote-code", action="store_true",
+                    help="allow a checkpoint to ship Python the loader imports (config.json "
+                         "model_file / auto_map). Refused by default: a crafted model repo "
+                         "would run code as you. Also MLX_DSPARK_TRUST_REMOTE_CODE=1")
+    ap.add_argument("--cpu-split", type=float, default=None, metavar="FRAC",
+                    help="prefill CPU co-prefill row fraction (default: calibrated once and "
+                         "cached; 0 disables — see `mlx-dspark generate -h`). /health "
+                         "reports the live state; /admin/load takes a per-swap "
+                         "`cpu_split` override (0 = off)")
     ap.add_argument("--small-m", action=argparse.BooleanOptionalAction, default=None,
                     help="small-M MMA verify kernel (see `mlx-dspark generate --help`). "
                          "Unset = on where the cached probe proves it faster on this machine; "
@@ -403,6 +436,10 @@ def cmd_serve(argv: list[str]) -> None:
                     help="spill the prefix cache to --prefix-cache-dir once it exceeds this many MB "
                          "of RAM (0 = never spill; requires --prefix-cache-dir)")
     args = ap.parse_args(argv)
+    if args.trust_remote_code:
+        from . import load as _load
+
+        _load.TRUST_REMOTE_CODE = True
 
     md = _parse_max_draft(args.max_draft, ap)
     if md is None or md == "auto":
@@ -437,6 +474,7 @@ def cmd_serve(argv: list[str]) -> None:
         "lookup_long_draft": args.lookup_long_draft,
         "wired_limit": args.wired_limit,
         "wide_gemm_min": args.wide_gemm_min,
+        "cpu_split": args.cpu_split,             # None = calibrated default, 0 = off
         "small_m": args.small_m,                 # None = probe-gated default, False = off
         "sdpa_split": args.sdpa_split,            # None = probe-gated default, False = off
         "warmup": args.warmup,                   # warm the kernels on load (first request fast)
@@ -646,8 +684,20 @@ def cmd_benchmark(argv: list[str]) -> None:
                     help="wide-verify SDPA split (see `mlx-dspark generate --help`). Unset = "
                          "on where the per-chip probe finds a cliff; --no-sdpa-split off. "
                          "Prints in the header.")
+    ap.add_argument("--trust-remote-code", action="store_true",
+                    help="allow a checkpoint to ship Python the loader imports (config.json "
+                         "model_file / auto_map). Refused by default: a crafted model repo "
+                         "would run code as you. Also MLX_DSPARK_TRUST_REMOTE_CODE=1")
+    ap.add_argument("--cpu-split", type=float, default=None, metavar="FRAC",
+                    help="prefill CPU co-prefill row fraction (see `mlx-dspark generate -h`). "
+                         "Unset = calibrated default; 0 forces it off for an A/B. Prints "
+                         "in the header (it moves the prefill column, not decode).")
     ap.add_argument("--json", default=None, help="also write results to this JSON file")
     args = ap.parse_args(argv)
+    if args.trust_remote_code:
+        from . import load as _load
+
+        _load.TRUST_REMOTE_CODE = True
 
     modes = [m.strip() for m in args.modes.split(",") if m.strip()]
     caps = [c.strip() for c in args.caps.split(",") if c.strip()]
@@ -675,10 +725,14 @@ def cmd_benchmark(argv: list[str]) -> None:
                 else "on where probe-verified (default)")
     sdpa_note = ("OFF (forced)" if args.sdpa_split is False
                  else "on where a cliff is measured (default)")
+    cpu_note = ("OFF (forced)" if args.cpu_split is not None and not args.cpu_split
+                else f"{args.cpu_split:.2f} (forced)" if args.cpu_split
+                else "calibrated fraction where it pays (default)")
     print(f"target: {target_repo}\n"
           f"hybrid lookup drafts: {lk_note}\n"
           f"small-M qmm kernel: {smm_note}\n"
           f"sdpa split (long-ctx verify): {sdpa_note}\n"
+          f"prefill CPU co-prefill: {cpu_note}\n"
           f"loading + warming up…")
     target, tok = load_target(
         target_repo, require_tap=any(m in ("dspark", "dflash") for m in modes))
@@ -749,6 +803,12 @@ def cmd_benchmark(argv: list[str]) -> None:
                       enabled=False if args.small_m is False else None, verbose=False)
         apply_sdpa_split(target, target_repo=target_repo,
                          enabled=False if args.sdpa_split is False else None, verbose=False)
+        # prefill paths as serve runs them (they move the prefill column only)
+        from .calibrate import apply_cpu_split, apply_wide_gemm
+
+        apply_wide_gemm(target, drafter, target_repo=target_repo, verbose=False)
+        apply_cpu_split(target, drafter, target_repo=target_repo, frac=args.cpu_split,
+                        verbose=False)
         for cap in caps:
             ctrl = None
             md: int | None = None

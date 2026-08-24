@@ -7,6 +7,10 @@ prefill->decode boundary (``mx.eval(logits); t_prefill``), so:
 
     prefill tok/s = len(prompt_ids) / result.prefill_seconds
 
+The prefill paths the CLI/server enable (wide-GEMM, CPU co-prefill) are applied the
+same way here, so the numbers match ``mlx-dspark generate``; ``--cpu-split 0`` measures
+the stock-GPU-only arm for an A/B.
+
 We feed a controlled ``prompt_ids`` of exact length (content is ~irrelevant to prefill
 throughput), warm up first (kernel compile + clock ramp otherwise land in the first
 prefill), and take the median over trials — this M4 Pro has ~14% between-trial noise.
@@ -39,6 +43,10 @@ def main() -> None:
     ap.add_argument("--trials", type=int, default=3,
                     help="repeat each length N times and report the MEDIAN (default 3; use 3+ — "
                          "between-trial noise is ~14%% on an M4 Pro)")
+    ap.add_argument("--cpu-split", type=float, default=None, metavar="FRAC",
+                    help="prefill CPU co-prefill row fraction (see `mlx-dspark generate -h`). "
+                         "Unset = the calibrated default the CLI/server use; 0 = off (the "
+                         "A/B arm); a fraction pins it.")
     ap.add_argument("--max-new-tokens", type=int, default=8,
                     help="decode length (only used to also report decode tok/s; prefill is "
                          "unaffected). Default 8.")
@@ -59,6 +67,19 @@ def main() -> None:
     t0 = time.time()
     target, tok = load_target(target_repo, require_tap=False)
     print(f"# loaded in {time.time() - t0:.1f}s")
+    # The prefill paths exactly as `mlx-dspark serve`/`generate` run them (both are process
+    # globals the library leaves off): wide-GEMM (bit-identical, calibrated crossover) and
+    # CPU co-prefill (fp-tie class, calibrated fraction; --cpu-split 0 is the stock arm).
+    from mlx_dspark.calibrate import apply_cpu_split, apply_wide_gemm
+
+    apply_wide_gemm(target, None, target_repo=target_repo, verbose=False)
+    split = apply_cpu_split(target, None, target_repo=target_repo, frac=args.cpu_split,
+                            verbose=False)
+    print("# prefill CPU co-prefill: " + (
+        f"on from M={split['min_rows']}, CPU row fraction by width "
+        + ", ".join(f"{k}:{v:.2f}" for k, v in sorted(split["fracs"].items(),
+                                                      key=lambda kv: int(kv[0])))
+        if split else "off"))
 
     # A pool of real token ids to tile into controlled-length prompts.
     pool = tok.encode("The quick brown fox jumps over the lazy dog. " * 200)

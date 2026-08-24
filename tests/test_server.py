@@ -1304,3 +1304,28 @@ def test_swap_makes_thinking_default_sticky(monkeypatch):
     assert seen[0]["enable_thinking"] is False and seen[0]["reasoning_effort"] == "low"
     assert seen[1]["enable_thinking"] is False and seen[1]["reasoning_effort"] == "low"
     assert seen[2]["enable_thinking"] is None
+
+
+# ------------------------------------------------------------------ issue #27: GET auth
+
+
+def test_get_routes_require_the_key_except_health():
+    eng = _FakeEngine()
+    httpd = ThreadingHTTPServer(("127.0.0.1", 0), S.make_handler(eng, api_key="secret"))
+    port = httpd.server_address[1]
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    base = f"http://127.0.0.1:{port}"
+    try:
+        assert _get(base, "/health")["status"] == "ok"           # readiness probe stays open
+        for path in ("/admin/integrations", "/v1/models", "/metrics", "/calibration"):
+            with pytest.raises(urllib.error.HTTPError) as e:
+                _get(base, path)
+            assert e.value.code == 401, path
+        req = urllib.request.Request(base + "/admin/integrations",
+                                     headers={"Authorization": "Bearer secret"})
+        body = json.loads(urllib.request.urlopen(req).read())
+        assert body["integrations"]                              # the key-bearing configs
+        req = urllib.request.Request(base + "/v1/models", headers={"x-api-key": "secret"})
+        assert json.loads(urllib.request.urlopen(req).read())["object"] == "list"
+    finally:
+        httpd.shutdown()

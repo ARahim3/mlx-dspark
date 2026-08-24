@@ -840,6 +840,60 @@ def apply_wide_gemm(target, drafter=None, *, target_repo: str,
     return _gen.WIDE_GEMM_MIN_ROWS
 
 
+def cpu_split_config(target, drafter=None, *, target_repo: str,
+                     cache_dir: str | None = None, verbose: bool = True) -> dict | None:
+    """The prefill CPU co-prefill configuration for this machine+model (see
+    ``wide_gemm.measure_cpu_split``): ``{"min_rows": N, "fracs": {width: frac}}`` or
+    ``None`` when handing rows to the CPU stream never pays here. Measured once (~10-20 s
+    on a 27B) and cached under the (device x mlx version x model) key — the balance
+    point between the GPU and the CPU matrix units is exactly the class of constant this
+    project refuses to hardcode (an M4 Max GPU is 2x this one's; the CPU is not)."""
+    from .wide_gemm import measure_cpu_split
+
+    key = _cache_key("cpusplit", target_repo, None)
+    entry = load_cached(key, cache_dir)
+    if entry is None:
+        if verbose:
+            print("calibrating prefill CPU co-prefill split (one-time, cached)…", flush=True)
+        got = measure_cpu_split(target.model, drafter)
+        entry = {"split": got}
+        save_cached(key, entry, cache_dir)
+        if verbose:
+            if got:
+                fr = ", ".join(f"{k}:{v:.2f}" for k, v in sorted(got["fracs"].items(),
+                                                                 key=lambda kv: int(kv[0])))
+                print(f"  prefill CPU split: on from M={got['min_rows']} "
+                      f"(CPU row fraction by width {fr})", flush=True)
+            else:
+                print("  prefill CPU split: off (no gain on this machine)", flush=True)
+    return entry.get("split")
+
+
+def apply_cpu_split(target, drafter=None, *, target_repo: str,
+                    frac: float | None = None, verbose: bool = True) -> dict | None:
+    """Turn prefill CPU co-prefill on for this process (``generate.CPU_SPLIT``) and
+    return the configuration used, or ``None`` when off.
+
+    ``frac=None`` calibrates (and caches); ``0`` disables; a float forces that CPU row
+    fraction from ``wide_gemm.SAFE_MIN_ROWS`` up (an A/B knob, not a tuned default).
+    Process-wide global rather than a library default, like the wide path: a plain
+    ``speculative_generate`` call must not silently change numerics class."""
+    from . import generate as _gen
+    from .wide_gemm import SAFE_MIN_ROWS
+
+    if frac is None:
+        _gen.CPU_SPLIT = cpu_split_config(target, drafter, target_repo=target_repo,
+                                          verbose=verbose)
+    elif not frac:
+        _gen.CPU_SPLIT = None
+    else:
+        f = float(frac)
+        if not 0.0 < f < 1.0:
+            raise ValueError(f"cpu split fraction must be in (0, 1), got {frac!r}")
+        _gen.CPU_SPLIT = {"min_rows": SAFE_MIN_ROWS, "fracs": {SAFE_MIN_ROWS: f}}
+    return _gen.CPU_SPLIT
+
+
 def _gpu_gen() -> int | None:
     """Apple GPU generation from ``mx.device_info()['architecture']`` ('applegpu_g16s' -> 16),
     or ``None`` if it can't be read. M1=g13, M2=g14, M3=g15, M4=g16, M5=g17."""

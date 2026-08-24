@@ -202,6 +202,9 @@ mlx-dspark serve --model mlx-community/Qwen3-8B-8bit        # → http://127.0.0
 #                   admits the next one mid-flight)
 #   --kv-bits 8     quantized KV cache (long-context bandwidth saver)
 #   --mode auto|dspark|dflash|lookup|baseline   ·   --no-thinking   ·   --api-key KEY
+#   --cpu-split 0   turn off CPU co-prefill (default: a calibrated share of each wide prefill
+#                   matmul runs on the CPU's matrix units alongside the GPU — ~1.3–1.4× prefill)
+#   --trust-remote-code   allow a checkpoint's own Python to be imported (refused by default)
 #   --reasoning-effort low|medium|xhigh   default reasoning depth on models that support it
 #                   (Qwen3.8-class; /health reports support, requests can override)
 #   --no-model      start instantly with nothing loaded; POST /admin/load loads later,
@@ -252,6 +255,16 @@ batched forward for ~2.5× aggregate throughput (see [Concurrent throughput](#co
 **prefix caching** (on by default) reuses the conversation prefix so multi-turn chat and agents don't
 re-prefill each turn — measured on an ~8k-token context: first token in ~62 s cold vs **0.2–1 s** on
 cached turns, hybrid targets included (see [Prefix caching](#prefix-caching)).
+
+### Security
+
+`mlx-dspark serve` is a local, single-user server. It binds `127.0.0.1` by default; if you expose
+it further, use `--api-key` — then **every route except `GET /health` requires the key**
+(`Authorization: Bearer …` or `x-api-key`). A checkpoint that ships its own Python
+(`config.json: model_file`, `auto_map` custom classes) is **refused by default**, because
+mlx-lm/transformers would otherwise import and run it; `--trust-remote-code` (or
+`MLX_DSPARK_TRUST_REMOTE_CODE=1`) opts the whole process in, and there is no per-request
+override on `/admin/load`. See [SECURITY.md](SECURITY.md) for the threat model and how to report.
 
 ### Use it from Claude Code
 
@@ -723,35 +736,51 @@ of your wall clock is **prefill**: reading the prompt. For a chat message that i
 pasted file, a long conversation, or an agent (Claude Code sends **~18–26k tokens every request**) it
 is most of the time you wait.
 
-Measured on an M4 Pro, ~3.2–3.7k-token prompt, median of 3, default settings:
+Measured on an M4 Pro, median of 3, default settings. Since the **CPU co-prefill** pass
+(unreleased) the CLI/server also run a calibrated share of every wide matmul on the CPU's matrix
+units, concurrently with the GPU — the "before → after" pairs below are the same process with it
+forced off (`--cpu-split 0`) vs on, 2048-token prompt (the ratio holds at 4096):
 
-| target | prefill | a 20k-token prompt takes |
-|---|---|---|
-| **LFM2.5-1.2B** (bf16) | **3240 tok/s** | ~6 s |
-| **LFM2.5-8B-A1B** (bf16, MoE) | **2170 tok/s** | ~9 s |
-| **LFM2.5-2.6B** (bf16) | **1420 tok/s** | ~14 s |
-| **Qwen3.6-35B-A3B** (4-bit, MoE) | **960 tok/s** | ~21 s |
-| **Qwen3-4B** (8-bit) | **761 tok/s** | ~26 s |
-| **Qwen3-8B** (8-bit) | **438 tok/s** | ~46 s |
-| **Gemma-4 12B** (8-bit) | **264 tok/s** | ~76 s |
-| **Qwen3.8-27B** (8-bit) | **133 tok/s** | ~151 s |
-| **Qwen3.6-27B** (8-bit) | **126 tok/s** | ~159 s |
+| target | prefill | with CPU co-prefill | a 20k-token prompt takes |
+|---|---|---|---|
+| **LFM2.5-1.2B** (bf16) | **3240 tok/s** | — (bf16 `nn.Linear` not yet split) | ~6 s |
+| **LFM2.5-8B-A1B** (bf16, MoE) | **2170 tok/s** | — | ~9 s |
+| **LFM2.5-2.6B** (bf16) | **1420 tok/s** | — | ~14 s |
+| **Qwen3-4B** (8-bit) | 886 tok/s | **1141 tok/s** (1.29×) | ~18 s |
+| **Qwen3.6-35B-A3B** (4-bit, MoE) | **960 tok/s** | — (experts are `gather_qmm`, not split) | ~21 s |
+| **Qwen3-8B** (8-bit) | 488 tok/s | **636 tok/s** (1.30×) | ~31 s |
+| **Gemma-4 12B** (8-bit) | 293 tok/s | **381 tok/s** (1.30×) | ~52 s |
+| **Qwen3.8-27B** (8-bit) | 138 tok/s | **182 tok/s** (1.31×) | ~110 s |
+| **Qwen3.8-27B** (4-bit) | 130 tok/s | **184 tok/s** (1.41×) | ~109 s |
+| **Qwen3.6-27B** (8-bit) | **126 tok/s** | not re-measured | ~159 s |
 
 Total model size barely predicts this ranking: prefill is compute-bound, so the small dense
 LFM2.5-1.2B leads, and both MoE rows punch far above their total-parameter weight — an A3B model
 does only ~3.8B parameters' worth of arithmetic per token, and the LFM2.5-8B-A1B only ~1B, no
 matter how many experts they store (which is why that 8B MoE prefills faster than the dense 2.6B).
-The same fact shows up on Qwen3.8-27B the other way: its 4-bit quant prefills at the same 135 tok/s
+The same fact shows up on Qwen3.8-27B the other way: its 4-bit quant prefills at the same rate
 as the 8-bit — weight bits change decode speed (bandwidth-bound), not prefill.
 
 Since 0.7.0 mlx-dspark skips the prefill logits every caller discards and dequantizes wide weights
-once instead of per output tile, which is worth **1.07–1.15×** here — **bit-identical**, no extra
-peak RAM, on every target and both model routes. The one exception is that MoE row, where it is
-worth only **1.035×** (928 → 960 tok/s): the optimization hooks `nn.QuantizedLinear`, and an MoE
-keeps most of its weight in `SwitchLinear` experts that it never sees. Extending it to the
-gather path is open work. Prefill runs at ~85% of this machine's measured
-bf16 GEMM peak (and so does attention), so that is close to all there is to take: the remaining
-lever is not prefilling at all, which is what [prefix caching](#prefix-caching) does.
+once instead of per output tile, which is worth **1.07–1.15×** — **bit-identical**, no extra
+peak RAM, on every target and both model routes (only **1.035×** on the MoE row, whose
+`SwitchLinear` experts the `nn.QuantizedLinear` hook never sees). With that the GPU runs prefill at
+~85% of this machine's measured bf16 GEMM peak (and so does attention), so a faster prefill needs a
+*second engine*. **CPU co-prefill** is that engine: above a measured row count each wide quantized
+matmul dequantizes its weight once on the GPU and hands a calibrated fraction of its rows (~0.3
+on this M4 Pro) to MLX's CPU stream, which runs on the CPU's matrix units at ~3 TFLOPS *while the
+GPU does the rest* — same arrays, no copy, no new dependency, no second thread. That is the
+**1.29–1.41×** column above, +0.4 GB peak RAM. It is not bit-identical (the CPU rows accumulate in
+a different order — the same fp-tie class as chunked prefill, and a 64-token greedy continuation
+came out token-identical), so the CLI and server turn it on and the library API leaves it off;
+`--cpu-split 0` disables it, `/health.cpu_split` shows the calibrated setting, and the fraction
+is measured once per machine+model because it is an optimum with a cliff, not a knob (0.45 is
+already slower than 0.30). Nothing to configure: the first load of each model after upgrading
+spends ~15 s calibrating (cached from then on, printed in the serve banner), and every mode —
+including the default `auto` and the Mac app — gets it. The Apple Neural Engine was measured for the same job and does not
+fit: its fast weight formats can't hold mlx's group-quantized weights exactly, and the exact fp16
+form is a 34 GB copy of a 27B's MLP — see NOTES "CPU co-prefill". The remaining lever is still not
+prefilling at all, which is what [prefix caching](#prefix-caching) does.
 
 That makes the table's "20k-token prompt" column a **first-request cost, not a per-request one**:
 in multi-turn chat or an agent loop, every turn after the first reuses the cached prefix and

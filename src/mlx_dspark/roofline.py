@@ -167,8 +167,11 @@ def swap_usage() -> dict:
 def system_memory() -> dict:
     """One cheap snapshot (a handful of sysctls, microseconds) of what the OS sees.
 
-    ``free_percent`` is ``kern.memorystatus_level`` — macOS's own "memory level" (100 = all
-    free); ``wired_limit_mb`` is the sysctl a user may have raised (0/None = default)."""
+    ``free_percent`` is ``kern.memorystatus_level`` — macOS's own "memory level": the share
+    of RAM it could reclaim *without swapping* (free + inactive/file-cache pages), the number
+    its pressure verdict keys off. Not the inverse of Activity Monitor's "Used" (app + wired +
+    compressed), so it reads higher than ``100 − used%``. ``wired_limit_mb`` is the sysctl a
+    user may have raised (0/None = default)."""
     swap = swap_usage()
     wired = _sysctl_int("iogpu.wired_limit_mb")
     return {

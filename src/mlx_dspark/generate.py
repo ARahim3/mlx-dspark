@@ -954,6 +954,12 @@ WIDE_GEMM_MIN_ROWS = None  # Rows from which QuantizedLinear switches to dequant
 # wide_gemm.measure_crossover(), cached to disk like every other tuned width here.
 WIDE_GEMM_SHAPES = None    # allowlist of weight shapes verified bit-identical at that
 # width (None = all eligible). Set together with WIDE_GEMM_MIN_ROWS.
+CPU_SPLIT = None           # prefill CPU co-prefill: {"min_rows": N, "fracs": {width: frac}}
+# hands that fraction of each wide QuantizedLinear's rows to the CPU stream, concurrently
+# with the GPU (see wide_gemm.py). None disables — library default, since the split is
+# fp-tie class (like the last-row head) and its fraction is a measured constant; the
+# CLI/server set it from calibrate.apply_cpu_split (cached). M4 Pro / Qwen3.8-27B-4bit:
+# 1.41x prefill at a 0.3 fraction, greedy continuation token-identical.
 
 
 def _cache_arrays(cache) -> list:
@@ -982,7 +988,7 @@ def _prefill_plain(target, ids: list[int], cache, chunk: int | None = None,
     stops = _mark_stops(marks, base, len(ids))
     logits = None
     many = len(ids) > chunk or bool(stops)
-    with wide_matmul(WIDE_GEMM_MIN_ROWS, WIDE_GEMM_SHAPES):
+    with wide_matmul(WIDE_GEMM_MIN_ROWS, WIDE_GEMM_SHAPES, CPU_SPLIT):
         i = 0
         while i < len(ids):
             end = min(i + chunk, len(ids))
@@ -1014,7 +1020,7 @@ def _prefill_tapped(target, ids: list[int], cache, tap, drafter=None, ctx_caches
     parts = []
     pos = ctx_offset
     many = len(ids) > chunk or bool(stops)
-    with wide_matmul(WIDE_GEMM_MIN_ROWS, WIDE_GEMM_SHAPES):
+    with wide_matmul(WIDE_GEMM_MIN_ROWS, WIDE_GEMM_SHAPES, CPU_SPLIT):
         i = 0
         while i < len(ids):
             end = min(i + chunk, len(ids))
