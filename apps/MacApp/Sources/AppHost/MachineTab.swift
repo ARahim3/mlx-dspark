@@ -187,8 +187,13 @@ struct MemoryCard: View {
                         + (ByteFormat.gb(alloc.peakBytes).map { " (peak \($0))" } ?? ""))
                 }
                 if let total = ByteFormat.gb(mem.totalBytes, digits: 0) {
+                    // `free_percent` is kern.memorystatus_level — the share macOS could
+                    // reclaim WITHOUT swapping (free + inactive/file-cache pages), which is
+                    // what its pressure verdict keys off. It is NOT the inverse of Activity
+                    // Monitor's "Used" (that counts app + wired + compressed), so it reads
+                    // higher than "100 − used%". Label it as what it is.
                     row("Unified memory", total
-                        + (mem.freePercent.map { " · \($0)% free by macOS's measure" } ?? ""))
+                        + (mem.freePercent.map { " · \($0)% reclaimable without swapping (macOS memory level)" } ?? ""))
                 }
                 if let pressure = mem.pressure {
                     HStack(alignment: .firstTextBaseline) {
