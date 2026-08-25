@@ -2864,6 +2864,10 @@ def make_handler(engine: Engine, api_key: str | None):
                 "prompt_tokens": len(prompt_ids),
                 "completion_tokens": gen_tokens,
                 "total_tokens": len(prompt_ids) + gen_tokens,
+                # OpenAI's shape for prefix-cache reuse (PR #9, @joeOGsan): clients measure
+                # cache-hit rate from this field. n-best rows share one prefix lookup, so the
+                # reuse is the same for every row — report it once rather than summed n times.
+                "prompt_tokens_details": {"cached_tokens": int(res_list[0].reused_tokens)},
             }
             choices = []
             for i, res in enumerate(res_list):
@@ -2964,6 +2968,7 @@ def make_handler(engine: Engine, api_key: str | None):
                     "prompt_tokens": len(prompt_ids),
                     "completion_tokens": res.num_tokens,
                     "total_tokens": len(prompt_ids) + res.num_tokens,
+                    "prompt_tokens_details": {"cached_tokens": int(res.reused_tokens)},
                 }
             final["x_mlx_dspark"] = engine.spec_info(res)
             self._sse(final)
