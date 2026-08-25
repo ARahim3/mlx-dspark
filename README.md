@@ -439,6 +439,10 @@ direction — using mlx-dspark as an engine *inside* LM Studio's chat window —
 (LM Studio only runs its own bundled engines), but the server speaks the standard OpenAI API,
 so any client that takes a custom OpenAI endpoint can point at it.
 
+**Serving other devices?** `mlx-dspark serve --host 0.0.0.0 --api-key <key>` listens on every
+interface; with a key set, every route needs `Authorization: Bearer <key>` (or `x-api-key`).
+The Mac app has the same two switches under Settings → Local server.
+
 **Keep models somewhere else?** (an external drive, `~/models`, a NAS…) Point
 `MLX_DSPARK_MODEL_DIRS` at those folders (`:`-separated) and they're searched before anything
 is downloaded — as `publisher/model` trees, `publisher_model` dirs, or bare `model` dirs

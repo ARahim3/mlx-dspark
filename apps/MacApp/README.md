@@ -9,9 +9,10 @@ terminal user would run.
 > Lab (Race with lossless verdict, Live acceptance decay, this Mac's cost curves, and **This
 > Mac** — measured bandwidth, plain-decode ceiling, roofline verdict, memory pressure), Models
 > (measured pairs with speedups and per-machine ceilings, anything on disk, any HF repo, hot
-> swap via `/admin/load`), Agents (per-client config + round-trip test), Settings (decoding
-> controls, fixed engine port), engine-warning banners, menu bar with live rate/memory/accept
-> ribbon.
+> swap via `/admin/load`, your own model folders), Agents (per-client config + round-trip
+> test), Settings (decoding controls, fixed engine port, serve on the local network + API
+> key, model folders), an "Update available" button with in-place engine updates,
+> engine-warning banners, menu bar with live rate/memory/accept ribbon.
 >
 > **Engine version:** the bootstrapper installs the **latest PyPI release** at launch (no
 > pin; it upgrades in place when a newer release exists, and offline launches keep the
