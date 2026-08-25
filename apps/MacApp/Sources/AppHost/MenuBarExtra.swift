@@ -95,6 +95,16 @@ struct MenuBarPanel: View {
                     .font(.caption)
                     .foregroundStyle(Theme.spark)
             }
+            if let engine = model.engineUpdateAvailable {
+                HStack(spacing: 6) {
+                    Label("Engine \(engine) available", systemImage: "arrow.triangle.2.circlepath")
+                        .font(.caption).foregroundStyle(Theme.spark)
+                    Button(model.engineUpdating ? "Updating…" : "Update now") {
+                        Task { await model.applyEngineUpdateNow() }
+                    }
+                    .buttonStyle(.link).font(.caption).disabled(model.engineUpdating)
+                }
+            }
 
             Divider()
 

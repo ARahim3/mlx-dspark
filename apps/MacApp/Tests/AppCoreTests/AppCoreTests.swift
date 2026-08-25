@@ -27,6 +27,42 @@ struct LineBufferTests {
     }
 }
 
+@Suite("Model folders → engine environment")
+struct ModelDirsTests {
+    @Test func joinsExpandsAndDedupes() {
+        let config = ServerConfig(modelDirs: [" ~/models ", "/Volumes/SSD/mlx", "", "/Volumes/SSD/mlx"])
+        let home = NSHomeDirectory()
+        #expect(config.modelDirsEnvironmentValue == "\(home)/models:/Volumes/SSD/mlx")
+        #expect(ServerConfig.modelDirsEnvironmentKey == "MLX_DSPARK_MODEL_DIRS")
+    }
+
+    @Test func emptyMeansLeaveTheVariableAlone() {
+        #expect(ServerConfig().modelDirsEnvironmentValue == nil)
+        #expect(ServerConfig(modelDirs: ["", "  "]).modelDirsEnvironmentValue == nil)
+    }
+}
+
+@Suite("LAN serving config")
+struct LANConfigTests {
+    @Test func wildcardListenerKeepsAppTrafficOnLoopback() {
+        let lan = ServerConfig(host: "0.0.0.0")
+        #expect(lan.servesLAN && lan.clientHost == "127.0.0.1")
+        let local = ServerConfig()
+        #expect(!local.servesLAN && local.clientHost == "127.0.0.1")
+    }
+
+    @Test func generatedKeysAreDistinctAndPasteable() {
+        let a = LocalNetwork.generateAPIKey(), b = LocalNetwork.generateAPIKey()
+        #expect(a != b && a.hasPrefix("mdk_") && a.count > 40)
+        #expect(a.allSatisfy { $0.isLetter || $0.isNumber || $0 == "-" || $0 == "_" })
+    }
+
+    @Test func freePortWorksForBothListenerModes() throws {
+        #expect(try ServerSupervisor.freePort(host: "127.0.0.1") > 0)
+        #expect(try ServerSupervisor.freePort(host: "0.0.0.0") > 0)
+    }
+}
+
 @Suite("Termination gate")
 struct TerminationGateTests {
     /// The bug that made the first app launch hang: Foundation does not call a

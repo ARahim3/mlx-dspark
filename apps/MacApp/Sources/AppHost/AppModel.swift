@@ -174,6 +174,27 @@ final class AppModel: ObservableObject {
     @Published var engineUpdateAvailable: String?
     /// An engine update is being applied right now ("Update now" in Settings).
     @Published var engineUpdating = false
+    /// A manual or scheduled update check is running (the pill/menu show a spinner).
+    @Published var updateCheckInFlight = false
+    /// When the last check finished (nil = never this session).
+    @Published var lastUpdateCheck: Date?
+    /// One-line outcome of the last *manual* check ("Up to date", "Couldn't reach …"), shown
+    /// next to the button so a click that finds nothing still visibly did something.
+    @Published var updateCheckMessage: String?
+
+    /// Anything the user can act on right now — drives the toolbar pill.
+    var hasUpdate: Bool { appUpdate != nil || engineUpdateAvailable != nil }
+
+    /// The network settings the RUNNING engine was started with (Settings shows a restart
+    /// hint while they differ from the saved preferences).
+    @Published var runningServeOnLAN = false
+    @Published var runningAPIKey: String?
+
+    /// Extra model folders the engine searches (Settings → Model folders). Takes effect when
+    /// the engine (re)starts.
+    @Published var modelDirs: [String] = Defaults.modelDirs {
+        didSet { Defaults.modelDirs = modelDirs }
+    }
 
     /// What the loading screen should say this load *is* — a first download, a hot swap, a
     /// settings reload. Without it every load claims "downloading", which reads as broken
@@ -265,15 +286,6 @@ final class AppModel: ObservableObject {
         phase = .settingUp
         errorMessage = nil
 
-        // Non-blocking: a release note in Settings/menu bar, never a launch dependency.
-        if AppIdentity.appVersion != "dev" {
-            Task { [weak self] in
-                if let update = await AppUpdate.check(current: AppIdentity.appVersion) {
-                    self?.appUpdate = update
-                }
-            }
-        }
-
         let bootstrapper = RuntimeBootstrapper(logStore: logStore)
         self.bootstrapper = bootstrapper
 
@@ -287,14 +299,12 @@ final class AppModel: ObservableObject {
         }
         engineURL = engine
 
-        // Engine updates are discovered here, off the launch path, and applied by the next
-        // launch's in-place upgrade — the old blocking launch-time PyPI check made every
-        // cached start look like an install.
-        Task { [weak self] in
-            if let newer = await bootstrapper.checkForEngineUpdate() {
-                await MainActor.run { self?.engineUpdateAvailable = newer }
-            }
-        }
+        // Updates (app + engine) are discovered here, off the launch path, and re-checked
+        // every few hours while the app runs — it typically stays up for days serving an
+        // agent, so a launch-only check would miss most releases. The engine update is
+        // applied by the next launch's in-place upgrade or by "Update now"; the old blocking
+        // launch-time PyPI check made every cached start look like an install.
+        startUpdateChecks()
 
         // First run: choose a model before loading anything heavy. The machine check is
         // model-free, so it runs without a server and without committing to a multi-GB
@@ -345,9 +355,69 @@ final class AppModel: ObservableObject {
         }
     }
 
+    // MARK: - Updates
+
+    private var updateCheckTask: Task<Void, Never>?
+    /// Re-check cadence while the app is running.
+    static let updateCheckInterval: TimeInterval = 6 * 60 * 60
+
+    private func startUpdateChecks() {
+        updateCheckTask?.cancel()
+        updateCheckTask = Task { [weak self] in
+            await self?.checkForUpdates(manual: false)
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: UInt64(Self.updateCheckInterval * 1e9))
+                if Task.isCancelled { break }
+                await self?.checkForUpdates(manual: false)
+            }
+        }
+    }
+
+    /// Check GitHub (app) and PyPI (engine) for newer releases. `manual` = triggered by the
+    /// user (menu / Settings / pill), which also reports a "nothing new" outcome; the
+    /// scheduled check stays silent unless it finds something.
+    func checkForUpdates(manual: Bool) async {
+        guard !updateCheckInFlight else { return }
+        updateCheckInFlight = true
+        if manual { updateCheckMessage = nil }
+        defer {
+            updateCheckInFlight = false
+            lastUpdateCheck = Date()
+        }
+        var reachable = false
+        if AppIdentity.appVersion != "dev" {
+            // `check` returns nil for "up to date" AND "offline"; a cheap reachability probe
+            // separates the two so a manual click can say which.
+            if let update = await AppUpdate.check(current: AppIdentity.appVersion) {
+                appUpdate = update
+                reachable = true
+            } else if await AppUpdate.reachable() {
+                reachable = true
+            }
+        }
+        if let bootstrapper, !engineUpdating {
+            if let newer = await bootstrapper.checkForEngineUpdate() {
+                engineUpdateAvailable = newer
+                reachable = true
+            } else if RuntimeBootstrapper.pendingEngineUpdate == nil {
+                // A previously seen update that has since been applied (or was never real).
+                engineUpdateAvailable = nil
+            }
+        }
+        if manual {
+            if hasUpdate {
+                updateCheckMessage = nil
+            } else if reachable || AppIdentity.appVersion == "dev" {
+                updateCheckMessage = "Up to date"
+            } else {
+                updateCheckMessage = "Couldn't reach GitHub / PyPI — offline?"
+            }
+        }
+    }
+
     /// Stop the engine process and bring it back with the current settings — how a changed
-    /// fixed port (Settings → Local server) takes effect without relaunching the app. The
-    /// model reloads through the same path a launch uses.
+    /// fixed port (Settings → Local server) or model folder takes effect without relaunching
+    /// the app. The model reloads through the same path a launch uses.
     func restartEngine() async {
         await supervisor?.stop()
         await startServer(model: model)
@@ -385,8 +455,10 @@ final class AppModel: ObservableObject {
         do {
             let port = try await supervisor.start(
                 config: ServerConfig(model: nil, mode: "auto", maxDraft: "auto",
+                                     host: Defaults.engineHost, apiKey: Defaults.effectiveAPIKey,
                                      port: Defaults.enginePort,
-                                     portIsExplicit: Defaults.enginePortIsExplicit))
+                                     portIsExplicit: Defaults.enginePortIsExplicit,
+                                     modelDirs: modelDirs))
             return await connect(port: port)
         } catch {
             // An engine below this app's floor doesn't know `--no-model`, and an offline
@@ -399,8 +471,10 @@ final class AppModel: ObservableObject {
             do {
                 let port = try await supervisor.start(
                     config: ServerConfig(model: model, mode: "auto", maxDraft: "auto",
+                                         host: Defaults.engineHost, apiKey: Defaults.effectiveAPIKey,
                                          port: Defaults.enginePort,
-                                         portIsExplicit: Defaults.enginePortIsExplicit))
+                                         portIsExplicit: Defaults.enginePortIsExplicit,
+                                         modelDirs: modelDirs))
                 return await connect(port: port)
             } catch {
                 fail(error)
@@ -410,7 +484,12 @@ final class AppModel: ObservableObject {
     }
 
     private func connect(port: Int) async -> Bool {
-        let client = APIClient(baseURL: URL(string: "http://127.0.0.1:\(port)")!)
+        runningServeOnLAN = Defaults.serveOnLAN
+        runningAPIKey = Defaults.effectiveAPIKey
+        // The app's own traffic stays on loopback even when serving the LAN, and carries the
+        // key when one is required — every screen (chat, race, agents) goes through this client.
+        let client = APIClient(baseURL: URL(string: "http://127.0.0.1:\(port)")!,
+                               apiKey: Defaults.effectiveAPIKey)
         self.apiClient = client
         currentHealth = try? await client.health()
         return true
@@ -1119,6 +1198,40 @@ enum Defaults {
     /// True when the user chose the port (any value, including 0 = automatic) — a taken
     /// user-chosen port is a hard error naming the fix; the app default falls back.
     static var enginePortIsExplicit: Bool { store.object(forKey: "enginePort") != nil }
+
+    /// Serve on the local network (`--host 0.0.0.0`) instead of loopback only.
+    static var serveOnLAN: Bool {
+        get { store.bool(forKey: "serveOnLAN") }
+        set { store.set(newValue, forKey: "serveOnLAN") }
+    }
+
+    /// Require `Authorization: Bearer <apiKey>` on every request (`--api-key`). Stored in
+    /// the app's preferences — readable by this user only, same trust level as the engine's
+    /// own command line where the key is visible in `ps` anyway.
+    static var apiKeyEnabled: Bool {
+        get { store.bool(forKey: "apiKeyEnabled") }
+        set { store.set(newValue, forKey: "apiKeyEnabled") }
+    }
+
+    static var apiKey: String {
+        get { store.string(forKey: "apiKey") ?? "" }
+        set { store.set(newValue, forKey: "apiKey") }
+    }
+
+    /// The key the engine is started with: nil unless enabled AND non-empty.
+    static var effectiveAPIKey: String? {
+        let key = apiKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        return apiKeyEnabled && !key.isEmpty ? key : nil
+    }
+
+    static var engineHost: String { serveOnLAN ? "0.0.0.0" : "127.0.0.1" }
+
+    /// Extra folders the engine searches for MLX checkpoints (Settings → Model folders);
+    /// passed to the engine as `MLX_DSPARK_MODEL_DIRS`.
+    static var modelDirs: [String] {
+        get { store.stringArray(forKey: "modelDirs") ?? [] }
+        set { store.set(newValue, forKey: "modelDirs") }
+    }
 
     static var currentSession: UUID? {
         get { store.string(forKey: "currentSession").flatMap(UUID.init(uuidString:)) }

@@ -47,7 +47,9 @@ struct ModelsScreen: View {
                 // They used to be disabled outright — which left a fresh machine with every
                 // pair greyed out and no way to download from this screen at all (issue #15).
                 ForEach(model.models) { row in
-                    ModelRowView(row: row, isLoaded: row.target == model.model,
+                    // `model.model` is the SELECTED target, set before a load succeeds — on
+                    // its own it left a "loaded" badge on a model whose load failed (PR #18).
+                    ModelRowView(row: row, isLoaded: model.isServerReady && row.target == model.model,
                                  canLoad: row.target != model.model && !model.isModelLoading) {
                         Task { await model.switchModel(to: row.target) }
                     }
@@ -64,7 +66,7 @@ struct ModelsScreen: View {
                                      + "unpaired models run with lookup speculation.")
                     ForEach(onDisk) { installed in
                         InstalledRowView(installed: installed,
-                                         isLoaded: installed.repo == model.model)
+                                         isLoaded: model.isServerReady && installed.repo == model.model)
                     }
                 }
 
@@ -354,8 +356,8 @@ struct InstalledRowView: View {
                     } else {
                         Text("lookup speculation").font(.caption).foregroundStyle(.secondary)
                     }
-                    if installed.isLMStudio {
-                        Text("from LM Studio").font(.caption).foregroundStyle(.secondary)
+                    if let label = installed.sourceLabel {
+                        Text(label).font(.caption).foregroundStyle(.secondary)
                     }
                 }
             }
@@ -365,9 +367,9 @@ struct InstalledRowView: View {
                     .controlSize(.small)
             }
             RevealButton(path: installed.path)
-            // LM Studio's downloads are another app's files — we read them, we don't
-            // offer to delete them.
-            if !installed.isLMStudio {
+            // LM Studio's downloads and the user's own model folders are not our files —
+            // we read them, we never offer to delete them.
+            if !installed.isExternal {
                 Button {
                     confirmingDelete = true
                 } label: {

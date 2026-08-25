@@ -116,8 +116,9 @@ public struct InstalledModel: Decodable, Sendable, Identifiable {
     /// Registry pairing this repo resolves into (quant-agnostic) — nil means `--mode auto`
     /// will fall back to drafter-free lookup speculation.
     public let registryID: String?
-    /// "cache" (our download) or "lmstudio" (LM Studio's — loadable, but not ours to
-    /// delete). Optional: older engines don't report it.
+    /// "cache" (our download), "lmstudio" (LM Studio's) or "model_dirs" (the user's own
+    /// `MLX_DSPARK_MODEL_DIRS` folder, engine ≥ 0.17.1) — the latter two are loadable but not
+    /// ours to delete. Optional: older engines don't report it.
     public let source: String?
 
     public var id: String { repo }
@@ -131,6 +132,19 @@ public struct InstalledModel: Decodable, Sendable, Identifiable {
     public var shortRepo: String { repo.components(separatedBy: "/").last ?? repo }
     public var isDrafter: Bool { kind == "drafter" }
     public var isLMStudio: Bool { source == "lmstudio" }
+    /// Someone else's files (LM Studio's, or a folder the user pointed the engine at): we
+    /// read them, we never offer to delete them. Anything that isn't our own cache counts —
+    /// a source this app doesn't know yet must default to "not ours", never to "deletable".
+    public var isExternal: Bool { source != nil && source != "cache" }
+    /// Short provenance caption for an external row.
+    public var sourceLabel: String? {
+        switch source {
+        case "lmstudio": return "from LM Studio"
+        case "model_dirs": return "from your model folder"
+        case nil, "cache": return nil
+        default: return "external"
+        }
+    }
 }
 
 public struct DiskUsage: Decodable, Sendable {

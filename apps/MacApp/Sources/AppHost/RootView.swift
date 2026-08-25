@@ -60,6 +60,12 @@ struct MainWindow: View {
                 }
             }
             .toolbar {
+                // An update is the one thing worth a permanent spot in the chrome: the app
+                // runs for days serving agents, and a note buried in Settings was never seen.
+                // The pill only exists while there is something to act on.
+                if model.hasUpdate {
+                    ToolbarItem(placement: .primaryAction) { UpdatePill() }
+                }
                 // The model belongs in the chrome: hot-swapping is a headline feature, not a
                 // settings-page errand. One click from any screen.
                 ToolbarItem(placement: .primaryAction) { ModelPill() }
@@ -69,6 +75,120 @@ struct MainWindow: View {
 
     private var visibleScreens: [Screen] {
         Screen.allCases.filter { $0 != .lab || model.detail.showsLab }
+    }
+}
+
+/// "Update available" in the window chrome — visible from every screen, gone once applied.
+/// Engine updates apply in place from here; app updates hand you the brew line (installing
+/// the app is Homebrew's / the DMG's job, see `AppUpdate`).
+struct UpdatePill: View {
+    @EnvironmentObject private var model: AppModel
+    @State private var open = false
+
+    var body: some View {
+        Button {
+            open.toggle()
+        } label: {
+            HStack(spacing: 5) {
+                Image(systemName: "arrow.down.circle.fill")
+                Text(title).font(.callout.weight(.semibold)).lineLimit(1)
+            }
+            .foregroundStyle(.white)
+            .padding(.horizontal, 10).padding(.vertical, 4)
+            .background(Theme.spark, in: Capsule())
+        }
+        .buttonStyle(.plain)
+        .help("A newer release is available — click to see what and update")
+        .popover(isPresented: $open, arrowEdge: .bottom) {
+            UpdatePopover().environmentObject(model)
+        }
+    }
+
+    private var title: String {
+        switch (model.appUpdate, model.engineUpdateAvailable) {
+        case (.some, .some): return "Updates available"
+        case (.some(let app), nil): return "App v\(app.version) available"
+        case (nil, .some(let engine)): return "Engine \(engine) available"
+        case (nil, nil): return "Update available"
+        }
+    }
+}
+
+struct UpdatePopover: View {
+    @EnvironmentObject private var model: AppModel
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("Updates").font(.headline)
+            if let engine = model.engineUpdateAvailable {
+                VStack(alignment: .leading, spacing: 4) {
+                    Label("Engine \(engine)", systemImage: "arrow.triangle.2.circlepath")
+                        .font(.callout.weight(.medium))
+                    Text("Current: \(model.doctorReport?.environment.version ?? "—"). "
+                         + "Installs in place; the model reloads (about a minute).")
+                        .font(.caption).foregroundStyle(.secondary)
+                    Button(model.engineUpdating ? "Updating…" : "Update engine now") {
+                        Task { await model.applyEngineUpdateNow() }
+                    }
+                    .disabled(model.engineUpdating)
+                    .controlSize(.small)
+                }
+            }
+            if let app = model.appUpdate {
+                VStack(alignment: .leading, spacing: 4) {
+                    Label("App v\(app.version)", systemImage: "app.badge")
+                        .font(.callout.weight(.medium))
+                    Text("Current: v\(AppIdentity.appVersion). Installed by Homebrew or a "
+                         + "fresh DMG — the app can't replace itself.")
+                        .font(.caption).foregroundStyle(.secondary)
+                    HStack(spacing: 8) {
+                        Text("brew upgrade --cask mlx-dspark")
+                            .font(.caption.monospaced()).textSelection(.enabled)
+                        CopyButton(text: "brew upgrade --cask mlx-dspark")
+                        Button("Download / notes") {
+                            if let url = URL(string: app.url) { NSWorkspace.shared.open(url) }
+                        }
+                        .controlSize(.small)
+                    }
+                }
+            }
+            Divider()
+            HStack(spacing: 8) {
+                if let when = model.lastUpdateCheck {
+                    Text("Checked \(when.formatted(date: .omitted, time: .shortened))")
+                        .font(.caption).foregroundStyle(.tertiary)
+                }
+                Spacer()
+                CheckForUpdatesButton()
+            }
+        }
+        .padding(14)
+        .frame(width: 360)
+    }
+}
+
+/// "Check now" with its in-flight spinner and the one-line outcome — shared by the pill
+/// popover, Settings → About and the menu-bar panel so all three behave the same.
+struct CheckForUpdatesButton: View {
+    @EnvironmentObject private var model: AppModel
+
+    var body: some View {
+        HStack(spacing: 6) {
+            if let message = model.updateCheckMessage, !model.updateCheckInFlight {
+                Text(message).font(.caption).foregroundStyle(.secondary)
+            }
+            Button {
+                Task { await model.checkForUpdates(manual: true) }
+            } label: {
+                if model.updateCheckInFlight {
+                    HStack(spacing: 5) { ProgressView().controlSize(.mini); Text("Checking…") }
+                } else {
+                    Text("Check for updates")
+                }
+            }
+            .controlSize(.small)
+            .disabled(model.updateCheckInFlight)
+        }
     }
 }
 

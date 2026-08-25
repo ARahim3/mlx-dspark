@@ -23,6 +23,12 @@ struct MlxDsparkApp: App {
         // look cramped on first launch.
         .defaultSize(width: 1120, height: 760)
         .commands {
+            CommandGroup(after: .appInfo) {
+                Button(model.updateCheckInFlight ? "Checking for Updates…" : "Check for Updates…") {
+                    Task { await model.checkForUpdates(manual: true) }
+                }
+                .disabled(model.updateCheckInFlight)
+            }
             CommandGroup(replacing: .newItem) {
                 Button("New Chat") { model.newChat() }
                     .keyboardShortcut("n")

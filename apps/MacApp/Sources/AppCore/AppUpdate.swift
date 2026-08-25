@@ -42,6 +42,19 @@ public enum AppUpdate {
         return Available(version: newest.version, url: newest.url)
     }
 
+    /// Whether GitHub answers at all — lets a manual "Check for updates" tell "up to date"
+    /// from "offline", which `check` folds into one nil on purpose (launch must never care).
+    public static func reachable(repo: String = AppIdentity.repoSlug,
+                                 timeout: TimeInterval = 6) async -> Bool {
+        guard let url = URL(string: "https://api.github.com/repos/\(repo)") else { return false }
+        var request = URLRequest(url: url)
+        request.timeoutInterval = timeout
+        request.httpMethod = "HEAD"
+        guard let (_, response) = try? await URLSession.shared.data(for: request),
+              let code = (response as? HTTPURLResponse)?.statusCode else { return false }
+        return (200..<500).contains(code)    // 403 = rate-limited, still "reachable"
+    }
+
     /// Dotted-numeric comparison; anything unparseable compares as 0 (never blocks launch).
     static func isOlder(_ lhs: String, than rhs: String) -> Bool {
         let a = lhs.split(separator: ".").map { Int($0.prefix(while: \.isNumber)) ?? 0 }

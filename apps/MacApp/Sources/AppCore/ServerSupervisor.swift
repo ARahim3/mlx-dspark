@@ -1,5 +1,6 @@
 import Darwin
 import Foundation
+import Security
 
 public enum ServerState: Equatable, Sendable {
     case idle
@@ -23,10 +24,15 @@ public struct ServerConfig: Equatable, Sendable {
     /// An explicit port that is taken is a hard error naming the fix; the DEFAULT fixed
     /// port falls back to automatic instead — a default must never block launch.
     public var portIsExplicit: Bool
+    /// Extra folders the engine searches for MLX checkpoints before downloading anything
+    /// (Settings → Model folders). Passed as the engine's `MLX_DSPARK_MODEL_DIRS` (engine ≥
+    /// 0.17.1; older engines ignore the variable) — a GUI app is the only way most users can
+    /// set an environment variable for the engine at all.
+    public var modelDirs: [String]
 
     public init(model: String? = nil, mode: String = "auto", maxDraft: String? = "auto",
                 host: String = "127.0.0.1", apiKey: String? = nil, port: Int = 0,
-                portIsExplicit: Bool = true) {
+                portIsExplicit: Bool = true, modelDirs: [String] = []) {
         self.model = model
         self.mode = mode
         self.maxDraft = maxDraft
@@ -34,6 +40,31 @@ public struct ServerConfig: Equatable, Sendable {
         self.apiKey = apiKey
         self.port = port
         self.portIsExplicit = portIsExplicit
+        self.modelDirs = modelDirs
+    }
+
+    /// Serve on every interface (`0.0.0.0`) or loopback only.
+    public var servesLAN: Bool { host == "0.0.0.0" || host == "::" }
+
+    /// Where the APP talks to its own engine. A wildcard is a listener address, never a client
+    /// destination — the app's control traffic stays on loopback even while other devices
+    /// reach the same port over the LAN.
+    public var clientHost: String { servesLAN ? "127.0.0.1" : host }
+
+    /// The env var name the engine reads (`load.MODEL_DIRS_ENV`).
+    public static let modelDirsEnvironmentKey = "MLX_DSPARK_MODEL_DIRS"
+
+    /// `modelDirs` as the engine expects it: `:`-joined, blanks dropped, `~` expanded, order
+    /// kept, duplicates removed. Nil when there is nothing to pass (the variable is then left
+    /// alone, so a user who exported it in their shell keeps it).
+    public var modelDirsEnvironmentValue: String? {
+        var seen: [String] = []
+        for raw in modelDirs {
+            let path = (raw.trimmingCharacters(in: .whitespacesAndNewlines) as NSString)
+                .expandingTildeInPath
+            if !path.isEmpty, !seen.contains(path) { seen.append(path) }
+        }
+        return seen.isEmpty ? nil : seen.joined(separator: ":")
     }
 }
 
@@ -87,10 +118,10 @@ public actor ServerSupervisor {
             } else {
                 logStore.note("default port \(config.port) is in use — "
                               + "starting on an automatic port instead")
-                chosenPort = try Self.freePort()
+                chosenPort = try Self.freePort(host: config.host)
             }
         } else {
-            chosenPort = try Self.freePort()
+            chosenPort = try Self.freePort(host: config.host)
         }
         port = chosenPort
 
@@ -112,6 +143,9 @@ public actor ServerSupervisor {
         var env = ProcessInfo.processInfo.environment
         env["PYTHONUNBUFFERED"] = "1"        // otherwise loading progress arrives only at exit
         env.removeValue(forKey: "VIRTUAL_ENV")
+        if let dirs = config.modelDirsEnvironmentValue {
+            env[ServerConfig.modelDirsEnvironmentKey] = dirs
+        }
         proc.environment = env
 
         let outPipe = Pipe(), errPipe = Pipe()
@@ -133,7 +167,7 @@ public actor ServerSupervisor {
             Task { await self?.childExited(code: p.terminationStatus) }
         }
 
-        let client = APIClient(baseURL: URL(string: "http://\(config.host):\(chosenPort)")!,
+        let client = APIClient(baseURL: URL(string: "http://\(config.clientHost):\(chosenPort)")!,
                                apiKey: config.apiKey)
         let deadline = Date().addingTimeInterval(readyTimeout)
         while Date() < deadline {
@@ -224,7 +258,7 @@ public actor ServerSupervisor {
     /// whatever else the user runs. There is an unavoidable race between closing this socket
     /// and the child binding it; the caller retries. (A *user-chosen* fixed port is different:
     /// it's opt-in, checked with ``portIsFree(_:host:)``, and fails with a named fix.)
-    public static func freePort() throws -> Int {
+    public static func freePort(host: String = "127.0.0.1") throws -> Int {
         let fd = socket(AF_INET, SOCK_STREAM, 0)
         guard fd >= 0 else { throw ShellError.launchFailed("socket", underlying: "unavailable") }
         defer { close(fd) }
@@ -234,7 +268,8 @@ public actor ServerSupervisor {
         var addr = sockaddr_in()
         addr.sin_family = sa_family_t(AF_INET)
         addr.sin_port = 0                                  // kernel picks
-        addr.sin_addr.s_addr = inet_addr("127.0.0.1")
+        // A LAN listener must find a port free on EVERY interface, not just loopback.
+        addr.sin_addr.s_addr = (host == "0.0.0.0" || host == "::") ? INADDR_ANY : inet_addr("127.0.0.1")
         let bound = withUnsafePointer(to: &addr) {
             $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
                 Darwin.bind(fd, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
@@ -253,5 +288,52 @@ public actor ServerSupervisor {
             throw ShellError.launchFailed("getsockname", underlying: "failed")
         }
         return Int(UInt16(bigEndian: addr.sin_port))
+    }
+}
+
+
+/// The Mac's own IPv4 addresses, for showing a LAN user what base URL to type on another
+/// device. Best-effort and point-in-time (Wi-Fi joins/leaves change it); loopback and
+/// link-local excluded; `en*` (Wi-Fi/Ethernet) first, then anything else (Thunderbolt bridge,
+/// VPN tunnels — those are still reachable addresses, just less likely to be the one wanted).
+public enum LocalNetwork {
+    public struct Address: Equatable, Sendable {
+        public let interface: String
+        public let ip: String
+    }
+
+    public static func ipv4Addresses() -> [Address] {
+        var out: [Address] = []
+        var list: UnsafeMutablePointer<ifaddrs>?
+        guard getifaddrs(&list) == 0, let first = list else { return out }
+        defer { freeifaddrs(list) }
+        var cursor: UnsafeMutablePointer<ifaddrs>? = first
+        while let ifa = cursor {
+            defer { cursor = ifa.pointee.ifa_next }
+            guard let sa = ifa.pointee.ifa_addr, sa.pointee.sa_family == UInt8(AF_INET),
+                  (Int32(ifa.pointee.ifa_flags) & IFF_UP) != 0,
+                  (Int32(ifa.pointee.ifa_flags) & IFF_LOOPBACK) == 0 else { continue }
+            var host = [CChar](repeating: 0, count: Int(NI_MAXHOST))
+            guard getnameinfo(sa, socklen_t(sa.pointee.sa_len), &host, socklen_t(host.count),
+                              nil, 0, NI_NUMERICHOST) == 0 else { continue }
+            let ip = String(cString: host)
+            if ip.hasPrefix("169.254.") { continue }
+            let name = String(cString: ifa.pointee.ifa_name)
+            out.append(Address(interface: name, ip: ip))
+        }
+        return out.sorted { a, b in
+            let ea = a.interface.hasPrefix("en"), eb = b.interface.hasPrefix("en")
+            return ea != eb ? ea : a.interface < b.interface
+        }
+    }
+
+    /// A fresh API key: 32 random bytes, URL-safe base64, no padding — pasteable anywhere.
+    public static func generateAPIKey() -> String {
+        var bytes = [UInt8](repeating: 0, count: 32)
+        _ = SecRandomCopyBytes(kSecRandomDefault, bytes.count, &bytes)
+        return "mdk_" + Data(bytes).base64EncodedString()
+            .replacingOccurrences(of: "+", with: "-")
+            .replacingOccurrences(of: "/", with: "_")
+            .replacingOccurrences(of: "=", with: "")
     }
 }

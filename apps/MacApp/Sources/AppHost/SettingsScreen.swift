@@ -11,6 +11,7 @@ struct SettingsScreen: View {
                 if model.detail != .simple { DecodingCard() }
                 if let report = model.doctorReport { MachineCard(report: report) }
                 ServerCard()
+                ModelFoldersCard()
                 AboutCard()
             }
             .padding(16)
@@ -47,8 +48,8 @@ struct AboutCard: View {
                     }
                     .padding(.top, 4)
                 } else {
-                    Text("The engine stays on the latest release automatically; app updates "
-                         + "are checked at launch.")
+                    Text("The engine stays on the latest release automatically; updates are "
+                         + "checked at launch and every few hours while the app runs.")
                         .font(.caption).foregroundStyle(.secondary)
                 }
                 if let engineUpdate = model.engineUpdateAvailable {
@@ -65,6 +66,15 @@ struct AboutCard: View {
                             .font(.caption).foregroundStyle(.tertiary)
                     }
                 }
+                HStack(spacing: 8) {
+                    if let when = model.lastUpdateCheck {
+                        Text("Last checked \(when.formatted(date: .omitted, time: .shortened))")
+                            .font(.caption).foregroundStyle(.tertiary)
+                    }
+                    Spacer()
+                    CheckForUpdatesButton()
+                }
+                .padding(.top, 2)
             }
         }
     }
@@ -463,14 +473,42 @@ struct ServerCard: View {
     @State private var portText: String =
         Defaults.enginePort == 0 ? "" : String(Defaults.enginePort)
     @State private var restarting = false
+    @State private var serveOnLAN = Defaults.serveOnLAN
+    @State private var apiKeyEnabled = Defaults.apiKeyEnabled
+    @State private var apiKey = Defaults.apiKey
+    @State private var addresses = LocalNetwork.ipv4Addresses()
+
+    /// Settings differ from what the running engine was started with.
+    private var needsRestart: Bool {
+        serveOnLAN != model.runningServeOnLAN
+            || (apiKeyEnabled && !apiKey.trimmingCharacters(in: .whitespaces).isEmpty
+                ? apiKey.trimmingCharacters(in: .whitespaces) : nil) != model.runningAPIKey
+    }
 
     var body: some View {
         Card(title: "Local server",
-             subtitle: "OpenAI- and Anthropic-compatible, on this machine only.") {
+             subtitle: model.runningServeOnLAN
+                 ? "OpenAI- and Anthropic-compatible, reachable from other devices on your network."
+                 : "OpenAI- and Anthropic-compatible, on this machine only.") {
             VStack(alignment: .leading, spacing: 8) {
                 if case .ready(let port, let health) = model.serverState {
                     endpoint("OpenAI", "http://127.0.0.1:\(port)/v1")
                     endpoint("Anthropic", "http://127.0.0.1:\(port)")
+                    if model.runningServeOnLAN {
+                        if addresses.isEmpty {
+                            Text("On the network: no IPv4 address found (not connected?)")
+                                .font(.caption).foregroundStyle(.secondary)
+                        }
+                        ForEach(addresses, id: \.ip) { address in
+                            endpoint("\(address.interface)", "http://\(address.ip):\(port)/v1")
+                        }
+                        if model.runningAPIKey == nil {
+                            Label("Serving to the network without an API key — anyone on it can "
+                                  + "use your Mac's GPU and read the server's admin endpoints.",
+                                  systemImage: "exclamationmark.triangle.fill")
+                                .font(.caption).foregroundStyle(Theme.warning)
+                        }
+                    }
                     if let window = health.contextWindow {
                         Text("Context window \(window) tokens")
                             .font(.caption).foregroundStyle(.secondary)
@@ -483,6 +521,64 @@ struct ServerCard: View {
                 }
                 Divider()
                 portRow
+                Divider()
+                networkRows
+            }
+        }
+        .onAppear { addresses = LocalNetwork.ipv4Addresses() }
+    }
+
+    /// LAN serving + API key (the app side of what `serve --host 0.0.0.0 --api-key` does).
+    /// Both take effect on the next engine start; "Apply & restart engine" does it now.
+    @ViewBuilder private var networkRows: some View {
+        Toggle("Serve on the local network", isOn: $serveOnLAN)
+            .onChange(of: serveOnLAN) { _, on in
+                Defaults.serveOnLAN = on
+                if on { addresses = LocalNetwork.ipv4Addresses() }
+            }
+        Text("Binds to every interface (0.0.0.0) so phones, other Macs and agents on your "
+             + "network can use this engine. The app itself keeps talking over loopback.")
+            .font(.caption).foregroundStyle(.secondary)
+        Toggle("Require an API key", isOn: $apiKeyEnabled)
+            .onChange(of: apiKeyEnabled) { _, on in
+                Defaults.apiKeyEnabled = on
+                if on, apiKey.trimmingCharacters(in: .whitespaces).isEmpty {
+                    apiKey = LocalNetwork.generateAPIKey()
+                    Defaults.apiKey = apiKey
+                }
+            }
+        if apiKeyEnabled {
+            HStack(spacing: 8) {
+                TextField("API key", text: $apiKey)
+                    .textFieldStyle(.roundedBorder).font(.callout.monospaced())
+                    .onSubmit { Defaults.apiKey = apiKey }
+                    .onChange(of: apiKey) { _, value in Defaults.apiKey = value }
+                CopyButton(text: apiKey)
+                Button("Generate") {
+                    apiKey = LocalNetwork.generateAPIKey()
+                    Defaults.apiKey = apiKey
+                }
+                .controlSize(.small)
+            }
+            Text("Clients send it as  Authorization: Bearer <key>  (or x-api-key). The app, "
+                 + "the Race tab and the Agents launcher use it automatically.")
+                .font(.caption).foregroundStyle(.secondary)
+        }
+        if serveOnLAN && !apiKeyEnabled {
+            Label("Without a key, anyone on your network can use the engine.",
+                  systemImage: "exclamationmark.triangle")
+                .font(.caption).foregroundStyle(Theme.warning)
+        }
+        if needsRestart {
+            HStack(spacing: 8) {
+                Text("Network settings apply when the engine restarts.")
+                    .font(.caption).foregroundStyle(.secondary)
+                Button(restarting ? "Restarting…" : "Apply & restart engine") {
+                    commitPort()
+                    restarting = true
+                    Task { await model.restartEngine(); restarting = false }
+                }
+                .font(.caption).disabled(restarting || model.isModelLoading)
             }
         }
     }
@@ -530,6 +626,75 @@ struct ServerCard: View {
             }
             .buttonStyle(.link).font(.caption)
             Spacer()
+        }
+    }
+}
+
+
+/// Extra folders the engine searches for MLX checkpoints before downloading anything — an
+/// external drive, ~/models, a NAS. Reaches the engine as `MLX_DSPARK_MODEL_DIRS`, which a GUI
+/// app is the only practical way to set. Needs engine ≥ 0.17.1 (older engines ignore it).
+struct ModelFoldersCard: View {
+    @EnvironmentObject private var model: AppModel
+    @State private var restarting = false
+
+    var body: some View {
+        Card(title: "Model folders",
+             subtitle: "Where you already keep MLX models. Searched before anything is "
+                     + "downloaded; they appear under Models → On this Mac.") {
+            VStack(alignment: .leading, spacing: 8) {
+                if model.modelDirs.isEmpty {
+                    Text("None yet — models load from the app's cache, the Hugging Face cache "
+                         + "and LM Studio's folder.")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+                ForEach(model.modelDirs, id: \.self) { dir in
+                    HStack(spacing: 8) {
+                        Image(systemName: "folder").foregroundStyle(.secondary)
+                        Text(dir).font(.callout.monospaced()).lineLimit(1)
+                            .truncationMode(.middle)
+                        Spacer()
+                        Button {
+                            model.modelDirs.removeAll { $0 == dir }
+                        } label: {
+                            Image(systemName: "minus.circle").imageScale(.small)
+                        }
+                        .buttonStyle(.borderless)
+                        .help("Stop searching this folder")
+                    }
+                }
+                HStack(spacing: 10) {
+                    Button("Add folder…") { addFolder() }
+                        .controlSize(.small)
+                    Text("Layouts: publisher/model, publisher_model or a bare model folder "
+                         + "(config.json + .safetensors).")
+                        .font(.caption).foregroundStyle(.tertiary)
+                }
+                HStack(spacing: 8) {
+                    Text("Changes apply when the engine restarts.")
+                        .font(.caption).foregroundStyle(.secondary)
+                    Button(restarting ? "Restarting…" : "Restart engine now") {
+                        restarting = true
+                        Task { await model.restartEngine(); restarting = false }
+                    }
+                    .buttonStyle(.link).font(.caption)
+                    .disabled(restarting || model.isModelLoading)
+                }
+            }
+        }
+    }
+
+    private func addFolder() {
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.allowsMultipleSelection = true
+        panel.message = "Choose a folder that holds MLX model directories"
+        panel.prompt = "Add"
+        guard panel.runModal() == .OK else { return }
+        for url in panel.urls {
+            let path = url.path
+            if !model.modelDirs.contains(path) { model.modelDirs.append(path) }
         }
     }
 }
