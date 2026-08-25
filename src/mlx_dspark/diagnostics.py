@@ -165,7 +165,19 @@ def memory_info() -> dict:
         return {"available": False}
 
 
-_HUB_DIR = "~/.cache/huggingface/hub"
+
+
+def _hub_dir() -> str:
+    """The HF hub cache the loaders actually read — honours ``HF_HOME`` / ``HF_HUB_CACHE``
+    (a user who moved it to an external drive used to see every hub model as "not
+    installed" here while it loaded fine)."""
+    try:
+        from huggingface_hub.constants import HF_HUB_CACHE
+        return HF_HUB_CACHE
+    except Exception:  # noqa: BLE001 — diagnostics never fail on an import
+        return os.path.expanduser("~/.cache/huggingface/hub")
+
+
 _PLAIN_DIR = "~/.cache/mlx_dspark/models"
 _DRAFTERS_DIR = "~/.cache/mlx_dspark/drafters"
 
@@ -206,7 +218,8 @@ def _drafter_repos() -> set[str]:
 
 
 def installed_models(hub_dir: str | None = None, plain_dir: str | None = None,
-                     lmstudio_roots: tuple[str, ...] | None = None) -> list[dict]:
+                     lmstudio_roots: tuple[str, ...] | None = None,
+                     extra_roots: tuple[str, ...] | None = None) -> list[dict]:
     """Every model actually on this disk — the inventory the registry can't see.
 
     The registry answers "which pairs do we vouch for"; this answers "what has this user
@@ -215,11 +228,12 @@ def installed_models(hub_dir: str | None = None, plain_dir: str | None = None,
     ``_resolve`` prefers. Rows carry ``path`` and ``size_bytes`` so a client can offer
     reveal/delete and honest disk accounting without re-walking anything.
     """
-    from .load import LMSTUDIO_ROOTS, _registry_entry, is_mlx_model_dir
+    from .load import LMSTUDIO_ROOTS, _registry_entry, extra_model_roots, is_mlx_model_dir
 
-    hub = os.path.expanduser(hub_dir or _HUB_DIR)
+    hub = os.path.expanduser(hub_dir or _hub_dir())
     plain = os.path.expanduser(plain_dir or _PLAIN_DIR)
     lmstudio = lmstudio_roots if lmstudio_roots is not None else LMSTUDIO_ROOTS
+    extra = extra_roots if extra_roots is not None else extra_model_roots()
     drafters = _drafter_repos()
     drafter_basenames = {os.path.basename(r).lower() for r in drafters}
 
@@ -244,8 +258,9 @@ def installed_models(hub_dir: str | None = None, plain_dir: str | None = None,
             # Which registry pairing this repo would resolve into (quant-agnostic) —
             # i.e. whether `--mode auto` gets it a real drafter or falls back to lookup.
             "registry_id": entry["id"] if (entry and not is_drafter) else None,
-            # "cache" (ours: plain dir or HF hub) vs "lmstudio" (another app's download,
-            # readable but not ours to delete or bill against our disk total).
+            # "cache" (ours: plain dir or HF hub) vs "lmstudio" (another app's download)
+            # vs "model_dirs" (the user's own MLX_DSPARK_MODEL_DIRS root) — the latter two
+            # are readable but not ours to delete or bill against our disk total.
             "source": source,
         }
 
@@ -281,6 +296,25 @@ def installed_models(hub_dir: str | None = None, plain_dir: str | None = None,
                 if os.path.isdir(path) and is_mlx_model_dir(path):
                     add(f"{org}/{name}", path, source="lmstudio")
 
+    # The user's own roots (MLX_DSPARK_MODEL_DIRS) last: both a <publisher>/<model> tree and
+    # flat <model> dirs at the root are listed — a flat dir is reported under its bare name,
+    # which is exactly the id `--model <name>` resolves (local_dir tries the bare form too).
+    for root in extra:
+        root = os.path.expanduser(root)
+        if not os.path.isdir(root):
+            continue
+        for org in sorted(os.listdir(root)):
+            org_path = os.path.join(root, org)
+            if org.startswith(".") or not os.path.isdir(org_path):
+                continue
+            if is_mlx_model_dir(org_path):
+                add(org, org_path, source="model_dirs")
+                continue
+            for name in sorted(os.listdir(org_path)):
+                path = os.path.join(org_path, name)
+                if os.path.isdir(path) and is_mlx_model_dir(path):
+                    add(f"{org}/{name}", path, source="model_dirs")
+
     return sorted(rows.values(), key=lambda r: (r["kind"] != "model", -r["size_bytes"]))
 
 
@@ -292,9 +326,10 @@ def disk_usage(rows: list[dict] | None = None, *, hub_dir: str | None = None,
     """
     if rows is None:
         rows = installed_models(hub_dir, plain_dir)
-    # LM Studio's copies are listed as loadable but they are not OUR disk usage — counting
-    # them would tell a user "12 GB of models on disk" they can't reclaim from this app.
-    total = sum(r["size_bytes"] for r in rows if r.get("source") != "lmstudio")
+    # LM Studio's copies and the user's own model dirs are listed as loadable but they are
+    # not OUR disk usage — counting them would tell a user "12 GB of models on disk" they
+    # can't reclaim from this app.
+    total = sum(r["size_bytes"] for r in rows if r.get("source", "cache") == "cache")
     conv = os.path.expanduser(drafters_dir or _DRAFTERS_DIR)
     if os.path.isdir(conv):
         total += _dir_size_bytes(conv)
@@ -318,8 +353,7 @@ def _local_dir(repo: str | None) -> str | None:
     found = local_dir(repo)
     if found is not None:
         return found
-    hub = os.path.join(os.path.expanduser("~/.cache/huggingface/hub"),
-                       "models--" + repo.replace("/", "--"))
+    hub = os.path.join(_hub_dir(), "models--" + repo.replace("/", "--"))
     return hub if os.path.isdir(hub) else None
 
 
@@ -413,5 +447,12 @@ def doctor() -> dict:
         problems.append(f"Only {env['ram_gb']:.0f} GB RAM — the smaller targets still work, "
                         "but 12B+ models will not.")
 
+    from .load import LMSTUDIO_ROOTS, extra_model_roots
+
     return {"ok": not problems, "problems": problems,
-            "environment": env, "models": model_inventory(env["ram_gb"])}
+            "environment": env, "models": model_inventory(env["ram_gb"]),
+            # Where models are looked for, in resolution order — the answer to "why does it
+            # want to download a model I already have?".
+            "model_dirs": {"cache": os.path.expanduser(_PLAIN_DIR), "hub": _hub_dir(),
+                           "lmstudio": [os.path.expanduser(r) for r in LMSTUDIO_ROOTS],
+                           "extra": list(extra_model_roots())}}

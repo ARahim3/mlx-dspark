@@ -439,6 +439,14 @@ direction — using mlx-dspark as an engine *inside* LM Studio's chat window —
 (LM Studio only runs its own bundled engines), but the server speaks the standard OpenAI API,
 so any client that takes a custom OpenAI endpoint can point at it.
 
+**Keep models somewhere else?** (an external drive, `~/models`, a NAS…) Point
+`MLX_DSPARK_MODEL_DIRS` at those folders (`:`-separated) and they're searched before anything
+is downloaded — as `publisher/model` trees, `publisher_model` dirs, or bare `model` dirs
+(MLX checkpoints only: `config.json` + `.safetensors`). They show up in `mlx-dspark models` and
+the app's list too. Your Hugging Face cache is honoured wherever `HF_HOME` puts it, and a
+plain path (`--model ~/models/Qwen3.8-27B-4bit`) always works. `mlx-dspark doctor --json`
+lists every folder the engine looks in, in order.
+
 `--drafter` lets you run **any** other matched z-lab / DeepSpec checkpoint with no code change and no
 registry entry — the registry only saves you from having to name the drafter:
 

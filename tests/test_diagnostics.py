@@ -93,6 +93,34 @@ class TestIsLocal:
         assert diagnostics._local_dir("org/Some-Model-MLX-4bit") == str(model)
         assert diagnostics._is_local("org/Absent-Model") is False
 
+    def test_hub_check_honours_hf_hub_cache(self, tmp_path, monkeypatch):
+        """A moved HF cache (HF_HOME / HF_HUB_CACHE) must count as installed."""
+        import huggingface_hub.constants as C
+
+        hub = tmp_path / "moved-hub"
+        (hub / "models--org--Moved-Model").mkdir(parents=True)
+        monkeypatch.setattr(C, "HF_HUB_CACHE", str(hub))
+        assert diagnostics._local_dir("org/Moved-Model") == str(hub / "models--org--Moved-Model")
+        assert diagnostics._is_local("org/Moved-Model") is True
+
+    def test_installed_models_lists_extra_roots_but_not_in_disk_total(self, tmp_path):
+        root = tmp_path / "drive"
+        for rel in ("org/Tree-Model", "Flat-Model"):
+            d = root / rel
+            d.mkdir(parents=True)
+            (d / "config.json").write_text("{}")
+            (d / "model.safetensors").write_bytes(b"w" * 10)
+        (root / "org" / "Only-GGUF").mkdir()
+        (root / "org" / "Only-GGUF" / "m.gguf").write_bytes(b"g")
+        hub, plain = str(tmp_path / "hub"), str(tmp_path / "plain")
+        rows = {r["repo"]: r for r in diagnostics.installed_models(
+            hub, plain, lmstudio_roots=(), extra_roots=(str(root),))}
+        assert set(rows) == {"org/Tree-Model", "Flat-Model"}
+        assert all(r["source"] == "model_dirs" for r in rows.values())
+        assert rows["org/Tree-Model"]["path"] == str(root / "org" / "Tree-Model")
+        assert diagnostics.disk_usage(list(rows.values()), hub_dir=hub, plain_dir=plain,
+                                      drafters_dir=str(tmp_path / "none"))["total_bytes"] == 0
+
     def test_gguf_scheme_is_unwrapped(self, tmp_path, monkeypatch):
         """`gguf:{repo}/{file}.gguf` drafters must be checked against the repo, not the URL."""
         (tmp_path / "some-repo").mkdir()

@@ -2214,6 +2214,7 @@ def make_handler(engine: Engine, api_key: str | None):
                 return self._send_json(200, doctor())
             if route == "/admin/models":
                 from .diagnostics import disk_usage, installed_models, model_inventory
+                from .load import extra_model_roots
 
                 installed = installed_models()
                 loaded = (engine.target_repo
@@ -2224,6 +2225,9 @@ def make_handler(engine: Engine, api_key: str | None):
                                              "installed": installed,
                                              "disk": disk_usage(installed),
                                              "loaded": loaded,
+                                             # the user's MLX_DSPARK_MODEL_DIRS roots, so a
+                                             # picker can say where a "model_dirs" row came from
+                                             "model_dirs": list(extra_model_roots()),
                                              # this Mac's bandwidth vs the M4 Pro every
                                              # stamped speedup was measured on — a client
                                              # scales badges by `scale` (labelled estimate)

@@ -387,6 +387,25 @@ def apply_wired_limit() -> None:
 # ~/.lmstudio). Both hold plain <publisher>/<model> dirs; the MLX ones load as-is.
 LMSTUDIO_ROOTS = ("~/.lmstudio/models", "~/.cache/lm-studio/models")
 
+# Extra places the user keeps MLX checkpoints (an external drive, ~/models, a NAS mount …):
+# a PATH-style list in this env var. Every root is searched for the three layouts hand
+# downloads produce — <publisher>/<model>, <publisher>_<model>, and the bare model name —
+# and only MLX-loadable dirs count. Read at call time (not import) so a server started
+# with it set and the test-suite's monkeypatching both work.
+MODEL_DIRS_ENV = "MLX_DSPARK_MODEL_DIRS"
+
+
+def extra_model_roots() -> tuple[str, ...]:
+    """The user's extra model roots from ``MLX_DSPARK_MODEL_DIRS`` (``os.pathsep``-separated,
+    ``~`` expanded, blanks dropped, order kept, duplicates removed). Empty when unset."""
+    raw = os.environ.get(MODEL_DIRS_ENV, "")
+    out: list[str] = []
+    for part in raw.split(os.pathsep):
+        part = os.path.expanduser(part.strip())
+        if part and part not in out:
+            out.append(part)
+    return tuple(out)
+
 
 def is_mlx_model_dir(path: str) -> bool:
     """Whether ``path`` holds an MLX-loadable checkpoint (config + safetensors) — what
@@ -408,29 +427,47 @@ def local_dir(repo_or_path: str | None) -> str | None:
     from LM Studio anyway): ``_resolve`` ("where do I load from"), ``download._looks_like_repo``
     ("is a pre-fetch needed at all") and ``diagnostics._local_dir`` ("is it installed").
 
-    Order = preference: an explicit directory; the plain-dir cache ``~/.cache/mlx_dspark/models``
-    under BOTH hand-download naming conventions (bare basename, then the org-prefixed
-    "<org>_<name>" form that huggingface-cli / robust_download.py produce and that
-    disambiguates two repos sharing a basename); then LM Studio's caches — exact
-    ``<publisher>/<model>`` match only (no basename guessing, so two publishers sharing a
-    model name can't cross-resolve) and only MLX-loadable dirs (``is_mlx_model_dir``; a
-    GGUF-only download falls through rather than failing deep inside a loader). The HF hub
-    cache is deliberately NOT consulted here: ``snapshot_download`` is itself hub-local-first,
-    and the preflight checks hub completeness on its own terms (``local_files_only``).
-    ``gguf:`` schemes are the converter's business and return None."""
+    Order = preference:
+    1. an explicit directory (``~`` expanded);
+    2. the plain-dir cache ``~/.cache/mlx_dspark/models`` under BOTH hand-download naming
+       conventions (bare basename, then the org-prefixed "<org>_<name>" form that
+       huggingface-cli / robust_download.py produce and that disambiguates two repos sharing
+       a basename);
+    3. LM Studio's caches — exact ``<publisher>/<model>`` match only (no basename guessing,
+       so two publishers sharing a model name can't cross-resolve) and only MLX-loadable
+       dirs (``is_mlx_model_dir``; a GGUF-only download falls through rather than failing
+       deep inside a loader);
+    4. the user's own roots from ``MLX_DSPARK_MODEL_DIRS`` — per root, ``<org>/<name>`` first
+       (exact), then ``<org>_<name>``, then the bare ``<name>``; MLX-loadable dirs only. The
+       bare form is last because it is the ambiguous one.
+
+    The HF hub cache is deliberately NOT consulted here: ``snapshot_download`` is itself
+    hub-local-first (and honours ``HF_HOME`` / ``HF_HUB_CACHE``), and the preflight checks hub
+    completeness on its own terms (``local_files_only``). ``gguf:`` schemes are the converter's
+    business and return None."""
     if not repo_or_path or repo_or_path.startswith("gguf:"):
         return None
-    if os.path.isdir(os.path.expanduser(repo_or_path)):
-        return repo_or_path
+    expanded = os.path.expanduser(repo_or_path)
+    if os.path.isdir(expanded):
+        return expanded
     models = os.path.expanduser("~/.cache/mlx_dspark/models")
     stripped = repo_or_path.rstrip("/")
-    for name in (os.path.basename(stripped), stripped.replace("/", "_")):
+    base = os.path.basename(stripped)
+    flat = stripped.replace("/", "_")
+    for name in (base, flat):
         local = os.path.join(models, name)
         if os.path.isdir(local):
             return local
-    if stripped.count("/") == 1:
+    is_repo_id = stripped.count("/") == 1
+    if is_repo_id:
         for root in LMSTUDIO_ROOTS:
             local = os.path.join(os.path.expanduser(root), stripped)
+            if os.path.isdir(local) and is_mlx_model_dir(local):
+                return local
+    for root in extra_model_roots():
+        candidates = (stripped, flat, base) if is_repo_id else (base,)
+        for name in candidates:
+            local = os.path.join(root, name)
             if os.path.isdir(local) and is_mlx_model_dir(local):
                 return local
     return None
