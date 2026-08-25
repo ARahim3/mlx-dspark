@@ -42,6 +42,29 @@ def test_looks_like_repo_prefers_plain_dir_cache(tmp_path, monkeypatch):
     assert _looks_like_repo("org/Other-Model")
 
 
+def test_looks_like_repo_skips_lmstudio_mlx_dir(tmp_path, monkeypatch):
+    """Issue #28: a model present only in LM Studio's folder must not be pre-fetched into the
+    HF cache (the loader reads LM Studio's copy). GGUF-only dirs there still route to the hub."""
+    import mlx_dspark.load as load
+
+    root = tmp_path / "lmstudio"
+    mlx_dir = root / "org" / "Some-Model-MLX-4bit"
+    mlx_dir.mkdir(parents=True)
+    (mlx_dir / "config.json").write_text("{}")
+    (mlx_dir / "model.safetensors").write_bytes(b"weights")
+    gguf_dir = root / "org" / "Some-Model-GGUF"
+    gguf_dir.mkdir(parents=True)
+    (gguf_dir / "model.gguf").write_bytes(b"gguf")
+    monkeypatch.setattr(load, "LMSTUDIO_ROOTS", (str(root),))
+    assert not _looks_like_repo("org/Some-Model-MLX-4bit")
+    assert _looks_like_repo("org/Some-Model-GGUF")
+    assert _looks_like_repo("org/Other-Model")
+    # and the three answers agree: where to load from == "on disk" == "no pre-fetch"
+    assert load._resolve("org/Some-Model-MLX-4bit") == str(mlx_dir)
+    assert load.local_dir("org/Some-Model-MLX-4bit") == str(mlx_dir)
+    assert load.local_dir("org/Some-Model-GGUF") is None
+
+
 def test_ensure_local_is_a_noop_for_non_repos(tmp_path):
     ensure_local(None)
     ensure_local(str(tmp_path))

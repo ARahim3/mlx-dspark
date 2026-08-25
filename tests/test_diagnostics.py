@@ -80,6 +80,19 @@ class TestIsLocal:
     def test_existing_directory_is_local(self, tmp_path):
         assert diagnostics._is_local(str(tmp_path)) is True
 
+    def test_lmstudio_mlx_dir_is_local(self, tmp_path, monkeypatch):
+        """Issue #28: 'installed?' must agree with the loader, which reads LM Studio's folder."""
+        import mlx_dspark.load as load
+
+        model = tmp_path / "org" / "Some-Model-MLX-4bit"
+        model.mkdir(parents=True)
+        (model / "config.json").write_text("{}")
+        (model / "model.safetensors").write_bytes(b"w")
+        monkeypatch.setattr(load, "LMSTUDIO_ROOTS", (str(tmp_path),))
+        assert diagnostics._is_local("org/Some-Model-MLX-4bit") is True
+        assert diagnostics._local_dir("org/Some-Model-MLX-4bit") == str(model)
+        assert diagnostics._is_local("org/Absent-Model") is False
+
     def test_gguf_scheme_is_unwrapped(self, tmp_path, monkeypatch):
         """`gguf:{repo}/{file}.gguf` drafters must be checked against the repo, not the URL."""
         (tmp_path / "some-repo").mkdir()

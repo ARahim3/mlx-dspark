@@ -304,23 +304,20 @@ def disk_usage(rows: list[dict] | None = None, *, hub_dir: str | None = None,
 def _local_dir(repo: str | None) -> str | None:
     """Where a repo's weights already sit on disk, or None — no download, no network.
 
-    Checks the plain-dir cache that ``_resolve`` prefers and the HF hub cache layout directly;
+    ``load.local_dir`` answers for every non-hub location (explicit path, plain-dir cache, LM
+    Studio — issue #28 was this function and the download preflight each missing LM Studio
+    while ``_resolve`` knew it); the HF hub cache layout is checked directly here, because
     calling ``_resolve`` itself would *start a download*, which is exactly what this must not do.
     """
     if not repo:
         return None
+    from .load import local_dir
+
     if repo.startswith("gguf:"):
         repo = repo[len("gguf:"):].rsplit("/", 1)[0]
-    if os.path.isdir(repo):
-        return repo
-    # Both hand-download naming conventions: bare basename and org-prefixed "<org>_<name>"
-    # (see load._resolve — these two must agree, one answers "installed?" and the other "where").
-    models = os.path.expanduser("~/.cache/mlx_dspark/models")
-    stripped = repo.rstrip("/")
-    for name in (os.path.basename(stripped), stripped.replace("/", "_")):
-        path = os.path.join(models, name)
-        if os.path.isdir(path):
-            return path
+    found = local_dir(repo)
+    if found is not None:
+        return found
     hub = os.path.join(os.path.expanduser("~/.cache/huggingface/hub"),
                        "models--" + repo.replace("/", "--"))
     return hub if os.path.isdir(hub) else None
