@@ -190,6 +190,7 @@ from mlx_dspark.wide_gemm import (  # noqa: E402
     cpu_rows,
     frac_for,
     measure_cpu_split,
+    pick_fraction,
 )
 
 
@@ -289,3 +290,15 @@ def test_measure_cpu_split_returns_sane_structure_or_none():
     class _Bare(nn.Module):
         pass
     assert measure_cpu_split(_Bare()) is None
+
+
+def test_pick_fraction_prefers_the_smaller_share_within_tolerance():
+    """The picker must not chase a 1% microbench win past the balance point (that costs
+    7.5% end-to-end on the 27B — NOTES 2026-08-25)."""
+    # 0.35 is nominally fastest by 1%; 0.30 is within tol -> 0.30 wins
+    assert pick_fraction({0.25: 1.10, 0.30: 1.01, 0.35: 1.00, 0.40: 1.20})[0] == 0.30
+    # a real gap keeps the faster one
+    assert pick_fraction({0.25: 1.10, 0.30: 1.05, 0.35: 1.00})[0] == 0.35
+    # the smallest of several near-ties
+    assert pick_fraction({0.20: 1.02, 0.25: 1.01, 0.30: 1.00})[0] == 0.20
+    assert pick_fraction({}) == (0.0, float("inf"))

@@ -389,3 +389,37 @@ class TestBandwidthCache:
         C = importlib.import_module("mlx_dspark.calibrate")
         monkeypatch.setattr(C, "_BW_MEMO", {})
         assert C.cached_bandwidth(str(tmp_path)) is None
+
+
+def test_split_chunk_rows_is_the_vector_kernel_gate():
+    """q_len * gqa <= 32 (mlx's use_fallback), clamped to [1, 8]."""
+    from mlx_dspark.calibrate import split_chunk_rows
+
+    assert split_chunk_rows(32, 8) == 8      # Qwen3 dense, GQA 4: whole vector window
+    assert split_chunk_rows(24, 4) == 5      # Qwen3.6/3.8-27B, GQA 6 -> the measured q6 cliff
+    assert split_chunk_rows(16, 2) == 4      # Qwen3.6-35B-A3B, GQA 8
+    assert split_chunk_rows(32, 2) == 2      # Muse / Nemotron, GQA 16
+    assert split_chunk_rows(16, 16) == 8     # MHA: clamp
+    assert split_chunk_rows(64, 1) == 1      # absurd GQA: never 0
+
+
+def test_split_window_from_costs_finds_the_gqa16_cliff_the_old_probe_missed():
+    """Synthetic GQA-16 sweep (shape of the measured 32/2/128 @ 32k): q1-2 cheap, q3+ on the
+    cliff. A 5-row chunk sits on the cliff itself (no win -> the old probe said 'no cliff');
+    2-row chunks recover it from q=3."""
+    from mlx_dspark.calibrate import split_window_from_costs
+
+    cost = {q: (0.001 if q <= 2 else 0.0065) for q in range(1, 17)}
+    assert split_window_from_costs(cost, 5) is None
+    win = split_window_from_costs(cost, 2)
+    # the band ends where the sub-calls themselves add up past one call (7 x 1 ms > 6.5 ms)
+    assert win["min_q"] == 3 and win["max_q"] == 12 and win["max_chunk"] == 2
+    # GQA 6 shape: cheap to 5, cliff 6..8, full kernel from 9 that a 5-row split still beats
+    cost6 = {1: 1.0, 2: 1.3, 3: 1.6, 4: 2.1, 5: 2.5, 6: 7.1, 7: 7.5, 8: 7.6,
+             9: 7.8, 10: 8.0, 11: 8.5, 12: 9.2, 13: 9.0, 14: 8.5, 15: 8.3, 16: 8.1}
+    cost6 = {q: v / 1000 for q, v in cost6.items()}
+    win6 = split_window_from_costs(cost6, 5)
+    assert win6["min_q"] == 6 and win6["max_chunk"] == 5
+    # no cliff at all -> None (self-disables)
+    flat = {q: 0.001 * q for q in range(1, 17)}
+    assert split_window_from_costs(flat, 5) is None

@@ -1016,16 +1016,62 @@ def _attn_dims(target):
 _SDPA_SPLIT_KEY = "sdpa_split_window"
 
 
+def split_chunk_rows(hq: int, hk: int) -> int:
+    """The widest q_len that still takes mlx's *vector* SDPA kernel for this GQA shape.
+
+    Read straight from ``ScaledDotProductAttention::use_fallback`` (mlx 0.32.1/0.32.2,
+    ``mlx/backend/metal/scaled_dot_product_attention.cpp``): for q_len <= 8 the fused vector
+    kernel requires ``q_len * (heads / kv_heads) <= 32``; anything wider falls to the unfused
+    graph that materializes scores and re-reads the whole KV — the cliff. So the cheap window
+    is ``q_len <= 32 // gqa``: 8 rows at GQA 4 (Qwen3 dense), 5 at GQA 6 (Qwen3.6/3.8-27B), 4
+    at GQA 8 (Qwen3.6-35B-A3B), **2 at GQA 16 (Muse-Glimmer, Nemotron)**. Measured M4 Pro,
+    32k KV, ms per call: GQA 6 q5 2.5 -> q6 7.1; GQA 8 q4 1.4 -> q5 5.5; GQA 16 q2 0.9 -> q3
+    6.5. Clamped to [1, 8]; the measured probe below confirms or disables it per chip."""
+    gqa = max(1, hq // max(1, hk))
+    return max(1, min(8, 32 // gqa))
+
+
+def split_window_from_costs(cost: dict, max_chunk: int, *, min_kv: int = 4096,
+                            margin: float = 0.05) -> dict | None:
+    """Pure half of :func:`measure_split_window`: given single-call SDPA cost per q_len
+    (``{q: seconds}``, q = 1..16) and the chunk size, return the split window or None.
+    A width wins when the balanced split (predicted from the same sweep — conservative: the
+    real split KV-slices earlier chunks) beats the single call by ``margin``; the window is
+    the contiguous band of wins starting at ``max_chunk + 1``."""
+    def split_cost(q):
+        n = max(1, -(-q // max_chunk))        # ceil
+        base, rem = divmod(q, n)
+        sizes = [base + 1] * rem + [base] * (n - rem)
+        return sum(cost[s] for s in sizes)
+
+    top = max(cost)
+    wins = [q for q in range(max_chunk + 1, top + 1)
+            if q in cost and split_cost(q) < (1.0 - margin) * cost[q]]
+    if not wins:
+        return None
+    # contiguous band from the first win (a stray win past a gap is noise, not a window)
+    band = [wins[0]]
+    for q in wins[1:]:
+        if q == band[-1] + 1:
+            band.append(q)
+        else:
+            break
+    return {"min_q": band[0], "max_q": band[-1], "min_kv": min_kv, "max_chunk": max_chunk}
+
+
 def measure_split_window(hq, hk, d, *, cache_dir=None, refresh=False, verbose=True):
     """Measure this (chip x mlx x attention-shape) SDPA cliff and return the split window
-    ``{min_q,max_q,min_kv,max_chunk}`` where splitting a wide-q verify into <=5-row sub-calls
-    beats the single call, or ``None`` if there is no cliff (self-disables on such chips).
+    ``{min_q,max_q,min_kv,max_chunk}`` where splitting a wide-q verify into sub-calls of at
+    most ``split_chunk_rows(hq, hk)`` rows beats the single call, or ``None`` if there is no
+    cliff (self-disables on such chips).
 
-    Probes single-call SDPA cost for q=1..16 at a long KV, predicts the balanced-split cost
-    from the same sweep (conservative: the real split KV-slices earlier chunks, so it is
-    faster than predicted), and takes the contiguous q>=6 band that wins by >5%."""
+    The chunk size is the closed form of mlx's vector-kernel gate (``q_len * gqa <= 32``),
+    not a constant: the old fixed 5-row chunk was itself on the cliff for GQA >= 8 targets
+    (35B-A3B, and Muse/Nemotron at GQA 16, whose window starts at q=3), so the probe reported
+    "no cliff" exactly where the cliff was worst. Probes single-call SDPA cost for q=1..16 at
+    a long KV and hands the sweep to :func:`split_window_from_costs`."""
     dev = mx.device_info().get("device_name", "unknown")
-    key = f"v{SCHEMA}|{dev}|mlx{mx.__version__}|smpv|{hq}x{hk}x{d}"
+    key = f"v{SCHEMA}|{dev}|mlx{mx.__version__}|smpv2|{hq}x{hk}x{d}"
     if not refresh:
         hit = load_cached(key, cache_dir)
         if hit is not None:
@@ -1034,7 +1080,7 @@ def measure_split_window(hq, hk, d, *, cache_dir=None, refresh=False, verbose=Tr
     import time as _t
     scale = 1.0 / (d ** 0.5)
     L = 16384
-    MAXC = 5
+    maxc = split_chunk_rows(hq, hk)
 
     def _t_single(q, reps=5):
         ts = []
@@ -1051,21 +1097,18 @@ def measure_split_window(hq, hk, d, *, cache_dir=None, refresh=False, verbose=Tr
         return ts[len(ts) // 2]
 
     cost = {q: _t_single(q) for q in range(1, 17)}
-
-    def split_cost(q):
-        n = max(1, -(-q // MAXC))         # ceil
-        base, rem = divmod(q, n)
-        sizes = [base + 1] * rem + [base] * (n - rem)
-        return sum(cost[s] for s in sizes)
-
-    wins = [q for q in range(6, 16) if split_cost(q) < 0.95 * cost[q]]
-    window = None
-    if wins:
-        window = {"min_q": min(wins), "max_q": max(wins), "min_kv": 4096, "max_chunk": MAXC}
+    window = split_window_from_costs(cost, maxc)
     if verbose:
         if window:
-            r = {q: round(cost[q] / split_cost(q), 2) for q in wins}
-            print(f"  sdpa-split: cliff at q>={min(wins)} ({hq}x{hk}x{d}); window {window['min_q']}-{window['max_q']}, predicted {r}", flush=True)
+            def _split_cost(q):
+                n = max(1, -(-q // maxc))
+                base, rem = divmod(q, n)
+                return sum(cost[s] for s in [base + 1] * rem + [base] * (n - rem))
+            r = {q: round(cost[q] / _split_cost(q), 2)
+                 for q in range(window["min_q"], window["max_q"] + 1)}
+            print(f"  sdpa-split: cliff at q>={window['min_q']} ({hq}x{hk}x{d}, gqa {hq // hk}"
+                  f" -> {maxc}-row chunks); window {window['min_q']}-{window['max_q']}, "
+                  f"predicted {r}", flush=True)
         else:
             print(f"  sdpa-split: no cliff on this chip/mlx for {hq}x{hk}x{d} -> disabled", flush=True)
     save_cached(key, {"window": window}, cache_dir)

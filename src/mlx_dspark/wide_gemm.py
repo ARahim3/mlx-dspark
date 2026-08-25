@@ -342,9 +342,27 @@ def measure_crossover(*models, widths: tuple[int, ...] = (256, 512, 1024, 2048),
     return None
 
 
+def pick_fraction(times: dict, *, tol: float = 0.03) -> tuple[float, float]:
+    """``(frac, seconds)`` — the SMALLEST fraction whose time is within ``tol`` of the best.
+
+    The split's cost curve is asymmetric: below the balance point a smaller CPU share loses
+    a little, past it the CPU becomes the critical path and the whole prefill loses a lot
+    (M4 Pro, 27B, 2048 rows: 0.30 = 1.41x, 0.45 = 1.08x). Microbench noise of a few percent
+    is enough to make the raw argmin land one step past balance — measured 2026-08-25: two
+    calibrations of the same machine picked 0.30 and 0.35 at width 2048, and 0.35 cost 7.5%
+    end-to-end (173 vs 188 tok/s). So ties within ``tol`` resolve toward the safe side."""
+    if not times:
+        return 0.0, float("inf")
+    best_t = min(times.values())
+    for f in sorted(times):
+        if times[f] <= best_t * (1.0 + tol):
+            return f, times[f]
+    return min(times, key=times.get), best_t
+
+
 def measure_cpu_split(*models, widths: tuple[int, ...] = (512, 1024, 2048),
                       fracs: tuple[float, ...] = (0.1, 0.15, 0.2, 0.25, 0.3, 0.35, 0.4),
-                      margin: float = 0.05, iters: int = 3) -> dict | None:
+                      margin: float = 0.05, iters: int = 5) -> dict | None:
     """``{"min_rows": N, "fracs": {width: frac}}`` for this machine+models, or ``None``
     when the CPU split should stay off (nothing quantized, or it never wins by ``margin``
     at the widest width).
@@ -382,13 +400,12 @@ def measure_cpu_split(*models, widths: tuple[int, ...] = (512, 1024, 2048),
                 y1 = a[-n:] @ wd.T
             return mx.concatenate([y0, y1], axis=0)
 
-        best_f, best_t = 0.0, base
+        times = {}
         for f in fracs:
             if cpu_rows(M, f) == 0:
                 continue
-            t = _bench(lambda a=x, f=f: split(a, f), iters)
-            if t < best_t:
-                best_f, best_t = f, t
+            times[f] = _bench(lambda a=x, f=f: split(a, f), iters)
+        best_f, best_t = pick_fraction(times)          # ties resolve toward the smaller share
         if best_f and base > best_t * (1.0 + margin):
             best[M] = (best_f, base / best_t)
         del x
