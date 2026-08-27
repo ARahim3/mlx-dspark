@@ -18,7 +18,7 @@ This package targets single-user local inference on Apple Silicon.
 # stale module attribute because they were bumped separately).
 import contextlib
 
-__version__ = "0.17.1"
+__version__ = "0.17.2"
 
 
 # --- transformers>=5.13 compat shim (must run before mlx_lm/mlx_vlm import below) ---
