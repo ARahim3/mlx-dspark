@@ -153,6 +153,30 @@ def test_static_cap_falls_back_rather_than_raising():
     assert static_cap(None, None, mode="dspark", target_repo="x", drafter_repo=None) == 2
     assert static_cap(object(), object(), mode="dspark", target_repo="x",
                       drafter_repo="y", fallback=3) == 3      # calibrate() blows up -> 3
+    # dflash callers pass the head's full block as the fallback (the historical default),
+    # so a calibration failure degrades to the pre-derivation behavior, never to 2
+    assert static_cap(None, None, mode="dflash", target_repo="x", drafter_repo=None,
+                      fallback=7) == 7
+    assert static_cap(object(), object(), mode="dflash", target_repo="x",
+                      drafter_repo="y", fallback=7) == 7
+
+
+def test_dflash_static_cap_follows_the_machine_curve():
+    """The dflash default cap is DERIVED per machine (was: hardcoded full block, an
+    M4-Pro measurement wearing a default's clothes). Two invariants: on the M4-shaped
+    curve (small-M kernel: rises to width 5, flat 6-8 — the real cached Qwen3.8-27B-4bit
+    entry) static_cap's argmax reproduces the measured full-block optimum exactly, so
+    the shipped M4 behavior is unchanged; on a compute-bound curve that keeps rising
+    with width (the M3-class shape the 2026-08-27 benchmark hinted at), it picks a
+    narrower cap instead of the M4 constant. Drafter cost is a scalar for dflash — the
+    bidirectional backbone always drafts the full block regardless of cap."""
+    from mlx_dspark.calibrate import STATIC_PRIOR_P, CapController
+    m4 = CapController({2: 68.6, 3: 75.2, 4: 92.2, 5: 111.8, 7: 110.2, 8: 109.6},
+                       13.8, max_cap=7)
+    assert m4.static_best(STATIC_PRIOR_P) == 7
+    rising = CapController({w: 60.0 + 30.0 * (w - 1) for w in range(1, 9)},
+                           13.8, max_cap=7)
+    assert rising.static_best(STATIC_PRIOR_P) < 7
 
 
 def test_disk_cache_roundtrip(tmp_path):

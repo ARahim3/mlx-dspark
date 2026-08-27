@@ -2,6 +2,11 @@
 
 All notable changes to `mlx-dspark`. Versions follow [SemVer](https://semver.org/) (pre-1.0: minor-ish features land as patch bumps).
 
+## [Unreleased]
+
+### Changed
+- **The dflash default cap is now derived from this machine's measured curves, like dspark's.** With no `--max-draft`, dflash mode ran a hardcoded full block — an M4-Pro measurement wearing a default's clothes (full block was the measured peak there on both Qwen3.8-27B quants, so the constant looked principled). An M3 Max benchmark (2026-08-27) showed the shape it hides: spec throughput identical to the M4 Pro's (33.7 vs 33.8 tok/s) despite 1.47× the bandwidth and an 18% faster baseline — wide verify is compute-bound on that chip, so its best cap may sit below the full block. `serve` and `generate` now resolve the unset cap through `calibrate.static_cap(mode="dflash")` exactly as dspark does (the curves were already measured at serve load for the depth-aware capper, so this adds no load time; on the M4 curves the argmax reproduces 7 on both quants, leaving shipped behavior unchanged). An explicit `--max-draft <=0` still means the full block and is now treated as a **pinned** cap (never derived, never depth-shrunk); a calibration failure falls back to the full block, not to 2. `--max-draft auto` is unchanged and was always machine-adaptive in dflash mode.
+
 ## [0.17.1] — 2026-08-25 — LM Studio no double download + cached_tokens in usage
 
 ### Added

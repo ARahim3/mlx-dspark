@@ -86,10 +86,10 @@ def cmd_generate(argv: list[str]) -> None:
                          "run before trusting it.")
     ap.add_argument("--max-new-tokens", type=int, default=220)
     ap.add_argument("--max-draft", default=None,
-                    help="tokens verified per round (cap). Omit to let dspark DERIVE the cap "
-                         "from this machine+model+quant's measured curves (static_cap, ~5 s "
-                         "once, cached); 'auto' adapts it per round instead. lookup=6, "
-                         "dflash=full block (<=0 also means full block).")
+                    help="tokens verified per round (cap). Omit to let dspark/dflash DERIVE "
+                         "the cap from this machine+model+quant's measured curves "
+                         "(static_cap, ~5 s once, cached); 'auto' adapts it per round "
+                         "instead. lookup=6; dflash <=0 = full block.")
     ap.add_argument("--temperature", type=float, default=0.0,
                     help="0 = greedy (exact); >0 = speculative sampling (paper setup, lossless wrt target@T)")
     ap.add_argument("--top-p", type=float, default=1.0, help="nucleus sampling (temperature > 0)")
@@ -252,6 +252,18 @@ def cmd_generate(argv: list[str]) -> None:
             extra += f" · {res.lookup_rounds} lookup rounds"
     elif args.mode == "dflash":
         cap = None if (max_draft is None or max_draft <= 0) else max_draft
+        if max_draft is None and cap_controller is None:
+            # No explicit --max-draft: derive the cap from THIS machine+model+quant's
+            # measured curves, exactly like dspark above. The old hardcoded "full block"
+            # was an M4-Pro measurement (static_cap reproduces it there: 7 on both
+            # Qwen3.8-27B quants); other chips get their own argmax. <=0 stays an
+            # explicit full-block request; failure falls back to the full block too.
+            from .calibrate import static_cap
+
+            fb = max(1, int(getattr(drafter.config, "block_size", 8)) - 1)
+            cap = static_cap(target, drafter, mode="dflash", target_repo=target_repo,
+                             drafter_repo=drafter_repo, fallback=fb)
+            print(f"  cap {cap} (measured for this model+quant; override with --max-draft)")
         res = dflash_generate(
             target, tok, drafter, args.prompt,
             max_new_tokens=args.max_new_tokens, max_draft_tokens=cap,
@@ -321,9 +333,9 @@ def cmd_serve(argv: list[str]) -> None:
     ap.add_argument("--target", default=None, help=argparse.SUPPRESS)  # deprecated alias for --model
     ap.add_argument("--max-draft", default=None,
                     help="cap on tokens verified per round; <=0 = full block; 'auto' = adapt "
-                         "the cap per round. Omit to let dspark DERIVE the cap from this "
-                         "machine+model+quant's measured curves (static_cap, ~5 s once, "
-                         "cached); lookup=6, dflash=full block.")
+                         "the cap per round. Omit to let dspark/dflash DERIVE the cap from "
+                         "this machine+model+quant's measured curves (static_cap, ~5 s once, "
+                         "cached); lookup=6.")
     ap.add_argument("--default-max-tokens", type=int, default=2048,
                     help="max_tokens used when a request doesn't send one (default 2048)")
     ap.add_argument("--max-tokens-cap", type=int, default=32768,
@@ -443,9 +455,10 @@ def cmd_serve(argv: list[str]) -> None:
 
     md = _parse_max_draft(args.max_draft, ap)
     if md is None or md == "auto":
-        max_draft = md                                     # engine picks default / calibrates
+        max_draft = md                                     # engine derives / calibrates
     elif args.mode == "dflash" and md <= 0:
-        max_draft = None                                   # full block
+        max_draft = 0                                      # explicit full block (pinned;
+        #                                                    Engine.load resolves the size)
     else:
         max_draft = max(1, md)
 

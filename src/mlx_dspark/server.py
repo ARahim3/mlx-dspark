@@ -692,18 +692,33 @@ class Engine:
         user_pinned_cap = isinstance(max_draft_tokens, int)
         if max_draft_tokens == "auto":
             max_draft_tokens = None                     # controller drives, up to the full block
-        # default cap: dspark derives it from this machine+model+quant's measured curves
-        # (one-time ~5 s, disk-cached — a hardcoded constant is only right for one curve
-        # shape, and mlx 0.32 already invalidated the old 2; see calibrate.static_cap);
-        # dflash's native point is the full block; lookup drafts are free so a modest 6
-        # balances hit gains vs miss-free rounds
+        elif (isinstance(max_draft_tokens, int) and max_draft_tokens <= 0
+                and mode == "dflash" and draft is not None):
+            # explicit <=0 = "the full block", resolvable only now that the drafter's
+            # block size is known; an explicit request stays a PINNED cap (never derived,
+            # never depth-shrunk), unlike the pre-derivation era when it collapsed to
+            # None and was indistinguishable from "unset".
+            max_draft_tokens = max(1, int(getattr(draft.config, "block_size", 8)) - 1)
+        # default cap: dspark AND dflash derive it from this machine+model+quant's measured
+        # curves (one-time ~5 s, disk-cached — a hardcoded constant is only right for one
+        # curve shape, and mlx 0.32 already invalidated the old 2; see calibrate.static_cap).
+        # dflash used to hardcode its native point (the full block) here, but that was an
+        # M4-Pro measurement wearing a default's clothes: on the M4 curves static_cap
+        # reproduces it exactly (7 on both Qwen3.8-27B quants at the 0.70 prior), while a
+        # chip whose wide-verify curve rises where the M4's is flat gets its own argmax
+        # instead of an M4 constant (the M3-Max benchmark datapoint, 2026-08-27). The
+        # curves were already being measured at load for the depth capper below, so this
+        # costs nothing extra; on failure the fallback is the historical full block.
+        # Lookup drafts are free so a modest 6 balances hit gains vs miss-free rounds.
         if max_draft_tokens is None and cap_controller is None:
-            if mode == "dspark":
+            if mode in ("dspark", "dflash") and draft is not None:
                 from .calibrate import static_cap
 
+                fb = (max(1, int(getattr(draft.config, "block_size", 8)) - 1)
+                      if mode == "dflash" else 2)
                 max_draft_tokens = executor.submit(
-                    static_cap, tgt, draft, mode="dspark", target_repo=target_repo,
-                    drafter_repo=drafter_repo).result()
+                    static_cap, tgt, draft, mode=mode, target_repo=target_repo,
+                    drafter_repo=drafter_repo, fallback=fb).result()
             elif mode == "lookup":
                 max_draft_tokens = 6
         # DERIVED caps get depth-aware per-request refinement (instant here: static_cap
