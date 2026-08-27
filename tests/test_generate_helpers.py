@@ -227,7 +227,7 @@ def test_mark_stops_are_suffix_relative_and_interior():
     assert _mark_stops([15], base=5, n=10) == []               # the end is not a mark stop
 
 
-def test_prefill_plain_splits_chunks_at_marks_and_reports_positions():
+def test_prefill_plain_splits_chunks_at_marks_and_reports_positions(monkeypatch):
     import mlx.core as mx
 
     from mlx_dspark.generate import _prefill_plain
@@ -250,14 +250,28 @@ def test_prefill_plain_splits_chunks_at_marks_and_reports_positions():
     tgt = Tgt()
     cache = [Layer()]
     seen = []
+    progress = []
+    timeline = []
+    real_eval = mx.eval
+
+    def tracked_eval(*args):
+        result = real_eval(*args)
+        timeline.append("eval")
+        return result
+
+    monkeypatch.setattr(mx, "eval", tracked_eval)
     ids = list(range(100, 112))                     # 12 suffix tokens after base 5
     _prefill_plain(tgt, ids, cache, chunk=8, base=5, marks=[8, 14],
-                   on_mark=lambda p: seen.append((p, cache[0].offset)))
+                   on_mark=lambda p: seen.append((p, cache[0].offset)),
+                   on_progress=lambda p: (progress.append(p), timeline.append(p)))
     # chunks split at the marks (8-5=3, 14-5=9); chunk is a max piece size, not a grid
     assert tgt.chunks == [3, 6, 3]
     # on_mark fires with the caches holding exactly the first `pos` tokens (offset is
     # suffix-relative here: 3 and 9 of the 12)
     assert seen == [(8, 3), (14, 9)]
+    assert progress == [8, 14, 17]                  # every evaluated chunk, including final
+    assert all(timeline[i - 1] == "eval" for i, item in enumerate(timeline)
+               if isinstance(item, int))
 
 
 # ------------------------------------------------------- enable_thinking force-close (LFM2.5)

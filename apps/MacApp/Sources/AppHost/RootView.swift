@@ -386,7 +386,18 @@ struct StatusBar: View {
 
     var body: some View {
         HStack(spacing: 10) {
-            if let pairing = model.pairingLine {
+            if let progress = model.prefillProgress {
+                ProgressView(value: progress.fraction)
+                    .progressViewStyle(.linear)
+                    .tint(Theme.spark)
+                    .frame(width: 72)
+                    .accessibilityLabel("Prefill progress")
+                    .accessibilityValue("\(Int(progress.fraction * 100)) percent")
+                Text("Prefill \(progress.processed.formatted()) / "
+                     + "\(progress.total.formatted()) · \(Int(progress.fraction * 100))%")
+                    .font(.caption.monospacedDigit())
+                    .lineLimit(1).truncationMode(.middle)
+            } else if let pairing = model.pairingLine {
                 Image(systemName: "arrow.triangle.merge").imageScale(.small)
                 Text(pairing).font(.caption.monospaced())
                     .lineLimit(1).truncationMode(.middle)

@@ -130,6 +130,7 @@ final class AppModel: ObservableObject {
 
     // MARK: Telemetry (Lab)
     @Published var rounds: [RoundEvent] = []
+    @Published var prefillProgress: PrefillEvent?
     @Published var stats: RoundStats?
     @Published var calibration: Calibration?
     /// MLX allocator state — what the loaded model holds resident, polled from `/metrics`.
@@ -501,6 +502,7 @@ final class AppModel: ObservableObject {
     func loadModel(_ target: String) async -> Bool {
         guard let client = apiClient else { return false }
         generationTask?.cancel()
+        prefillProgress = nil
         modelSwitchError = nil
         isModelLoading = true
         self.model = target
@@ -611,6 +613,7 @@ final class AppModel: ObservableObject {
     func unloadModel() async {
         guard let client = apiClient, isServerReady else { return }
         generationTask?.cancel()
+        prefillProgress = nil
         rounds = []
         stats = nil
         calibration = nil
@@ -631,6 +634,7 @@ final class AppModel: ObservableObject {
                              kvBits: Int? = nil, enableThinking: Bool? = nil) async {
         guard let client = apiClient else { return }
         generationTask?.cancel()
+        prefillProgress = nil
         modelSwitchError = nil
         rounds = []
         stats = nil
@@ -690,6 +694,7 @@ final class AppModel: ObservableObject {
     /// so the Lab keeps updating even when the tokens are being generated for Claude Code or
     /// any other client pointed at this server.
     private func startTelemetry() {
+        prefillProgress = nil
         // No model → /events answers 503; don't spin against it. The next successful load
         // calls this again.
         guard let client, isServerReady else { return }
@@ -701,12 +706,17 @@ final class AppModel: ObservableObject {
                         guard let self else { return }
                         switch event {
                         case .round(let round):
+                            if self.prefillProgress?.req == round.req {
+                                self.prefillProgress = nil
+                            }
                             self.rounds.append(round)
                             if self.rounds.count > self.liveWindow {
                                 self.rounds.removeFirst(self.rounds.count - self.liveWindow)
                             }
                             if round.ms > 0 { self.observeRate(round.tokensPerSecond) }
                             self.lastActivity = Date()
+                        case .prefill(let progress):
+                            self.prefillProgress = progress.active ? progress : nil
                         case .stats(let stats):
                             self.stats = stats
                         }
@@ -715,6 +725,7 @@ final class AppModel: ObservableObject {
                     // The stream ends when the engine restarts or a socket drops; reconnect
                     // rather than leaving the Lab silently frozen.
                 }
+                self?.prefillProgress = nil
                 try? await Task.sleep(nanoseconds: 1_000_000_000)
             }
         }

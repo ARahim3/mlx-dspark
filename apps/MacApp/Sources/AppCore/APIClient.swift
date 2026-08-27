@@ -388,6 +388,10 @@ public struct APIClient: Sendable {
                             if let stats = try? decoder.decode(RoundStats.self, from: data) {
                                 continuation.yield(.stats(stats))
                             }
+                        case "prefill":
+                            if let progress = try? decoder.decode(PrefillEvent.self, from: data) {
+                                continuation.yield(.prefill(progress))
+                            }
                         default:
                             if let round = try? decoder.decode(RoundEvent.self, from: data) {
                                 continuation.yield(.round(round))

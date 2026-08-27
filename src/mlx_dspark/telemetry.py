@@ -98,6 +98,14 @@ class RoundLog:
             with contextlib.suppress(queue.Full):   # a slow client must never stall generation
                 q.put_nowait(event)
 
+    def publish(self, event_name: str, event: dict) -> None:
+        """Fan out a named live event without adding it to round history or aggregates."""
+        with self._lock:
+            subscribers = tuple(self._subscribers)
+        for q in subscribers:
+            with contextlib.suppress(queue.Full):
+                q.put_nowait((event_name, event))
+
     # ------------------------------------------------------------------ reading
 
     def snapshot(self, limit: int | None = None) -> list[dict]:

@@ -276,8 +276,8 @@ def test_metrics_reports_allocator_memory(server):
         assert memory["active_bytes"] >= 0 and memory["peak_bytes"] >= 0
 
 
-def test_events_stream_ends_cleanly_across_a_model_swap():
-    """A hot swap replaces the engine (and its round log) under a live /events stream.
+def test_events_stream_names_prefill_and_ends_cleanly_across_a_model_swap():
+    """Named live events share the stream, which still ends cleanly on a hot swap.
 
     The stream must END — so the client reconnects to the new engine's log — never
     traceback through the holder's no-engine guard (that stack trace lands in the app's
@@ -300,6 +300,12 @@ def test_events_stream_ends_cleanly_across_a_model_swap():
     base = f"http://127.0.0.1:{port}"
     try:
         stream = urllib.request.urlopen(base + "/events", timeout=5)
+        payload = {"req": "abc", "mode": "dflash", "processed": 2048,
+                   "total": 22000, "active": True}
+        holder._engine.rounds.publish("prefill", payload)
+        while stream.readline() != b"event: prefill\n":
+            pass
+        assert json.loads(stream.readline().removeprefix(b"data: ")) == payload
         # Swap the engine out from under the stream (a real swap loads weights; identity
         # of `rounds` changing is all the stream watches).
         holder._engine = Eng()

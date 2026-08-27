@@ -147,6 +147,15 @@ class TestFanOut:
         log.record(_round(committed=5))
         assert all(q.get_nowait()["committed"] == 5 for q in qs)
 
+    def test_named_event_is_live_only(self):
+        log = RoundLog()
+        q = log.subscribe()
+        event = {"req": "abc", "processed": 2048, "total": 22000, "active": True}
+        log.publish("prefill", event)
+        assert q.get_nowait() == ("prefill", event)
+        assert log.snapshot() == []
+        assert log.stats()["rounds"] == 0
+
     def test_slow_subscriber_never_blocks_the_writer(self):
         """A stalled HTTP client must not be able to stall token generation."""
         from mlx_dspark.telemetry import SUBSCRIBER_BACKLOG

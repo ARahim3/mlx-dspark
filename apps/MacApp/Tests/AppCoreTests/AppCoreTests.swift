@@ -155,6 +155,24 @@ struct SpecInfoTests {
     }
 }
 
+@Suite("Prefill telemetry")
+struct PrefillEventTests {
+    @Test func decodesProgressAndBoundsItsFraction() throws {
+        let json = """
+        {"req":"abc","mode":"dflash","processed":16384,"total":21935,"active":true}
+        """
+        let progress = try JSONDecoder().decode(PrefillEvent.self, from: Data(json.utf8))
+        #expect(progress.req == "abc" && progress.mode == "dflash" && progress.active)
+        #expect(abs(progress.fraction - 16384.0 / 21935.0) < 0.0001)
+
+        let over = """
+        {"req":"abc","mode":"dflash","processed":12,"total":10,"active":false}
+        """
+        #expect(try JSONDecoder().decode(PrefillEvent.self,
+                                         from: Data(over.utf8)).fraction == 1)
+    }
+}
+
 @Suite("Health payload")
 struct HealthInfoTests {
     /// Verbatim from a live `mlx-dspark serve` on 2026-07-21 — decoding must not drift from

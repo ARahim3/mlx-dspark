@@ -928,6 +928,22 @@ class Engine:
                         self.prefix.checkpoint(c, x, pos, _ids)
                     elif pos < _stable:
                         self.prefix.rung(c, pos)
+        prefill_position = [reuse_len]
+        on_prefill_progress = None
+        if reuse_len < len(prompt_ids):
+            def publish_prefill(pos, active):
+                pos = int(pos)
+                prefill_position[0] = pos
+                self.rounds.publish("prefill", {
+                    "req": recorder.request_id,
+                    "mode": self.mode,
+                    "processed": pos,
+                    "total": len(prompt_ids),
+                    "active": bool(active),
+                })
+
+            def on_prefill_progress(pos):
+                publish_prefill(pos, pos < len(prompt_ids))
         # Depth-aware cap for DERIVED defaults: a long prompt shrinks the verify width,
         # because verify cost carries a measured width-x-depth KV-read term the flat
         # chat-depth curves can't see (cap 7 at 32k measured 1.05x vs cap 3's 1.48x;
@@ -943,6 +959,8 @@ class Engine:
                 len(prompt_ids), default, STATIC_PRIOR_P)
         self._last_cap = eff_cap
         try:
+            if on_prefill_progress is not None:
+                publish_prefill(reuse_len, True)
             if self.mode == "dspark":
                 res = speculative_generate(
                     self.target, self.tokenizer, self.drafter, prompt_ids=prompt_ids,
@@ -955,6 +973,7 @@ class Engine:
                     presence_penalty=presence_penalty, frequency_penalty=frequency_penalty,
                     logprobs=logprobs, seed=seed, stop=stop, on_text=on_text,
                     on_round=on_round, on_prefill=on_prefill, prefill_marks=prefill_marks,
+                    on_prefill_progress=on_prefill_progress,
                 )
             elif self.mode == "dflash":
                 res = dflash_generate(
@@ -965,6 +984,7 @@ class Engine:
                     temperature=temperature, top_p=top_p, top_k=top_k,
                     seed=seed, stop=stop, on_text=on_text, on_round=on_round,
                     on_prefill=on_prefill, prefill_marks=prefill_marks,
+                    on_prefill_progress=on_prefill_progress,
                 )
             elif self.mode == "lookup":
                 res = lookup_generate(
@@ -975,6 +995,7 @@ class Engine:
                     temperature=temperature, top_p=top_p, top_k=top_k,
                     seed=seed, stop=stop, on_text=on_text, on_round=on_round,
                     on_prefill=on_prefill, prefill_marks=prefill_marks,
+                    on_prefill_progress=on_prefill_progress,
                 )
             else:
                 res = greedy_generate(
@@ -985,8 +1006,11 @@ class Engine:
                     frequency_penalty=frequency_penalty, logprobs=logprobs, seed=seed,
                     stop=stop, on_text=on_text, on_round=on_round,
                     on_prefill=on_prefill, prefill_marks=prefill_marks,
+                    on_prefill_progress=on_prefill_progress,
                 )
         except BaseException:                     # never leave a desynced cache behind
+            if on_prefill_progress is not None and prefill_position[0] < len(prompt_ids):
+                publish_prefill(prefill_position[0], False)
             if self.prefix is not None:
                 self.prefix.reset()
             raise
@@ -2517,7 +2541,7 @@ def make_handler(engine: Engine, api_key: str | None):
                 return default
 
         def _events_stream(self):
-            """SSE stream of per-round telemetry.
+            """SSE stream of live generation telemetry.
 
             Deliberately independent of any one request: a client opens this once and watches
             every round the engine runs, whoever asked for it. That is what lets a UI show a
@@ -2561,7 +2585,11 @@ def make_handler(engine: Engine, api_key: str | None):
                             self._sse(log.stats(), "stats")
                             idle = 0.0
                         continue
-                    self._sse(event, "round")
+                    if isinstance(event, tuple):
+                        event_name, event = event
+                    else:
+                        event_name = "round"
+                    self._sse(event, event_name)
             except (BrokenPipeError, ConnectionResetError):
                 pass                     # client went away; nothing to report
             finally:

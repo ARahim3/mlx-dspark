@@ -34,6 +34,20 @@ public struct RoundEvent: Decodable, Sendable, Identifiable, Equatable {
     public var isPlainStep: Bool { drafted == 0 }
 }
 
+/// Prompt tokens made ready before decoding, including any prefix-cache reuse.
+public struct PrefillEvent: Decodable, Sendable, Equatable {
+    public let req: String
+    public let mode: String
+    public let processed: Int
+    public let total: Int
+    public let active: Bool
+
+    public var fraction: Double {
+        guard total > 0 else { return 0 }
+        return min(max(Double(processed) / Double(total), 0), 1)
+    }
+}
+
 /// Aggregates over every round the engine has run.
 public struct RoundStats: Decodable, Sendable, Equatable {
     public let rounds: Int
@@ -64,9 +78,10 @@ public struct RoundStats: Decodable, Sendable, Equatable {
     }
 }
 
-/// An event off the `/events` stream: either a round or a periodic aggregate refresh.
+/// A live event off the engine-wide `/events` stream.
 public enum TelemetryEvent: Sendable {
     case round(RoundEvent)
+    case prefill(PrefillEvent)
     case stats(RoundStats)
 }
 
