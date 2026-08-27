@@ -2,7 +2,10 @@
 
 All notable changes to `mlx-dspark`. Versions follow [SemVer](https://semver.org/) (pre-1.0: minor-ish features land as patch bumps).
 
-## [Unreleased]
+## [0.17.2] — 2026-08-27 — Codex support (Responses API) + the dflash default cap is measured, not assumed
+
+### Added
+- **OpenAI Responses API** (`POST /v1/responses`, streaming and non-streaming) — the dialect [Codex](https://github.com/openai/codex) requires once its provider is configured with `wire_api = "responses"` (Codex dropped Chat Completions support, so an OpenAI-compatible server without this endpoint is invisible to it — see #138). `input` accepts a bare string or the structured item list (`message`, `function_call`, `function_call_output`); `tools` are accepted in the Responses API's flat shape and translated to whatever the loaded model's own chat template expects, same as the Chat Completions and Anthropic dialects. Stateless, like Ollama's implementation — no `previous_response_id` / server-side conversation store, since a client resubmits its own history each request (Codex already does this). New `responses_api.py` module, pure and model-free like `anthropic_api.py`. From @seungjulee's PR #23.
 
 ### Changed
 - **The dflash default cap is now derived from this machine's measured curves, like dspark's.** With no `--max-draft`, dflash mode ran a hardcoded full block — an M4-Pro measurement wearing a default's clothes (full block was the measured peak there on both Qwen3.8-27B quants, so the constant looked principled). An M3 Max benchmark (2026-08-27) showed the shape it hides: spec throughput identical to the M4 Pro's (33.7 vs 33.8 tok/s) despite 1.47× the bandwidth and an 18% faster baseline — wide verify is compute-bound on that chip, so its best cap may sit below the full block. `serve` and `generate` now resolve the unset cap through `calibrate.static_cap(mode="dflash")` exactly as dspark does (the curves were already measured at serve load for the depth-aware capper, so this adds no load time; on the M4 curves the argmax reproduces 7 on both quants, leaving shipped behavior unchanged). An explicit `--max-draft <=0` still means the full block and is now treated as a **pinned** cap (never derived, never depth-shrunk); a calibration failure falls back to the full block, not to 2. `--max-draft auto` is unchanged and was always machine-adaptive in dflash mode.

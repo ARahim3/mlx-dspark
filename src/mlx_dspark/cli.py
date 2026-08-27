@@ -1,9 +1,10 @@
 """mlx-dspark command line.
 
 Subcommands:
-  serve      Start the API server: OpenAI (/v1/chat/completions) **and** Anthropic
-             (/v1/messages) on the same port, so LM Studio clients, the openai SDK, curl,
-             and Claude Code all talk to it.
+  serve      Start the API server: OpenAI Chat Completions (/v1/chat/completions), OpenAI
+             Responses (/v1/responses), **and** Anthropic Messages (/v1/messages) on the
+             same port, so LM Studio clients, the openai SDK, curl, Claude Code, and Codex
+             all talk to it.
   claude     Launch Claude Code against a running ``serve``, configured for this process
              only — your normal ``claude`` sessions are untouched.
   generate   One-shot local generation (DSpark / DFlash / lookup / baseline). This is also
