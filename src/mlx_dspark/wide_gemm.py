@@ -59,8 +59,8 @@ peak, 64-token greedy continuation token-identical.
 
 Not bit-identical: the CPU rows are a different accumulation order (fp-tie class —
 max|Δlogit| 2.0 on the 27B's final row vs 1.55 for chunked prefill and 2.0 for the
-unverified wide path, i.e. the same band). Hence the CLI/server turn it on (like the
-last-row head slice and the small-M kernel) and the library API leaves it off. The
+unverified wide path, i.e. the same band). Hence it is an explicit CLI/server opt-in and
+the library API leaves it off. The
 fraction and the row floor are (chip x mlx x model) constants: ``measure_cpu_split``
 finds the best fraction per width — it falls off a cliff past the balance point (M4
 Pro: 0.3 at 2048 rows, 1.41x; 0.45 is 1.08x) — and the caller caches it.

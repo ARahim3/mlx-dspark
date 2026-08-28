@@ -883,6 +883,13 @@ def test_health_reports_small_m(server):
     assert _get(base, "/health")["small_m"] is True
 
 
+def test_health_reports_cpu_split(server):
+    eng, base = server
+    assert _get(base, "/health")["cpu_split"] is None
+    eng.cpu_split = {"min_rows": 512, "fracs": {512: 0.2}}
+    assert _get(base, "/health")["cpu_split"]["min_rows"] == 512
+
+
 # --- on-load warmup: kernels are primed before "ready" so the first request is fast --------
 
 
@@ -924,6 +931,22 @@ def test_admin_load_rejects_bad_warmup(holder_server):
             _post(base, "/admin/load", {"model": "repo", "warmup": bad})
         assert e.value.code == 400, bad
         assert "warmup" in json.loads(e.value.read())["error"]["message"]
+
+
+def test_admin_load_validates_and_passes_cpu_split(holder_server):
+    holder, base = holder_server
+    seen = []
+    holder.swap = lambda **kw: seen.append(kw) or holder.status()
+
+    _post(base, "/admin/load", {"model": "repo", "cpu_split": "auto"})
+    _post(base, "/admin/load", {"model": "repo", "cpu_split": 0.25})
+    assert [call["cpu_split"] for call in seen] == ["auto", 0.25]
+
+    for bad in ("fast", True, -0.1, 1):
+        with pytest.raises(urllib.error.HTTPError) as e:
+            _post(base, "/admin/load", {"model": "repo", "cpu_split": bad})
+        assert e.value.code == 400, bad
+        assert "cpu_split" in json.loads(e.value.read())["error"]["message"]
 
 
 class _SlowStreamEngine(_FakeEngine):
@@ -1347,6 +1370,24 @@ def test_swap_makes_thinking_default_sticky(monkeypatch):
     assert seen[0]["enable_thinking"] is False and seen[0]["reasoning_effort"] == "low"
     assert seen[1]["enable_thinking"] is False and seen[1]["reasoning_effort"] == "low"
     assert seen[2]["enable_thinking"] is None
+
+
+def test_swap_keeps_cpu_split_only_for_the_server_session(monkeypatch):
+    seen = []
+
+    class _E:
+        model_id = "m"
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(S.Engine, "load", staticmethod(lambda **kw: seen.append(kw) or _E()))
+    monkeypatch.setattr(S, "maybe_batch_engine", lambda e, n: e)
+    holder = S.EngineHolder(None, {"mode": "auto", "cpu_split": None})
+    holder.swap(model="a", cpu_split="auto")
+    holder.swap(model="b")
+    holder.swap(model="c", cpu_split=0)
+    assert [call["cpu_split"] for call in seen] == ["auto", "auto", 0]
 
 
 # ------------------------------------------------------------------ issue #27: GET auth

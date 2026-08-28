@@ -182,13 +182,15 @@ struct HealthInfoTests {
         {"status": "ok", "model": "Qwen3-4B-8bit", "mode": "dspark",
          "target": "mlx-community/Qwen3-4B-8bit",
          "drafter": "deepseek-ai/dspark_qwen3_4b_block7",
-         "context_window": 40960, "max_output_tokens": 32768}
+         "context_window": 40960, "max_output_tokens": 32768,
+         "cpu_split": {"min_rows": 512, "fracs": {"512": 0.2}}}
         """
         let health = try JSONDecoder().decode(HealthInfo.self, from: Data(json.utf8))
         #expect(health.status == "ok")
         #expect(health.mode == "dspark")
         #expect(health.drafter == "deepseek-ai/dspark_qwen3_4b_block7")
         #expect(health.contextWindow == 40960)
+        #expect(health.cpuSplit?.minRows == 512)
     }
 
     /// Drafter-free modes (lookup, baseline) report no drafter; the UI must not require one.
@@ -197,6 +199,7 @@ struct HealthInfoTests {
         let health = try JSONDecoder().decode(HealthInfo.self, from: Data(json.utf8))
         #expect(health.drafter == nil)
         #expect(health.contextWindow == nil)
+        #expect(health.cpuSplit == nil)
     }
 }
 

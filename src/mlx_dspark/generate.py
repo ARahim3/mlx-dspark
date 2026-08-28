@@ -961,8 +961,8 @@ WIDE_GEMM_SHAPES = None    # allowlist of weight shapes verified bit-identical a
 CPU_SPLIT = None           # prefill CPU co-prefill: {"min_rows": N, "fracs": {width: frac}}
 # hands that fraction of each wide QuantizedLinear's rows to the CPU stream, concurrently
 # with the GPU (see wide_gemm.py). None disables — library default, since the split is
-# fp-tie class (like the last-row head) and its fraction is a measured constant; the
-# CLI/server set it from calibrate.apply_cpu_split (cached). M4 Pro / Qwen3.8-27B-4bit:
+# fp-tie class (like the last-row head); the CLI/server only set it when a fraction is
+# explicitly requested. M4 Pro / Qwen3.8-27B-4bit:
 # 1.41x prefill at a 0.3 fraction, greedy continuation token-identical.
 
 

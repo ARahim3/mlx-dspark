@@ -2,6 +2,11 @@
 
 All notable changes to `mlx-dspark`. Versions follow [SemVer](https://semver.org/) (pre-1.0: minor-ish features land as patch bumps).
 
+## [Unreleased]
+
+### Fixed
+- **CPU co-prefill is now off by default.** Two long-prefill runs reproducibly crashed inside MLX's bf16 BNNS CPU matmul (`EXC_BAD_ACCESS`). The Mac app's Advanced toggle and `/admin/load {"cpu_split":"auto"}` explicitly opt into the existing per-Mac/model calibration for the current server session; `--cpu-split FRAC` remains the fixed-fraction A/B knob.
+
 ## [0.17.2] — 2026-08-27 — Codex support (Responses API) + the dflash default cap is measured, not assumed
 
 ### Added

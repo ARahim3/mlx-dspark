@@ -608,7 +608,7 @@ class Engine:
         kv_bits: int | None = None,              # quantize the target KV cache (4/8)
         context_window: int | None = None,       # override the target's own limit
         wide_gemm_min: int | None = None,        # prefill wide-GEMM: None=calibrate, 0=off, N=forced
-        cpu_split: float | None = None,          # prefill CPU co-prefill: None=calibrate, 0=off, f=forced
+        cpu_split: float | str | None = None,    # prefill CPU co-prefill: None/0=off, auto/f
         small_m: bool | None = None,             # small-M MMA verify kernel: None=probe-gated
         #                                          default, False=force off (serve-side A/B)
         sdpa_split: bool | None = None,          # wide-verify SDPA split: None=probe-gated, False=off
@@ -683,7 +683,7 @@ class Engine:
             from .calibrate import apply_wide_gemm
 
             apply_wide_gemm(tgt, draft, target_repo=target_repo, min_rows=wide_gemm_min)
-            # prefill CPU co-prefill (see wide_gemm.py): a measured fraction of each wide
+            # optional CPU co-prefill (see wide_gemm.py): an explicit fraction of each wide
             # matmul's rows on the CPU stream, concurrently with the GPU. Same rails.
             from .calibrate import apply_cpu_split
 
@@ -1880,7 +1880,7 @@ class EngineHolder:
              context_window: int | None = None,
              small_m: bool | None = None,
              sdpa_split: bool | None = None,
-             cpu_split: float | None = None,
+             cpu_split: float | str | None = None,
              kv_bits: int | None = None,
              warmup: bool | None = None,
              memory_guard: bool | None = None,
@@ -1931,6 +1931,10 @@ class EngineHolder:
                     self._load_kwargs["enable_thinking"] = None if enable_thinking else False
                 if reasoning_effort is not None:
                     self._load_kwargs["reasoning_effort"] = reasoning_effort
+                # Session-sticky like context_window: one app toggle covers later model
+                # swaps, but a fresh server still starts safely off.
+                if cpu_split is not None:
+                    self._load_kwargs["cpu_split"] = cpu_split
                 kwargs = dict(self._load_kwargs)
                 kwargs["model"] = model
                 if mode is not None:
@@ -1945,8 +1949,6 @@ class EngineHolder:
                     kwargs["small_m"] = small_m
                 if sdpa_split is not None:
                     kwargs["sdpa_split"] = sdpa_split
-                if cpu_split is not None:
-                    kwargs["cpu_split"] = cpu_split       # 0 -> off, float -> forced fraction
                 if kv_bits is not None:
                     kwargs["kv_bits"] = kv_bits or None    # 0 -> full precision
                 if warmup is not None:
@@ -2205,9 +2207,9 @@ def make_handler(engine: Engine, api_key: str | None):
                     # mlx's multi-row cliff and it wasn't forced off) — pairs with serve
                     # --no-sdpa-split / the /admin/load "sdpa_split" override
                     "sdpa_split": bool(getattr(engine, "sdpa_split", False)),
-                    # prefill CPU co-prefill: the calibrated {min_rows, fracs} in force, or
+                    # prefill CPU co-prefill: the configured {min_rows, fracs} in force, or
                     # null when off — pairs with serve --cpu-split / the /admin/load
-                    # "cpu_split" override (0 = off) for a prefill A/B without a restart
+                    # "cpu_split" override ("auto" or fraction; 0 = off) without a restart
                     "cpu_split": getattr(engine, "cpu_split", None),
                     # whether this load ran a warmup pass (throwaway generation to compile
                     # kernels + ramp the clock so the first real request is warm). On by
@@ -2371,13 +2373,15 @@ def make_handler(engine: Engine, api_key: str | None):
                                              "stock verify kernel; omit it to use the "
                                              "server's setting)")
             cpu_split = req.get("cpu_split")
-            if cpu_split is not None and (isinstance(cpu_split, bool)
-                                          or not isinstance(cpu_split, (int, float))
-                                          or not 0 <= cpu_split < 1):
-                return self._send_error(400, "'cpu_split' must be a number in [0, 1): 0 forces "
-                                             "prefill CPU co-prefill off, a fraction pins the "
-                                             "CPU row share; omit it to use the server's "
-                                             "calibrated setting")
+            valid_cpu_split = (cpu_split == "auto"
+                               or (not isinstance(cpu_split, bool)
+                                   and isinstance(cpu_split, (int, float))
+                                   and 0 <= cpu_split < 1))
+            if cpu_split is not None and not valid_cpu_split:
+                return self._send_error(400, "'cpu_split' must be 'auto' or a number in "
+                                             "[0, 1): 0 forces prefill CPU co-prefill off, "
+                                             "a fraction pins the CPU row share; omit it to "
+                                             "keep the server's setting (off by default)")
             sdpa_split = req.get("sdpa_split")
             if sdpa_split is not None and not isinstance(sdpa_split, bool):
                 return self._send_error(400, "'sdpa_split' must be a boolean (false forces the "

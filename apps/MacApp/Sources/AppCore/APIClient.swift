@@ -7,6 +7,12 @@ import Foundation
 // (accept length, cap, lookup rounds), so it is a first-class type here, not an afterthought.
 
 public struct HealthInfo: Decodable, Sendable, Equatable {
+    public struct CPUSplitInfo: Decodable, Sendable, Equatable {
+        public let minRows: Int
+
+        enum CodingKeys: String, CodingKey { case minRows = "min_rows" }
+    }
+
     /// `ok` (model loaded) · `loading` (swap in flight) · `no_model` (server up, nothing
     /// loaded — the fast-launch/unloaded state). Older engines only ever report `ok` here;
     /// their loading state was undecodable and surfaced as a failed request instead.
@@ -54,6 +60,8 @@ public struct HealthInfo: Decodable, Sendable, Equatable {
     /// `/admin/load` override, so the picker hides then (a control that silently does
     /// nothing is worse than none).
     public let kvBits: Int?
+    /// Non-nil when experimental CPU co-prefill is active for this load.
+    public let cpuSplit: CPUSplitInfo?
     /// Banner-worthy conditions: live macOS memory pressure and the engine's load-time notes
     /// (e.g. "this context window's KV cache can't fit alongside the weights"). Optional:
     /// older engines don't report it.
@@ -75,6 +83,7 @@ public struct HealthInfo: Decodable, Sendable, Equatable {
         case raceArmConfidence = "race_arm_confidence"
         case lookupDrafts = "lookup_drafts"
         case kvBits = "kv_bits"
+        case cpuSplit = "cpu_split"
     }
 
     /// True when a model is loaded and serving (`status == "ok"`).
@@ -271,6 +280,7 @@ public struct APIClient: Sendable {
                           contextWindow: Int? = nil,
                           lookupDrafts: Bool? = nil,
                           kvBits: Int? = nil,
+                          cpuPrefill: Bool? = nil,
                           enableThinking: Bool? = nil) async throws -> LoadStatus {
         var payload: [String: Any] = ["model": target]
         if let mode { payload["mode"] = mode }
@@ -286,6 +296,10 @@ public struct APIClient: Sendable {
         // KV-cache quantization (issue #17): 0 = explicitly full precision, 4/8 = quantized;
         // nil = keep the server's setting. The caller gates on /health.kv_bits presence.
         if let kvBits { payload["kv_bits"] = kvBits }
+        // App choice is deliberately only off/automatic; fixed fractions remain a CLI knob.
+        if let cpuPrefill {
+            payload["cpu_split"] = cpuPrefill ? "auto" : 0
+        }
         // Thinking default for API clients (issue #19): false = off unless a request asks,
         // true = the model's own default; nil = keep. Sticky across later swaps server-side.
         if let enableThinking { payload["enable_thinking"] = enableThinking }

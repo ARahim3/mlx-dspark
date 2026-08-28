@@ -120,8 +120,7 @@ def cmd_generate(argv: list[str]) -> None:
                     help="prefill only: hand this fraction of every wide QuantizedLinear's "
                          "rows to the CPU stream, concurrently with the GPU (the CPU's "
                          "matrix units are a second GEMM engine prefill never used). "
-                         "Default: measure the best fraction per width for this "
-                         "machine+model once and cache it; 0 disables. Not bit-identical "
+                         "Default: off; pass a fraction to opt in. Not bit-identical "
                          "(fp-tie class, like chunked prefill); 1.41x prefill on an M4 Pro "
                          "with Qwen3.8-27B-4bit")
     ap.add_argument("--small-m", action=argparse.BooleanOptionalAction, default=None,
@@ -207,8 +206,8 @@ def cmd_generate(argv: list[str]) -> None:
     from .calibrate import apply_wide_gemm
 
     apply_wide_gemm(target, drafter, target_repo=target_repo, min_rows=args.wide_gemm_min)
-    # prefill CPU co-prefill: a measured fraction of each wide matmul's rows runs on the
-    # CPU stream concurrently with the GPU (see wide_gemm.py)
+    # optional CPU co-prefill: an explicit fraction of each wide matmul's rows runs on
+    # the CPU stream concurrently with the GPU (see wide_gemm.py)
     from .calibrate import apply_cpu_split
 
     apply_cpu_split(target, drafter, target_repo=target_repo, frac=args.cpu_split)
@@ -417,10 +416,10 @@ def cmd_serve(argv: list[str]) -> None:
                          "model_file / auto_map). Refused by default: a crafted model repo "
                          "would run code as you. Also MLX_DSPARK_TRUST_REMOTE_CODE=1")
     ap.add_argument("--cpu-split", type=float, default=None, metavar="FRAC",
-                    help="prefill CPU co-prefill row fraction (default: calibrated once and "
-                         "cached; 0 disables — see `mlx-dspark generate -h`). /health "
+                    help="prefill CPU co-prefill row fraction (default: off; pass a fraction "
+                         "to opt in — see `mlx-dspark generate -h`). /health "
                          "reports the live state; /admin/load takes a per-swap "
-                         "`cpu_split` override (0 = off)")
+                         "`cpu_split` override (`auto`, fraction, or 0 = off)")
     ap.add_argument("--small-m", action=argparse.BooleanOptionalAction, default=None,
                     help="small-M MMA verify kernel (see `mlx-dspark generate --help`). "
                          "Unset = on where the cached probe proves it faster on this machine; "
@@ -488,7 +487,7 @@ def cmd_serve(argv: list[str]) -> None:
         "lookup_long_draft": args.lookup_long_draft,
         "wired_limit": args.wired_limit,
         "wide_gemm_min": args.wide_gemm_min,
-        "cpu_split": args.cpu_split,             # None = calibrated default, 0 = off
+        "cpu_split": args.cpu_split,             # None/0 = off, fraction = explicit opt-in
         "small_m": args.small_m,                 # None = probe-gated default, False = off
         "sdpa_split": args.sdpa_split,            # None = probe-gated default, False = off
         "warmup": args.warmup,                   # warm the kernels on load (first request fast)
@@ -704,7 +703,7 @@ def cmd_benchmark(argv: list[str]) -> None:
                          "would run code as you. Also MLX_DSPARK_TRUST_REMOTE_CODE=1")
     ap.add_argument("--cpu-split", type=float, default=None, metavar="FRAC",
                     help="prefill CPU co-prefill row fraction (see `mlx-dspark generate -h`). "
-                         "Unset = calibrated default; 0 forces it off for an A/B. Prints "
+                         "Unset/0 = off; a fraction opts in for an A/B. Prints "
                          "in the header (it moves the prefill column, not decode).")
     ap.add_argument("--json", default=None, help="also write results to this JSON file")
     args = ap.parse_args(argv)
@@ -741,7 +740,7 @@ def cmd_benchmark(argv: list[str]) -> None:
                  else "on where a cliff is measured (default)")
     cpu_note = ("OFF (forced)" if args.cpu_split is not None and not args.cpu_split
                 else f"{args.cpu_split:.2f} (forced)" if args.cpu_split
-                else "calibrated fraction where it pays (default)")
+                else "OFF (default)")
     print(f"target: {target_repo}\n"
           f"hybrid lookup drafts: {lk_note}\n"
           f"small-M qmm kernel: {smm_note}\n"

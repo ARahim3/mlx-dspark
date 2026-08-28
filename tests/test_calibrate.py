@@ -6,10 +6,28 @@ from __future__ import annotations
 from mlx_dspark.calibrate import (
     CapController,
     _cache_key,
+    apply_cpu_split,
     _interp,
     load_cached,
     save_cached,
 )
+
+
+def test_cpu_split_is_opt_in_or_auto(monkeypatch):
+    import importlib
+
+    calibrate = importlib.import_module("mlx_dspark.calibrate")
+    generate = importlib.import_module("mlx_dspark.generate")
+    monkeypatch.setattr(generate, "CPU_SPLIT", {"stale": True})
+
+    assert apply_cpu_split(None, target_repo="unused", verbose=False) is None
+    assert generate.CPU_SPLIT is None
+    assert apply_cpu_split(None, target_repo="unused", frac=0.25, verbose=False)["fracs"] == {
+        256: 0.25,
+    }
+    measured = {"min_rows": 512, "fracs": {512: 0.2}}
+    monkeypatch.setattr(calibrate, "cpu_split_config", lambda *a, **kw: measured)
+    assert apply_cpu_split(None, target_repo="unused", frac="auto", verbose=False) is measured
 
 
 def test_interp_exact_between_and_extrapolate():

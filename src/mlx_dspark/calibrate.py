@@ -870,18 +870,19 @@ def cpu_split_config(target, drafter=None, *, target_repo: str,
 
 
 def apply_cpu_split(target, drafter=None, *, target_repo: str,
-                    frac: float | None = None, verbose: bool = True) -> dict | None:
+                    frac: float | str | None = None, verbose: bool = True) -> dict | None:
     """Turn prefill CPU co-prefill on for this process (``generate.CPU_SPLIT``) and
     return the configuration used, or ``None`` when off.
 
-    ``frac=None`` calibrates (and caches); ``0`` disables; a float forces that CPU row
-    fraction from ``wide_gemm.SAFE_MIN_ROWS`` up (an A/B knob, not a tuned default).
+    ``frac=None`` and ``0`` disable it; ``"auto"`` uses the cached machine+model
+    calibration; a float forces that CPU row fraction from ``wide_gemm.SAFE_MIN_ROWS``
+    up (an explicit A/B knob).
     Process-wide global rather than a library default, like the wide path: a plain
     ``speculative_generate`` call must not silently change numerics class."""
     from . import generate as _gen
     from .wide_gemm import SAFE_MIN_ROWS
 
-    if frac is None:
+    if frac == "auto":
         _gen.CPU_SPLIT = cpu_split_config(target, drafter, target_repo=target_repo,
                                           verbose=verbose)
     elif not frac:

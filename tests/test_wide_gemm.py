@@ -217,8 +217,8 @@ def test_cpu_rows_is_tile_rounded_and_never_everything():
 
 def test_split_matches_plain_path_within_bf16_and_restores():
     """The CPU rows are a different accumulation order (fp-tie class), so agreement is
-    'within bf16 rounding', not bit-identity — that is exactly why the library leaves
-    this off and the CLI turns it on, like the last-row head."""
+    'within bf16 rounding', not bit-identity — that is exactly why the library and CLI
+    leave it off unless explicitly requested."""
     mx.random.seed(3)
     lin = _qlinear(bits=4)
     x = mx.random.normal((ROWS, K)).astype(mx.bfloat16)

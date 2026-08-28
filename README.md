@@ -202,8 +202,8 @@ mlx-dspark serve --model mlx-community/Qwen3-8B-8bit        # → http://127.0.0
 #                   admits the next one mid-flight)
 #   --kv-bits 8     quantized KV cache (long-context bandwidth saver)
 #   --mode auto|dspark|dflash|lookup|baseline   ·   --no-thinking   ·   --api-key KEY
-#   --cpu-split 0   turn off CPU co-prefill (default: a calibrated share of each wide prefill
-#                   matmul runs on the CPU's matrix units alongside the GPU — ~1.3–1.4× prefill)
+#   --cpu-split FRAC   opt into CPU co-prefill with this row share (off by default;
+#                      ~1.3–1.4× prefill on the measured M4 Pro configurations)
 #   --trust-remote-code   allow a checkpoint's own Python to be imported (refused by default)
 #   --reasoning-effort low|medium|xhigh   default reasoning depth on models that support it
 #                   (Qwen3.8-class; /health reports support, requests can override)
@@ -762,10 +762,10 @@ of your wall clock is **prefill**: reading the prompt. For a chat message that i
 pasted file, a long conversation, or an agent (Claude Code sends **~18–26k tokens every request**) it
 is most of the time you wait.
 
-Measured on an M4 Pro, median of 3, default settings. Since the **CPU co-prefill** pass
-(unreleased) the CLI/server also run a calibrated share of every wide matmul on the CPU's matrix
-units, concurrently with the GPU — the "before → after" pairs below are the same process with it
-forced off (`--cpu-split 0`) vs on, 2048-token prompt (the ratio holds at 4096):
+Measured on an M4 Pro, median of 3. The **CPU co-prefill** column opts into a calibrated
+share of every wide matmul on the CPU's matrix units, concurrently with the GPU — the
+"before → after" pairs below are the same process with it off vs explicitly on, 2048-token
+prompt (the ratio holds at 4096):
 
 | target | prefill | with CPU co-prefill | a 20k-token prompt takes |
 |---|---|---|---|
@@ -798,12 +798,11 @@ on this M4 Pro) to MLX's CPU stream, which runs on the CPU's matrix units at ~3 
 GPU does the rest* — same arrays, no copy, no new dependency, no second thread. That is the
 **1.29–1.41×** column above, +0.4 GB peak RAM. It is not bit-identical (the CPU rows accumulate in
 a different order — the same fp-tie class as chunked prefill, and a 64-token greedy continuation
-came out token-identical), so the CLI and server turn it on and the library API leaves it off;
-`--cpu-split 0` disables it, `/health.cpu_split` shows the calibrated setting, and the fraction
-is measured once per machine+model because it is an optimum with a cliff, not a knob (0.45 is
-already slower than 0.30). Nothing to configure: the first load of each model after upgrading
-spends ~15 s calibrating (cached from then on, printed in the serve banner), and every mode —
-including the default `auto` and the Mac app — gets it. The Apple Neural Engine was measured for the same job and does not
+came out token-identical), so it is off by default; `--cpu-split FRAC` explicitly enables it and
+`/health.cpu_split` shows the live setting. The Mac app's Advanced controls can opt into the
+per-Mac/model calibration for the current server session (a restart safely turns it off again),
+as can `/admin/load {"cpu_split":"auto"}`. Fixed fractions remain a CLI/API A/B knob because the
+optimum is hardware-sensitive; 0.45 is already slower than 0.30 on the measured M4 Pro. The Apple Neural Engine was measured for the same job and does not
 fit: its fast weight formats can't hold mlx's group-quantized weights exactly, and the exact fp16
 form is a 34 GB copy of a 27B's MLP — see NOTES "CPU co-prefill". The remaining lever is still not
 prefilling at all, which is what [prefix caching](#prefix-caching) does.

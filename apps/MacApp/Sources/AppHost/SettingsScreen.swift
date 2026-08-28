@@ -144,6 +144,7 @@ struct DecodingControls: View {
     @State private var contextWindow: String = "default"
     @State private var lookupDrafts: Bool = true
     @State private var kvBits: String = "default"
+    @State private var cpuPrefill = false
     /// "on" / "off" — the engine's thinking default for API requests that don't specify it.
     @State private var apiThinking: String = "on"
     @State private var applying = false
@@ -230,6 +231,10 @@ struct DecodingControls: View {
                             Spacer(minLength: 0)
                         }
                     }
+                    HStack(spacing: 14) {
+                        cpuPrefillToggle
+                        Spacer(minLength: 0)
+                    }
                     HStack(spacing: 8) {
                         applyControl
                         if !applying, isDirty {
@@ -260,6 +265,10 @@ struct DecodingControls: View {
                         applyControl
                         Spacer(minLength: 0)
                     }
+                    HStack(spacing: 14) {
+                        cpuPrefillToggle
+                        Spacer(minLength: 0)
+                    }
                 }
             }
         }
@@ -273,6 +282,7 @@ struct DecodingControls: View {
             contextWindow = Self.contextTag(model.health?.contextWindow)
             lookupDrafts = model.health?.lookupDrafts ?? true
             kvBits = Self.kvTag(model.health?.kvBits)
+            cpuPrefill = model.health?.cpuSplit != nil
             apiThinking = model.health?.thinkingDefault ?? "on"
         }
     }
@@ -360,6 +370,14 @@ struct DecodingControls: View {
                   + "Flip it to A/B on your own content; it can't affect output, only speed.")
     }
 
+    @ViewBuilder private var cpuPrefillToggle: some View {
+        Toggle("CPU prefill (experimental)", isOn: $cpuPrefill)
+            .fixedSize()
+            .help("Speeds up long uncached prompts by using CPU and GPU together. "
+                  + "Does not affect decode speed. May crash MLX on some Macs. "
+                  + "Off again after restarting the app.")
+    }
+
     @ViewBuilder private var applyControl: some View {
         if applying {
             ProgressView().controlSize(.small)
@@ -375,6 +393,7 @@ struct DecodingControls: View {
             || contextWindow != Self.contextTag(model.health?.contextWindow)
             || lookupDrafts != (model.health?.lookupDrafts ?? lookupDrafts)
             || kvBits != Self.kvTag(model.health?.kvBits)
+            || cpuPrefill != (model.health?.cpuSplit != nil)
             || apiThinking != (model.health?.thinkingDefault ?? apiThinking)
     }
 
@@ -392,6 +411,7 @@ struct DecodingControls: View {
                 // 0 (full precision). Gated on health reporting the field at all.
                 kvBits: kvBits == Self.kvTag(model.health?.kvBits) ? nil
                         : (kvBits == "default" ? 0 : Int(kvBits)),
+                cpuPrefill: cpuPrefill == (model.health?.cpuSplit != nil) ? nil : cpuPrefill,
                 // Unchanged -> nil (keep); "on" -> true = the model's own default.
                 enableThinking: apiThinking == model.health?.thinkingDefault ? nil
                         : (apiThinking == "on"))
