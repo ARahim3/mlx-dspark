@@ -1214,6 +1214,22 @@ def test_machine_answers_for_any_engine(server):
     assert m["model"] is None
 
 
+def test_machine_answers_during_model_swap():
+    """/machine stays usable while an EngineHolder has temporarily no engine."""
+    from mlx_dspark.server import EngineHolder
+
+    holder = EngineHolder(None, load_kwargs={})
+    httpd = ThreadingHTTPServer(("127.0.0.1", 0), S.make_handler(holder, api_key=None))
+    port = httpd.server_address[1]
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    try:
+        machine = _get(f"http://127.0.0.1:{port}", "/machine")
+        assert machine["model"] is None
+        assert "chip" in machine and "memory" in machine
+    finally:
+        httpd.shutdown()
+
+
 def test_admin_models_reports_bandwidth_scale(server):
     _, base = server
     bw = _get(base, "/admin/models")["bandwidth"]

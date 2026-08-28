@@ -176,9 +176,28 @@ struct DecodingControls: View {
         return String(format: "%.1f", value)
     }
 
+    private var healthForModel: HealthInfo? {
+        guard model.health?.target == model.model else { return nil }
+        return model.health
+    }
+
+    private func syncFromModel() {
+        let saved = Defaults.modelSettings(for: model.model)
+        let health = healthForModel
+        mode = saved?.mode ?? health?.mode ?? "auto"
+        cap = saved?.maxDraft ?? health?.maxDraft ?? "auto"
+        confidence = Self.confTag(saved?.confidenceThreshold ?? health?.confidenceThreshold)
+        contextWindow = Self.contextTag(saved?.contextWindow ?? health?.contextWindow)
+        lookupDrafts = saved?.lookupDrafts ?? health?.lookupDrafts ?? true
+        kvBits = Self.kvTag(saved?.kvBits ?? health?.kvBits)
+        cpuPrefill = saved?.cpuPrefill ?? (health?.cpuSplit != nil)
+        apiThinking = saved?.enableThinking.map { $0 ? "on" : "off" }
+            ?? health?.thinkingDefault ?? "on"
+    }
+
     private var confOptions: [String] {
         var options = ["off", "0.2", "0.3", "0.5"]
-        let current = Self.confTag(model.health?.confidenceThreshold)
+        let current = Self.confTag(healthForModel?.confidenceThreshold)
         if !options.contains(current) { options.append(current) }
         return options
     }
@@ -213,19 +232,19 @@ struct DecodingControls: View {
                         contextPicker
                         Spacer(minLength: 0)
                     }
-                    if model.health?.kvBits != nil {
+                    if healthForModel?.kvBits != nil {
                         HStack(spacing: 14) {
                             kvPicker
                             Spacer(minLength: 0)
                         }
                     }
-                    if model.health?.lookupDrafts != nil {
+                    if healthForModel?.lookupDrafts != nil {
                         HStack(spacing: 14) {
                             lookupToggle
                             Spacer(minLength: 0)
                         }
                     }
-                    if model.health?.thinkingDefault != nil {
+                    if healthForModel?.thinkingDefault != nil {
                         HStack(spacing: 14) {
                             apiThinkingPicker
                             Spacer(minLength: 0)
@@ -253,13 +272,13 @@ struct DecodingControls: View {
                     }
                     HStack(spacing: 14) {
                         contextPicker
-                        if model.health?.kvBits != nil {
+                        if healthForModel?.kvBits != nil {
                             kvPicker
                         }
-                        if model.health?.lookupDrafts != nil {
+                        if healthForModel?.lookupDrafts != nil {
                             lookupToggle
                         }
-                        if model.health?.thinkingDefault != nil {
+                        if healthForModel?.thinkingDefault != nil {
                             apiThinkingPicker
                         }
                         applyControl
@@ -275,16 +294,8 @@ struct DecodingControls: View {
         // The pickers show what the engine is actually running, not a stale default — the
         // server reports both (`/health` mode + max_draft), so a reopened popover agrees
         // with what was applied.
-        .onAppear {
-            mode = model.health?.mode ?? "auto"
-            cap = model.health?.maxDraft ?? "auto"
-            confidence = Self.confTag(model.health?.confidenceThreshold)
-            contextWindow = Self.contextTag(model.health?.contextWindow)
-            lookupDrafts = model.health?.lookupDrafts ?? true
-            kvBits = Self.kvTag(model.health?.kvBits)
-            cpuPrefill = model.health?.cpuSplit != nil
-            apiThinking = model.health?.thinkingDefault ?? "on"
-        }
+        .onAppear { syncFromModel() }
+        .onChange(of: model.model) { _, _ in syncFromModel() }
     }
 
     /// The engine's thinking default for *API* requests that don't say (issue #19): the
@@ -373,9 +384,9 @@ struct DecodingControls: View {
     @ViewBuilder private var cpuPrefillToggle: some View {
         Toggle("CPU prefill (experimental)", isOn: $cpuPrefill)
             .fixedSize()
-            .help("Speeds up long uncached prompts by using CPU and GPU together. "
-                  + "Does not affect decode speed. May crash MLX on some Macs. "
-                  + "Off again after restarting the app.")
+        .help("Speeds up long uncached prompts by using CPU and GPU together. "
+              + "Does not affect decode speed. May crash MLX on some Macs. "
+              + "Stored separately for each model.")
     }
 
     @ViewBuilder private var applyControl: some View {
@@ -388,13 +399,17 @@ struct DecodingControls: View {
     }
 
     private var isDirty: Bool {
-        mode != (model.health?.mode ?? "auto") || cap != (model.health?.maxDraft ?? "auto")
-            || confidence != Self.confTag(model.health?.confidenceThreshold)
-            || contextWindow != Self.contextTag(model.health?.contextWindow)
-            || lookupDrafts != (model.health?.lookupDrafts ?? lookupDrafts)
-            || kvBits != Self.kvTag(model.health?.kvBits)
-            || cpuPrefill != (model.health?.cpuSplit != nil)
-            || apiThinking != (model.health?.thinkingDefault ?? apiThinking)
+        let saved = Defaults.modelSettings(for: model.model)
+        let health = healthForModel
+        let baseline = saved ?? health.map(ModelSettings.init) ?? ModelSettings()
+        return mode != baseline.mode || cap != baseline.maxDraft
+            || confidence != Self.confTag(baseline.confidenceThreshold)
+            || contextWindow != Self.contextTag(baseline.contextWindow)
+            || lookupDrafts != (baseline.lookupDrafts ?? lookupDrafts)
+            || kvBits != Self.kvTag(baseline.kvBits)
+            || cpuPrefill != (baseline.cpuPrefill ?? (health?.cpuSplit != nil))
+            || apiThinking != (baseline.enableThinking.map { $0 ? "on" : "off" }
+                ?? health?.thinkingDefault ?? apiThinking)
     }
 
     private func apply() {
@@ -406,14 +421,14 @@ struct DecodingControls: View {
                 contextWindow: contextWindow == "default" ? 0 : Int(contextWindow),
                 // Sent only when the user actually flipped it, so an untouched Apply
                 // keeps riding the pair's measured default instead of pinning it.
-                lookupDrafts: lookupDrafts == model.health?.lookupDrafts ? nil : lookupDrafts,
+                lookupDrafts: lookupDrafts == healthForModel?.lookupDrafts ? nil : lookupDrafts,
                 // Same: unchanged -> nil (keep the server's setting); "default" -> explicit
                 // 0 (full precision). Gated on health reporting the field at all.
-                kvBits: kvBits == Self.kvTag(model.health?.kvBits) ? nil
+                kvBits: kvBits == Self.kvTag(healthForModel?.kvBits) ? nil
                         : (kvBits == "default" ? 0 : Int(kvBits)),
-                cpuPrefill: cpuPrefill == (model.health?.cpuSplit != nil) ? nil : cpuPrefill,
+                cpuPrefill: cpuPrefill == (healthForModel?.cpuSplit != nil) ? nil : cpuPrefill,
                 // Unchanged -> nil (keep); "on" -> true = the model's own default.
-                enableThinking: apiThinking == model.health?.thinkingDefault ? nil
+                enableThinking: apiThinking == healthForModel?.thinkingDefault ? nil
                         : (apiThinking == "on"))
             applying = false
         }
@@ -619,7 +634,7 @@ struct ServerCard: View {
                 Task { await model.restartEngine(); restarting = false }
             }
             .font(.caption)
-            .disabled(restarting)
+            .disabled(restarting || model.isModelLoading)
             Spacer()
         }
         Text("A fixed port keeps external clients' base URL stable across launches "

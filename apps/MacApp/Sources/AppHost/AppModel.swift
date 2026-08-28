@@ -83,6 +83,40 @@ struct ChatSettings: Codable, Equatable {
     var reasoningEffort: String?
 }
 
+/// Engine settings belonging to one model target. Optional fields stay optional so an older
+/// engine keeps its pair default when it does not expose that control.
+struct ModelSettings: Codable, Equatable {
+    var mode: String = "auto"
+    var maxDraft: String = "auto"
+    var confidenceThreshold: Double = 0.0
+    var contextWindow: Int?
+    var lookupDrafts: Bool?
+    var kvBits: Int?
+    var cpuPrefill: Bool?
+    var enableThinking: Bool?
+
+    init(mode: String = "auto", maxDraft: String = "auto", confidenceThreshold: Double = 0.0,
+         contextWindow: Int? = nil, lookupDrafts: Bool? = nil, kvBits: Int? = nil,
+         cpuPrefill: Bool? = nil, enableThinking: Bool? = nil) {
+        self.mode = mode
+        self.maxDraft = maxDraft
+        self.confidenceThreshold = confidenceThreshold
+        self.contextWindow = contextWindow
+        self.lookupDrafts = lookupDrafts
+        self.kvBits = kvBits
+        self.cpuPrefill = cpuPrefill
+        self.enableThinking = enableThinking
+    }
+
+    init(health: HealthInfo) {
+        self.init(mode: health.mode ?? "auto", maxDraft: health.maxDraft ?? "auto",
+                  confidenceThreshold: health.confidenceThreshold ?? 0.0,
+                  contextWindow: health.contextWindow, lookupDrafts: health.lookupDrafts,
+                  kvBits: health.kvBits, cpuPrefill: health.cpuSplit != nil,
+                  enableThinking: health.thinkingDefault.map { $0 == "on" })
+    }
+}
+
 /// A log line with a stable identity, so trimming the buffer never reshuffles SwiftUI ids.
 struct LogRow: Identifiable {
     let id: Int
@@ -329,10 +363,11 @@ final class AppModel: ObservableObject {
     /// boot on a return visit. The server itself starts model-less (`--no-model`, seconds) and
     /// the window opens immediately; the model then loads *inside* the running window with
     /// inline progress, instead of gating the whole app behind a loading screen.
-    func startServer(model: String) async {
+    func startServer(model: String, preserving settings: ModelSettings? = nil) async {
         self.model = model
         Defaults.selectedModel = model
-        guard await spawnServer() else { return }
+        let settings = settings ?? Defaults.modelSettings(for: model)
+        guard await spawnServer(preserving: settings) else { return }
         phase = .ready
         await refreshDiagnostics()               // model pickers work before anything loads
         let loaded: Bool
@@ -342,7 +377,7 @@ final class AppModel: ObservableObject {
             startMemoryPolling()
             loaded = true
         } else {
-            loaded = await loadModel(model)
+            loaded = await loadModel(model, applying: settings)
         }
         if loaded, isFirstRun {
             // The plan's "hooked" moment: straight from onboarding into a race the user
@@ -420,8 +455,12 @@ final class AppModel: ObservableObject {
     /// fixed port (Settings → Local server) or model folder takes effect without relaunching
     /// the app. The model reloads through the same path a launch uses.
     func restartEngine() async {
+        guard !isModelLoading else { return }
+        let activeSettings = Defaults.modelSettings(for: model)
+            ?? currentHealth.map(ModelSettings.init)
+        logStore.note("restarting engine")
         await supervisor?.stop()
-        await startServer(model: model)
+        await startServer(model: model, preserving: activeSettings)
     }
 
     /// Apply a pending engine update NOW instead of on the next launch (issue #16: a stuck
@@ -445,7 +484,7 @@ final class AppModel: ObservableObject {
 
     /// Spawn `mlx-dspark serve --no-model` and wait for `/health` — up in seconds (python
     /// import, no weights). Returns false after calling `fail()` when even that can't start.
-    private func spawnServer() async -> Bool {
+    private func spawnServer(preserving settings: ModelSettings? = nil) async -> Bool {
         guard let engine = engineURL else { return false }
         phase = .startingServer
         let supervisor = ServerSupervisor(engine: engine, logStore: logStore)
@@ -453,14 +492,19 @@ final class AppModel: ObservableObject {
         await supervisor.observeState { [weak self] state in
             Task { @MainActor in self?.serverState = state }
         }
+        let config = ServerConfig(model: nil, mode: settings?.mode ?? "auto",
+                                  maxDraft: settings?.maxDraft ?? "auto",
+                                  contextWindow: settings?.contextWindow,
+                                  host: Defaults.engineHost, apiKey: Defaults.effectiveAPIKey,
+                                  port: Defaults.enginePort,
+                                  portIsExplicit: Defaults.enginePortIsExplicit,
+                                  modelDirs: modelDirs,
+                                  confidenceThreshold: settings?.confidenceThreshold ?? 0.0,
+                                  lookupDrafts: settings?.lookupDrafts,
+                                  kvBits: settings?.kvBits,
+                                  enableThinking: settings?.enableThinking)
         do {
-            let port = try await supervisor.start(
-                config: ServerConfig(model: nil, mode: "auto", maxDraft: "auto",
-                                     contextWindow: Defaults.contextWindow,
-                                     host: Defaults.engineHost, apiKey: Defaults.effectiveAPIKey,
-                                     port: Defaults.enginePort,
-                                     portIsExplicit: Defaults.enginePortIsExplicit,
-                                     modelDirs: modelDirs))
+            let port = try await supervisor.start(config: config)
             return await connect(port: port)
         } catch {
             // An engine below this app's floor doesn't know `--no-model`, and an offline
@@ -471,13 +515,9 @@ final class AppModel: ObservableObject {
             logStore.note("model-less start failed — retrying with the model inline "
                           + "(older engine?)")
             do {
-                let port = try await supervisor.start(
-                    config: ServerConfig(model: model, mode: "auto", maxDraft: "auto",
-                                         contextWindow: Defaults.contextWindow,
-                                         host: Defaults.engineHost, apiKey: Defaults.effectiveAPIKey,
-                                         port: Defaults.enginePort,
-                                         portIsExplicit: Defaults.enginePortIsExplicit,
-                                         modelDirs: modelDirs))
+                var inlineConfig = config
+                inlineConfig.model = model
+                let port = try await supervisor.start(config: inlineConfig)
                 return await connect(port: port)
             } catch {
                 fail(error)
@@ -501,8 +541,9 @@ final class AppModel: ObservableObject {
     /// Load `target` into the running server (`/admin/load`) with inline progress — the
     /// window, the port, and every other screen stay up throughout. Returns whether it loaded.
     @discardableResult
-    func loadModel(_ target: String) async -> Bool {
+    func loadModel(_ target: String, applying settings: ModelSettings? = nil) async -> Bool {
         guard let client = apiClient else { return false }
+        let profile = settings ?? Defaults.modelSettings(for: target)
         generationTask?.cancel()
         prefillProgress = nil
         modelSwitchError = nil
@@ -536,7 +577,18 @@ final class AppModel: ObservableObject {
             isCancellingLoad = false
         }
         do {
-            _ = try await client.loadModel(target)
+            // Context is sticky in the running engine, so 0 is required when a model has no
+            // saved cap; it means "use this model's own maximum" and prevents leakage.
+            _ = try await client.loadModel(
+                target,
+                mode: profile?.mode,
+                maxDraft: profile?.maxDraft,
+                confidence: profile.map { $0.confidenceThreshold },
+                contextWindow: profile.map { $0.contextWindow ?? 0 } ?? 0,
+                lookupDrafts: profile?.lookupDrafts,
+                kvBits: profile?.kvBits,
+                cpuPrefill: profile?.cpuPrefill ?? (profile == nil ? false : nil),
+                enableThinking: profile?.enableThinking ?? (profile == nil ? true : nil))
             // Re-point health at the new model and restart the telemetry stream (the old one
             // ended when the engine it was streaming from was torn down).
             currentHealth = try? await client.health()
@@ -643,14 +695,39 @@ final class AppModel: ObservableObject {
         stats = nil
         calibration = nil
         loadingDetail = "Applying mode \(mode ?? "auto") · cap \(cap ?? "auto") — reloading "
-            + "the model in place. Weights are already on disk; this takes seconds to a "
-            + "minute, and the server's port stays up."
+            + "the model in place. The first DSpark load may download a drafter and calibrate "
+            + "this Mac; the server's port stays up."
         isModelLoading = true
         logStore.note("reloading \(model) — mode \(mode ?? "auto") · cap \(cap ?? "auto")"
                       + (confidence.map { " · conf \($0)" } ?? ""))
+        let previousSettings = Defaults.modelSettings(for: model)
+            ?? currentHealth.map(ModelSettings.init)
+        let nextSettings = ModelSettings(
+            mode: mode ?? previousSettings?.mode ?? "auto",
+            maxDraft: cap ?? previousSettings?.maxDraft ?? "auto",
+            confidenceThreshold: confidence ?? previousSettings?.confidenceThreshold ?? 0.0,
+            contextWindow: contextWindow.map { $0 == 0 ? nil : $0 }
+                ?? previousSettings?.contextWindow,
+            lookupDrafts: lookupDrafts ?? previousSettings?.lookupDrafts,
+            kvBits: kvBits ?? previousSettings?.kvBits,
+            cpuPrefill: cpuPrefill ?? previousSettings?.cpuPrefill,
+            enableThinking: enableThinking ?? previousSettings?.enableThinking)
+        let poll = Task { [weak self] in
+            while !Task.isCancelled {
+                let health = try? await client.health()
+                await MainActor.run {
+                    self?.downloadProgress = health?.download
+                    self?.loadPhase = health?.phase
+                }
+                try? await Task.sleep(nanoseconds: 1_000_000_000)
+            }
+        }
         defer {
+            poll.cancel()
             isModelLoading = false
             loadingDetail = nil
+            downloadProgress = nil
+            loadPhase = nil
         }
         do {
             _ = try await client.loadModel(model, mode: mode, maxDraft: cap,
@@ -660,18 +737,27 @@ final class AppModel: ObservableObject {
                                            kvBits: kvBits,
                                            cpuPrefill: cpuPrefill,
                                            enableThinking: enableThinking)
-            if let contextWindow {
-                Defaults.contextWindow = contextWindow == 0 ? nil : contextWindow
-            }
+            Defaults.saveModelSettings(nextSettings, for: model)
             currentHealth = try? await client.health()
             startTelemetry()
             startMemoryPolling()
             await refreshDiagnostics()
         } catch {
             modelSwitchError = error.localizedDescription
-            // The engine is modelless after a failed load — restore with default settings.
+            // The engine is modelless after a failed load — restore the previous profile.
             // If even that fails, the server survives model-less; the picker still works.
-            _ = try? await client.loadModel(model)
+            _ = try? await client.loadModel(
+                model,
+                mode: previousSettings?.mode,
+                maxDraft: previousSettings?.maxDraft,
+                confidence: previousSettings.map { $0.confidenceThreshold },
+                contextWindow: previousSettings.map { $0.contextWindow ?? 0 } ?? 0,
+                lookupDrafts: previousSettings?.lookupDrafts,
+                kvBits: previousSettings?.kvBits,
+                cpuPrefill: previousSettings?.cpuPrefill ?? (previousSettings == nil
+                    ? false : nil),
+                enableThinking: previousSettings?.enableThinking ?? (previousSettings == nil
+                    ? true : nil))
             currentHealth = try? await client.health()
             startTelemetry()
             startMemoryPolling()
@@ -1156,6 +1242,7 @@ final class AppModel: ObservableObject {
 /// how the app gets driven for screenshots and QA without a click.
 enum Defaults {
     private static let store = UserDefaults.standard
+    private static let modelSettingsPrefix = "modelSettings."
 
     static var screen: Screen {
         get { store.string(forKey: "screen").flatMap(Screen.init(rawValue:)) ?? .chat }
@@ -1195,17 +1282,33 @@ enum Defaults {
         set { store.set(newValue, forKey: "selectedModel") }
     }
 
-    /// Persistent context cap. Nil means use the model's own maximum.
-    static var contextWindow: Int? {
-        get {
-            guard store.object(forKey: "contextWindow") != nil else { return nil }
-            let value = store.integer(forKey: "contextWindow")
-            return value >= 1024 ? value : nil
+    /// Settings are keyed by the exact model target, so changing one model never changes
+    /// another model's mode, cap, context, or auxiliary decode knobs.
+    static func modelSettings(for model: String) -> ModelSettings? {
+        let key = modelSettingsPrefix + model
+        if let data = store.data(forKey: key),
+           let settings = try? JSONDecoder().decode(ModelSettings.self, from: data) {
+            return settings
         }
-        set {
-            if let newValue { store.set(newValue, forKey: "contextWindow") }
-            else { store.removeObject(forKey: "contextWindow") }
-        }
+
+        // Migrate the old global context cap once, and only to the model it belonged to.
+        guard model == selectedModel,
+              let value = legacyContextWindow else { return nil }
+        let settings = ModelSettings(contextWindow: value)
+        saveModelSettings(settings, for: model)
+        store.removeObject(forKey: "contextWindow")
+        return settings
+    }
+
+    static func saveModelSettings(_ settings: ModelSettings, for model: String) {
+        guard let data = try? JSONEncoder().encode(settings) else { return }
+        store.set(data, forKey: modelSettingsPrefix + model)
+    }
+
+    private static var legacyContextWindow: Int? {
+        guard store.object(forKey: "contextWindow") != nil else { return nil }
+        let value = store.integer(forKey: "contextWindow")
+        return value >= 1024 ? value : nil
     }
 
     /// The out-of-the-box engine port. Fixed BY DEFAULT (community ask: agent configs —

@@ -31,11 +31,17 @@ public struct ServerConfig: Equatable, Sendable {
     /// 0.17.1; older engines ignore the variable) — a GUI app is the only way most users can
     /// set an environment variable for the engine at all.
     public var modelDirs: [String]
+    public var confidenceThreshold: Double
+    public var lookupDrafts: Bool?
+    public var kvBits: Int?
+    public var enableThinking: Bool?
 
     public init(model: String? = nil, mode: String = "auto", maxDraft: String? = "auto",
                 contextWindow: Int? = nil,
                 host: String = "127.0.0.1", apiKey: String? = nil, port: Int = 0,
-                portIsExplicit: Bool = true, modelDirs: [String] = []) {
+                portIsExplicit: Bool = true, modelDirs: [String] = [],
+                confidenceThreshold: Double = 0.0, lookupDrafts: Bool? = nil,
+                kvBits: Int? = nil, enableThinking: Bool? = nil) {
         self.model = model
         self.mode = mode
         self.maxDraft = maxDraft
@@ -45,6 +51,10 @@ public struct ServerConfig: Equatable, Sendable {
         self.port = port
         self.portIsExplicit = portIsExplicit
         self.modelDirs = modelDirs
+        self.confidenceThreshold = confidenceThreshold
+        self.lookupDrafts = lookupDrafts
+        self.kvBits = kvBits
+        self.enableThinking = enableThinking
     }
 
     /// Serve on every interface (`0.0.0.0`) or loopback only.
@@ -140,6 +150,16 @@ public actor ServerSupervisor {
         if let contextWindow = config.contextWindow {
             args.append(contentsOf: ["--context-window", String(contextWindow)])
         }
+        if config.confidenceThreshold != 0 {
+            args.append(contentsOf: ["--confidence-threshold", String(config.confidenceThreshold)])
+        }
+        if let lookupDrafts = config.lookupDrafts {
+            args.append(lookupDrafts ? "--lookup-drafts" : "--no-lookup-drafts")
+        }
+        if let kvBits = config.kvBits {
+            args.append(contentsOf: ["--kv-bits", String(kvBits)])
+        }
+        if config.enableThinking == false { args.append("--no-thinking") }
         if let key = config.apiKey, !key.isEmpty { args.append(contentsOf: ["--api-key", key]) }
 
         transition(.starting(detail: "Launching engine"))

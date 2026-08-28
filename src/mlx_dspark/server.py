@@ -2280,8 +2280,10 @@ def make_handler(engine: Engine, api_key: str | None):
                 # Chip, measured bandwidth, OS memory view, the loaded model's footprint and
                 # its single-stream roofline. Answers model-less too (chip/bandwidth/memory
                 # only) so a picker can scale estimates before anything is loaded.
+                if isinstance(engine, EngineHolder) and not engine.ready:
+                    return self._send_json(200, _machine_basics())
                 report = getattr(engine, "machine_report", None)
-                if (isinstance(engine, EngineHolder) and not engine.ready) or report is None:
+                if report is None:
                     return self._send_json(200, _machine_basics())
                 return self._send_json(200, report())
             if not self._require_ready():
