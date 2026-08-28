@@ -15,6 +15,8 @@ public struct ServerConfig: Equatable, Sendable {
     public var model: String?
     public var mode: String
     public var maxDraft: String?
+    /// Context cap; nil uses the model's own maximum.
+    public var contextWindow: Int?
     public var host: String
     public var apiKey: String?
     /// Fixed engine port (issue #16) so external OpenAI/Anthropic clients keep a stable
@@ -31,11 +33,13 @@ public struct ServerConfig: Equatable, Sendable {
     public var modelDirs: [String]
 
     public init(model: String? = nil, mode: String = "auto", maxDraft: String? = "auto",
+                contextWindow: Int? = nil,
                 host: String = "127.0.0.1", apiKey: String? = nil, port: Int = 0,
                 portIsExplicit: Bool = true, modelDirs: [String] = []) {
         self.model = model
         self.mode = mode
         self.maxDraft = maxDraft
+        self.contextWindow = contextWindow
         self.host = host
         self.apiKey = apiKey
         self.port = port
@@ -133,6 +137,9 @@ public actor ServerSupervisor {
         if let model = config.model { args.append(contentsOf: ["--model", model]) }
         else { args.append("--no-model") }
         if let maxDraft = config.maxDraft { args.append(contentsOf: ["--max-draft", maxDraft]) }
+        if let contextWindow = config.contextWindow {
+            args.append(contentsOf: ["--context-window", String(contextWindow)])
+        }
         if let key = config.apiKey, !key.isEmpty { args.append(contentsOf: ["--api-key", key]) }
 
         transition(.starting(detail: "Launching engine"))

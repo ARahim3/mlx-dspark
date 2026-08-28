@@ -456,6 +456,7 @@ final class AppModel: ObservableObject {
         do {
             let port = try await supervisor.start(
                 config: ServerConfig(model: nil, mode: "auto", maxDraft: "auto",
+                                     contextWindow: Defaults.contextWindow,
                                      host: Defaults.engineHost, apiKey: Defaults.effectiveAPIKey,
                                      port: Defaults.enginePort,
                                      portIsExplicit: Defaults.enginePortIsExplicit,
@@ -472,6 +473,7 @@ final class AppModel: ObservableObject {
             do {
                 let port = try await supervisor.start(
                     config: ServerConfig(model: model, mode: "auto", maxDraft: "auto",
+                                         contextWindow: Defaults.contextWindow,
                                          host: Defaults.engineHost, apiKey: Defaults.effectiveAPIKey,
                                          port: Defaults.enginePort,
                                          portIsExplicit: Defaults.enginePortIsExplicit,
@@ -658,6 +660,9 @@ final class AppModel: ObservableObject {
                                            kvBits: kvBits,
                                            cpuPrefill: cpuPrefill,
                                            enableThinking: enableThinking)
+            if let contextWindow {
+                Defaults.contextWindow = contextWindow == 0 ? nil : contextWindow
+            }
             currentHealth = try? await client.health()
             startTelemetry()
             startMemoryPolling()
@@ -1188,6 +1193,19 @@ enum Defaults {
     static var selectedModel: String? {
         get { store.string(forKey: "selectedModel") }
         set { store.set(newValue, forKey: "selectedModel") }
+    }
+
+    /// Persistent context cap. Nil means use the model's own maximum.
+    static var contextWindow: Int? {
+        get {
+            guard store.object(forKey: "contextWindow") != nil else { return nil }
+            let value = store.integer(forKey: "contextWindow")
+            return value >= 1024 ? value : nil
+        }
+        set {
+            if let newValue { store.set(newValue, forKey: "contextWindow") }
+            else { store.removeObject(forKey: "contextWindow") }
+        }
     }
 
     /// The out-of-the-box engine port. Fixed BY DEFAULT (community ask: agent configs —

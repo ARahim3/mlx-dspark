@@ -403,7 +403,7 @@ struct DecodingControls: View {
             await model.applyEngineSettings(
                 mode: mode, cap: cap,
                 confidence: confidence == "off" ? 0.0 : Double(confidence),
-                contextWindow: contextWindow == "default" ? nil : Int(contextWindow),
+                contextWindow: contextWindow == "default" ? 0 : Int(contextWindow),
                 // Sent only when the user actually flipped it, so an untouched Apply
                 // keeps riding the pair's measured default instead of pinning it.
                 lookupDrafts: lookupDrafts == model.health?.lookupDrafts ? nil : lookupDrafts,
