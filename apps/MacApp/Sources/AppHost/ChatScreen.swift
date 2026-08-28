@@ -176,7 +176,7 @@ struct ChatSettingsPanel: View {
                         Slider(value: Binding(
                             get: { temperature },
                             set: { model.chatSettings.temperature = $0 }
-                        ), in: 0...1.5)
+                        ), in: 0...1.5, step: 0.01)
                         Text(String(format: "%.2f", temperature))
                             .font(.caption.monospacedDigit()).frame(width: 34)
                     }
@@ -198,7 +198,7 @@ struct ChatSettingsPanel: View {
                         Slider(value: Binding(
                             get: { topP },
                             set: { model.chatSettings.topP = $0 }
-                        ), in: 0.05...1.0)
+                        ), in: 0.05...1.0, step: 0.01)
                         Text(String(format: "%.2f", topP))
                             .font(.caption.monospacedDigit()).frame(width: 34)
                     }
