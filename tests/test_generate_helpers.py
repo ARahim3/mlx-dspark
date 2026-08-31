@@ -260,6 +260,48 @@ def test_prefill_plain_splits_chunks_at_marks_and_reports_positions():
     assert seen == [(8, 3), (14, 9)]
 
 
+def test_prefill_plain_on_chunk_reports_progress_after_each_evaluated_chunk():
+    # Prefill progress (issue #29): on_chunk fires with the ABSOLUTE prompt position after
+    # each NON-final chunk — the chunks the loop already mx.eval's — and never for the
+    # final chunk (generation starting is its completion signal) or a single-chunk prompt.
+    import mlx.core as mx
+
+    from mlx_dspark.generate import _prefill_plain
+
+    class Layer:
+        def __init__(self):
+            self.offset = 0
+
+    class Tgt:
+        def prefill(self, ids, cache, tap=None, want_logits=True, head_last_row=True):
+            for c in cache:
+                c.offset += ids.shape[1]
+            return (mx.zeros((1, 1, 4)) if want_logits else None), None
+
+    seen = []
+    _prefill_plain(Tgt(), list(range(20)), [Layer()], chunk=8, base=100,
+                   on_chunk=seen.append)
+    assert seen == [108, 116]                       # absolute; final chunk (120) not reported
+    seen = []
+    _prefill_plain(Tgt(), list(range(5)), [Layer()], chunk=8, base=0,
+                   on_chunk=seen.append)
+    assert seen == []                               # single-chunk prompt: no progress events
+
+
+def test_roundlog_publish_fans_out_without_recording():
+    # publish() (prefill progress) reaches /events subscribers but must not enter round
+    # history or any aggregate — /rounds and /metrics stay rounds-only.
+    from mlx_dspark.telemetry import RoundLog
+
+    log = RoundLog()
+    q = log.subscribe()
+    log.publish({"type": "prefill", "req": "r1", "processed": 2048, "total": 9000})
+    ev = q.get_nowait()
+    assert ev["type"] == "prefill" and ev["processed"] == 2048 and "t" in ev
+    assert log.snapshot() == []                     # not recorded
+    assert log.stats()["rounds"] == 0
+
+
 # ------------------------------------------------------- enable_thinking force-close (LFM2.5)
 
 

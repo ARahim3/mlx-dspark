@@ -496,6 +496,7 @@ def greedy_generate(
     on_round=None,
     on_prefill=None,
     prefill_marks=None,
+    on_prefill_chunk=None,
 ) -> GenResult:
     """Plain decoding of the target (no drafter, no hidden-state capture) — the fair
     'run the model normally' baseline. ``temperature`` 0 = greedy, > 0 = sampling (matches
@@ -518,7 +519,8 @@ def greedy_generate(
     suffix = ids[reuse_len:] if reuse_len else ids      # only prefill past the reused prefix
     logits = _prefill_plain(
         target_model, suffix, cache, base=reuse_len, marks=prefill_marks,
-        on_mark=(lambda p: on_prefill(cache, None, p)) if on_prefill else None)
+        on_mark=(lambda p: on_prefill(cache, None, p)) if on_prefill else None,
+        on_chunk=on_prefill_chunk)
     if on_prefill is not None:
         on_prefill(cache, None, len(ids))   # caches hold exactly `ids` right now
     mx.eval(logits)                          # settle prompt-eval so the prefill/decode timing split is
@@ -614,6 +616,7 @@ def dflash_generate(
     on_round=None,
     on_prefill=None,
     prefill_marks=None,
+    on_prefill_chunk=None,
 ) -> GenResult:
     """Speculative decoding with a **z-lab DFlash** (block-diffusion) drafter.
 
@@ -738,7 +741,8 @@ def dflash_generate(
 
     logits, _ = _prefill_tapped(
         target_model, suffix, cache, tap, drafter=_Acc, ctx_offset=reuse_len,
-        marks=prefill_marks, on_mark=_mark if on_prefill is not None else None)
+        marks=prefill_marks, on_mark=_mark if on_prefill is not None else None,
+        on_chunk=on_prefill_chunk)
     if on_prefill is not None:
         _mark(len(ids))                # caches hold exactly `ids` (stable == n templates)
     mx.eval(logits)                    # settle prompt-eval so the prefill/decode timing split is honest
@@ -979,11 +983,15 @@ def _mark_stops(marks, base: int, n: int) -> list[int]:
 
 
 def _prefill_plain(target, ids: list[int], cache, chunk: int | None = None,
-                   base: int = 0, marks=None, on_mark=None):
+                   base: int = 0, marks=None, on_mark=None, on_chunk=None):
     """Chunked no-tap prefill; returns the last chunk's logits [1, 1, V]. ``marks``
     (absolute positions, with ``base`` = tokens already in the caches) split chunks so
     ``on_mark(pos)`` runs while the caches hold exactly the first ``pos`` tokens — the
-    prefix cache snapshots its interior boundaries there."""
+    prefix cache snapshots its interior boundaries there. ``on_chunk(pos)`` is prefill
+    PROGRESS (issue #29): it fires after each non-final chunk's existing ``mx.eval`` —
+    the sync the loop already does to bound activations — so it is honest (that much of
+    the prompt is genuinely computed) and free (no synchronization is added; the final
+    chunk needs none because generation starting IS its completion signal)."""
     chunk = chunk or PREFILL_CHUNK      # read the module knob at call time
     stops = _mark_stops(marks, base, len(ids))
     logits = None
@@ -1000,6 +1008,8 @@ def _prefill_plain(target, ids: list[int], cache, chunk: int | None = None,
             if many and not last:
                 mx.eval(_cache_arrays(cache))
                 mx.clear_cache()
+                if on_chunk is not None:
+                    on_chunk(base + end)
             if on_mark is not None and end in stops:
                 on_mark(base + end)
             i = end
@@ -1008,12 +1018,13 @@ def _prefill_plain(target, ids: list[int], cache, chunk: int | None = None,
 
 def _prefill_tapped(target, ids: list[int], cache, tap, drafter=None, ctx_caches=None,
                     ctx_offset: int = 0, chunk: int | None = None,
-                    marks=None, on_mark=None):
+                    marks=None, on_mark=None, on_chunk=None):
     """Chunked prefill with the hidden-state tap. When ``drafter`` is given, each chunk's
     fused states feed the drafter context immediately (so a long prompt's fused activations
     never all materialize at once); returns (last logits, last chunk's fused). Without a
     drafter the fused chunks are concatenated (DFlash needs the whole prompt's fused).
-    ``marks``/``on_mark``: see :func:`_prefill_plain` (``ctx_offset`` is the base)."""
+    ``marks``/``on_mark`` and the progress hook ``on_chunk``: see :func:`_prefill_plain`
+    (``ctx_offset`` is the base)."""
     chunk = chunk or PREFILL_CHUNK      # read the module knob at call time
     stops = _mark_stops(marks, ctx_offset, len(ids))
     logits = fused = None
@@ -1041,6 +1052,8 @@ def _prefill_tapped(target, ids: list[int], cache, tap, drafter=None, ctx_caches
                 mx.eval(_cache_arrays(cache),
                         [c.k for c in ctx_caches] if ctx_caches else fused)
                 mx.clear_cache()
+                if on_chunk is not None:
+                    on_chunk(ctx_offset + end)
             if on_mark is not None and end in stops:
                 on_mark(ctx_offset + end)
             i = end
@@ -1113,6 +1126,7 @@ def speculative_generate(
     on_round=None,
     on_prefill=None,
     prefill_marks=None,
+    on_prefill_chunk=None,
     verbose: bool = False,
 ) -> GenResult:
     """Speculative decoding (batch=1).
@@ -1194,7 +1208,8 @@ def speculative_generate(
     logits, _ = _prefill_tapped(
         target_model, suffix, cache, tap,
         drafter=drafter, ctx_caches=ctx_caches, ctx_offset=reuse_len, marks=prefill_marks,
-        on_mark=(lambda p: on_prefill(cache, ctx_caches, p)) if on_prefill else None)
+        on_mark=(lambda p: on_prefill(cache, ctx_caches, p)) if on_prefill else None,
+        on_chunk=on_prefill_chunk)
     if on_prefill is not None:
         on_prefill(cache, ctx_caches, len(ids))   # caches hold exactly `ids` right now
     mx.eval(logits)                    # settle prompt-eval so the prefill/decode timing split is honest

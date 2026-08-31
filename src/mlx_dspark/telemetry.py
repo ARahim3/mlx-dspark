@@ -98,6 +98,22 @@ class RoundLog:
             with contextlib.suppress(queue.Full):   # a slow client must never stall generation
                 q.put_nowait(event)
 
+    def publish(self, event: dict) -> None:
+        """Fan one event out to ``/events`` subscribers WITHOUT recording it — for engine
+        signals that are not rounds (prefill progress, issue #29). No ring-buffer append and
+        no counter bumps: round history, the acceptance curves and every aggregate stay
+        rounds-only, so a UI polling ``/rounds`` or ``/metrics`` sees no difference. Same
+        cheapness contract as :meth:`record` (non-blocking put, drop on a full queue); with
+        no subscribers it is a lock grab and nothing else. Consumers tell these apart by the
+        ``type`` key, which round events never carry — the Mac app's decoder already skips
+        events that don't parse as rounds, so old clients are unaffected."""
+        event.setdefault("t", round((time.perf_counter() - self._t0) * 1e3, 1))
+        with self._lock:
+            subscribers = tuple(self._subscribers)
+        for q in subscribers:
+            with contextlib.suppress(queue.Full):
+                q.put_nowait(event)
+
     # ------------------------------------------------------------------ reading
 
     def snapshot(self, limit: int | None = None) -> list[dict]:

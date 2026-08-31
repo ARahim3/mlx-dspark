@@ -162,6 +162,7 @@ def lookup_generate(
     on_round=None,
     on_prefill=None,
     prefill_marks=None,
+    on_prefill_chunk=None,
 ) -> GenResult:
     """Prompt-lookup speculative decoding (batch=1) — no drafter model.
 
@@ -193,7 +194,8 @@ def lookup_generate(
     suffix = ids[reuse_len:] if reuse_len else ids
     logits = _prefill_plain(
         target_model, suffix, cache, base=reuse_len, marks=prefill_marks,
-        on_mark=(lambda p: on_prefill(cache, None, p)) if on_prefill else None)
+        on_mark=(lambda p: on_prefill(cache, None, p)) if on_prefill else None,
+        on_chunk=on_prefill_chunk)
     if on_prefill is not None:
         on_prefill(cache, None, len(ids))   # caches hold exactly `ids` right now
     pending = _pick(logits[0, -1], temperature, top_p, top_k)

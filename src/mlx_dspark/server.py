@@ -942,6 +942,21 @@ class Engine:
             eff_cap = self._depth_capper.depth_adjusted_cap(
                 len(prompt_ids), default, STATIC_PRIOR_P)
         self._last_cap = eff_cap
+        # Prefill progress (issue #29): one non-recorded `/events` event per evaluated
+        # prefill chunk, so a client (the app's status bar) can show how far a long cold
+        # prompt has come while nothing streams. The hook fires after each chunk's
+        # EXISTING per-chunk eval (see generate._prefill_plain), so it adds no
+        # synchronization; positions are absolute, i.e. they start at the reused prefix
+        # length. The trailing done-event fires from `finally` so an error or cancel
+        # mid-prefill clears a client's progress display too. A prompt that fits in one
+        # chunk emits nothing.
+        _progress_seen = [False]
+        _n_prompt = len(prompt_ids)
+
+        def on_prefill_chunk(pos, _req=recorder.request_id, _total=_n_prompt):
+            _progress_seen[0] = True
+            self.rounds.publish({"type": "prefill", "req": _req, "mode": self.mode,
+                                 "processed": int(pos), "total": _total})
         try:
             if self.mode == "dspark":
                 res = speculative_generate(
@@ -955,6 +970,7 @@ class Engine:
                     presence_penalty=presence_penalty, frequency_penalty=frequency_penalty,
                     logprobs=logprobs, seed=seed, stop=stop, on_text=on_text,
                     on_round=on_round, on_prefill=on_prefill, prefill_marks=prefill_marks,
+                    on_prefill_chunk=on_prefill_chunk,
                 )
             elif self.mode == "dflash":
                 res = dflash_generate(
@@ -965,6 +981,7 @@ class Engine:
                     temperature=temperature, top_p=top_p, top_k=top_k,
                     seed=seed, stop=stop, on_text=on_text, on_round=on_round,
                     on_prefill=on_prefill, prefill_marks=prefill_marks,
+                    on_prefill_chunk=on_prefill_chunk,
                 )
             elif self.mode == "lookup":
                 res = lookup_generate(
@@ -975,6 +992,7 @@ class Engine:
                     temperature=temperature, top_p=top_p, top_k=top_k,
                     seed=seed, stop=stop, on_text=on_text, on_round=on_round,
                     on_prefill=on_prefill, prefill_marks=prefill_marks,
+                    on_prefill_chunk=on_prefill_chunk,
                 )
             else:
                 res = greedy_generate(
@@ -985,11 +1003,17 @@ class Engine:
                     frequency_penalty=frequency_penalty, logprobs=logprobs, seed=seed,
                     stop=stop, on_text=on_text, on_round=on_round,
                     on_prefill=on_prefill, prefill_marks=prefill_marks,
+                    on_prefill_chunk=on_prefill_chunk,
                 )
         except BaseException:                     # never leave a desynced cache behind
             if self.prefix is not None:
                 self.prefix.reset()
             raise
+        finally:
+            if _progress_seen[0]:                 # clear clients' progress on every exit path
+                self.rounds.publish({"type": "prefill", "req": recorder.request_id,
+                                     "mode": self.mode, "processed": len(prompt_ids),
+                                     "total": len(prompt_ids), "done": True})
         if self.prefix is not None and cache is not None and self.mode != "dflash":
             # dflash slots come only from the boundary checkpoint during prefill: its
             # drafter ctx window can't serve trim-mode reuse, so a post-generation trim
@@ -2765,7 +2789,8 @@ def make_handler(engine: Engine, api_key: str | None):
             body = A.build_message(res.text, model=model, input_tokens=len(prompt_ids),
                                    output_tokens=res.num_tokens,
                                    finish_reason=res.finish_reason, thinking=want_thinking,
-                                   schemas=schemas)
+                                   schemas=schemas,
+                                   in_thinking=bool(self._prompt_opens_thinking(prompt_ids)))
             body["x_mlx_dspark"] = engine.spec_info(res)   # non-standard; clients ignore it
             self._send_json(200, body)
 
@@ -2879,7 +2904,8 @@ def make_handler(engine: Engine, api_key: str | None):
                 return self._responses_stream(prompt_ids, params, model, len(prompt_ids),
                                               tools, resp_id, created)
             res = engine.generate(prompt_ids, on_text=None, **params)
-            reasoning_text, content = A.split_thinking(res.text)
+            reasoning_text, content = A.split_thinking(
+                res.text, in_thinking=bool(self._prompt_opens_thinking(prompt_ids)))
             tool_calls = None
             if tools:
                 parsed, cleaned = parse_tool_calls(content, schema_types(tools))
@@ -3020,13 +3046,15 @@ def make_handler(engine: Engine, api_key: str | None):
                 "prompt_tokens_details": {"cached_tokens": int(res_list[0].reused_tokens)},
             }
             choices = []
+            prefilled_think = bool(self._prompt_opens_thinking(prompt_ids)) if chat else False
             for i, res in enumerate(res_list):
                 if chat:
                     # split reasoning out of the text (Qwen `<think>`, Gemma thought channel,
                     # muse `to=self` analysis) so it rides in `reasoning_content` instead of
                     # leaking into content — and so tool calls parse from the answer, not the
-                    # reasoning. split_thinking auto-detects the format; no reasoning -> ("", text).
-                    reasoning, content = A.split_thinking(res.text)
+                    # reasoning. split_thinking auto-detects the format; no reasoning -> ("", text);
+                    # in_thinking covers a prefilled opener whose closer was truncated away.
+                    reasoning, content = A.split_thinking(res.text, in_thinking=prefilled_think)
                     finish, tool_calls = res.finish_reason, None
                     if want_tools:
                         parsed, cleaned = parse_tool_calls(content, schema_types(req.get("tools")))
