@@ -248,6 +248,28 @@ REGISTRY = [
     {"id": "lfm2.5-8b-a1b", "target": "LiquidAI/LFM2.5-8B-A1B-MLX-bf16",
      "dspark": "LiquidAI/LFM2.5-8B-A1B-DSpark", "lookup_drafts": False,
      "ram": "~19 GB", "speedup": "~1.3× (MoE, bf16)"},
+    # Nanbeige4.2-3B — the first **looped-depth** target (model_type nanbeige: 22 dense qwen-style
+    # GQA layers applied TWICE with shared weights, per-loop KV caches — 44 cache entries — and the
+    # final RMSNorm at the end of each loop). mlx-lm has the module on main but unreleased, so
+    # nanbeige_lm.py vendors it (self-retiring). Official Nanbeige DSpark head, SpecForge/SGLang
+    # packaging (nested dflash_config, projector_type "dspark"): 5-layer plain qwen3 GQA backbone,
+    # block_size 7, anchor-as-pos0 (probed: accept 3.03 vs 2.04 read as logits_start=1), markov-256
+    # + confidence, reuses the target's embed AND lm_head. Tap ids index the UNROLLED 44-layer
+    # stream, and the tap at id 21 (the loop boundary) must be captured AFTER the inter-loop
+    # RMSNorm — the reference (Nanbeige/sglang@nbg42) captures before unrolled step k+1; feeding
+    # the pre-norm value measured accept 2.45 -> 3.03 on code (see target.py::_body_nanbeige).
+    # The looped stack makes the bf16 baseline decode like a ~6B (~16.5 tok/s at ~86% MBU on an
+    # M4 Pro), which is exactly the regime where DSpark pays: **cap 7 (static_cap's zero-flag
+    # pick) = 2.92x mean** (2.02x chat / 2.48x code / 4.25x math, accept 3.96, 49 tok/s; 3-trial
+    # medians). Lossless (fp ties, margins 0.0/0.0/0.25). Confidence head does NOT pay (flat bf16
+    # verify curve inside the cap window); lookup on-vs-off is a wash -> default kept. The target
+    # is the community bf16 MLX conversion (byte-identical tensors to Nanbeige/Nanbeige4.2-3B,
+    # verified); NOTE both repos ship config.json `auto_map` markers, so a fresh download trips
+    # refuse_remote_code until the auto_map carve-out question is settled — strip the key locally
+    # or run with --trust-remote-code. See NOTES "Nanbeige4.2-3B: the first looped-depth target".
+    {"id": "nanbeige4.2-3b", "target": "MercuriusDream/Nanbeige4.2-3B-mlx-bf16",
+     "dspark": "Nanbeige/Nanbeige4.2-3B-DSpark",
+     "ram": "~10 GB", "speedup": "~2.9× (4.3× math)"},
 ]
 
 # legacy `--family` / load_pair("qwen3") values -> a concrete target repo (deprecated).
@@ -871,6 +893,14 @@ def load_target(repo_or_path: str = DEFAULT_TARGET, *, require_tap: bool = False
             f"{repo_or_path}: this checkpoint is quantized to {bits} bits, which stock MLX "
             f"cannot load (mx.quantize supports 2/3/4/5/6/8).{hint}"
         )
+
+    if cfg.get("model_type") == "nanbeige":
+        # Nanbeige4.2 (looped-depth transformer): mlx-lm has the module on main but no
+        # release ships it yet — register the vendored copy so _route_target and mlx-lm's
+        # own module lookup resolve it. Self-retiring (see nanbeige_lm.register).
+        from .nanbeige_lm import register as _register_nanbeige
+
+        _register_nanbeige()
 
     refuse_remote_code(path, repo_or_path)
     if _route_target(cfg) == "mlx_lm":

@@ -60,6 +60,21 @@ around it are mlx-dspark's own.
 
 ---
 
+Nanbeige model module (Apple / mlx-lm)
+--------------------------------------
+
+The file `src/mlx_dspark/nanbeige_lm.py` contains the Nanbeige4.2 model classes
+(ModelArgs, Attention, MLP, TransformerBlock, NanbeigeModel, Model) vendored from the
+mlx-lm main branch (`mlx_lm/models/nanbeige.py`, MIT License; Copyright © 2026 Apple
+Inc.), which no mlx-lm release ships yet:
+
+  - https://github.com/ml-explore/mlx-lm  (MIT License)
+
+The runtime registration shim around it is mlx-dspark's own and self-retires once an
+installed mlx-lm provides the module itself.
+
+---
+
 Target models (Gemma-4, Qwen3) are downloaded at runtime from their respective
 publishers and are subject to their own licenses (e.g. the Gemma Terms of Use and the
 Qwen license).

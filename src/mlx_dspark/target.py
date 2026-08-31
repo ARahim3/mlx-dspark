@@ -42,6 +42,15 @@ class Target:
         # (_body_muse_glimmer, the same approach the mlx-lm paths take), reusing the model's
         # own layer modules + per-layer sliding/full masks; verify_tap() proves it faithful.
         self._muse = self.is_vlm and getattr(model, "model_type", "") == "muse_glimmer"
+        # nanbeige (Nanbeige4.2): a looped-depth transformer — num_hidden_layers dense
+        # blocks applied num_loops times with shared weights, per-loop KV caches, and the
+        # final RMSNorm at the end of every loop pass. The drafter's target_layer_ids index
+        # the UNROLLED layer stream (num_loops * num_hidden_layers positions), so the
+        # generic dense body (one pass over zip(layers, cache)) cannot serve the tap;
+        # _body_nanbeige replicates the looped forward. Everything else is dense-standard:
+        # all caches are trimmable KVCache, so verify/rollback/prefix-cache take the
+        # ordinary dense paths.
+        self._nanbeige = (not self.is_vlm) and self.family == "nanbeige"
         # hybrid = some layers hold recurrent state (no trimmable KV). Two recurrences are
         # supported, each with its own capture/rollback: qwen3_5 gated-DeltaNet (layers flagged
         # ``is_linear``, e.g. Bonsai/Qwen3.6) and Nemotron-H Mamba-2 (blocks ``block_type=="M"``).
@@ -133,6 +142,8 @@ class Target:
             return self._run_lfm2(ids, cache, tap)
         if self.is_hybrid:
             return self._run_hybrid(ids, cache, tap)
+        if self._nanbeige:
+            return self._run_nanbeige(ids, cache, tap)
         return self._run_mlxlm(ids, cache, tap)
 
     # The mlx-lm paths are split body/head so a prefill chunk can skip the vocab
@@ -229,6 +240,52 @@ class Target:
 
     def _run_lfm2(self, ids, cache, tap):
         hn, fused = self._body_lfm2(ids, cache, tap)
+        return self._head_mlxlm(hn), fused
+
+    def _body_nanbeige(self, ids, cache, tap):
+        """Replicates the vendored nanbeige forward (looped-depth: the shared layer stack
+        applied num_loops times, per-loop KV cache slices, final RMSNorm at the end of every
+        loop pass) with the residual-stream capture. Tap indices address the UNROLLED stream
+        — loop_idx * n_layers + layer_idx — matching the drafter's target_layer_ids /
+        num_target_layers (= num_loops * num_hidden_layers; the Nanbeige4.2-3B head declares
+        44 over a 22-layer, 2-loop target).
+
+        Capture convention (from the reference, Nanbeige/sglang@nbg42
+        ``srt/models/nanbeige.py``): a tap at unrolled id k is captured *before unrolled
+        step k+1* — the residual stream after layer k for a mid-loop tap, but for a tap at
+        the LAST layer of a non-final loop (id 21 here) the value entering the next loop,
+        i.e. AFTER the inter-loop residual fold + RMSNorm. Capturing that boundary tap
+        pre-norm feeds the drafter one silently-wrong fused feature of five (the offset-
+        RMSNorm bug class: no error anywhere, only lost acceptance). A tap at the very
+        last unrolled layer is never reachable in the reference loop and is refused.
+        Faithfulness of the forward itself is proven by :meth:`verify_tap` at load."""
+        from mlx_lm.models.base import create_attention_mask
+
+        mm = self._inner.model
+        want = {t + 1 for t in tap} if tap is not None else ()
+        h = mm.embed_tokens(ids)
+        mask = create_attention_mask(h, cache[0])
+        captured = []
+        n = len(mm.layers)
+        total = mm.num_loops * n
+        if want and max(want) > total - 1:
+            raise ValueError(
+                f"nanbeige tap id {max(want) - 1} is not capturable: the reference captures "
+                f"before the NEXT unrolled step, and there is none after layer {total - 1}.")
+        for loop_idx in range(mm.num_loops):
+            loop_cache = cache[loop_idx * n:(loop_idx + 1) * n]
+            for j, (layer, c) in enumerate(zip(mm.layers, loop_cache)):
+                if loop_idx * n + j in want:
+                    captured.append(h)
+                h = layer(h, mask, c)
+            if not mm.skip_loop_final_norm:
+                h = mm.norm(h)
+        if mm.skip_loop_final_norm:
+            h = mm.norm(h)
+        return h, (mx.concatenate(captured, axis=-1) if tap is not None else None)
+
+    def _run_nanbeige(self, ids, cache, tap):
+        hn, fused = self._body_nanbeige(ids, cache, tap)
         return self._head_mlxlm(hn), fused
 
     def _head_mlxlm(self, hn):
@@ -343,7 +400,8 @@ class Target:
         else:
             body = (self._body_nemotron if self._recurrence == "mamba2"
                     else self._body_lfm2 if self._recurrence == "shortconv"
-                    else self._body_hybrid if self.is_hybrid else self._body_mlxlm)
+                    else self._body_hybrid if self.is_hybrid
+                    else self._body_nanbeige if self._nanbeige else self._body_mlxlm)
             hn, fused = body(ids, cache, tap)
             head = self._head_mlxlm
         if not want_logits:
@@ -668,6 +726,8 @@ class Target:
                 self.reset_spec()
             elif self._muse:
                 got, _ = self._run_muse_glimmer(ids, self.make_cache(), [0])
+            elif self._nanbeige:
+                got, _ = self._run_nanbeige(ids, self.make_cache(), [0])
             else:
                 got, _ = self._run_mlxlm(ids, self.make_cache(), [0])
             diff = float(mx.abs(ref - got).max())
