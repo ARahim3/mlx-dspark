@@ -118,9 +118,24 @@ def cpu_rows(rows: int, frac: float) -> int:
 
 
 def _split_call(self, x, rows: int, frac: float):
-    """GPU takes rows[:a], the CPU stream rows[a:], both from ONE dequantized transient.
-    The CPU work is scheduled by mlx's own scheduler on its CPU stream — no second Python
-    thread, so the one-MLX-thread rule holds — and unified memory means no copy."""
+    """CPU stream takes rows[:n_cpu], the GPU rows[n_cpu:], both from ONE dequantized
+    transient. The CPU work is scheduled by mlx's own scheduler on its CPU stream — no
+    second Python thread, so the one-MLX-thread rule holds — and unified memory means no
+    copy.
+
+    The CPU gets the HEAD rows deliberately (issue #31): its GEMM runs through BNNS, and a
+    reported SIGSEGV on a 24 GB M4 Pro (``matmul_bnns`` → ``BNNSFilterApplyTwoInputBatch``
+    reading an unmapped address, deterministic fault offsets, gone with ``--cpu-split 0``)
+    is consistent with a tile read running past the end of an input slice. A head slice's
+    over-read lands inside ``x``'s own allocation — always mapped — where the old tail
+    slice ended exactly at the buffer's edge, so the same over-read could cross into an
+    unmapped gap on a machine whose allocator pools sit tighter. The GPU reading the tail
+    instead is safe either way (an out-of-bounds GPU read cannot SIGSEGV the process).
+    Not reproduced on the 48 GB dev machine (10 varied-width prefills at the reporter's
+    fracs); this removes the one fault mode we can remove from here — the underlying
+    BNNS/mlx question is upstream's (see drafts/mlx-issue-bnns-cpu-split-sigsegv.md).
+    Row order is preserved by the concat, so outputs are unchanged (same rows, same
+    kernels, fp-tie class as before)."""
     n_cpu = cpu_rows(rows, frac)
     if n_cpu == 0:
         return None
@@ -128,11 +143,10 @@ def _split_call(self, x, rows: int, frac: float):
                       group_size=self.group_size, bits=self.bits)
     lead = x.shape[:-1]
     x2 = x.reshape(rows, x.shape[-1])
-    a = rows - n_cpu
-    y_gpu = x2[:a] @ w.T
     with mx.stream(mx.cpu):
-        y_cpu = x2[a:] @ w.T
-    y = mx.concatenate([y_gpu, y_cpu], axis=0)
+        y_cpu = x2[:n_cpu] @ w.T
+    y_gpu = x2[n_cpu:] @ w.T
+    y = mx.concatenate([y_cpu, y_gpu], axis=0)
     if "bias" in self:
         y = y + self["bias"]
     return y.reshape(*lead, y.shape[-1])
