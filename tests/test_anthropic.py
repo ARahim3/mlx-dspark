@@ -492,6 +492,20 @@ def test_split_thinking_self_opened_and_prefilled_and_absent():
     assert A.split_thinking("<think>cut off") == ("cut off", "")
 
 
+def test_split_thinking_prefilled_opener_truncated_is_all_reasoning():
+    # A template that PREFILLS <think> (Qwen3-2507 / qwen3_5 / Qwen3.8 / nanbeige) plus a
+    # max_tokens truncation leaves output with NO thinking markup at all — indistinguishable
+    # from a plain answer without the prompt-tail hint. With in_thinking the whole text is
+    # reasoning (matching the streaming splitter, which has always taken the same hint);
+    # without the flag the old behavior is unchanged.
+    assert A.split_thinking("cut off mid-thought", in_thinking=True) == ("cut off mid-thought", "")
+    assert A.split_thinking("cut off mid-thought") == ("", "cut off mid-thought")
+    # a closer present still splits normally under the flag
+    assert A.split_thinking("reasoning</think>\n\nanswer", in_thinking=True) == ("reasoning", "answer")
+    # and a self-opened block is untouched by it
+    assert A.split_thinking("<think>r</think>\n\na", in_thinking=True) == ("r", "a")
+
+
 def test_prompt_opens_thinking_returns_the_matching_closer():
     assert A.prompt_opens_thinking("<|im_start|>assistant\n<think>\n") == "</think>"
     assert A.prompt_opens_thinking("<|im_start|>assistant\n") is None
