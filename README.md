@@ -42,6 +42,7 @@ chat/code/math), the Muse row per-content best (footnoted); full tables, baselin
 
 | target | best measured speedup | speed (chat → best) |
 |---|---|---|
+| **Nanbeige4.2-3B** (bf16, looped)[^nanbeige] | **4.25×** math · **2.48×** code · **2.02×** chat | ~34–71 tok/s |
 | **Qwen3.8-27B** (8-bit, DFlash 2)[^q38] | **4.06×** math · **4.05×** code · **2.79×** chat | ~24–34 tok/s |
 | **LFM2.5-1.2B** (bf16, conv-hybrid)[^lfm2] | **3.78×** math · **3.70×** code · **2.44×** chat | **~245–380 tok/s** |
 | **LFM2.5-2.6B** (bf16, conv-hybrid)[^lfm2] | **3.37×** math · **2.39×** code · **2.11×** chat | ~93–148 tok/s |
@@ -418,6 +419,7 @@ anything else, add `--drafter <repo>`. Run `mlx-dspark models` to print this tab
 | `mlx-community/Ornith-1.0-9B-8bit`   | `stanleyphoong/Ornith-1.0-9B-DSpark` (community) | — | ~13 GB | not measured yet |
 | `mlx-community/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-4bit` | `mlx-community/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-DSpark-bf16` (NVIDIA head, MLX) | — | ~20 GB | not measured yet |
 | `mlx-community/Muse-Glimmer-30B-4bit` | `DaoCloud/Muse-Glimmer-30B-DSpark` (community, DFlash-lineage) | — | ~26 GB (4-bit) / ~40 GB (8-bit[^muse]) | not measured yet |
+| `MercuriusDream/Nanbeige4.2-3B-mlx-bf16`[^nanbeige] | `Nanbeige/Nanbeige4.2-3B-DSpark` (official, SpecForge) | — | ~10 GB | not measured yet |
 
 *Peak RAM* is measured on an M4 Pro (8-bit target + 4-bit drafter + KV cache) at chat-length
 context; add headroom for macOS. *Cache at 128k ctx* is what a long-context session **adds on
@@ -643,6 +645,7 @@ curves.
 | target | cap | accept len | baseline | mlx-dspark | speedup | chat / code / math |
 |---|---|---|---|---|---|---|
 | **LFM2.5-1.2B** (bf16, conv-hybrid)[^lfm2] | 7 | 5.33 | 100.7 tok/s | 332.8 tok/s | **3.30×** | 2.44× / 3.70× / 3.78× |
+| **Nanbeige4.2-3B** (bf16, looped)[^nanbeige] | 7 | 3.96 | 16.5 tok/s | 49.0 tok/s | **2.92×** | 2.02× / 2.48× / 4.25× |
 | **Gemma-4 12B** | 4 | 3.95 | 17.8 tok/s | 49.4 tok/s | **2.78×** | 2.63× / 2.61× / 3.09× |
 | **Qwen3.8-27B** (8-bit, hybrid)[^community][^q38] | 7 | 4.05 | 8.3 tok/s | 22.6 tok/s | **2.72×** | 1.95× / 2.84× / 3.37× |
 | **LFM2.5-2.6B** (bf16, conv-hybrid)[^lfm2] | 6 | 3.70 | 43.9 tok/s | 115.2 tok/s | **2.62×** | 2.11× / 2.39× / 3.37× |
@@ -775,6 +778,7 @@ forced off (`--cpu-split 0`) vs on, 2048-token prompt (the ratio holds at 4096):
 | **Qwen3-4B** (8-bit) | 886 tok/s | **1141 tok/s** (1.29×) | ~18 s |
 | **Qwen3.6-35B-A3B** (4-bit, MoE) | **960 tok/s** | — (experts are `gather_qmm`, not split) | ~21 s |
 | **Qwen3-8B** (8-bit) | 488 tok/s | **636 tok/s** (1.30×) | ~31 s |
+| **Nanbeige4.2-3B** (bf16, looped) | **526 tok/s** | — (bf16 `nn.Linear` not yet split) | ~38 s |
 | **Gemma-4 12B** (8-bit) | 293 tok/s | **381 tok/s** (1.30×) | ~52 s |
 | **Qwen3.8-27B** (8-bit) | 138 tok/s | **182 tok/s** (1.31×) | ~110 s |
 | **Qwen3.8-27B** (4-bit) | 130 tok/s | **184 tok/s** (1.41×) | ~109 s |
@@ -785,7 +789,9 @@ LFM2.5-1.2B leads, and both MoE rows punch far above their total-parameter weigh
 does only ~3.8B parameters' worth of arithmetic per token, and the LFM2.5-8B-A1B only ~1B, no
 matter how many experts they store (which is why that 8B MoE prefills faster than the dense 2.6B).
 The same fact shows up on Qwen3.8-27B the other way: its 4-bit quant prefills at the same rate
-as the 8-bit — weight bits change decode speed (bandwidth-bound), not prefill.
+as the 8-bit — weight bits change decode speed (bandwidth-bound), not prefill. And it cuts against
+Nanbeige4.2-3B from the other side: its looped architecture runs every token through the 22-layer
+stack twice, so the "3B" pays a ~6B model's arithmetic and prefills accordingly.
 
 Since 0.7.0 mlx-dspark skips the prefill logits every caller discards and dequantizes wide weights
 once instead of per output tile, which is worth **1.07–1.15×** — **bit-identical**, no extra
@@ -1269,6 +1275,24 @@ are bundled.
     8-bit-at-baseline (~114 tok/s) still beats bf16+spec (~82), so the drafter is a win for
     bf16-quality users, not the fastest way to run this model — which is why it's kept out of the
     tables above. Lossless at both quants.
+
+[^nanbeige]: **Nanbeige4.2-3B** — the project's first **looped-depth** target (`model_type`
+    nanbeige): 22 dense layers applied **twice with shared weights** (per-loop KV caches, an
+    RMSNorm between loops), so each bf16 decode step reads a ~6B model's weights — the baseline
+    is only ~16.5 tok/s at ~86% MBU, and that expensive step is exactly what makes the official
+    DSpark head pay this well (accept 3.96 at cap 7, the zero-flag derived pick; math runs at
+    **71 tok/s**). The drafter is Nanbeige's own (SpecForge packaging, block-7, anchor-as-pos0,
+    reuses the target's embed and lm_head); the drafter's tap layers index the **unrolled**
+    44-layer stream, and the tap at the loop boundary is captured *after* the inter-loop norm —
+    the convention their sglang fork defines (getting it wrong silently costs ~20% acceptance).
+    mlx-lm doesn't ship the nanbeige module in a release yet, so mlx-dspark vendors mlx-lm
+    main's implementation until it lands (verified token-identical to the reference PyTorch
+    modeling on the same weights). The registry points at the community bf16 MLX conversion
+    (tensors byte-verified against the original repo); any quant of the target resolves the
+    same drafter. Heads-up: these checkpoints carry `auto_map` pointers in `config.json`, which
+    the remote-code scan flags on a fresh download — start with `--trust-remote-code` for this
+    pair (nothing is imported on the mlx-lm route: mlx-dspark uses its own model code and keeps
+    tokenizer `trust_remote_code` off).
 
 [^community]: **Community-drafter rows.** Qwen3.6-27B runs the **8-bit** target with
     `satgeze/Qwen3.6-27B-DSpark` — a block-15 head (vs 7 everywhere else) trained against the
