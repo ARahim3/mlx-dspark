@@ -14,6 +14,11 @@ struct MenuBarLabel: View {
             if model.liveTokensPerSec > 0 {
                 Text("\(Int(model.liveTokensPerSec))")
                     .monospacedDigit()
+            } else if let prefill = model.prefill {
+                // Reading the prompt (no tokens yet): the % is the only sign of life a long
+                // cold request has — decode's tok/s takes this slot over once rounds start.
+                Text("\(Int(prefill.fraction * 100))%")
+                    .monospacedDigit()
             }
         }
     }
@@ -55,6 +60,13 @@ struct MenuBarPanel: View {
                        model.machine?.memory.isUnderPressure == true {
                         row("Pressure", pressure.uppercased())
                             .foregroundStyle(pressure == "critical" ? .red : Theme.warning)
+                    }
+                    if let prefill = model.prefill {
+                        // Any client's request — the app hears every prefill via /events.
+                        row("Prefill", "\(prefill.processed.formatted()) / \(prefill.total.formatted()) tokens")
+                        ProgressView(value: prefill.fraction)
+                            .progressViewStyle(.linear)
+                            .tint(Theme.spark)
                     }
                 }
 

@@ -64,10 +64,30 @@ public struct RoundStats: Decodable, Sendable, Equatable {
     }
 }
 
-/// An event off the `/events` stream: either a round or a periodic aggregate refresh.
+/// Prefill progress for one request, off the `/events` stream (engine ≥ the release after
+/// 0.17.2; issue #29). The engine emits one of these per evaluated prefill chunk — the only
+/// signal during the minutes a long cold prompt spends before the first token — and a final
+/// `done` event on every exit path (success, error, cancel), so a display can always clear.
+/// Positions are absolute prompt tokens, so `processed` starts at the reused prefix length.
+public struct PrefillEvent: Decodable, Sendable, Equatable {
+    /// Always `"prefill"` — the discriminator (round events carry no `type` key).
+    public let type: String
+    public let req: String
+    public let mode: String
+    public let processed: Int
+    public let total: Int
+    public let done: Bool?
+
+    public var isDone: Bool { done == true }
+    public var fraction: Double { total > 0 ? Double(processed) / Double(total) : 0 }
+}
+
+/// An event off the `/events` stream: a round, a periodic aggregate refresh, or prefill
+/// progress.
 public enum TelemetryEvent: Sendable {
     case round(RoundEvent)
     case stats(RoundStats)
+    case prefill(PrefillEvent)
 }
 
 // MARK: - Calibration

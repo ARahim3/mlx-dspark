@@ -391,6 +391,13 @@ public struct APIClient: Sendable {
                         default:
                             if let round = try? decoder.decode(RoundEvent.self, from: data) {
                                 continuation.yield(.round(round))
+                            } else if let prefill = try? decoder.decode(PrefillEvent.self,
+                                                                        from: data),
+                                      prefill.type == "prefill" {
+                                // rounds and prefill events are disjoint shapes (a round has
+                                // no `type`, a prefill event none of the round counters), so
+                                // decode order can't misfile one as the other
+                                continuation.yield(.prefill(prefill))
                             }
                         }
                     }

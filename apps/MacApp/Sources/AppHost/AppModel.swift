@@ -131,6 +131,12 @@ final class AppModel: ObservableObject {
     // MARK: Telemetry (Lab)
     @Published var rounds: [RoundEvent] = []
     @Published var stats: RoundStats?
+    /// Prefill progress for the request the engine is currently prefilling, nil when none —
+    /// the only feedback during the minutes a long cold prompt (an external client's 20k-token
+    /// agent request, say) spends before its first token. Set from the `/events` stream, so it
+    /// covers every client, and cleared by the engine's own `done` event on every exit path
+    /// (plus defensively when the stream drops or goes stale).
+    @Published var prefill: PrefillEvent?
     @Published var calibration: Calibration?
     /// MLX allocator state — what the loaded model holds resident, polled from `/metrics`.
     @Published var memory: EngineMemory?
@@ -709,11 +715,16 @@ final class AppModel: ObservableObject {
                             self.lastActivity = Date()
                         case .stats(let stats):
                             self.stats = stats
+                        case .prefill(let progress):
+                            self.prefill = progress.isDone ? nil : progress
+                            self.lastActivity = Date()
                         }
                     }
+                    self?.prefill = nil     // stream ended (engine restart): don't show stale progress
                 } catch {
                     // The stream ends when the engine restarts or a socket drops; reconnect
                     // rather than leaving the Lab silently frozen.
+                    self?.prefill = nil
                 }
                 try? await Task.sleep(nanoseconds: 1_000_000_000)
             }
@@ -750,6 +761,13 @@ final class AppModel: ObservableObject {
                    Date().timeIntervalSince(self.lastActivity) > 4 {
                     self.liveTokensPerSec = 0
                     self.rateEWMA = 0
+                }
+                // Prefill progress goes stale only if the engine's done-event was lost (a
+                // dropped stream mid-prefill). Chunks land every few seconds — even a 30B at
+                // ~100 tok/s prefill produces one per ~20 s — so a quiet minute means gone.
+                if self.prefill != nil,
+                   Date().timeIntervalSince(self.lastActivity) > 60 {
+                    self.prefill = nil
                 }
             }
         }
