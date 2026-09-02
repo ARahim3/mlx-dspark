@@ -742,6 +742,16 @@ def test_admin_unload_frees_the_engine(holder_server):
     assert _post(base, "/admin/unload", {})["ready"] is False
 
 
+def test_machine_answers_after_unload(holder_server):
+    """The Mac app polls /machine after unloading; that must remain model-free."""
+    _holder, base = holder_server
+    _post(base, "/admin/unload", {})
+
+    payload = _get(base, "/machine")
+
+    assert "memory" in payload
+
+
 def test_inventory_routes_answer_without_a_model(holder_server):
     """/doctor and /admin/models are model-free by design — a picker must work from the
     no-model state. /admin/models reports loaded=None there."""
