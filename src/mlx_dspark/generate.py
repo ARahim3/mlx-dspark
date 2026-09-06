@@ -21,6 +21,7 @@ from dataclasses import dataclass
 import mlx.core as mx
 from mlx.utils import tree_flatten
 
+from .dflash_model import skip_ctx
 from .sampling import sample_probs, truncate_probs
 from .sdpa_split import sdpa_split as _sdpa_split_scope
 from .small_m_qmm import small_m_matmul
@@ -686,7 +687,7 @@ def dflash_generate(
     if reuse_len and window is not None and window.rows and window.end == reuse_len:
         restored = window.k
         for c in dcache:
-            c.offset = window.start
+            skip_ctx(c, window.start)
         drafter.append_ctx(restored, dcache)
 
     # --- prefill the suffix (chunked), accumulating the fused states the first draft call
@@ -750,10 +751,12 @@ def dflash_generate(
     pending_ctx = _fused_all()         # the first draft call appends the suffix's ctx
     if trimmed["dropped"]:
         # Rows the bound discarded would have been skipped inside append_ctx anyway; its
-        # skip logic advances cache.offset past them so rope positions stay absolute —
-        # reproduce that bump here (the window-restore preset above did the same).
+        # skip logic advances the cache's absolute position past them so rope positions
+        # stay absolute — reproduce that here (the window restore above did the same).
+        # skip_ctx, not a bare offset bump: the rotating cache must know the offset runs
+        # ahead of its rows, or a later single-row append mis-sizes the buffer (issue #33).
         for c in dcache:
-            c.offset += trimmed["dropped"]
+            skip_ctx(c, trimmed["dropped"])
     pending = _pick(logits[0, -1], temperature, top_p, top_k)
     out_ids: list[int] = [pending]
     accept_lengths: list[int] = []

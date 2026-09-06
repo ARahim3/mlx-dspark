@@ -29,6 +29,10 @@ Design (edge-triggered, threaded through the generation thread, never racing it)
   kill; the re-prefill is the lesser cost). Weights are never touched; the model keeps serving.
 - Every shed is recorded (level, bytes freed, when) for ``/health.warnings``, ``/machine`` and
   the log, so a user can see *why* a turn re-prefilled.
+- **The engine rides along** (``on_shed``, same thread): the first shed also suspends CPU
+  co-prefill for the session — every BNNS SIGSEGV reported in the CPU-stream prefill GEMM
+  (issue #31) was on a machine under sustained pressure, and the split buys nothing while
+  the OS is paging. Recorded on the event (``cpu_split: "suspended"``), shown in ``/health``.
 
 Pure enough to test model-free: the poller, clock, and the two actions are injectable.
 """
@@ -78,7 +82,7 @@ class MemoryGuard:
                  clock=time.monotonic, interval_s: float = DEFAULT_INTERVAL_S,
                  rearm_s: float = DEFAULT_REARM_S, defer_s: float = DEFAULT_DEFER_S,
                  clear_cache=_clear_allocator_cache, allocator_bytes=_allocator_bytes,
-                 log=None):
+                 log=None, on_shed=None):
         self.prefix = prefix
         self._submit = submit
         self._is_busy = is_busy or (lambda: False)
@@ -89,6 +93,7 @@ class MemoryGuard:
         self.defer_s = defer_s
         self._clear_cache = clear_cache
         self._allocator_bytes = allocator_bytes
+        self._on_shed = on_shed                  # engine hook, runs with the shed (MLX thread)
         self._log = log or (lambda msg: print(f"[serve] {msg}", file=sys.stderr, flush=True))
         self._lock = threading.Lock()
         self._pending: str | None = None         # level of a shed waiting for the MLX thread
@@ -188,6 +193,16 @@ class MemoryGuard:
         now = self._clock()
         event = {"level": level, "at": time.time(), "freed_bytes": max(before - after, 0),
                  "allocator_before": before, "allocator_after": after, **dropped}
+        if self._on_shed is not None:
+            # The engine's own pressure response (today: suspending CPU co-prefill for the
+            # session, issue #31). Same thread as the shed, so it may flip generation knobs;
+            # whatever it returns is recorded on the event for /health and the log.
+            try:
+                extra = self._on_shed(level)
+            except Exception as e:  # noqa: BLE001 — never let a hook take the engine down
+                extra = {"on_shed_error": f"{type(e).__name__}: {e}"}
+            if extra:
+                event.update(extra)
         with self._lock:
             self._last_shed_at, self._last_shed_level = now, level
             self.events.append(event)
@@ -196,7 +211,9 @@ class MemoryGuard:
         self._log(f"memory guard: pressure {level.upper()} — freed "
                   f"{event['freed_bytes'] / gb:.2f} GB (prefix cache: "
                   f"{dropped.get('action', 'none')}; allocator {before / gb:.1f} → "
-                  f"{after / gb:.1f} GB)")
+                  f"{after / gb:.1f} GB)"
+                  + ("; CPU co-prefill suspended for this session (issue #31)"
+                     if event.get("cpu_split") == "suspended" else ""))
         return event
 
     # ------------------------------------------------------------------ reporting
@@ -221,7 +238,9 @@ class MemoryGuard:
             "level": "attention",
             "message": (f"Memory guard freed {last['freed_bytes'] / gb:.1f} GB when macOS "
                         f"reported {last['level'].upper()} pressure — the prefix cache was "
-                        f"{'emptied, so the next turn re-prefills' if last['level'] == 'critical' else 'trimmed (rungs dropped; conversations kept)'}."),
+                        f"{'emptied, so the next turn re-prefills' if last['level'] == 'critical' else 'trimmed (rungs dropped; conversations kept)'}."
+                        + (" CPU co-prefill is off for the rest of this session."
+                           if last.get("cpu_split") == "suspended" else "")),
             "action": "Free memory (close apps, lower the context window, smaller quant) so "
                       "it stops recurring.",
         }

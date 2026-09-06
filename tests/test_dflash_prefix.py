@@ -12,10 +12,12 @@ import mlx.core as mx
 import numpy as np
 
 from mlx_dspark.dflash_model import (
+    CtxRotatingKVCache,
     DFlashConfig,
     DFlashCtxWindow,
     DFlashDraftModel,
     DFlashGroupedConv,  # noqa: F401  (import guard: same module, same load path)
+    skip_ctx,
 )
 from mlx_dspark.prefix_cache import PrefixCache, _restore, _snapshot
 
@@ -164,7 +166,7 @@ def _forward(model, fused_parts, offsets_start=None, window_rows=None):
     dcache = model.make_cache()
     if window_rows is not None:
         for c in dcache:
-            c.offset = offsets_start
+            skip_ctx(c, offsets_start)
         model.append_ctx(window_rows, dcache)
     block = mx.array([[1] + [3] * 3])
     return model.forward_hidden(block, fused_parts, dcache, logits_start=1), dcache
@@ -195,7 +197,7 @@ def test_append_ctx_advances_offsets_to_boundary():
     w.set(model.project_ctx(mx.random.normal((1, 20, 2 * 32))), end=100)
     dcache = model.make_cache()
     for c in dcache:
-        c.offset = w.start
+        skip_ctx(c, w.start)
     model.append_ctx(w.k, dcache)
     assert all(c.offset == 100 for c in dcache)
 
@@ -215,9 +217,89 @@ def test_trimmed_prefill_accumulator_reproduces_full_path():
         dropped = n - keep
         dcache_trim = model.make_cache()
         for c in dcache_trim:
-            c.offset = dropped                           # generate.py's post-trim bump
+            skip_ctx(c, dropped)                         # generate.py's post-trim bump
         block = mx.array([[1] + [3] * 3])
         trimmedout = model.forward_hidden(block, fused[:, dropped:], dcache_trim,
                                           logits_start=1)
         assert np.allclose(np.array(full), np.array(trimmedout), atol=1e-5), n
         assert dcache_trim[0].offset == dcache_full[0].offset == n
+
+
+# ------------------------------------------- issue #33: offset running ahead of the rows
+
+def _rows(a, b):
+    r = mx.arange(a, b, dtype=mx.float32).reshape(1, 1, b - a, 1)
+    return r, r
+
+
+def test_ctx_cache_single_row_append_after_skip_past_window():
+    """Issue #33's exact state: a rotating ctx cache whose absolute offset is far past the
+    window while the buffer is part-filled (a prefix-cache window trimmed to the shared
+    prefix after a memory-guard shed dropped the rungs), then single-row appends (0-accept
+    rounds). Upstream's arithmetic sized the growth from the absolute offset
+    (``max_size - 30000`` -> "Negative dimensions not allowed"); rows must land in order at
+    absolute positions and the buffer must grow from the rows it holds."""
+    max_size = 15
+    c = CtxRotatingKVCache(max_size=max_size, keep=0)
+    c.skip(30_000)                                     # restore: window.start
+    k, _ = c.update_and_fetch(*_rows(0, 4))            # window rows (4 < max_size)
+    assert c.offset == 30_004 and k.shape[2] == 4
+    for i in range(4, 20):                             # single rows through the fill + wrap
+        k, v = c.update_and_fetch(*_rows(i, i + 1))
+        assert c.offset == 30_000 + i + 1, i
+        assert k.shape[2] == min(i + 1, max_size), (i, k.shape)
+        held = sorted(int(x) for x in np.array(k).reshape(-1))   # never zero-fill padding
+        assert held == list(range(max(0, i + 1 - max_size), i + 1)), (i, held)
+        assert np.array_equal(np.array(k), np.array(v))
+
+
+def test_ctx_cache_multi_row_after_partial_fill_matches_upstream_fresh_path():
+    """Both append paths on the run-ahead state must equal upstream's plain fresh path
+    (same rows, no skip) — the rebase changes nothing but the coordinates."""
+    c = CtxRotatingKVCache(max_size=8, keep=0)
+    c.skip(5000)
+    ref = CtxRotatingKVCache(max_size=8, keep=0)
+    for a, b in [(0, 3), (3, 4), (4, 10), (10, 11), (11, 12)]:
+        k, _ = c.update_and_fetch(*_rows(a, b))
+        kr, _ = ref.update_and_fetch(*_rows(a, b))
+        assert np.array_equal(np.array(k), np.array(kr)), (a, b)
+        assert c.offset == ref.offset + 5000
+    got = sorted(int(x) for x in np.array(k).reshape(-1))
+    assert got == list(range(12 - 8, 12)), got            # the last max_size rows, all real
+
+
+def test_skip_ctx_refuses_a_plain_kv_cache_and_is_a_noop_at_zero():
+    import pytest
+    from mlx_lm.models.cache import KVCache
+    c = KVCache()
+    skip_ctx(c, 0)
+    assert c.offset == 0
+    with pytest.raises(ValueError):
+        skip_ctx(c, 3)
+
+
+def test_restore_of_a_trimmed_window_then_one_row_round_matches_skipped_fresh_path():
+    """Through the drafter: a window holding FEWER rows than the sliding window but starting
+    deep in the context (the trimmed-to-shared-prefix shape), restored, then a 1-row ctx
+    append (a 0-accept round). Before the fix the first draft call raised; now it must equal
+    a fresh cache skipped ahead by the same amount and fed the same rows."""
+    sliding = 16
+    model = _tiny(sliding=sliding)
+    n = 40
+    fused = mx.random.normal((1, n, 2 * 32))
+    block = mx.array([[1] + [3] * 3])
+    w = DFlashCtxWindow(cap=sliding - 1)
+    w.set(model.project_ctx(fused[:, n - 6:n - 1]), end=n - 1)
+    assert w.start == n - 6 and w.rows == 5 < sliding - 1
+    ref_cache = model.make_cache()
+    for c in ref_cache:
+        skip_ctx(c, n - 6)
+    model.forward_hidden(block, fused[:, n - 6:n - 1], ref_cache, logits_start=1)
+    ref = model.forward_hidden(block, fused[:, n - 1:n], ref_cache, logits_start=1)
+    restored, dcache = _forward(model, fused[:, n - 1:n],
+                                offsets_start=w.start, window_rows=w.k)
+    assert np.allclose(np.array(ref), np.array(restored), atol=1e-5)
+    assert all(c.offset == n for c in dcache)
+    # and the round after that (another single row) still lands in order
+    nxt = model.forward_hidden(block, mx.random.normal((1, 1, 2 * 32)), dcache, logits_start=1)
+    assert nxt.shape == (1, 3, 32) and all(c.offset == n + 1 for c in dcache)

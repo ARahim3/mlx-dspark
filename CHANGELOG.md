@@ -2,6 +2,14 @@
 
 All notable changes to `mlx-dspark`. Versions follow [SemVer](https://semver.org/) (pre-1.0: minor-ish features land as patch bumps).
 
+## [0.18.1] — 2026-09-06 — dflash long-context crash fix (#33) + CPU co-prefill backs off under memory pressure (#31)
+
+### Fixed
+- **dflash: a prefix-cache restore after a memory-guard shed could crash the drafter's sliding-window cache (`ValueError: [full] Negative dimensions not allowed`, issue #33, @leoli-dev).** The DFlash drafter's rotating ctx caches carry an absolute position (`offset`, what rope reads) that legitimately runs far ahead of the rows they hold — a prefix-cache window restore, the bounded prefill accumulator and the sliding skip all advance it without writing. mlx-lm's single-row append sizes its buffer growth from that offset, so a part-filled buffer at a long-context offset (a slot window trimmed to the shared prefix, which only happens once the guard has dropped the rungs) crashed the first 0-accept round. The ctx caches are now a subclass that records the run-ahead (`skip`) and runs mlx-lm's arithmetic in its own coordinates around every append; full buffers rotate exactly as before, rope positions are unchanged. The reporter's diagnosis was right on the invariant and the trigger; the exact crashing state is its sibling (restore of a trimmed window, not a missed restore) — NOTES has the walk-through. Regression tests reproduce the reported state against the fix and the reported error against the plain upstream class.
+
+### Changed
+- **CPU co-prefill is suspended for the session the first time the memory guard fires (issue #31 mitigation, @amusman).** The BNNS SIGSEGV in mlx's CPU-stream bf16 GEMM recurred on the v0.18.0 head-rows build, and the new crash report rules out the slice-edge theory: the faulting read is from an address with no mapping at all, not the tail of a live buffer (three crashes, three neighbourhoods, identical libBNNS frames). All three happened on a 24 GB machine under sustained memory pressure with the guard shedding every few minutes (the last right after a CRITICAL shed); the same split has run clean for thousands of prefills on machines that never reach pressure. Under pressure the split's prefill win is not realized anyway (paging is the bottleneck), so the guard's first shed now also turns it off — logged on the guard line, `/health` reports `cpu_split: null` plus `cpu_split_suspended` with the config it turned off, and a hot swap or `/admin/load {"cpu_split": …}` re-arms it. This is a mitigation keyed on the one precondition every report shares, not a root cause; the crash itself is being taken upstream (`drafts/mlx-issue-bnns-cpu-split-sigsegv.md`). `--cpu-split 0` still turns it off unconditionally.
+
 ## [0.18.0] — 2026-09-01 — Nanbeige4.2-3B (the first looped-depth target) + prefill progress
 
 ### Added

@@ -70,6 +70,55 @@ from mlx_lm.models.qwen3 import MLP
 from mlx_lm.models.rope_utils import initialize_rope
 
 
+class CtxRotatingKVCache(RotatingKVCache):
+    """mlx-lm's :class:`RotatingKVCache` with the ctx contract this drafter needs:
+    ``offset`` is the ABSOLUTE position (what rope reads) and may run AHEAD of the rows the
+    buffer holds — a prefix-cache restore presets it to the window's start, and the prefill
+    bound / the sliding skip advance it past rows that were never written.
+
+    Upstream's bookkeeping assumes ``offset == rows appended`` until the buffer first fills:
+    the single-row path grows the buffer by ``max_size - offset`` and writes at index
+    ``offset``, and the multi-row path's temporal reorder compares ``_idx < offset``. With
+    a run-ahead offset the single-row path is wrong as soon as the buffer is not yet full —
+    ``max_size - offset`` goes negative once offset > max_size ("[full] Negative dimensions
+    not allowed", issue #33: a memory-guard shed dropped the rungs, the next request's
+    window was trimmed to the shared prefix, and the first 0-accept round appended one
+    row into a part-filled buffer at offset ~30k). So: :meth:`skip` records the run-ahead,
+    and every append runs upstream's arithmetic in its own coordinates (offset temporarily
+    rebased to rows appended), then restores the absolute offset. Nothing else changes —
+    full buffers rotate exactly as before, and rope keeps reading ``offset``."""
+
+    def __init__(self, max_size, keep=0):
+        super().__init__(max_size, keep)
+        self.skipped = 0            # positions advanced without a write (absolute - appended)
+
+    def skip(self, n: int) -> None:
+        """Advance the absolute position past ``n`` rows that will never be appended."""
+        self.offset += n
+        self.skipped += n
+
+    def update_and_fetch(self, keys, values):
+        self.offset -= self.skipped
+        try:
+            return super().update_and_fetch(keys, values)
+        finally:
+            self.offset += self.skipped
+
+
+def skip_ctx(cache, n: int) -> None:
+    """Advance a drafter ctx cache's absolute position past ``n`` never-appended rows.
+    Rotating caches record the run-ahead (:meth:`CtxRotatingKVCache.skip`); a plain
+    :class:`KVCache` (full-attention layer) only ever sees ``n == 0`` — its window is
+    unbounded, so nothing is dropped ahead of it — and keeps upstream's bookkeeping."""
+    if n <= 0:
+        return
+    if hasattr(cache, "skip"):
+        cache.skip(n)
+    else:
+        raise ValueError(f"{type(cache).__name__} cannot skip {n} ctx rows: only a rotating "
+                         "(sliding-window) ctx cache may run ahead of its rows")
+
+
 @dataclass
 class DFlashConfig:
     hidden_size: int
@@ -140,7 +189,7 @@ class DFlashAttention(nn.Module):
                 skip = S - keep_ctx
                 x_ctx = x_ctx[:, skip:]
                 S = x_ctx.shape[1]
-                cache.offset += skip
+                skip_ctx(cache, skip)
         ctx_keys = self.k_proj(x_ctx)
         ctx_values = self.v_proj(x_ctx)
         ctx_keys = self.k_norm(ctx_keys.reshape(B, S, self.n_kv_heads, -1)).transpose(0, 2, 1, 3)
@@ -355,7 +404,7 @@ class DFlashDraftModel(nn.Module):
             if layer_type == "sliding_attention":
                 if self.config.sliding_window is None:
                     raise ValueError("Draft config must define sliding_window for sliding_attention layers.")
-                caches.append(RotatingKVCache(max_size=self.config.sliding_window - 1, keep=0))
+                caches.append(CtxRotatingKVCache(max_size=self.config.sliding_window - 1, keep=0))
             else:
                 caches.append(KVCache())
         return caches
@@ -369,9 +418,9 @@ class DFlashDraftModel(nn.Module):
     def append_ctx(self, h_ctx, cache):
         """Append PROJECTED context rows (from :meth:`project_ctx`) to every layer's ctx
         cache without drafting — used by a prefix-cache restore to rebuild the drafter
-        context from a stored window (:class:`DFlashCtxWindow`). Set each layer cache's
-        ``offset`` to the rows' start position first; the fresh path instead appends ctx
-        inside the first draft call, same math."""
+        context from a stored window (:class:`DFlashCtxWindow`). Advance each layer cache
+        to the rows' start position first (:func:`skip_ctx`); the fresh path instead appends
+        ctx inside the first draft call, same math."""
         for layer, c in zip(self.layers, cache):
             layer.self_attn.append_ctx(h_ctx, self.rope, c)
 
@@ -442,7 +491,7 @@ class DFlashCtxWindow:
     (``.k``/``.v`` arrays + :meth:`trim_to`), so checkpoint slots carry it unchanged.
 
     A restore rebuilds fresh drafter caches from the rows (``append_ctx`` with each layer
-    cache's ``offset`` preset to ``start``). A window trimmed too deep to cover its rung
+    cache skipped ahead to ``start`` via :func:`skip_ctx`). A window trimmed too deep to cover its rung
     goes EMPTY: drafting then starts context-bare and self-heals as rounds append — less
     acceptance for a while, never a correctness issue (the target verifies every token).
 

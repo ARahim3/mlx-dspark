@@ -165,3 +165,60 @@ def test_polling_thread_feeds_observe(monkeypatch):
         time.sleep(0.01)
     guard.stop()
     assert len(seen) == 1 and guard.level == "warn"
+
+
+def test_on_shed_hook_runs_with_the_shed_and_lands_on_the_event():
+    calls = []
+
+    def hook(level):
+        calls.append(level)
+        return {"cpu_split": "suspended"} if len(calls) == 1 else {}
+
+    rig = _Rig()
+    rig.guard._on_shed = hook
+    assert rig.guard.observe("warn")
+    rig.run_submitted()
+    assert calls == ["warn"]
+    assert rig.guard.events[-1]["cpu_split"] == "suspended"
+    assert "CPU co-prefill suspended" in rig.logs[-1]
+    assert "CPU co-prefill is off" in rig.guard.warning()["message"]
+    rig.clock += 200
+    assert rig.guard.observe("critical")
+    rig.run_submitted()
+    assert calls == ["warn", "critical"]
+    assert "cpu_split" not in rig.guard.events[-1]           # second shed: nothing new
+    assert "suspended" not in rig.logs[-1]
+
+
+def test_on_shed_hook_failure_is_recorded_not_raised():
+    rig = _Rig()
+    rig.guard._on_shed = lambda level: 1 / 0
+    assert rig.guard.observe("warn")
+    rig.run_submitted()
+    assert rig.guard.events[-1]["on_shed_error"].startswith("ZeroDivisionError")
+    assert rig.cleared == 1
+
+
+def test_engine_shed_hook_suspends_cpu_split_once():
+    """The Engine's hook flips the process-wide prefill knob (generate.CPU_SPLIT) and keeps
+    the config it turned off for /health; a second shed is a no-op; nothing happens when
+    co-prefill was already off."""
+    from types import SimpleNamespace
+
+    from mlx_dspark import generate as gen
+    from mlx_dspark.server import Engine
+
+    saved = gen.CPU_SPLIT
+    try:
+        cfg = {"min_rows": 512, "fracs": {"512": 0.2}}
+        gen.CPU_SPLIT = cfg
+        eng = SimpleNamespace(cpu_split=cfg, cpu_split_suspended=None)
+        assert Engine._on_memory_shed(eng, "warn") == {"cpu_split": "suspended"}
+        assert gen.CPU_SPLIT is None and eng.cpu_split is None
+        assert eng.cpu_split_suspended == cfg
+        assert Engine._on_memory_shed(eng, "critical") == {}
+        off = SimpleNamespace(cpu_split=None, cpu_split_suspended=None)
+        assert Engine._on_memory_shed(off, "warn") == {}
+        assert off.cpu_split_suspended is None
+    finally:
+        gen.CPU_SPLIT = saved

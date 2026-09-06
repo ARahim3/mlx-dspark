@@ -388,6 +388,7 @@ class Engine:
         self.sdpa_split = sdpa_split                        # wide-verify SDPA split active (long-ctx)
         self.small_m = small_m                             # small-M MMA verify kernel active
         self.cpu_split = cpu_split                         # prefill CPU co-prefill config (None = off)
+        self.cpu_split_suspended = None                    # the config the memory guard turned off (#31)
         #   (i.e. the per-shape probe admitted ≥1 shape AND it wasn't forced off) — reported
         #   in /health so a client can see the knob, and so issue-#14-style A/Bs are possible
         self.warmup_enabled = False                        # set by load(); drives the `cold` flag
@@ -818,8 +819,28 @@ class Engine:
             from .memory_guard import MemoryGuard
 
             eng.memory_guard = MemoryGuard(prefix=eng.prefix, submit=eng._executor.submit,
-                                           is_busy=lambda: eng._busy).start()
+                                           is_busy=lambda: eng._busy,
+                                           on_shed=eng._on_memory_shed).start()
         return eng
+
+    def _on_memory_shed(self, level: str) -> dict:
+        """The engine's part of a memory-guard shed (runs with it, on the MLX thread):
+        suspend CPU co-prefill for the rest of this session the first time macOS reports
+        pressure. Every SIGSEGV reported inside mlx's CPU-stream bf16 GEMM (issue #31:
+        ``matmul_bnns`` → BNNS worker reading an unmapped address, 24 GB M4 Pro) happened on a
+        machine under sustained memory pressure with the guard firing, and the v0.18.0
+        head-rows hardening did not stop it; the same split has run clean for thousands of
+        prefills on machines that never reach pressure. Under pressure the split's win is
+        moot anyway (paging, not GEMM, is the bottleneck), so the trade is one-sided. The
+        flip is the process-wide ``generate.CPU_SPLIT`` (read at each prefill's entry), so
+        the next prefill is GPU-only; a hot swap or ``/admin/load cpu_split`` re-arms it."""
+        from . import generate as _gen
+
+        if _gen.CPU_SPLIT is None or self.cpu_split_suspended is not None:
+            return {}
+        self.cpu_split_suspended, self.cpu_split = self.cpu_split or _gen.CPU_SPLIT, None
+        _gen.CPU_SPLIT = None
+        return {"cpu_split": "suspended"}
 
     # --- generation ---
     def generate(
@@ -2209,6 +2230,9 @@ def make_handler(engine: Engine, api_key: str | None):
                     # null when off — pairs with serve --cpu-split / the /admin/load
                     # "cpu_split" override (0 = off) for a prefill A/B without a restart
                     "cpu_split": getattr(engine, "cpu_split", None),
+                    # the config the memory guard suspended for this session (null unless
+                    # macOS reported pressure and co-prefill was on — issue #31)
+                    "cpu_split_suspended": getattr(engine, "cpu_split_suspended", None),
                     # whether this load ran a warmup pass (throwaway generation to compile
                     # kernels + ramp the clock so the first real request is warm). On by
                     # default; serve --no-warmup / the /admin/load "warmup" override turn it off.
