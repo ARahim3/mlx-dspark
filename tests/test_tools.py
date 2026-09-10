@@ -102,6 +102,49 @@ def test_lfm2_truncated_call_no_raise():
     assert tcs == [] and cleaned == "ok"
 
 
+def test_minicpm5_single_typed_by_schema():
+    text = ('Let me check.<function name="get_weather"><param name="city">Paris</param>'
+            '<param name="days">3</param><param name="live">true</param></function>')
+    schemas = {"get_weather": {"city": "string", "days": "integer", "live": "boolean"}}
+    tcs, cleaned = parse_tool_calls(text, schemas)
+    assert len(tcs) == 1 and tcs[0]["function"]["name"] == "get_weather"
+    assert json.loads(tcs[0]["function"]["arguments"]) == {"city": "Paris", "days": 3, "live": True}
+    assert cleaned == "Let me check."
+
+
+def test_minicpm5_cdata_multiline_value_kept_verbatim():
+    code = 'if a < b:\n    print("x & y")\n'
+    text = ('<function name="write_file"><param name="path">/tmp/a.py</param>'
+            f'<param name="content"><![CDATA[{code}]]></param></function>')
+    tcs, cleaned = parse_tool_calls(text, {"write_file": {"path": "string", "content": "string"}})
+    args = json.loads(tcs[0]["function"]["arguments"])
+    assert args == {"path": "/tmp/a.py", "content": code}
+    assert cleaned == ""
+
+
+def test_minicpm5_multiple_calls_and_no_schema_heuristics():
+    text = ('<function name="a"><param name="n">7</param></function>\n'
+            '<function name="b"><param name="s">hello world</param></function>')
+    tcs, cleaned = parse_tool_calls(text)
+    assert [t["function"]["name"] for t in tcs] == ["a", "b"]
+    assert json.loads(tcs[0]["function"]["arguments"]) == {"n": 7}
+    assert json.loads(tcs[1]["function"]["arguments"]) == {"s": "hello world"}
+    assert cleaned == ""
+
+
+def test_minicpm5_truncated_call_parses_and_prose_is_cut():
+    text = 'Sure.<function name="a"><param name="n">7</param>'
+    tcs, cleaned = parse_tool_calls(text)
+    assert len(tcs) == 1 and json.loads(tcs[0]["function"]["arguments"]) == {"n": 7}
+    assert cleaned == "Sure."
+
+
+def test_minicpm5_does_not_shadow_ornith_xml_form():
+    text = '<tool_call>\n<function=f>\n<parameter=k>\nv\n</parameter>\n</function>\n</tool_call>'
+    tcs, _ = parse_tool_calls(text)
+    assert len(tcs) == 1 and json.loads(tcs[0]["function"]["arguments"]) == {"k": "v"}
+
+
 def test_normalize_arguments_string_to_dict():
     msgs = [{"role": "assistant", "content": None,
              "tool_calls": [{"type": "function",

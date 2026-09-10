@@ -69,10 +69,20 @@ Pro: 0.3 at 2048 rows, 1.41x; 0.45 is 1.08x) — and the caller caches it.
 from __future__ import annotations
 
 import contextlib
+import os
 import time
 
 import mlx.core as mx
 import mlx.nn as nn
+
+# CPU share dtype. fp32 (default) routes the CPU-stream GEMM to Accelerate BLAS (sgemm); bf16
+# routes it to BNNS — the library behind every issue-#31 SIGSEGV (`matmul_bnns` ->
+# `BNNSFilterApplyTwoInputBatch` reading an unmapped address). The products are identical
+# (bf16 x bf16 is exact in fp32) and both paths accumulate in fp32, so the fp-tie class is
+# unchanged; only the accumulation order differs, as it already did between CPU and GPU rows.
+# Proposed and measured by @felix-ab on issue #31 (41 prefills, 0 crashes). Env
+# MLX_DSPARK_CPU_SPLIT_FP32=0 restores the bf16/BNNS path for an A/B.
+CPU_SPLIT_FP32 = os.environ.get("MLX_DSPARK_CPU_SPLIT_FP32", "1") != "0"
 
 _orig_call = nn.QuantizedLinear.__call__
 _min_rows = 0                       # 0 = wide (dequant+GEMM) path inactive
@@ -135,7 +145,9 @@ def _split_call(self, x, rows: int, frac: float):
     fracs); this removes the one fault mode we can remove from here — the underlying
     BNNS/mlx question is upstream's (see drafts/mlx-issue-bnns-cpu-split-sigsegv.md).
     Row order is preserved by the concat, so outputs are unchanged (same rows, same
-    kernels, fp-tie class as before)."""
+    kernels, fp-tie class as before). The head-rows layout did NOT stop the crashes (a
+    48 GB machine hit it too); what did is taking BNNS off the path — see
+    ``CPU_SPLIT_FP32`` above, the default since the 2026-09-10 A/B (NOTES "Issue batch")."""
     n_cpu = cpu_rows(rows, frac)
     if n_cpu == 0:
         return None
@@ -143,8 +155,14 @@ def _split_call(self, x, rows: int, frac: float):
                       group_size=self.group_size, bits=self.bits)
     lead = x.shape[:-1]
     x2 = x.reshape(rows, x.shape[-1])
-    with mx.stream(mx.cpu):
-        y_cpu = x2[:n_cpu] @ w.T
+    if CPU_SPLIT_FP32:
+        # widen on the GPU stream, GEMM on the CPU stream in fp32 (BLAS, not BNNS), round once
+        w32 = w.astype(mx.float32)
+        with mx.stream(mx.cpu):
+            y_cpu = (x2[:n_cpu].astype(mx.float32) @ w32.T).astype(x.dtype)
+    else:
+        with mx.stream(mx.cpu):
+            y_cpu = x2[:n_cpu] @ w.T
     y_gpu = x2[n_cpu:] @ w.T
     y = mx.concatenate([y_cpu, y_gpu], axis=0)
     if "bias" in self:
@@ -407,12 +425,19 @@ def measure_cpu_split(*models, widths: tuple[int, ...] = (512, 1024, 2048),
         base = min(t_q, t_w)
 
         def split(a, frac):
+            # the same head-rows / dtype path _split_call runs, so the fraction is measured
+            # on what will actually execute
             wd = mx.dequantize(w, s, b, group_size=gs, bits=bits)
             n = cpu_rows(a.shape[0], frac)
-            y0 = a[:-n] @ wd.T
-            with mx.stream(mx.cpu):
-                y1 = a[-n:] @ wd.T
-            return mx.concatenate([y0, y1], axis=0)
+            if CPU_SPLIT_FP32:
+                wd32 = wd.astype(mx.float32)
+                with mx.stream(mx.cpu):
+                    y1 = (a[:n].astype(mx.float32) @ wd32.T).astype(a.dtype)
+            else:
+                with mx.stream(mx.cpu):
+                    y1 = a[:n] @ wd.T
+            y0 = a[n:] @ wd.T
+            return mx.concatenate([y1, y0], axis=0)
 
         times = {}
         for f in fracs:

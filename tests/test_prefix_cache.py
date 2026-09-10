@@ -549,19 +549,25 @@ def _fill(pc, n_convs=2):
     return convs
 
 
-def test_shed_warn_drops_rungs_but_keeps_every_slot():
-    """The memory guard's WARN action: rungs (the big fp32 interior snapshots) go, every
-    conversation keeps its boundary checkpoint — dropping one measured as a 36 s re-prefill
-    on a 27B under pressure, for 0.6 GB."""
+def test_shed_warn_drops_shallow_rungs_but_keeps_every_slot_and_the_deepest_rungs():
+    """The memory guard's WARN action: the shallow interior rungs go, every conversation
+    keeps its boundary checkpoint (dropping one measured as a 36 s re-prefill on a 27B under
+    pressure, for 0.6 GB) AND its deepest rungs — on a long static agent prefix those are the
+    anchors every new session restores from, minutes to rebuild (issue #36)."""
     pc = PrefixCache(_mk_cache, _mk_ctx, min_reuse=4, slots=2)
     convs = _fill(pc)
-    pc._slots[0].rungs = {8: [], 16: []}         # pretend the newest slot carries a ladder
+    pc._slots[0].rungs = {8: [], 16: [], 24: [], 32: []}   # newest slot carries a ladder
     out = pc.shed("warn")
-    assert out["action"] == "rungs dropped, slots kept" and out["slots_dropped"] == 0
+    assert out["action"].startswith("rungs dropped") and out["slots_dropped"] == 0
     assert out["rungs_dropped"] == 2
-    assert len(pc.info()["slots"]) == 2 and not any(s.rungs for s in pc._slots)
+    assert sorted(pc._slots[0].rungs) == [8, 16]          # the deepest two survive
+    assert len(pc.info()["slots"]) == 2
     assert pc.acquire(convs[1] + [9])[2] > 0      # both conversations still hit
     assert pc.acquire(convs[0] + [9])[2] > 0
+    pc2 = PrefixCache(_mk_cache, _mk_ctx, min_reuse=4, slots=2, warn_keep_rungs=0)
+    _fill(pc2)
+    pc2._slots[0].rungs = {8: [], 16: []}
+    assert pc2.shed("warn")["rungs_dropped"] == 2 and not pc2._slots[0].rungs
 
 
 def test_shed_critical_empties_everything():
@@ -578,3 +584,70 @@ def test_shed_on_an_empty_cache_is_a_noop():
     out = pc.shed("warn")
     assert out["slots_dropped"] == 0 and out["prefix_bytes_freed"] == 0
     assert pc.shed("critical")["action"] == "emptied"
+
+
+def test_partial_hit_inherits_the_ladder_below_the_restore_point():
+    """A request restored from a rung checkpoints a slot that carries every rung at or below
+    that rung (shared captures). Otherwise, once the LRU evicts the slot that planted a
+    static-prefix anchor, every later divergence below it is a cold prefill (issue #36)."""
+    pc = PrefixCache(_mk_mixed, None, min_reuse=4, checkpoint=True, slots=2)
+    prompt = list(range(40))
+    cache, _, _ = pc.acquire(prompt)
+    for pos in (8, 16, 24):
+        _feed(cache, pos - (cache[0].offset if hasattr(cache[0], "offset") else 0))
+        pc.rung(cache, pos)
+    pc.checkpoint(cache, None, 30, prompt)
+    assert sorted(pc._slots[0].rungs) == [8, 16, 24]
+    # conversation B diverges at 20 -> restored from rung 16, checkpoints its own slot
+    conv_b = prompt[:20] + [500] * 20
+    cache_b, _, reuse = pc.acquire(conv_b)
+    assert reuse == 16
+    pc.checkpoint(cache_b, None, 36, conv_b)
+    slot_b = pc._slots[0]
+    assert slot_b.tokens == conv_b[:36]
+    assert sorted(slot_b.rungs) == [8, 16]        # inherited; 24 is above the divergence
+    assert slot_b.rungs[8] is pc._slots[1].rungs[8]   # shared, not copied
+    # conversation C evicts the priming slot; a later divergence at 12 still hits rung 8 via B
+    conv_c = list(range(1000, 1040))
+    cache_c, _, _ = pc.acquire(conv_c)
+    pc.checkpoint(cache_c, None, 36, conv_c)
+    assert [len(s.tokens) for s in pc._slots] == [36, 36]
+    assert pc.acquire(prompt[:12] + [900] * 20)[2] == 8
+
+
+def test_short_prompt_does_not_evict_long_slots():
+    """Two unrelated short requests must not push two long conversations out of a full
+    2-slot LRU (issue #36) — but short prompts still get slots when nothing long is resident,
+    so a workload of short conversations keeps its caching."""
+    pc = PrefixCache(_mk_cache, _mk_ctx, min_reuse=4, slots=2, min_slot_tokens=64)
+    longs = [list(range(i * 1000, i * 1000 + 400)) for i in (1, 2)]
+    for conv in longs:
+        c, x, _ = pc.acquire(conv)
+        for layer in c:
+            layer.offset = len(conv)
+        pc.store(c, x, conv, [7, 8])
+    short = list(range(5000, 5020))
+    c, x, _ = pc.acquire(short)
+    for layer in c:
+        layer.offset = len(short)
+    pc.store(c, x, short, [7, 8])
+    assert [len(s.tokens) for s in pc._slots] == [401, 401]     # untouched (prompt + 1 gen)
+    assert pc.acquire(longs[0] + [9])[2] > 0 and pc.acquire(longs[1] + [9])[2] > 0
+    # short-only workload: slots are free, short prompts are cached
+    pc2 = PrefixCache(_mk_cache, _mk_ctx, min_reuse=4, slots=2, min_slot_tokens=64)
+    c, x, _ = pc2.acquire(short)
+    for layer in c:
+        layer.offset = len(short)
+    pc2.store(c, x, short, [7, 8])
+    assert pc2.acquire(short + [9])[2] > 0
+    # checkpoint mode takes the same guard
+    pc3 = PrefixCache(_mk_hybrid, None, min_reuse=4, checkpoint=True, slots=1,
+                      min_slot_tokens=64)
+    long_p = list(range(400))
+    c, _, _ = pc3.acquire(long_p)
+    _feed(c, 399)
+    pc3.checkpoint(c, None, 399, long_p)
+    c, _, _ = pc3.acquire(short)
+    _feed(c, 19)
+    pc3.checkpoint(c, None, 19, short)
+    assert [len(s.tokens) for s in pc3._slots] == [399]

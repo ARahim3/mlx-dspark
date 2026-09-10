@@ -42,6 +42,7 @@ chat/code/math), the Muse row per-content best (footnoted); full tables, baselin
 
 | target | best measured speedup | speed (chat → best) |
 |---|---|---|
+| **MiniCPM5-2B** (bf16, dense)[^minicpm5] | **4.29×** math · **3.16×** code · **2.10×** chat | **~107–215 tok/s** |
 | **Nanbeige4.2-3B** (bf16, looped)[^nanbeige] | **4.25×** math · **2.48×** code · **2.02×** chat | ~34–71 tok/s |
 | **Qwen3.8-27B** (8-bit, DFlash 2)[^q38] | **4.06×** math · **4.05×** code · **2.79×** chat | ~24–34 tok/s |
 | **LFM2.5-1.2B** (bf16, conv-hybrid)[^lfm2] | **3.78×** math · **3.70×** code · **2.44×** chat | **~245–380 tok/s** |
@@ -60,32 +61,10 @@ chat/code/math), the Muse row per-content best (footnoted); full tables, baselin
 
 </div>
 
-> [!TIP]
-> **Qwen3.8-27B's measured best is now a DFlash 2 drafter, on both quants** —
-> [`incoai/Qwen3.8-27B-DFlash2`](https://huggingface.co/incoai/Qwen3.8-27B-DFlash2) (Inco AI's
-> DFlash successor: a candidate path selector + dynamic convs that lift acceptance at the *same*
-> verify width). Measured paired, same session, identical width 8: **8-bit 3.63× mean** (4.06×
-> math · 4.05× code · 2.79× chat, accept 5.53) vs the DSpark head's 2.92×; **4-bit 2.30×**
-> (accept 5.14, **33.8 tok/s — the fastest decode among the project's 27B-class targets**) vs 2.01×. Chat gains the
-> most (+40% at 8-bit). Greedy-lossless like everything here, and prefix caching covers this
-> mode too. **No flags needed**: `--mode auto` — the default, and what the Mac app uses —
-> resolves each row's measured-best mode, which is DFlash 2 here:
->
-> ```bash
-> # the default mode (auto) resolves DFlash 2 for this target (downloads it once):
-> mlx-dspark serve    --model mlx-community/Qwen3.8-27B-8bit
-> mlx-dspark generate --model mlx-community/Qwen3.8-27B-8bit --prompt "…"
->
-> # name a mode explicitly to A/B; --mode dspark still gets the DSpark heads:
-> mlx-dspark generate --model mlx-community/Qwen3.8-27B-4bit --mode dspark --prompt "…"
-> ```
->
-> No cap flag needed: the dflash default (full block = cap 7) **is** the measured optimum on
-> both quants. The DSpark rows remain the measured best of their mode —
-> [`DimInfer/Qwen3.8-27B-Dspark-v1`](https://huggingface.co/DimInfer/Qwen3.8-27B-Dspark-v1)
-> at 4-bit (1.99–2.01×, cap 7, no confidence flag) and `RadixArk/Qwen3.8-27B-DSpark` at 8-bit
-> (2.72–2.92×, cap 7) — see [DSpark vs DFlash](#dspark-vs-dflash-head-to-head) for the
-> head-to-head.
+Qwen3.8-27B's rows are its **DFlash 2** drafter ([`incoai/Qwen3.8-27B-DFlash2`](https://huggingface.co/incoai/Qwen3.8-27B-DFlash2)),
+which `--mode auto` (the default, and what the Mac app uses) resolves for both quants; the DSpark
+heads for this target remain available with `--mode dspark` — the paired numbers are in
+[DFlash 2 on Qwen3.8-27B](#dflash-2-on-qwen38-27b--the-project-best-2026-08-19).
 
 <sub>The speed column is the measured range across the three benchmark contents at the row's
 best configuration — chat at the low end, code/math at the high end (decoding speed depends on
@@ -420,6 +399,7 @@ anything else, add `--drafter <repo>`. Run `mlx-dspark models` to print this tab
 | `mlx-community/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-4bit` | `mlx-community/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-DSpark-bf16` (NVIDIA head, MLX) | — | ~20 GB | not measured yet |
 | `mlx-community/Muse-Glimmer-30B-4bit` | `DaoCloud/Muse-Glimmer-30B-DSpark` (community, DFlash-lineage) | — | ~26 GB (4-bit) / ~40 GB (8-bit[^muse]) | not measured yet |
 | `MercuriusDream/Nanbeige4.2-3B-mlx-bf16`[^nanbeige] | `Nanbeige/Nanbeige4.2-3B-DSpark` (official, SpecForge) | — | ~10 GB | not measured yet |
+| `mlx-community/MiniCPM5-2B-bf16`[^minicpm5] | `openbmb/MiniCPM5-2B-DSpark` (official, DeepSpec) | — | ~6 GB | not measured yet |
 
 *Peak RAM* is measured on an M4 Pro (8-bit target + 4-bit drafter + KV cache) at chat-length
 context; add headroom for macOS. *Cache at 128k ctx* is what a long-context session **adds on
@@ -590,6 +570,8 @@ and caps are this M4 Pro's — yours are derived fresh on first run):
 - **~24–36 GB** — `Qwen3.8-27B-4bit` (27B quality in ~18 GB at **~25–38 tok/s, the fastest
   decode among the 27B-class targets** — DFlash 2 via `--mode auto`, no cap flag needed), `gemma-4-12B-it-8bit`
   (big ratio *and* real speed: ~46–55 tok/s), or `Qwen3.6-27B-8bit`.
+- **~8 GB** — `MiniCPM5-2B-bf16` (**3.18×** mean, 4.29× on math, ~107–215 tok/s in ~6 GB
+  resident — the best small-Mac pick, and a tool-calling model).
 - **~16 GB** — `Ornith-1.0-9B-8bit` (2.4× at ~59–68 tok/s, the mid-size sweet spot),
   `Qwen3-8B-8bit`, or `Qwen3-4B-8bit` (~87–101 tok/s, fits ~8 GB).
 - **Raw tokens per second above all** — the MoEs: `Qwen3.6-35B-A3B-4bit` (~91–145 tok/s).
@@ -645,6 +627,7 @@ curves.
 | target | cap | accept len | baseline | mlx-dspark | speedup | chat / code / math |
 |---|---|---|---|---|---|---|
 | **LFM2.5-1.2B** (bf16, conv-hybrid)[^lfm2] | 7 | 5.33 | 100.7 tok/s | 332.8 tok/s | **3.30×** | 2.44× / 3.70× / 3.78× |
+| **MiniCPM5-2B** (bf16, dense)[^minicpm5] | 7 | 4.85 | 50.5 tok/s | 160.6 tok/s | **3.18×** | 2.10× / 3.16× / 4.29× |
 | **Nanbeige4.2-3B** (bf16, looped)[^nanbeige] | 7 | 3.96 | 16.5 tok/s | 49.0 tok/s | **2.92×** | 2.02× / 2.48× / 4.25× |
 | **Gemma-4 12B** | 4 | 3.95 | 17.8 tok/s | 49.4 tok/s | **2.78×** | 2.63× / 2.61× / 3.09× |
 | **Qwen3.8-27B** (8-bit, hybrid)[^community][^q38] | 7 | 4.05 | 8.3 tok/s | 22.6 tok/s | **2.72×** | 1.95× / 2.84× / 3.37× |
@@ -766,14 +749,20 @@ pasted file, a long conversation, or an agent (Claude Code sends **~18–26k tok
 is most of the time you wait.
 
 Measured on an M4 Pro, median of 3, default settings. Since the **CPU co-prefill** pass
-(unreleased) the CLI/server also run a calibrated share of every wide matmul on the CPU's matrix
+(v0.17.0) the CLI/server also run a calibrated share of every wide matmul on the CPU's matrix
 units, concurrently with the GPU — the "before → after" pairs below are the same process with it
-forced off (`--cpu-split 0`) vs on, 2048-token prompt (the ratio holds at 4096):
+forced off (`--cpu-split 0`) vs on, 2048-token prompt (the ratio holds at 4096). The pairs were
+measured with the CPU share in bf16 (BNNS); since the fix for issue #31 the CPU share runs in
+**fp32 through Accelerate BLAS** by default, which removes the library behind every reported
+co-prefill crash at the cost of part of the win — Qwen3.8-27B-4bit re-measured: 136 tok/s off,
+170 bf16, **157 fp32** (1.15× instead of 1.25×). `MLX_DSPARK_CPU_SPLIT_FP32=0` restores the
+bf16 route on a machine that never reaches memory pressure:
 
 | target | prefill | with CPU co-prefill | a 20k-token prompt takes |
 |---|---|---|---|
 | **LFM2.5-1.2B** (bf16) | **3240 tok/s** | — (bf16 `nn.Linear` not yet split) | ~6 s |
 | **LFM2.5-8B-A1B** (bf16, MoE) | **2170 tok/s** | — | ~9 s |
+| **MiniCPM5-2B** (bf16) | **1640 tok/s** | — (bf16 `nn.Linear` not yet split) | ~13 s |
 | **LFM2.5-2.6B** (bf16) | **1420 tok/s** | — | ~14 s |
 | **Qwen3-4B** (8-bit) | 886 tok/s | **1141 tok/s** (1.29×) | ~18 s |
 | **Qwen3.6-35B-A3B** (4-bit, MoE) | **960 tok/s** | — (experts are `gather_qmm`, not split) | ~21 s |
@@ -1009,9 +998,9 @@ math for you at load — the window defaults to the model's own maximum (262144 
 KV on top of ~29 GB of weights), and if weights + full-window KV would overrun your GPU working set it
 prints a warning with a `--context-window` value that fits (also on `/health.warnings`). And since
 v0.15.0 a **memory-pressure guard** (on by default, `--no-memory-guard`) watches macOS's own pressure
-level: at WARN it hands back the allocator's retained buffers and the prefix cache's interior snapshots
-(~1.7 GB measured on a 27B) while keeping every conversation's cached prefix; at CRITICAL it empties the
-prefix cache. It buys headroom before the OS starts paging the weights — it cannot make a swapping model
+level: at WARN it hands back the allocator's retained buffers and the prefix cache's shallow interior
+snapshots (~1.7 GB measured on a 27B) while keeping every conversation's cached prefix and its deepest
+anchors; at CRITICAL it empties the prefix cache. It buys headroom before the OS starts paging the weights — it cannot make a swapping model
 fast again, so the `--context-window` cap is still the real fix for a model that nearly fills RAM.
 
 ### DSpark vs DFlash (head-to-head)
@@ -1293,6 +1282,20 @@ are bundled.
     the remote-code scan flags on a fresh download — start with `--trust-remote-code` for this
     pair (nothing is imported on the mlx-lm route: mlx-dspark uses its own model code and keeps
     tokenizer `trust_remote_code` off).
+
+[^minicpm5]: **MiniCPM5-2B** — OpenBMB's 2B (a plain dense `llama`-architecture model: 42 layers,
+    16/2 GQA heads, 130k vocab, 128k context, thinking + XML tool calls) with OpenBMB's **official
+    DSpark head** (`openbmb/MiniCPM5-2B-DSpark`: stock DeepSpec packaging, block-7, anchor-as-pos0,
+    reuses the target's embed and lm_head). The registry points at the mlx-community **bf16**
+    conversion because bf16 is where the ratio is: the target is a straight mlx-lm convert of a
+    config that is literally `llama` (no folded scales), and on mlx 0.32's `gemv_wide` a bf16
+    verify is flat out to width 8, so the derived default cap is the full block (7) and the
+    measured mean is **3.18×** (accept 4.85; math 4.29× at **215 tok/s**). Greedy-lossless (fp
+    ties only). The confidence head does not pay here, lookup drafts are a wash (kept on). Tool
+    calls come out in MiniCPM5's own `<function name="…"><param name="…">` form (CDATA-wrapped
+    values), which the server translates to OpenAI / Anthropic `tool_calls` like every other
+    syntax here. Any quant of the target resolves the same drafter; 8-bit/4-bit quants are
+    unmeasured (a 2B target's bf16 baseline is already ~50 tok/s).
 
 [^community]: **Community-drafter rows.** Qwen3.6-27B runs the **8-bit** target with
     `satgeze/Qwen3.6-27B-DSpark` — a block-15 head (vs 7 everywhere else) trained against the

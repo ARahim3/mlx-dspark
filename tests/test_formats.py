@@ -654,6 +654,37 @@ def _reference_weights(cfg_dict: dict = QWEN3_MIN) -> dict:
     return weights
 
 
+def test_full_vocab_draft_vocab_size_is_not_a_reduction(tmp_path):
+    """openbmb/MiniCPM5-2B-DSpark (stock DeepSpec standalone) declares
+    draft_vocab_size == vocab_size and ships no d2t table: that is the full vocab, not a
+    reduced one, so it must parse as None and load — not trip the 'reduced vocab without
+    d2t' refusal (which is for a real mismatch)."""
+    cfg_dict = dict(QWEN3_MIN, architectures=["Qwen3DSparkModel"],
+                    draft_vocab_size=QWEN3_MIN["vocab_size"], projector_type="dspark",
+                    auto_map={"AutoModel": "dspark.DSparkDraftModel"},
+                    rope_parameters={"rope_theta": 5000000, "rope_type": "default"})
+    cfg = DSparkConfig.from_json(_cfg_path(tmp_path, cfg_dict))
+    assert cfg.draft_vocab_size is None and cfg.out_vocab_size == cfg.vocab_size
+    assert cfg.rope_theta == 5000000 and cfg.logits_start == 0
+    weights = _reference_weights(cfg_dict)
+    del weights["embed_tokens.weight"], weights["lm_head.weight"]      # reuse-both head
+    path = _write_drafter_ckpt(tmp_path, weights, cfg_dict)
+    drafter, cfg2 = load_drafter(path, quantize=False)
+    assert cfg2.draft_vocab_size is None
+    assert cfg2.has_own_embed is False and cfg2.has_own_lm_head is False
+    assert drafter.markov_head.markov_w2.weight.shape[0] == cfg2.vocab_size
+
+
+def test_reduced_vocab_without_d2t_is_still_refused(tmp_path):
+    """The guard the test above must not weaken: a genuinely smaller draft vocab with no d2t
+    table is unmappable and stays an error."""
+    cfg_dict = dict(QWEN3_MIN, draft_vocab_size=QWEN3_MIN["vocab_size"] // 2)
+    weights = _reference_weights(cfg_dict)
+    path = _write_drafter_ckpt(tmp_path, weights, cfg_dict)
+    with pytest.raises(ValueError, match="d2t"):
+        load_drafter(path, quantize=False)
+
+
 def test_load_drafter_matching_checkpoint_loads(tmp_path):
     path = _write_drafter_ckpt(tmp_path, _reference_weights())
     drafter, cfg = load_drafter(path, quantize=False)

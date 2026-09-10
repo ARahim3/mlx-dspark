@@ -826,14 +826,15 @@ class Engine:
     def _on_memory_shed(self, level: str) -> dict:
         """The engine's part of a memory-guard shed (runs with it, on the MLX thread):
         suspend CPU co-prefill for the rest of this session the first time macOS reports
-        pressure. Every SIGSEGV reported inside mlx's CPU-stream bf16 GEMM (issue #31:
-        ``matmul_bnns`` → BNNS worker reading an unmapped address, 24 GB M4 Pro) happened on a
-        machine under sustained memory pressure with the guard firing, and the v0.18.0
-        head-rows hardening did not stop it; the same split has run clean for thousands of
-        prefills on machines that never reach pressure. Under pressure the split's win is
-        moot anyway (paging, not GEMM, is the bottleneck), so the trade is one-sided. The
-        flip is the process-wide ``generate.CPU_SPLIT`` (read at each prefill's entry), so
-        the next prefill is GPU-only; a hot swap or ``/admin/load cpu_split`` re-arms it."""
+        pressure. Introduced in 0.18.1 as the issue-#31 mitigation (every SIGSEGV inside
+        mlx's CPU-stream bf16 GEMM — ``matmul_bnns`` → a BNNS worker reading an unmapped
+        address — happened under sustained pressure with the guard firing). Since the CPU
+        share moved to fp32/BLAS (``wide_gemm.CPU_SPLIT_FP32``) BNNS is off the path and this
+        is a performance call rather than a safety one, and it still holds: under pressure
+        the split's win is not realized (paging, not GEMM, is the bottleneck) and the fp32
+        transients are larger. The flip is the process-wide ``generate.CPU_SPLIT`` (read at
+        each prefill's entry), so the next prefill is GPU-only; a hot swap or
+        ``/admin/load cpu_split`` re-arms it."""
         from . import generate as _gen
 
         if _gen.CPU_SPLIT is None or self.cpu_split_suspended is not None:

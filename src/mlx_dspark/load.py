@@ -270,6 +270,27 @@ REGISTRY = [
     {"id": "nanbeige4.2-3b", "target": "MercuriusDream/Nanbeige4.2-3B-mlx-bf16",
      "dspark": "Nanbeige/Nanbeige4.2-3B-DSpark",
      "ram": "~10 GB", "speedup": "~2.9× (4.3× math)"},
+    # OpenBMB MiniCPM5-2B — a plain dense `llama`-type target (42 layers, 16/2 GQA heads, hd 128,
+    # untied 130560 vocab, rope theta 5e6; mlx-lm's llama module, generic dense tap) with
+    # OpenBMB's official DSpark head: stock DeepSpec-standalone packaging (architectures
+    # "Qwen3DSparkModel", top-level projector_type/target_layer_ids), 5-layer ungated qwen3 GQA
+    # backbone (q/k-norm), block_size 7, anchor-as-pos0, markov-256 + confidence, reuses the
+    # target's embed AND lm_head (ships neither). Its config declares draft_vocab_size == vocab_size
+    # (the full vocab; config.py normalizes it to None — without that the d2t guard refused it).
+    # The target is the mlx-community bf16 convert of openbmb/MiniCPM5-2B (whose own config is
+    # literally llama — no folded scales). The drafter's dangling `auto_map` is never imported
+    # (drafter weights load 1:1). Tool calls use MiniCPM5's attribute-XML form (tools.py).
+    # bf16 is where the ratio is (a flat gemv_wide verify curve out to width 8): static_cap picks
+    # the full block, 7, unaided (measured COLD — a curve calibrated right after minutes of decode
+    # read 45% high at wide widths and mis-derived 3; see NOTES). Measured M4 Pro, 3-trial medians,
+    # benchmark suite, zero flags: **cap 7 = 3.18x mean** (2.10x chat / 3.16x code / 4.29x math at
+    # 215 tok/s; accept 4.85; baseline 50.5 tok/s). Anchor-as-pos0 probed (accept 3.1/5.0/5.9 vs
+    # 2.0/3.1/3.2 as logits_start 1). Lossless (fp ties, margins 0.0/0.0/0.125). Confidence head
+    # does NOT pay (conf 0 wins on all three prompts); lookup a wash (kept on). See NOTES
+    # "MiniCPM5-2B: the first llama-type target".
+    {"id": "minicpm5-2b", "target": "mlx-community/MiniCPM5-2B-bf16",
+     "dspark": "openbmb/MiniCPM5-2B-DSpark",
+     "ram": "~6 GB", "speedup": "~3.2× (4.3× math)"},
 ]
 
 # legacy `--family` / load_pair("qwen3") values -> a concrete target repo (deprecated).

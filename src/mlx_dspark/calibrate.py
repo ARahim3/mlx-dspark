@@ -848,9 +848,11 @@ def cpu_split_config(target, drafter=None, *, target_repo: str,
     on a 27B) and cached under the (device x mlx version x model) key — the balance
     point between the GPU and the CPU matrix units is exactly the class of constant this
     project refuses to hardcode (an M4 Max GPU is 2x this one's; the CPU is not)."""
-    from .wide_gemm import measure_cpu_split
+    from .wide_gemm import CPU_SPLIT_FP32, measure_cpu_split
 
-    key = _cache_key("cpusplit", target_repo, None)
+    # the fp32/BLAS and bf16/BNNS routes have different balance points (the fp32 rows move 2x
+    # the bytes), so each is calibrated under its own key
+    key = _cache_key("cpusplit32" if CPU_SPLIT_FP32 else "cpusplit", target_repo, None)
     entry = load_cached(key, cache_dir)
     if entry is None:
         if verbose:

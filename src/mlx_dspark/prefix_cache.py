@@ -254,7 +254,8 @@ class _Slot:
 class PrefixCache:
     def __init__(self, make_cache, make_ctx=None, *, min_reuse: int = 16,
                  l2_dir: str | None = None, max_ram_bytes: int = 0, slots: int = 2,
-                 checkpoint: bool = False, max_rungs: int = 8):
+                 checkpoint: bool = False, max_rungs: int = 8, warn_keep_rungs: int = 2,
+                 min_slot_tokens: int = 1024):
         self.make_cache = make_cache          # () -> list[target layer cache]
         self.make_ctx = make_ctx              # () -> list[CtxCache] | None (None for baseline)
         self.min_reuse = max(1, min_reuse)
@@ -264,6 +265,8 @@ class PrefixCache:
         self.max_slots = max(1, slots)
         self.max_rungs = max(1, max_rungs)    # per-slot ladder cap (recurrent state is ~MBs
         #                                       to ~100s of MB per rung on big hybrids)
+        self.warn_keep_rungs = max(0, warn_keep_rungs)   # deepest rungs a WARN shed keeps
+        self.min_slot_tokens = max(0, min_slot_tokens)   # see _short_prompt_would_evict_long
         self.hits = 0
         self.partial_hits = 0                 # subset of hits that restored at a rung
         self.reused_tokens = 0
@@ -315,6 +318,18 @@ class PrefixCache:
                         return (self.make_cache(),
                                 (self.make_ctx() if self.make_ctx else None), 0)
                     self.partial_hits += 1
+                    # Inherit the ladder at and below the restore point: every rung there is
+                    # a valid prefix state of THIS request too, so the slot it checkpoints
+                    # carries them (shared, already-evaluated arrays — no RAM beyond the
+                    # references; restores copy). Without this a conversation started from a
+                    # static-prefix anchor held no rung below its own boundary, so once the
+                    # LRU evicted the slot that first planted the anchor, every later
+                    # divergence below it (a new day's date line, a memory edit) was a full
+                    # cold prefill — issue #36 (@felix-ab): 130–260 s on a 27B hybrid with a
+                    # 15–30k static prefix, vs 2–12 s with the ladder inherited.
+                    for r, cap in best.rungs.items():
+                        if r <= best_rung:
+                            self._pending_rungs.setdefault(r, cap)
                 self._slots.remove(best)
                 self._slots.insert(0, best)          # LRU touch
                 self.hits += 1
@@ -368,6 +383,8 @@ class PrefixCache:
                 slot.rungs.update(rungs)
                 self._cap_rungs(slot)
                 return
+        if self._short_prompt_would_evict_long(n_prompt):
+            return
         nontrim = [i for i, c in enumerate(cache) if not _layer_trimmable(c)]
         for old in [s for s in self._slots
                     if s.snapshot is not None and len(s.tokens) < n_prompt
@@ -414,6 +431,8 @@ class PrefixCache:
         if ctx is not None:
             for c in ctx:
                 c.trim_to(len(tokens))
+        if self._short_prompt_would_evict_long(len(tokens)):
+            return
         slot = _Slot(tokens, cache, ctx, self._next_sid)
         self._next_sid += 1
         self._slots.insert(0, slot)
@@ -430,11 +449,16 @@ class PrefixCache:
     def shed(self, level: str = "warn") -> dict:
         """Give memory back under OS pressure (see :mod:`~mlx_dspark.memory_guard`).
 
-        ``"warn"`` drops the interior rungs (and anything staged) but keeps every slot's
-        boundary checkpoint / trim cache; ``"critical"`` empties the cache. Slots are kept at
-        WARN on purpose: the A/B (NOTES "Memory-pressure guard") measured dropping a 27B
-        conversation's checkpoint as a 36 s re-prefill under pressure to free 0.6 GB, while the
-        allocator-cache clear the guard does alongside freed 1.3 GB for nothing. Returns an
+        ``"warn"`` drops the interior rungs above each slot's ``warn_keep_rungs`` deepest
+        ones (and anything staged) but keeps every slot's boundary checkpoint / trim cache;
+        ``"critical"`` empties the cache. Slots are kept at WARN on purpose: the A/B (NOTES
+        "Memory-pressure guard") measured dropping a 27B conversation's checkpoint as a 36 s
+        re-prefill under pressure to free 0.6 GB, while the allocator-cache clear the guard
+        does alongside freed 1.3 GB for nothing. The deepest rungs are kept for the same
+        reason (issue #36): on a long static agent prefix they are the anchors every new
+        session restores from — ~130 MB each on a 27B hybrid, 130–260 s to rebuild — while
+        the shallow per-turn rungs above them are cheap to rebuild and hold most of the
+        ladder's RAM. Returns an
         estimate of the bytes released and what was done, for the guard's log. Callers hold
         the generation thread; a slot an in-flight request already acquired is not in
         ``_slots`` (acquire removes it; ``store`` re-validates), so nothing live is touched.
@@ -452,10 +476,12 @@ class PrefixCache:
             action = "emptied"
         else:
             for s in self._slots:
-                s.rungs = {}
+                keep = sorted(s.rungs)[:self.warn_keep_rungs]
+                s.rungs = {r: s.rungs[r] for r in keep}
             self._pending_rungs = {}
             self._anchor = 0
-            action = "rungs dropped, slots kept"
+            action = (f"rungs dropped (deepest {self.warn_keep_rungs} kept), slots kept"
+                      if self.warn_keep_rungs else "rungs dropped, slots kept")
         after = sum(slot_bytes(s) for s in self._slots)
         return {"action": action, "prefix_bytes_freed": max(before - after, 0),
                 "slots_dropped": slots_before - len(self._slots),
@@ -495,6 +521,17 @@ class PrefixCache:
             for c in ctx:
                 c.trim_to(r)
         return cache, ctx
+
+    def _short_prompt_would_evict_long(self, n_tokens: int) -> bool:
+        """True when storing an ``n_tokens`` prompt would evict a slot at least 4x longer
+        while ``n_tokens`` is under ``min_slot_tokens``. With a 2-slot LRU, two unrelated
+        short requests (a title/summary call, a warm-up ping) otherwise evict two 30k-token
+        conversations that cost minutes each to rebuild, to cache prompts that re-prefill in
+        a few seconds (issue #36). Only fires when the cache is full AND every resident slot
+        is that much longer, so a workload of short conversations keeps caching them."""
+        if n_tokens >= self.min_slot_tokens or len(self._slots) < self.max_slots:
+            return False
+        return all(len(s.tokens) >= 4 * n_tokens for s in self._slots)
 
     def _cap_rungs(self, slot: _Slot) -> None:
         """Bound the ladder's RAM: drop the rung with the smallest gap to its lower

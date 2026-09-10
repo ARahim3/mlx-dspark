@@ -300,6 +300,16 @@ class DSparkConfig:
             c = _translate_speculators(c, path)
             mt = c.get("model_type", "")
 
+        # A declared draft_vocab_size EQUAL to vocab_size is the full vocab: no reduction and
+        # no d2t table in the checkpoint (the stock DeepSpec trainer writes the field either
+        # way — openbmb/MiniCPM5-2B-DSpark declares 130560 == 130560 and ships no d2t). Keep
+        # None so the full-vocab path stays untouched and load_drafter's "reduced vocab but no
+        # d2t" refusal is reserved for a real mismatch. The speculators translator already
+        # normalizes its own schema the same way; this covers the standalone/SpecForge/LFM2 ones.
+        _dv, _v = c.get("draft_vocab_size"), c.get("vocab_size")
+        if _dv is not None and _v is not None and int(_dv) == int(_v):
+            c["draft_vocab_size"] = None
+
         # SpecForge (sgl-project/SpecForge, served by SGLang) packaging — the fourth one, e.g.
         # RadixArk/Qwen3.8-27B-DSpark. Its DSparkDraftModel subclasses SpecForge's
         # DFlashDraftModel, whose config is a plain transformers Qwen3Config plus a nested

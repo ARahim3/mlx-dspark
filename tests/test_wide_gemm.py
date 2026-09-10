@@ -215,10 +215,15 @@ def test_cpu_rows_is_tile_rounded_and_never_everything():
     assert cpu_rows(128, 0.9) == 0             # would be everything -> no split
 
 
-def test_split_matches_plain_path_within_bf16_and_restores():
+@pytest.mark.parametrize("fp32", [True, False])
+def test_split_matches_plain_path_within_bf16_and_restores(monkeypatch, fp32):
     """The CPU rows are a different accumulation order (fp-tie class), so agreement is
     'within bf16 rounding', not bit-identity — that is exactly why the library leaves
-    this off and the CLI turns it on, like the last-row head."""
+    this off and the CLI turns it on, like the last-row head. Both CPU routes — fp32 via
+    Accelerate BLAS (the default since the issue-#31 BNNS crashes) and bf16 via BNNS — hold
+    the same bound."""
+    import mlx_dspark.wide_gemm as wg
+    monkeypatch.setattr(wg, "CPU_SPLIT_FP32", fp32)
     mx.random.seed(3)
     lin = _qlinear(bits=4)
     x = mx.random.normal((ROWS, K)).astype(mx.bfloat16)
@@ -232,13 +237,14 @@ def test_split_matches_plain_path_within_bf16_and_restores():
     d = mx.abs(y.astype(mx.float32) - ref.astype(mx.float32))
     scale = float(mx.abs(ref.astype(mx.float32)).max())
     assert float(d.max()) <= 0.02 * scale      # a few bf16 ulps of the output scale
-    # the GPU rows (the first ones) are bit-identical to the dequant+GEMM path
+    # the GPU rows — the TAIL since v0.18.0 (the CPU takes the head rows, issue #31) — are
+    # bit-identical to the dequant+GEMM path; the CPU rows are the fp-tie band above
     n_cpu = cpu_rows(ROWS, 0.25)
     wide = x @ mx.dequantize(lin["weight"], lin["scales"], lin["biases"],
                              group_size=64, bits=4).T
     mx.eval(wide)
-    assert float(mx.abs(y[:-n_cpu].astype(mx.float32)
-                        - wide[:-n_cpu].astype(mx.float32)).max()) == 0.0
+    assert float(mx.abs(y[n_cpu:].astype(mx.float32)
+                        - wide[n_cpu:].astype(mx.float32)).max()) == 0.0
 
 
 def test_split_respects_min_rows_and_leading_dims_and_bias():

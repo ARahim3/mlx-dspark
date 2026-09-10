@@ -1,6 +1,6 @@
 """Tool-calling glue: translate between OpenAI ``tool_calls`` and each model's native syntax.
 
-Five output formats are parsed (detected by markers, so it doesn't matter which model is
+Six output formats are parsed (detected by markers, so it doesn't matter which model is
 loaded — it also covers any model that borrows one of these conventions):
 
   * **Hermes / JSON** (Qwen3, DeepSpec drafters' targets, many others)::
@@ -45,6 +45,16 @@ loaded — it also covers any model that borrows one of these conventions):
     when that fails (a bare unquoted string, code, file contents). No schema needed; the format
     types its own scalars. See NOTES "Muse-Glimmer-30B".
 
+  * **MiniCPM5 / attribute-XML** (OpenBMB MiniCPM5; SGLang's ``minicpm5`` parser)::
+
+        <function name="example_function_name"><param name="example_parameter_1">value_1</param></function>
+
+    Like the Ornith form the values are raw text (schema-coerced the same way), with one
+    addition from the model's own chat template: a value containing ``<``, ``&`` or a newline
+    is wrapped in a CDATA block (``<![CDATA[...]]>``), which is unwrapped here. Distinct from
+    the Ornith form by the ``name="…"`` attribute (``<function name=`` vs ``<function=``) and
+    by having no ``<tool_call>`` wrapper.
+
   * **LFM2 / pythonic** (LiquidAI LFM2.5)::
 
         <|tool_call_start|>[get_weather(location="Paris", days=3)]<|tool_call_end|>
@@ -86,6 +96,12 @@ _XML_PARAM = re.compile(r"<parameter=\s*([^>\s]+?)\s*>\n?(.*?)\n?</parameter>", 
 _ATEM = re.compile(r'<atem:invoke\b[^>]*?\bname="([^"]+)"\s*>(.*?)(?:</atem:invoke>|\Z)', re.DOTALL)
 _ATEM_PARAM = re.compile(r'<atem:parameter\b[^>]*?\bname="([^"]+)"[^>]*?>(.*?)</atem:parameter>',
                          re.DOTALL)
+# MiniCPM5 (OpenBMB): <function name="NAME"><param name="K">V</param>…</function>, values
+# optionally CDATA-wrapped (the chat template wraps any value containing '<', '&' or a newline).
+# The closing </function> is optional so a call truncated at max_tokens still parses.
+_MINICPM = re.compile(r'<function\s+name="([^"]+)"\s*>(.*?)(?:</function>|\Z)', re.DOTALL)
+_MINICPM_PARAM = re.compile(r'<param\s+name="([^"]+)"\s*>(.*?)</param>', re.DOTALL)
+_CDATA = re.compile(r"\A\s*<!\[CDATA\[(.*?)\]\]>\s*\Z", re.DOTALL)
 # LFM2 (LiquidAI): <|tool_call_start|>[func_name(key="v", n=3)]<|tool_call_end|>. The body is a
 # Python-style call list, so it's parsed with `ast` (below), not a regex. `<|tool_call_start|>`
 # is emitted as a NON-special token (it survives detokenization), which is what makes it
@@ -170,6 +186,22 @@ def _coerce_typed(raw: str, jtype: str | None):
 def _parse_xml_args(body: str, types: dict[str, str] | None) -> dict:
     return {m.group(1): _coerce_typed(m.group(2), (types or {}).get(m.group(1)))
             for m in _XML_PARAM.finditer(body)}
+
+
+def _parse_minicpm_args(body: str, types: dict[str, str] | None) -> dict:
+    args: dict = {}
+    for m in _MINICPM_PARAM.finditer(body):
+        key, raw = m.group(1), m.group(2)
+        cd = _CDATA.match(raw)
+        if cd:
+            # CDATA is the template's escape for text values; keep it verbatim (only coerce
+            # to a declared non-string type, never by heuristic).
+            jtype = (types or {}).get(key)
+            args[key] = (_coerce_typed(cd.group(1), jtype)
+                         if jtype and jtype != "string" else cd.group(1))
+        else:
+            args[key] = _coerce_typed(raw, (types or {}).get(key))
+    return args
 
 
 def _atem_value(raw: str):
@@ -269,6 +301,11 @@ def parse_tool_calls(text: str, schemas: dict[str, dict[str, str]] | None = None
             name = m.group(1)
             calls.append((name, _parse_xml_args(m.group(2), (schemas or {}).get(name))))
         cleaned = _XML.sub("", cleaned)
+    if "<function name=" in cleaned:
+        for m in _MINICPM.finditer(cleaned):
+            name = m.group(1)
+            calls.append((name, _parse_minicpm_args(m.group(2), (schemas or {}).get(name))))
+        cleaned = _MINICPM.sub("", cleaned)
     if "<tool_call>" in cleaned:
         for m in _HERMES.finditer(cleaned):
             try:
@@ -294,7 +331,8 @@ def parse_tool_calls(text: str, schemas: dict[str, dict[str, str]] | None = None
         cleaned = _LFM.sub("", cleaned)
     # A generation cut off at max_tokens mid-call leaves an unclosed opener; everything from
     # it onward is an aborted call, not prose, so drop it rather than render raw markup.
-    for opener in ("<tool_call>", "<atem:invoke", "<atem:function_calls>", "<|tool_call_start|>"):
+    for opener in ("<tool_call>", "<atem:invoke", "<atem:function_calls>", "<|tool_call_start|>",
+                   "<function name="):
         dangling = cleaned.find(opener)
         if dangling != -1:
             cleaned = cleaned[:dangling]
