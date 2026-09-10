@@ -2827,6 +2827,15 @@ def make_handler(engine: Engine, api_key: str | None):
             except Exception:  # noqa: BLE001 — a tokenizer that can't decode just opts out
                 return False
 
+        def _channel_splitter(self, prompt_ids):
+            """The incremental reasoning/answer splitter for the loaded model, shared by every
+            streaming path so the muse choice is made in one place: muse tags its channels with
+            recipient headers (``to=self`` analysis, ``to=user`` answer); everything else uses
+            ``<think>``-style pairs, self-opened or prefilled by the chat template."""
+            if engine.is_muse:
+                return A.MuseChannelParser()
+            return A.ThinkingStreamSplitter(in_thinking=self._prompt_opens_thinking(prompt_ids))
+
         def _messages_stream(self, prompt_ids, params, model, want_thinking=True, schemas=None):
             stream = A.MessageStream(model=model, input_tokens=len(prompt_ids),
                                      thinking=want_thinking, schemas=schemas,
@@ -2969,8 +2978,7 @@ def make_handler(engine: Engine, api_key: str | None):
             # responses_api.py's module docstring for why); a tool-call gate holds back
             # partial markup the same way the Chat Completions `want_tools` path does —
             # incremental tool-call streaming isn't reliable to reconstruct.
-            splitter = A.ThinkingStreamSplitter(
-                in_thinking=self._prompt_opens_thinking(prompt_ids))
+            splitter = self._channel_splitter(prompt_ids)
             gate = A._ToolGate()
 
             def on_text(piece: str):
@@ -3191,8 +3199,7 @@ def make_handler(engine: Engine, api_key: str | None):
                 # inter-chunk idle timeouts (DSH/pi, 300 s) dropped the stream and lost the
                 # whole turn (issue #19). Only whole tool_use blocks land atomically at the
                 # end — incremental tool-call streaming isn't reliable to reconstruct.
-                splitter = A.ThinkingStreamSplitter(
-                    in_thinking=self._prompt_opens_thinking(prompt_ids))
+                splitter = self._channel_splitter(prompt_ids)
                 gate = A._ToolGate()
 
                 def _emit_tools_split(chunks):
@@ -3227,28 +3234,6 @@ def make_handler(engine: Engine, api_key: str | None):
                 if cleaned:
                     self._sse(base({"content": cleaned}, None))
                 return res, res.finish_reason
-            if chat and engine.is_muse:
-                # muse streams its analysis (`to=self`) and answer (`to=user`) channels
-                # interleaved with structural markers; split them incrementally so reasoning
-                # rides in `reasoning_content` and only the answer lands in `content`.
-                muse = A.MuseChannelParser()
-
-                def _emit_muse(chunks):
-                    for kind, text in chunks:
-                        if not text:
-                            continue
-                        field = "reasoning_content" if kind == "reasoning" else "content"
-                        self._sse(base({field: text}, None))
-
-                def on_text(piece: str):
-                    alive()
-                    try:
-                        _emit_muse(muse.feed(piece))
-                    except (BrokenPipeError, ConnectionResetError) as e:
-                        raise StopStreaming() from e
-                res = engine.generate(prompt_ids, on_text=on_text, **params)
-                _emit_muse(muse.feed("", final=True))   # flush the held-back tail
-                return res, res.finish_reason
             if chat:
                 # Split reasoning into `reasoning_content` incrementally (the streaming twin
                 # of the non-streaming path's split_thinking). Covers both the self-opened
@@ -3256,8 +3241,7 @@ def make_handler(engine: Engine, api_key: str | None):
                 # prefill the opener in the prompt, so the output holds only the closer —
                 # streamed raw, clients render the reasoning as answer text with a stray
                 # `</think>` in the middle).
-                splitter = A.ThinkingStreamSplitter(
-                    in_thinking=self._prompt_opens_thinking(prompt_ids))
+                splitter = self._channel_splitter(prompt_ids)
 
                 def _emit_split(chunks):
                     for kind, text in chunks:

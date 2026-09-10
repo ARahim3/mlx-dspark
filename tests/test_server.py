@@ -785,6 +785,63 @@ def test_stream_splits_prefilled_thinking(server):
     assert _stream_fields(sse) == ("I reason here", "The answer")
 
 
+# muse_glimmer's recipient-tagged channels, the real shapes captured from the 8-bit target
+# (the same strings tests/test_anthropic.py drives through the Anthropic stream).
+_MUSE_ANSWER = (" to=self<|message|>17*23 = 391. Provide answer.<|eom|>"
+                "<|start|>assistant to=user<|message|>17 × 23 = **391**.")
+_MUSE_TOOL = (" to=self<|message|>I should look it up.<|eom|>"
+              "<|start|>assistant to=get_weather<|message|><atem:function_calls>\n"
+              '<atem:invoke name="get_weather">\n'
+              '<atem:parameter name="city">Paris</atem:parameter>\n'
+              "</atem:invoke>\n</atem:function_calls>")
+_WEATHER_TOOLS = [{"type": "function", "function": {
+    "name": "get_weather",
+    "parameters": {"type": "object", "properties": {"city": {"type": "string"}}}}}]
+
+
+def test_stream_splits_muse_channels(server):
+    """Without tools the plain chat stream picks the muse parser the same way."""
+    eng, base = server
+    eng.is_muse = True
+    eng.response_text = _MUSE_ANSWER
+    sse = _post(base, "/v1/chat/completions",
+                {"messages": [{"role": "user", "content": "17*23?"}], "stream": True},
+                stream=True)
+    assert _stream_fields(sse) == ("17*23 = 391. Provide answer.", "17 × 23 = **391**.")
+
+
+def test_tools_stream_splits_muse_channels(server):
+    """With `tools` in the request the streaming path used to build the `<think>` splitter
+    for muse too, so the raw `to=self` analysis and `<|eom|>` markers streamed as content.
+    Agents always send tools, so every muse turn showed its reasoning as answer text."""
+    eng, base = server
+    eng.is_muse = True
+    eng.response_text = _MUSE_ANSWER
+    sse = _post(base, "/v1/chat/completions",
+                {"messages": [{"role": "user", "content": "17*23?"}],
+                 "tools": _WEATHER_TOOLS, "stream": True}, stream=True)
+    assert _stream_fields(sse) == ("17*23 = 391. Provide answer.", "17 × 23 = **391**.")
+
+
+def test_tools_stream_muse_tool_call_parses_and_never_leaks(server):
+    """The answer channel still goes through the tool gate: atem markup is held back, parsed
+    into a tool_calls delta, and never streamed as prose."""
+    eng, base = server
+    eng.is_muse = True
+    eng.response_text = _MUSE_TOOL
+    sse = _post(base, "/v1/chat/completions",
+                {"messages": [{"role": "user", "content": "weather in Paris?"}],
+                 "tools": _WEATHER_TOOLS, "stream": True}, stream=True)
+    assert _stream_fields(sse) == ("I should look it up.", "")
+    chunks = [json.loads(l[6:]) for l in sse.split("\n\n")
+              if l.startswith("data: ") and l != "data: [DONE]"]
+    tc = [c for c in chunks if c["choices"][0]["delta"].get("tool_calls")]
+    call = tc[0]["choices"][0]["delta"]["tool_calls"][0]["function"]
+    assert call["name"] == "get_weather"
+    assert json.loads(call["arguments"]) == {"city": "Paris"}
+    assert chunks[-1]["choices"][0]["finish_reason"] == "tool_calls"
+
+
 def test_race_cap_auto_and_validation(server):
     """Race arms accept cap 'auto' for drafter modes (per-round adaptive cap from the
     cached curves), reject it for modes with no controller to drive, and reject garbage

@@ -399,6 +399,20 @@ def test_responses_streaming_event_sequence(api):
     assert full_text == "Hello world"
 
 
+def test_responses_streaming_muse_drops_the_analysis_channel(api):
+    """muse's `to=self` analysis and its channel markers are reasoning, not output text: the
+    stream has to split them the way the non-streaming path's split_thinking already does."""
+    eng, base = api
+    eng.is_muse = True
+    eng.response_text = (" to=self<|message|>17*23 = 391. Provide answer.<|eom|>"
+                         "<|start|>assistant to=user<|message|>17 × 23 = **391**.")
+    body = _post(base, "/v1/responses",
+                 {"input": "17*23?", "max_output_tokens": 100, "stream": True}, raw=True)
+    events = _read_sse(body)
+    text = "".join(p["delta"] for n, p in events if n == "response.output_text.delta")
+    assert text == "17 × 23 = **391**."
+
+
 def test_responses_streaming_usage_in_final_event(api):
     _, base = api
     body = _post(base, "/v1/responses",
