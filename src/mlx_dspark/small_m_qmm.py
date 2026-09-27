@@ -1,58 +1,39 @@
-"""Small-M quantized matmul for the verify window: an MMA kernel that amortizes the
-weight read across rows.
+"""Small-M quantized matmul for the verify window: dispatch, per-shape gate, scoped patch.
 
-``mx.quantized_matmul`` grows ~linearly in M for M in 2..8 on Apple GPUs — the weight
-read is re-paid per row until the GEMM tiling takes over around M=13+ (upstream
-ml-explore/mlx#4265; our own #3852 is the 2-bit face of the same thing). Speculative
-verify lives exactly there: verify width = cap + 1, and the drafter's bidirectional
-block backbone runs at block width every round. So on 4-bit targets the verify curve
-"rises steeply from width 3" (the measured shape that pins Qwen3.8-27B-4bit at cap 2)
-for no fundamental reason.
+``mx.quantized_matmul`` grows ~linearly in M for M in 2..~12 on Apple GPUs — the weight read
+is re-paid per row until the GEMM tiling takes over (upstream ml-explore/mlx#4265; our own
+#3852 is the 2-bit face of the same thing). Speculative verify lives exactly there: verify
+width = cap + 1, and a drafter's block backbone runs at block width (7-16) every round.
 
-The kernel here is avlp12's ``qmm_mma4`` (github.com/avlp12/mlx-lm ``fast_qmm.py``,
-MIT — see NOTICE), vendored with the dispatch rewritten to this project's conventions:
-an 8x8 ``simdgroup_matrix`` MMA tile covers M <= 8 exactly, so each quantized weight
-group is read and dequantized ONCE and reused by every row; K is split across the 8
-simdgroups of a threadgroup (split-K) so the serial loop per simdgroup is short.
+This module routes those forwards through :mod:`.skinny_qmm` — mlx-dspark's own matrix-unit
+kernel (weights as the MMA operand, loaded once per group and shared by up to 16 rows) —
+over a measured window per quantization width:
 
-Measured (M4 Pro, mlx 0.32.0, dependent chain, rotated weights — both are load-bearing,
-see "Measurement notes" below), real Qwen3.8-27B-4bit shapes:
+- **4-bit: M ∈ [5, 16]** (M 2-3 lose to qmv/qmm, 4 ties). Whole Qwen3.8-27B-4bit verify at
+  ctx 512: widths 5-8 113 -> ~96 ms, widths 9-16 214-276 -> ~165 ms.
+- **8-bit: M ∈ [6, 16]** (8-bit qmm is flat to M=5, then cliffs at 6: 0.41 -> 0.66 ms on the
+  Qwen3.8-27B-8bit MLP shapes; the kernel holds 0.44 through 8 and 0.56 at 12-16).
 
-    shape              M=4     M=5     M=6     M=7     M=8
-    17408x5120        0.85x   1.05x   1.31x   1.58x   1.61x
-    5120x17408        0.87x   1.05x   1.32x   1.61x   1.63x
-    10240x5120        0.84x   1.03x   1.28x   1.55x   1.56x
-    248320x5120 (head) 0.85x  1.07x   1.36x   1.68x   1.70x
+History: v0.12.0 shipped avlp12's ``qmm_mma4`` (MIT, dequant staged in threadgroup memory)
+for M 6-8 — the first proof that the 4-bit curve's "rise from width 3" was a kernel dead zone,
+not the hardware (cap 2 -> 7 on the 4-bit 27B). 2026-09-27 briefly vendored TensorFold's
+``simd_qmm`` for 4-bit 5-16; both are replaced by ``skinny_qmm`` (1-3% faster than the
+former at 4-bit, ties the latter at 8-bit 6-8, and covers 9-16 for both widths). NOTES
+"The small-M MMA verify kernel" and "Engine pass 2026-09-27".
 
-The kernel is FLAT in M (one tile). ``quantized_matmul`` wins below M=5 (its GEMV path
-is at roofline), so this is a supplement dispatched only inside M in [M_MIN, 8] — never
-a replacement. End-to-end it turned Qwen3.8-27B-4bit code cap 5 from 23.7 to 29.2 tok/s
-(2.06x vs baseline, past cap 2's 1.89x), output ids identical.
-
-An **8-bit variant** (same kernel, different unpack — 4 values per uint32 instead of 8)
-covers 8-bit gs64 targets, where the story is the mirror image: 8-bit qmm is already
-flat to M=5 (why cap 4 was its optimum) but cliffs at M=6 (0.41 -> 0.66 ms on the
-Qwen3.8-27B-8bit MLP shapes, 5.7 -> 9.3 on its lm_head); the kernel holds the flat level
-through M=8 (1.20-1.62x at M=6-8), so caps 5-7 stop being priced out there too.
-
-Numerics: fp32 accumulation in a different order than qmm — outputs differ by 1-2 bf16
-ulps (max|d| 0.125-0.375 at max|y| ~30-58). Same class as the batched path: per-token
-greedy-correct under the verify loop (the target still verifies every token), NOT
-bit-identical to the stock kernel. :func:`measure_shapes` checks both the numerics and
-the speed per shape at runtime and returns only shapes where the kernel actually wins
-on this (chip x mlx version) — the wide_gemm doctrine: verified, never assumed.
+Numerics: fp32 accumulation in a different order than qmm — outputs differ by 1-2 bf16 ulps.
+Same class as the batched path: per-token greedy-correct under the verify loop (the target
+still verifies every token), NOT bit-identical to the stock kernel. :func:`measure_shapes`
+checks both the numerics and the speed per shape at runtime and returns only shapes where
+the kernel actually wins on this (chip x mlx version) — verified, never assumed.
 
 Measurement notes (cost real time upstream, don't relearn):
 - DEPENDENT chains only. Queue-batched/independent-call microbenches let kernel launches
   overlap and hide the longer critical path — avlp12 measured a kernel that looked 1.13x
   that way and made the real model 26% slower. Decode is a serial chain.
-- Rotate weights across calls (katlun's lesson): a single weight stays cache-resident
-  and hides the read cost the kernel exists to amortize. :func:`measure_shapes` rotates
-  across the model's OWN same-shape layers, so it allocates nothing.
-
-Eligibility is tighter than upstream's: the K-loop strides 64 values per simdgroup over
-a K/8 slice, so K must be a multiple of 512 (upstream gates on 128, which would
-mis-handle K in {128,256,384} mod 512 — all real shapes here are %512 anyway).
+- Rotate weights across calls (katlun's lesson): a single weight stays cache-resident and
+  hides the read cost the kernel exists to amortize. :func:`measure_shapes` rotates across the
+  model's OWN same-shape layers, so it allocates nothing.
 """
 
 from __future__ import annotations
@@ -63,113 +44,11 @@ import time
 import mlx.core as mx
 import mlx.nn as nn
 
-M_MIN = 6   # measured crossover on a dependent chain: M=5 is 1.03-1.07x (noise band,
-# and upstream measured it net-negative in-model), M=6 is the first clear win. Constant
-# of (chip x mlx version) — revisit after any mlx upgrade, like every knee here.
-# The same window holds for the 8-bit variant from the other side: 8-bit qmm is FLAT to
-# M=5 (why cap 4 was its measured optimum) and cliffs at 6 (0.41 -> 0.66 ms on the MLP
-# shapes); the kernel sits at the flat level through M=8 (1.20-1.62x at M=6-8).
-M_MAX = 8   # one MMA tile
-N_MIN = 4096  # below this the grid is too few threadgroups to occupy the GPU
+from . import skinny_qmm as _sk
 
-# The dequant unpack is the only part that differs by quantization width: 4-bit packs 8
-# values per uint32 (16 values = 2 uints per lane-slice), 8-bit packs 4 (16 values = 4
-# uints). Everything else — split-K, staging layout, MMA, reduction — is identical.
-_UNPACK = {
-    4: r"""
-            const device uint* wr = w + (size_t)n * (K / 8) + (ka >> 3) + kq * 2;
-            uint p0 = wr[0], p1 = wr[1];
-            for (int t = 0; t < 8; ++t)
-                bt[(kq * 16 + t) * 8 + j] = (bfloat16_t)((float)((p0 >> (4 * t)) & 15u) * s + bb);
-            for (int t = 0; t < 8; ++t)
-                bt[(kq * 16 + 8 + t) * 8 + j] = (bfloat16_t)((float)((p1 >> (4 * t)) & 15u) * s + bb);
-""",
-    8: r"""
-            const device uint* wr = w + (size_t)n * (K / 4) + (ka >> 2) + kq * 4;
-            for (int u = 0; u < 4; ++u) {
-                uint p = wr[u];
-                for (int t = 0; t < 4; ++t)
-                    bt[(kq * 16 + u * 4 + t) * 8 + j] =
-                        (bfloat16_t)((float)((p >> (8 * t)) & 255u) * s + bb);
-            }
-""",
-}
-
-_SRC = r"""
-    const int K = KD, N = ND, M = MD;
-    const int KPS = KD / 8;                 // K-span per simdgroup (split-K)
-
-    uint tid  = thread_position_in_threadgroup.x;
-    uint tgid = threadgroup_position_in_grid.x;
-    uint sg   = tid >> 5;
-    uint lane = tid & 31;
-
-    int n0 = (int)tgid * 8;                 // one threadgroup -> 8 output columns
-
-    // x is read straight from device into the MMA (bf16 in, fp32 accumulate): no
-    // staging keeps threadgroup memory small and, more importantly, the critical
-    // path short.
-    threadgroup bfloat16_t bs[8 * 512];     // per-simdgroup 64k x 8n dequant stage
-    threadgroup float red[8 * 64];          // cross-simdgroup reduction
-
-    simdgroup_matrix<float, 8, 8> C = simdgroup_matrix<float, 8, 8>(0);
-    threadgroup bfloat16_t* bt = bs + sg * 512;
-
-    // Split-K: the 8 simdgroups each walk 1/8 of K in short serial loops. (A prior
-    // revision walked all of K per threadgroup and put ~160 barrier pairs on the
-    // critical path.)
-    int kbeg = (int)sg * KPS;
-    for (int kk = 0; kk < KPS; kk += 64) {
-        int ka = kbeg + kk;
-        int j  = (int)(lane & 7);
-        int kq = (int)(lane >> 3);
-        int n  = n0 + j;
-        if (n < N) {
-            // dequantize per quantization group (64 values), not per MMA tile (8):
-            // one scale/bias load serves the whole group and barriers drop 8x.
-            int g = ka >> 6;
-            float s  = (float)sc[(size_t)n * (K / 64) + g];
-            float bb = (float)bi[(size_t)n * (K / 64) + g];
-__UNPACK__
-        } else {
-            for (int t = 0; t < 16; ++t) bt[(kq * 16 + t) * 8 + j] = (bfloat16_t)0;
-        }
-        simdgroup_barrier(mem_flags::mem_threadgroup);
-
-        simdgroup_matrix<bfloat16_t, 8, 8> A, B;
-        for (int kt = 0; kt < 8; ++kt) {
-            simdgroup_load(A, x + ka + kt * 8, K);   // x rows 0..7 (padded to 8)
-            simdgroup_load(B, bt + kt * 64, 8);
-            simdgroup_multiply_accumulate(C, A, B, C);
-        }
-        simdgroup_barrier(mem_flags::mem_threadgroup);
-    }
-
-    simdgroup_store(C, red + sg * 64, 8);
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    // sum the 8 split-K partials and write out
-    for (int i = (int)tid; i < 64; i += 256) {
-        int m = i >> 3, j = i & 7;
-        int n = n0 + j;
-        if (m < M && n < N) {
-            float v = 0.0f;
-            for (int q = 0; q < 8; ++q) v += red[q * 64 + i];
-            out[(size_t)m * N + n] = (bfloat16_t)v;
-        }
-    }
-"""
-
-_TG = 256  # 8 simdgroups
-_KERNELS = {
-    bits: mx.fast.metal_kernel(
-        name=f"dspark_qmm_mma{bits}",
-        input_names=["x", "w", "sc", "bi"],
-        output_names=["out"],
-        source=_SRC.replace("__UNPACK__", unpack),
-    )
-    for bits, unpack in _UNPACK.items()
-}
+M4_MIN, M4_MAX = _sk.WINDOW[4]      # 4-bit rows served
+M8_MIN, M8_MAX = _sk.WINDOW[8]      # 8-bit rows served
+M_MIN, M_MAX = M8_MIN, M8_MAX       # (legacy names: the 8-bit window)
 
 _orig_call = nn.QuantizedLinear.__call__
 _active_ids: frozenset | None = None   # None = patch inactive
@@ -182,62 +61,36 @@ def _in_features(mod) -> int:
 
 def eligible(mod) -> bool:
     """Can this ``QuantizedLinear``'s shape/format run on the kernel at all?"""
-    if not isinstance(mod, nn.QuantizedLinear):
-        return False
-    if getattr(mod, "mode", "affine") != "affine" or "biases" not in mod:
-        return False
-    if int(mod.bits) not in _KERNELS or int(mod.group_size) != 64:
-        return False
-    N = int(mod["weight"].shape[0])
-    return N >= N_MIN and _in_features(mod) % 512 == 0
+    return isinstance(mod, nn.QuantizedLinear) and _sk.fits(mod)
 
 
 def shape_key(mod) -> str:
     return f"{_in_features(mod)}x{int(mod['weight'].shape[0])}b{int(mod.bits)}"
 
 
-def _mma(x8: mx.array, wq, sc, bi, M: int, N: int, K: int, bits: int) -> mx.array:
-    (out,) = _KERNELS[bits](
-        inputs=[x8, wq, sc, bi],
-        template=[("KD", K), ("ND", N), ("MD", M)],
-        output_shapes=[(M, N)], output_dtypes=[mx.bfloat16],
-        grid=(((N + 7) // 8) * _TG, 1, 1), threadgroup=(_TG, 1, 1),
-    )
-    return out
-
-
 def _mma_call(self, x):
+    if _active_ids is None or id(self) not in _active_ids or x.dtype != mx.bfloat16:
+        return _orig_call(self, x)
     M = 1
     for d in x.shape[:-1]:
         M *= d
-    if (M_MIN <= M <= M_MAX and x.dtype == mx.bfloat16
-            and _active_ids is not None and id(self) in _active_ids):
-        K = x.shape[-1]
-        N = self["weight"].shape[0]
-        flat = x.reshape(M, K)
-        if M < 8:  # the kernel reads a full 8-row MMA tile from device
-            flat = mx.concatenate(
-                [flat, mx.zeros((8 - M, K), dtype=flat.dtype)], axis=0)
-        y = _mma(flat, self["weight"], self["scales"], self["biases"],
-                 M, N, K, int(self.bits))
-        y = y.reshape(*x.shape[:-1], N)
-        if "bias" in self:
-            y = y + self["bias"]
-        return y
+    lo, hi = _sk.WINDOW[self.bits]
+    if lo <= M <= hi:
+        return _sk.call(self, x, M)
     return _orig_call(self, x)
 
 
 @contextlib.contextmanager
 def small_m_matmul(ids: frozenset | None):
-    """Route the given ``QuantizedLinear`` instances (by ``id``) through the MMA kernel
-    for forwards of M in [M_MIN, M_MAX] rows. ``None``/empty disables — the context is
-    then a no-op, so call sites stay unconditional.
+    """Route the given ``QuantizedLinear`` instances (by ``id``) through the kernel for
+    forwards inside their width's window. ``None``/empty disables — the context is then a
+    no-op, so call sites stay unconditional.
 
     ``ids`` is a *pre-verified allowlist* built by :func:`calibrate.apply_small_m` from
-    shapes that :func:`measure_shapes` proved faster AND numerically sane on this
-    machine. An id-set (not per-call shape math) keeps the dispatch overhead off the
-    M=1 decode path. Class-level patch, one-MLX-thread rule applies (see NOTES);
-    restores to the value found at entry so it nests with ``wide_matmul``.
+    shapes that :func:`measure_shapes` proved faster AND numerically sane on this machine.
+    An id-set (not per-call shape math) keeps the dispatch overhead off the M=1 decode path.
+    Class-level patch, one-MLX-thread rule applies (see NOTES); restores to the value found
+    at entry so it nests with ``wide_matmul``.
     """
     global _active_ids
     if not ids or nn.QuantizedLinear.__call__ is _mma_call:
@@ -261,8 +114,9 @@ def active() -> bool:
 
 _CHAIN = 12   # dependent steps per timed eval
 _EVALS = 4    # first is warmup, median of the rest
-_MIN_GAIN = 1.15   # a shape must beat quantized_matmul by this at M=8 to be worth the
-# fp-tie churn; below it the flat-in-M kernel is within noise of the rising qmm curve.
+_MIN_GAIN = 1.15   # a shape must beat quantized_matmul by this in the window to be worth
+# the fp-tie churn; below it the flat-in-M kernel is within noise of the rising qmm curve
+_EDGE_MIN = 0.97   # at the 4-bit window's bottom edge (M=5) the kernel must not LOSE
 _REL_TOL = 0.02    # max|kernel - qmm| <= _REL_TOL * max|qmm| (measured 1-2 bf16 ulps,
 # ~0.007 relative; 0.02 leaves headroom without admitting a broken shape)
 
@@ -281,14 +135,19 @@ def _time_chain(step, x0) -> float:
     return rest[len(rest) // 2]
 
 
+def _kernel_rows(mod, x: mx.array) -> mx.array:
+    return _sk.qmm(x, mod["weight"], mod["scales"], mod["biases"], int(mod.bits))
+
+
 def measure_shapes(*models, verbose: bool = False) -> list[str]:
     """Which eligible weight shapes actually WIN on the kernel, on this machine, now.
 
     For every distinct eligible shape in the given models: check numerics against
-    ``quantized_matmul`` at each window width, then race a dependent chain at M=8 —
-    rotating across the model's own same-shape layers so nothing stays cache-resident
-    and nothing is allocated. Returns the shape keys that pass both gates; anything
-    else stays on the stock path at stock speed and stock numerics.
+    ``quantized_matmul`` across the window, then race dependent chains — rotating across the
+    model's own same-shape layers so nothing stays cache-resident and nothing is allocated. A
+    shape must win by ``_MIN_GAIN`` at M=8 and at M=12 (the two tile regimes: one and two
+    8-row tiles), and a 4-bit shape must not lose at its bottom edge M=5. Returns the shape
+    keys that pass; anything else stays on the stock path at stock speed and stock numerics.
     """
     groups: dict[str, list] = {}
     for model in models:
@@ -301,18 +160,14 @@ def measure_shapes(*models, verbose: bool = False) -> list[str]:
     won: list[str] = []
     for key, mods in groups.items():
         mod = mods[0]
-        N = int(mod["weight"].shape[0])
         K = _in_features(mod)
-        bits = int(mod.bits)
+        lo, hi = _sk.WINDOW[int(mod.bits)]
 
         ok = True
-        for M in range(M_MIN, M_MAX + 1):
+        for M in sorted({lo, 8, 12, hi}):
             x = (mx.random.normal((M, K)) * 0.1).astype(mx.bfloat16)
-            x8 = x if M == 8 else mx.concatenate(
-                [x, mx.zeros((8 - M, K), dtype=x.dtype)], axis=0)
             ref = _orig_call(mod, x).astype(mx.float32)
-            got = _mma(x8, mod["weight"], mod["scales"], mod["biases"],
-                       M, N, K, bits).astype(mx.float32)
+            got = _kernel_rows(mod, x).astype(mx.float32)
             diff = mx.max(mx.abs(ref - got))
             scale = mx.max(mx.abs(ref))
             mx.eval(diff, scale)
@@ -324,24 +179,29 @@ def measure_shapes(*models, verbose: bool = False) -> list[str]:
                 print(f"  small-M qmm: {key} rejected (numerics)", flush=True)
             continue
 
-        x = (mx.random.normal((8, K)) * 0.1).astype(mx.bfloat16)
-        mx.eval(x)
+        def race(M, _m=mods, _K=K):
+            x = (mx.random.normal((M, _K)) * 0.1).astype(mx.bfloat16)
+            mx.eval(x)
 
-        def q_step(xx, t, _m=mods):
-            w = _m[t % len(_m)]
-            return _orig_call(w, xx)
+            def q_step(xx, t):
+                return _orig_call(_m[t % len(_m)], xx)
 
-        def k_step(xx, t, _m=mods, _N=N, _K=K, _b=bits):
-            w = _m[t % len(_m)]
-            return _mma(xx, w["weight"], w["scales"], w["biases"], 8, _N, _K, _b)
+            def k_step(xx, t):
+                return _kernel_rows(_m[t % len(_m)], xx)
 
-        tq = min(_time_chain(q_step, x), _time_chain(q_step, x))
-        tk = min(_time_chain(k_step, x), _time_chain(k_step, x))
-        if tq / tk >= _MIN_GAIN:
+            tq = min(_time_chain(q_step, x), _time_chain(q_step, x))
+            tk = min(_time_chain(k_step, x), _time_chain(k_step, x))
+            return tq / tk
+
+        g8, g12 = race(8), race(12)
+        g_lo = race(lo) if lo < 6 else None
+        on = g8 >= _MIN_GAIN and g12 >= _MIN_GAIN and (g_lo is None or g_lo >= _EDGE_MIN)
+        if on:
             won.append(key)
         if verbose:
-            print(f"  small-M qmm: {key} M=8 {tq/tk:.2f}x "
-                  f"({'on' if tq / tk >= _MIN_GAIN else 'off'})", flush=True)
+            edge = f", M={lo} {g_lo:.2f}x" if g_lo is not None else ""
+            print(f"  small-M qmm: {key} M=8 {g8:.2f}x, M=12 {g12:.2f}x{edge} "
+                  f"({'on' if on else 'off'})", flush=True)
     return won
 
 

@@ -210,10 +210,10 @@ def test_resolve_mode_auto_honors_row_best_mode_dflash():
 def test_resolve_mode_explicit_dspark_still_gets_the_dspark_heads():
     from mlx_dspark.load import resolve_mode
 
-    mode, _t, drf = resolve_mode("mlx-community/Qwen3.8-27B-4bit", mode="dspark")
-    assert (mode, drf) == ("dspark", "DimInfer/Qwen3.8-27B-Dspark-v1")
-    mode, _t, drf = resolve_mode("mlx-community/Qwen3.8-27B-8bit", mode="dspark")
-    assert (mode, drf) == ("dspark", "RadixArk/Qwen3.8-27B-DSpark")
+    # one DSpark head for both quants since 2026-09-28 (RedHat replaced DimInfer / RadixArk)
+    for tgt in ("mlx-community/Qwen3.8-27B-4bit", "mlx-community/Qwen3.8-27B-8bit"):
+        mode, _t, drf = resolve_mode(tgt, mode="dspark")
+        assert (mode, drf) == ("dspark", "RedHatAI/Qwen3.8-27B-speculator.dspark"), tgt
 
 
 def test_resolve_mode_rows_without_best_mode_keep_dspark_first():
@@ -230,3 +230,23 @@ def test_resolve_mode_explicit_dflash_resolves_dflash2_head():
 
     mode, _t, drf = resolve_mode("mlx-community/Qwen3.8-27B-8bit", mode="dflash")
     assert (mode, drf) == ("dflash", "incoai/Qwen3.8-27B-DFlash2")
+
+
+def test_drafter_window_default_and_explicit_override():
+    """The DSpark drafter context window: registry rows may carry a measured
+    `drafter_window` (0 = whole context); everything else gets the global default; an
+    explicit setting (CLI / request) wins, and 0 there means the whole context."""
+    from mlx_dspark import load as L
+
+    assert L.drafter_window_default(None) == L.DRAFTER_WINDOW_DEFAULT
+    assert L.drafter_window_default("some/unknown-target") == L.DRAFTER_WINDOW_DEFAULT
+    assert L.resolve_drafter_window(0, "some/unknown-target") is None
+    assert L.resolve_drafter_window(2048, "some/unknown-target") == 2048
+    assert L.resolve_drafter_window(None, "some/unknown-target") == L.DRAFTER_WINDOW_DEFAULT
+    row = {"id": "zz-test-row", "target": "x/zz-test-row", "dspark": "x/d", "drafter_window": 0}
+    L.REGISTRY.append(row)
+    try:
+        assert L.drafter_window_default("x/zz-test-row-4bit") is None     # row: full context
+        assert L.resolve_drafter_window(1024, "x/zz-test-row-4bit") == 1024
+    finally:
+        L.REGISTRY.remove(row)

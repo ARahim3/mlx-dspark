@@ -139,6 +139,21 @@ def cmd_generate(argv: list[str]) -> None:
                          "path, then concatenate. ~1.5-2x on the long-context verify "
                          "attention; per-row-equivalent (fp-tie, verify-checked). Unset = on "
                          "where a one-time per-chip probe finds a cliff; --no-sdpa-split off.")
+    ap.add_argument("--multirow-attn", action=argparse.BooleanOptionalAction, default=None,
+                    help="multi-row decode-attention kernel for the speculative shapes (verify "
+                         "widths 2-16, the DSpark drafter's block over its context): packs "
+                         "every GQA x query row onto the GPU matrix units so each KV tile is "
+                         "read once. 1.5-4x on those attention calls, ~1.2x on a 32k-deep "
+                         "27B verify; fp-tie class, verify-checked. Unset = on for attention "
+                         "shapes a one-time cached probe proves faster (and numerically "
+                         "sound) on this machine; --no-multirow-attn uses mlx's kernels.")
+    ap.add_argument("--drafter-window", type=int, default=None, metavar="N",
+                    help="DSpark drafter context window: the draft block cross-attends only the "
+                         "last N context rows (0 = the whole context). DeepSpec-style heads lose "
+                         "acceptance with depth when they attend everything; a window restores "
+                         "it (DimInfer head at 32k: accept 1.98 -> 2.60). Unset = the pair's "
+                         "default (4096 unless the registry row says otherwise). Drafting-only: "
+                         "output is unchanged.")
     ap.add_argument("--lookup-long-draft", type=int, default=32,
                     help="match-scaled long-draft ceiling for lookup drafts (dspark hybrid "
                          "+ lookup mode): a deep context match (real copy run) earns drafts "
@@ -173,6 +188,9 @@ def cmd_generate(argv: list[str]) -> None:
     if args.mode == "dspark":
         drafter, _ = load_drafter(drafter_repo, quantize=args.drafter_bits > 0,
                                   bits=max(args.drafter_bits, 2))
+        from .load import resolve_drafter_window
+
+        drafter.ctx_window = resolve_drafter_window(args.drafter_window, target_repo)
     elif args.mode == "dflash":
         drafter, _ = load_dflash(drafter_repo, quantize=args.drafter_bits > 0,
                                  bits=max(args.drafter_bits, 2))
@@ -189,6 +207,10 @@ def cmd_generate(argv: list[str]) -> None:
     # Also before calibrate() so the verify curve is measured with the split live.
     apply_sdpa_split(target, target_repo=target_repo,
                      enabled=False if args.sdpa_split is False else None)
+    # multi-row attention kernel (see multirow_attn.py) — same rails, same ordering
+    from .calibrate import apply_multirow_attn
+
+    apply_multirow_attn(target, drafter, enabled=False if args.multirow_attn is False else None)
 
     max_draft = _parse_max_draft(args.max_draft, ap)
     cap_controller = None
@@ -431,6 +453,15 @@ def cmd_serve(argv: list[str]) -> None:
                     help="wide-verify SDPA split (see `mlx-dspark generate --help`). Unset = "
                          "on where a per-chip probe finds mlx's multi-row cliff; "
                          "--no-sdpa-split forces the single call. /health reports the state.")
+    ap.add_argument("--multirow-attn", action=argparse.BooleanOptionalAction, default=None,
+                    help="multi-row decode-attention kernel (see `mlx-dspark generate --help`). "
+                         "Unset = on for attention shapes a per-chip probe proves faster; "
+                         "--no-multirow-attn uses mlx's kernels. /health reports the state; "
+                         "/admin/load takes a per-swap `multirow_attn` boolean.")
+    ap.add_argument("--drafter-window", type=int, default=None, metavar="N",
+                    help="DSpark drafter context window (see `mlx-dspark generate --help`); 0 = "
+                         "whole context, unset = the pair default. /health reports it; "
+                         "/admin/load takes a per-swap `drafter_window` integer.")
     ap.add_argument("--warmup", action=argparse.BooleanOptionalAction, default=True,
                     help="on load, run a tiny throwaway generation to compile the Metal "
                          "kernels and ramp the GPU clock so the FIRST real request is warm "
@@ -491,6 +522,8 @@ def cmd_serve(argv: list[str]) -> None:
         "cpu_split": args.cpu_split,             # None = calibrated default, 0 = off
         "small_m": args.small_m,                 # None = probe-gated default, False = off
         "sdpa_split": args.sdpa_split,            # None = probe-gated default, False = off
+        "multirow_attn": args.multirow_attn,      # None = probe-gated default, False = off
+        "drafter_window": args.drafter_window,    # None = pair default, 0 = whole context
         "warmup": args.warmup,                   # warm the kernels on load (first request fast)
         "memory_guard": args.memory_guard,       # shed caches when macOS reports memory pressure
         "batch_widths": (sorted({2, args.max_batch}) if args.max_batch > 1 else None),
@@ -698,6 +731,13 @@ def cmd_benchmark(argv: list[str]) -> None:
                     help="wide-verify SDPA split (see `mlx-dspark generate --help`). Unset = "
                          "on where the per-chip probe finds a cliff; --no-sdpa-split off. "
                          "Prints in the header.")
+    ap.add_argument("--multirow-attn", action=argparse.BooleanOptionalAction, default=None,
+                    help="multi-row decode-attention kernel (see `mlx-dspark generate "
+                         "--help`). Unset = on where the per-shape probe proves it faster; "
+                         "--no-multirow-attn off. Prints in the header.")
+    ap.add_argument("--drafter-window", type=int, default=None, metavar="N",
+                    help="DSpark drafter context window (see `mlx-dspark generate --help`); 0 = "
+                         "whole context, unset = the pair default.")
     ap.add_argument("--trust-remote-code", action="store_true",
                     help="allow a checkpoint to ship Python the loader imports (config.json "
                          "model_file / auto_map). Refused by default: a crafted model repo "
@@ -739,6 +779,8 @@ def cmd_benchmark(argv: list[str]) -> None:
                 else "on where probe-verified (default)")
     sdpa_note = ("OFF (forced)" if args.sdpa_split is False
                  else "on where a cliff is measured (default)")
+    mra_note = ("OFF (forced)" if args.multirow_attn is False
+                else "on where the per-shape probe wins (default)")
     cpu_note = ("OFF (forced)" if args.cpu_split is not None and not args.cpu_split
                 else f"{args.cpu_split:.2f} (forced)" if args.cpu_split
                 else "calibrated fraction where it pays (default)")
@@ -746,6 +788,7 @@ def cmd_benchmark(argv: list[str]) -> None:
           f"hybrid lookup drafts: {lk_note}\n"
           f"small-M qmm kernel: {smm_note}\n"
           f"sdpa split (long-ctx verify): {sdpa_note}\n"
+          f"multi-row attention kernel: {mra_note}\n"
           f"prefill CPU co-prefill: {cpu_note}\n"
           f"loading + warming up…")
     target, tok = load_target(
@@ -806,6 +849,9 @@ def cmd_benchmark(argv: list[str]) -> None:
             continue
         if mode == "dspark":
             drafter, _ = load_drafter(drafter_repo)
+            from .load import resolve_drafter_window
+
+            drafter.ctx_window = resolve_drafter_window(args.drafter_window, target_repo)
         else:
             drafter, _ = load_dflash(drafter_repo)
             drafter.bind(target.model)
@@ -817,6 +863,11 @@ def cmd_benchmark(argv: list[str]) -> None:
                       enabled=False if args.small_m is False else None, verbose=False)
         apply_sdpa_split(target, target_repo=target_repo,
                          enabled=False if args.sdpa_split is False else None, verbose=False)
+        from .calibrate import apply_multirow_attn
+
+        apply_multirow_attn(target, drafter,
+                            enabled=False if args.multirow_attn is False else None,
+                            verbose=False)
         # prefill paths as serve runs them (they move the prefill column only)
         from .calibrate import apply_cpu_split, apply_wide_gemm
 

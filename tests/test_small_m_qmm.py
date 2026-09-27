@@ -3,7 +3,7 @@
 The kernel is fp-tie class BY DESIGN (different fp32 accumulation order than
 ``quantized_matmul``), so unlike wide_gemm there is no bit-identity to assert; the
 load-bearing checks are (1) numerics stay within a few bf16 ulps at every window width,
-(2) dispatch NEVER touches anything outside the window (M outside [M_MIN, 8], non-bf16
+(2) dispatch NEVER touches anything outside the window (M outside its width's range, non-bf16
 input, unlisted instances) — those must return the stock kernel's exact bits — and
 (3) the context patch composes with ``wide_matmul`` and always restores.
 """
@@ -15,8 +15,10 @@ import mlx.nn as nn
 import pytest
 
 from mlx_dspark.small_m_qmm import (
-    M_MAX,
-    M_MIN,
+    M4_MAX,
+    M4_MIN,
+    M8_MAX,
+    M8_MIN,
     _orig_call,
     active,
     eligible,
@@ -46,10 +48,11 @@ def test_eligibility_gates():
     assert eligible(_qlinear(bits=8))                          # 8-bit unpack variant
     assert not eligible(_qlinear(bits=2))                      # no 2-bit kernel
     assert not eligible(_qlinear(group_size=32))               # gs64 only
-    assert not eligible(_qlinear(out_features=1024))           # N < 4096
-    assert not eligible(_qlinear(in_features=K + 128))         # K % 512 != 0 — the
-    # K-loop strides 64 values per simdgroup over a K/8 slice, so upstream's %128 gate
-    # is too loose; this asserts ours stays tight
+    # any K % 64 / N % 8 layout, both widths (the per-shape race decides whether it pays)
+    assert eligible(_qlinear(out_features=1024))
+    assert eligible(_qlinear(in_features=K + 128))
+    assert eligible(_qlinear(bits=8, out_features=1024, in_features=K + 64))
+    assert not eligible(_qlinear(out_features=1020))           # N % 8 != 0
     assert not eligible(nn.Linear(K, N))                       # not quantized
 
 
@@ -58,7 +61,7 @@ def test_kernel_numerics_within_window():
     mod = model.proj
     ids = ids_for_shapes([shape_key(mod)], model)
     assert ids == frozenset({id(mod)})
-    for m in range(M_MIN, M_MAX + 1):
+    for m in range(M4_MIN, M4_MAX + 1):                # 4-bit window: 5-16
         x = (mx.random.normal((1, m, K)) * 0.1).astype(mx.bfloat16)
         ref = _orig_call(mod, x).astype(mx.float32)
         with small_m_matmul(ids):
@@ -74,7 +77,7 @@ def test_kernel_numerics_8bit():
     mod = model.proj
     ids = ids_for_shapes([shape_key(mod)], model)
     assert ids == frozenset({id(mod)})
-    for m in (M_MIN, M_MAX):
+    for m in range(M8_MIN, M8_MAX + 1):                # 8-bit window: 6-16
         x = (mx.random.normal((m, K)) * 0.1).astype(mx.bfloat16)
         ref = _orig_call(mod, x).astype(mx.float32)
         with small_m_matmul(ids):
@@ -89,24 +92,41 @@ def test_shape_key_separates_bits():
 
 
 def test_dispatch_outside_window_is_stock_bits():
-    model = _Tiny()
-    ids = frozenset({id(model.proj)})
-    for m in (1, 2, M_MIN - 1, M_MAX + 1, 32):
-        x = (mx.random.normal((m, K)) * 0.1).astype(mx.bfloat16)
-        ref = _orig_call(model.proj, x)
-        with small_m_matmul(ids):
-            got = model.proj(x)
-        assert mx.array_equal(ref, got).item(), f"M={m} must be the stock path"
+    for bits, outside in ((4, (1, 2, M4_MIN - 1, M4_MAX + 1, 32)),
+                          (8, (1, 2, M8_MIN - 1, M8_MAX + 1, 32))):
+        model = _Tiny(bits=bits)
+        ids = frozenset({id(model.proj)})
+        for m in outside:
+            x = (mx.random.normal((m, K)) * 0.1).astype(mx.bfloat16)
+            ref = _orig_call(model.proj, x)
+            with small_m_matmul(ids):
+                got = model.proj(x)
+            assert mx.array_equal(ref, got).item(), f"{bits}-bit M={m} must be the stock path"
+
+
+def test_skinny_rows_are_row_count_invariant():
+    """A row's result does not depend on how many rows ride with it: 5-, 9- and 16-row calls
+    (one and two 8-row tiles) agree on the shared rows bit for bit, both widths — so a verify
+    row is the same number whatever the cap."""
+    from mlx_dspark import skinny_qmm
+
+    for bits in (4, 8):
+        mod = _qlinear(bits=bits)
+        x = (mx.random.normal((16, K)) * 0.1).astype(mx.bfloat16)
+        full = skinny_qmm.qmm(x, mod["weight"], mod["scales"], mod["biases"], bits)
+        for m in (5, 9):
+            part = skinny_qmm.qmm(x[:m], mod["weight"], mod["scales"], mod["biases"], bits)
+            assert mx.array_equal(full[:m], part).item(), (bits, m)
 
 
 def test_non_bf16_and_unlisted_instances_fall_back():
     model = _Tiny()
     other = _qlinear()
     ids = frozenset({id(model.proj)})
-    x16 = (mx.random.normal((M_MIN, K)) * 0.1).astype(mx.float16)
+    x16 = (mx.random.normal((M8_MIN, K)) * 0.1).astype(mx.float16)
     with small_m_matmul(ids):
         assert mx.array_equal(_orig_call(model.proj, x16), model.proj(x16)).item()
-        xbf = (mx.random.normal((M_MIN, K)) * 0.1).astype(mx.bfloat16)
+        xbf = (mx.random.normal((M8_MIN, K)) * 0.1).astype(mx.bfloat16)
         assert mx.array_equal(_orig_call(other, xbf), other(xbf)).item()
 
 
@@ -115,7 +135,7 @@ def test_bias_applies_on_kernel_path():
     model = _Tiny()
     model.proj = mod
     ids = ids_for_shapes([shape_key(mod)], model)
-    x = (mx.random.normal((M_MIN, K)) * 0.1).astype(mx.bfloat16)
+    x = (mx.random.normal((M8_MIN, K)) * 0.1).astype(mx.bfloat16)
     ref = _orig_call(mod, x).astype(mx.float32)
     with small_m_matmul(ids):
         got = mod(x).astype(mx.float32)
@@ -158,5 +178,5 @@ def test_measure_shapes_returns_verified_subset():
     for s in shapes:
         assert s == shape_key(model.proj)
     # an ineligible model yields nothing
-    small = _Tiny(out_features=1024)
+    small = _Tiny(out_features=1020)
     assert measure_shapes(small) == []

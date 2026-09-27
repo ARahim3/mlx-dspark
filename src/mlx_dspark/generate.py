@@ -22,6 +22,7 @@ import mlx.core as mx
 from mlx.utils import tree_flatten
 
 from .dflash_model import skip_ctx
+from .multirow_attn import multirow_attention as _multirow_scope
 from .sampling import sample_probs, truncate_probs
 from .sdpa_split import sdpa_split as _sdpa_split_scope
 from .small_m_qmm import small_m_matmul
@@ -30,7 +31,7 @@ from .wide_gemm import wide_matmul
 TAP = None  # set from drafter config at call time
 
 SMALL_M_IDS = None  # QuantizedLinear instances (by id) routed through the small-M MMA
-# kernel for verify-window forwards of 6-8 rows (see small_m_qmm.py). None disables.
+# kernel for verify-window forwards (4-bit 5-16 rows, 8-bit 6-16; see small_m_qmm.py). None disables.
 # Same doctrine as WIDE_GEMM_*: the library default stays off — a plain generate call
 # must not silently change numerics class — and the CLI/server set it from
 # calibrate.apply_small_m()'s measured per-shape gate.
@@ -39,6 +40,11 @@ SDPA_SPLIT_CFG = None  # sdpa_split.SplitConfig routing wide-verify SDPA (q_len 
 # window, long KV) through <=5-row sub-calls to dodge mlx's multi-row cliff (see
 # sdpa_split.py). None disables. Same doctrine as SMALL_M_IDS: library default off, the
 # CLI/server set it from calibrate.apply_sdpa_split()'s per-chip measured window.
+
+MULTIROW_CFG = None  # multirow_attn.MultirowConfig routing few-row SDPA (verify widths,
+# the DSpark drafter's block over its context) through the GQA-packed MMA attention kernel
+# (see multirow_attn.py), per measured attention shape. None disables. Same doctrine: the
+# library default is off; the CLI/server set it from calibrate.apply_multirow_attn().
 
 
 def _with_small_m(fn):
@@ -60,6 +66,18 @@ def _with_sdpa_split(fn):
     @functools.wraps(fn)
     def wrapper(*args, **kwargs):
         with _sdpa_split_scope(SDPA_SPLIT_CFG):
+            return fn(*args, **kwargs)
+    return wrapper
+
+
+def _with_multirow(fn):
+    """Run a generation loop inside :func:`multirow_attention` (a no-op when MULTIROW_CFG is
+    None). Must sit INSIDE :func:`_with_sdpa_split`: the split's patch calls mlx's kernel
+    directly, so the multirow patch has to be installed after it to see the calls first —
+    ineligible calls (array masks, unmeasured shapes) then fall through to the split."""
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        with _multirow_scope(MULTIROW_CFG):
             return fn(*args, **kwargs)
     return wrapper
 
@@ -590,6 +608,7 @@ def greedy_generate(
 
 
 @_with_sdpa_split
+@_with_multirow
 @_with_small_m
 def dflash_generate(
     target_model,
@@ -1098,6 +1117,7 @@ def _spec_sample_accept(v_logits, draft, q_probs, temperature, top_p=1.0, top_k=
 
 
 @_with_sdpa_split
+@_with_multirow
 @_with_small_m
 def speculative_generate(
     target_model,

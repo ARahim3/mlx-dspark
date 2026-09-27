@@ -53,16 +53,19 @@ DFLASH_PRESETS = {
 # **no user-facing nicknames** — `id` is only the substring we match against a target repo name.
 # `speedup` is the measured headline ratio from the README table (M4 Pro, mlx 0.32, warm,
 # vs greedy baseline) — a human string for pickers, not a promise; content and machine move it.
+# Rows whose models were local were re-measured 2026-09-27 (mlx 0.32.2, current kernels,
+# zero-flag derived caps): qwen3-4b/8b, gemma-4-12b, qwen3.8-27b(-8bit), lfm2.5-*, nanbeige,
+# minicpm5. The rest carry their original stamps.
 # `lookup_drafts: False` marks pairs whose measured-best configuration runs with hybrid
 # n-gram lookup drafts OFF — the shipped default then reproduces the vouched-for numbers with
 # no flag (see lookup_drafts_default; an explicit --lookup-drafts/--no-lookup-drafts wins).
 REGISTRY = [
     {"id": "qwen3-4b",   "target": "mlx-community/Qwen3-4B-8bit",
      "dspark": "deepseek-ai/dspark_qwen3_4b_block7", "dflash": "z-lab/Qwen3-4B-DFlash-b16",
-     "ram": "~8 GB", "speedup": "~1.8×"},
+     "ram": "~8 GB", "speedup": "~2.0×"},
     {"id": "qwen3-8b",   "target": "mlx-community/Qwen3-8B-8bit",
      "dspark": "deepseek-ai/dspark_qwen3_8b_block7", "dflash": "z-lab/Qwen3-8B-DFlash-b16",
-     "ram": "~11 GB", "speedup": "~2.1×"},
+     "ram": "~11 GB", "speedup": "~2.2×"},
     # Same official DeepSeek drop and recipe as the 4B/8B entries above; registered
     # 2026-07-22 once it was actually benchmarked (2.03x at cap 4: 2.36x math / 2.11x code /
     # 1.62x chat, baseline 15.3 tok/s). No z-lab DFlash adapter published at this size.
@@ -71,7 +74,7 @@ REGISTRY = [
      "ram": "~19 GB", "speedup": "~2.0×"},
     {"id": "gemma-4-12b", "target": "mlx-community/gemma-4-12B-it-8bit",
      "dspark": "deepseek-ai/dspark_gemma4_12b_block7", "dflash": "z-lab/gemma4-12B-it-DFlash",
-     "ram": "~15 GB", "speedup": "~2.8×"},
+     "ram": "~15 GB", "speedup": "~3.2×"},
     # PrismML Ternary-Bonsai 27B (ternary rebuild of Qwen3.6-27B, hybrid linear attention).
     # PrismML ships the DSpark drafter GGUF-only (no safetensors export exists); the repo
     # below is our 1:1 bf16 repack into the DeepSpec layout (converted with gguf_convert.py —
@@ -120,55 +123,43 @@ REGISTRY = [
      "dspark": "Koopah/Qwen3.6-35B-A3B-NVFP4-DSPARK", "lookup_drafts": False,
      "ram": "~23 GB", "speedup": "~1.3×"},
     # Qwen3.8-27B (qwen3_5 hybrid — same 64-layer/5120-hidden 48-linear/16-full shape class as
-    # Qwen3.6-27B, new 248320-token vocab). Two community drafters, one per quant, each matched
-    # to the precision it was trained against:
+    # Qwen3.6-27B, new 248320-token vocab). Default mode is DFlash 2 (below); the DSpark head for
+    # `--mode dspark` is the same on both quants:
     #
-    # **4-bit -> DimInfer/Qwen3.8-27B-Dspark-v1** (measured 2026-08-18; beats RadixArk here).
-    # A DeepSpec-stock `Qwen3DSparkModel` (NOT SpecForge — no dflash_config/projector_type):
-    # 5-layer ungated qwen3 GQA (q_proj [4096,5120]; `attn_output_gate:true` in its config is
-    # deepcopy-of-target noise), plain rope (no YaRN), **block_size 15** sampled anchor-as-pos0
-    # (logits_start 0), tap layers [1,16,31,46,61] (deeper than RadixArk's), markov-256 +
-    # confidence, reuses the target's embed AND lm_head. Trained for the Q4_K_M / 4-bit class.
-    # Paired vs RadixArk (M4 Pro, warm, 3-trial medians, 200 tok, small-M kernel on, lookup off):
-    # **`--max-draft 7` = 1.99x mean** (chat 1.51x / code 2.14x / math 2.31x, accept
-    # 3.28/4.86/5.32; ~23/32/34 tok/s) vs RadixArk's cap7+conf0.3 = 1.82x same session — higher
-    # acceptance at every cap/content. The confidence head does NOT pay here (already-high
-    # acceptance -> conf-truncation just sheds accepted tokens), so no --confidence-threshold;
-    # and block-15 buys nothing past cap 7 (cap 8 = 1.18x — verify width 9 exits the small-M
-    # kernel window M in [6,8]). static_cap picks **7** unaided here (its block-15 backbone cost
-    # amortizes at high cap where RadixArk's block-7 got 2), so a no-flag `--model` already
-    # lands the 1.99x — `--max-draft 7` is just explicit. Greedy-lossless (firstdiff=-1 vs
-    # single-row greedy). Loaded with zero model-code change.
+    # **DSpark -> RedHatAI/Qwen3.8-27B-speculator.dspark** (measured 2026-09-28, replaces
+    # DimInfer/Qwen3.8-27B-Dspark-v1 at 4-bit and RadixArk/Qwen3.8-27B-DSpark at 8-bit — both
+    # still load via --drafter). vLLM-speculators packaging (`algorithm: dspark`): 5-layer
+    # ungated qwen3 GQA backbone (20/4 heads, hd 256), block_size 8 with speculative_tokens 8
+    # (logits_start 0 — anchor probe: accept 5.23 vs 2.99 as 1), 8 taps [4..60], trained CAUSAL
+    # sliding window 2048 (so the engine's drafter window does not apply), markov-256 +
+    # confidence, full vocab, reuses the target's embed AND lm_head. Trained vs the bf16
+    # verifier on 8192-token Qwen3.8-regenerated data. Its config.json carries a config-only
+    # `auto_map` — harmless for a drafter (weights load 1:1; the remote-code guard is
+    # target-only). Paired, one process, benchmark prompts, cap 7 (= static_cap on both
+    # quants; cap 8 = verify width 9 = the next 8-row tile, 1.78x/3.34x): 4-bit **2.59x** vs
+    # DimInfer 2.32x (chat 2.24x vs 1.82x), 8-bit **3.67x** vs RadixArk 2.97x (chat 3.08x vs
+    # 1.99x). Head-to-head vs DFlash 2 in one process: 8-bit 3.79x vs 3.74x (a tie), 4-bit
+    # 2.63x vs 2.72x — so DFlash 2 stays the default. Lossless (fp ties only). Lookup drafts and
+    # the confidence head not re-A/B'd for this head (lookup stays off per row). See NOTES
+    # "Engine pass 2026-09-27" §6.
     #
-    # **8-bit -> RadixArk/Qwen3.8-27B-DSpark** (kept — DimInfer is 4-bit-class, not measured at
-    # 8-bit). The first **SpecForge/SGLang**-packaged head here: DFlash-backbone DSpark, block_7
-    # anchor-as-pos0, YaRN rope (factor 32 / orig 8192, honored), reuses embed AND lm_head,
-    # trained vs the FP8 verifier so 8-bit is its matched precision (accept 2.44 -> 3.43). cap 4
-    # was pre-kernel; with the small-M kernel static_cap moves to cap 7 = **2.72x mean** (math
-    # 3.37x / code 2.84x / chat 1.95x, accept 4.05), 22.6 tok/s, ~29 GB. Lookup off both quants
-    # (4-bit: net loss; 8-bit: a wash on the flat curve). Lossless (fp ties, margins 0.0/0.125).
-    #
-    # **DFlash 2 (`incoai/Qwen3.8-27B-DFlash2`) beats BOTH DSpark heads at the identical
-    # verify width 8 (measured 2026-08-19, same-session pairs, 3-trial medians)** — its
-    # candidate path selector + dynamic convs lift acceptance without widening the verify:
-    # 8-bit cap 7 = **3.63x mean** (2.79x chat / 4.05x code / 4.06x math, accept 5.53,
-    # 30.5 tok/s) vs RadixArk 2.92x; 4-bit cap 7 = **2.30x** (accept 5.14, 33.8 tok/s —
-    # the absolute-speed crown) vs DimInfer 2.01x. Full block (= the dflash-mode default
-    # cap) is the peak on both quants; prefix caching covers dflash since the same day.
-    # So `"mode": "dflash"` makes `--mode auto` (and the app, which loads with auto) serve
-    # these targets with DFlash 2; `--mode dspark` still gets the DSpark heads for A/B.
+    # **DFlash 2 (`incoai/Qwen3.8-27B-DFlash2`) is the default (`"mode": "dflash"`)**: its
+    # candidate path selector + dynamic convs lift acceptance without widening the verify.
+    # Re-measured 2026-09-27/28 (current kernels): 4-bit cap 7 = **2.71x** (39.9 tok/s, the
+    # absolute-speed crown), 8-bit 3.66x; at 32k context 1.85x (4-bit). Full block
+    # (= the dflash-mode default cap) is the peak on both quants; prefix caching covers dflash.
+    # `--mode auto` (and the app, which loads with auto) serves it; `--mode dspark` gets RedHat.
     {"id": "qwen3.8-27b", "target": "mlx-community/Qwen3.8-27B-4bit",
-     "dspark": "DimInfer/Qwen3.8-27B-Dspark-v1", "dflash": "incoai/Qwen3.8-27B-DFlash2",
+     "dspark": "RedHatAI/Qwen3.8-27B-speculator.dspark", "dflash": "incoai/Qwen3.8-27B-DFlash2",
      "mode": "dflash", "lookup_drafts": False,
-     "ram": "~18 GB", "speedup": "~2.3×"},
-    # Same pair at 8-bit — best ratio (RadixArk was trained vs an FP8 verifier). Listed as its
-    # own row so pickers offer both; the 4-bit row keeps the absolute-speed crown (~34 vs 30.5
-    # tok/s) in ~18 GB. Resolution: the longest-id-first match sends "*-8bit" here and
-    # everything else Qwen3.8 to the row above.
+     "ram": "~18 GB", "speedup": "~2.7×"},
+    # Same pair at 8-bit — best ratio. Listed as its own row so pickers offer both; the 4-bit
+    # row keeps the absolute-speed crown (~40 vs ~30 tok/s) in ~18 GB. Resolution: the
+    # longest-id-first match sends "*-8bit" here and everything else Qwen3.8 to the row above.
     {"id": "qwen3.8-27b-8bit", "target": "mlx-community/Qwen3.8-27B-8bit",
-     "dspark": "RadixArk/Qwen3.8-27B-DSpark", "dflash": "incoai/Qwen3.8-27B-DFlash2",
+     "dspark": "RedHatAI/Qwen3.8-27B-speculator.dspark", "dflash": "incoai/Qwen3.8-27B-DFlash2",
      "mode": "dflash", "lookup_drafts": False,
-     "ram": "~29 GB", "speedup": "~3.6×"},
+     "ram": "~29 GB", "speedup": "~3.7×"},
     # NVIDIA Nemotron-3.5-Lightning-30B-A3B — a hybrid **Mamba-2 + MoE + attention** target
     # (model_type nemotron_h: 52 blocks, 128 experts top-6 + 1 shared, ~3B active, latent MoE),
     # the first non-attention recurrence here. NVIDIA's official DSpark head: a plain qwen3 GQA
@@ -232,7 +223,7 @@ REGISTRY = [
      "ram": "~7 GB", "speedup": "~2.8×"},
     {"id": "lfm2.5-1.2b", "target": "LiquidAI/LFM2.5-1.2B-Instruct-MLX-bf16",
      "dspark": "LiquidAI/LFM2.5-1.2B-Instruct-DSpark",
-     "ram": "~4 GB", "speedup": "~3.1× (4.4× code)"},
+     "ram": "~4 GB", "speedup": "~3.4× (3.8× code)"},
     # 8B-A1B is MoE (lfm2_moe: 32 experts, ~1B active) — loaded with ZERO extra model code (its
     # ShortConv / decoder layout matches lfm2; the MoE only swaps the FFN inside the layer, invisible
     # to the tap), lossless. **Registered on BF16, not 8-bit** — the drafter only pays where the
@@ -247,7 +238,7 @@ REGISTRY = [
     # (modest + that caveat). lookup off (MoE). The quant-agnostic id still resolves the 8bit target.
     {"id": "lfm2.5-8b-a1b", "target": "LiquidAI/LFM2.5-8B-A1B-MLX-bf16",
      "dspark": "LiquidAI/LFM2.5-8B-A1B-DSpark", "lookup_drafts": False,
-     "ram": "~19 GB", "speedup": "~1.3× (MoE, bf16)"},
+     "ram": "~19 GB", "speedup": "~1.2× (MoE, bf16)"},
     # Nanbeige4.2-3B — the first **looped-depth** target (model_type nanbeige: 22 dense qwen-style
     # GQA layers applied TWICE with shared weights, per-loop KV caches — 44 cache entries — and the
     # final RMSNorm at the end of each loop). mlx-lm has the module on main but unreleased, so
@@ -290,7 +281,7 @@ REGISTRY = [
     # "MiniCPM5-2B: the first llama-type target".
     {"id": "minicpm5-2b", "target": "mlx-community/MiniCPM5-2B-bf16",
      "dspark": "openbmb/MiniCPM5-2B-DSpark",
-     "ram": "~6 GB", "speedup": "~3.2× (4.3× math)"},
+     "ram": "~6 GB", "speedup": "~3.2× (4.2× math)"},
 ]
 
 # legacy `--family` / load_pair("qwen3") values -> a concrete target repo (deprecated).
@@ -329,6 +320,33 @@ def lookup_drafts_default(target: str | None) -> bool:
     if entry is None:
         return True
     return bool(entry.get("lookup_drafts", True))
+
+
+# Default DSpark drafter context window (context rows the draft block cross-attends; None =
+# the whole context). DeepSpec-style heads cross-attend the ENTIRE target context and their
+# acceptance decays with depth; the last few thousand rows restore it (DimInfer Qwen3.8-27B
+# head at 32k: accept 1.98 full -> 2.60 at 4096, its 2k value; 8192 too wide, 2048 slightly
+# narrow). A no-op below the window, and drafting-only (the target verifies every token).
+# Registry rows may carry their own measured "drafter_window" (0 = full context).
+# NOTES "Engine pass 2026-09-27" §4.
+DRAFTER_WINDOW_DEFAULT = 4096
+
+
+def drafter_window_default(target: str | None) -> int | None:
+    """Default DSpark drafter context window for this target's pair (None = full context):
+    the registry row's measured ``drafter_window`` when present, else the global default."""
+    entry = _registry_entry(target) if target else None
+    w = DRAFTER_WINDOW_DEFAULT if entry is None else entry.get("drafter_window",
+                                                               DRAFTER_WINDOW_DEFAULT)
+    return int(w) if w else None
+
+
+def resolve_drafter_window(explicit: int | None, target: str | None) -> int | None:
+    """An explicit setting (CLI flag / request) wins — 0 means the whole context — else the
+    pair default."""
+    if explicit is not None:
+        return int(explicit) if int(explicit) > 0 else None
+    return drafter_window_default(target)
 
 
 def resolve(model: str | None = None, *, mode: str = "dspark", drafter: str | None = None,
@@ -968,6 +986,7 @@ def load_pair(model: str = "gemma4", *, drafter: str | None = None):
     target_repo, drafter_repo = resolve(model, mode="dspark", drafter=drafter)
     target, tok = load_target(target_repo, require_tap=True)
     drafter_m, cfg = load_drafter(drafter_repo)
+    drafter_m.ctx_window = drafter_window_default(target_repo)   # see DRAFTER_WINDOW_DEFAULT
     return target, tok, drafter_m, cfg
 
 

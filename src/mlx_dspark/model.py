@@ -51,36 +51,88 @@ class MLP(nn.Module):
 class CtxCache:
     """Per-layer cache of the target context's projected K/V (roped K, normed/raw V).
 
-    Append-only (the drafter context only ever grows with *committed* tokens — it is
-    never trimmed/rolled back, unlike the target KV cache). A preallocated growing buffer
-    (mlx-lm KVCache style) was tried to avoid the O(n²) realloc, but measured 0.99× at
-    ≤600 tokens — the realloc is negligible at realistic lengths and the scatter overhead
-    is not. Plain concatenate is simpler and as fast here."""
+    Append-only during generation (the drafter context only grows with *committed*
+    tokens); prefix caching may :meth:`trim_to` it back to a shared prefix.
 
-    __slots__ = ("k", "v")
+    Stored in a preallocated buffer written in place (mlx-lm ``KVCache`` style), with
+    ``k`` / ``v`` exposed as views of the committed prefix. The old version concatenated
+    on every append AND concatenated ``[ctx, block]`` in every layer every round — two
+    whole-context copies per layer per round. An earlier prealloc attempt was measured
+    0.99× at ≤600 tokens and dropped, but that is the wrong regime: at depth the copies
+    dominate the drafter's context term (DimInfer Qwen3.8-27B head, 20 KB/token: ~2.5 GB
+    of copying per round at 32k; drafter round 75.7 → 62.7 ms, 1.21×; flat at chat depth).
+    :meth:`with_block` writes the block's K/V into the free tail slot and returns views
+    over ``[ctx, block]`` — the tail is scratch, overwritten by the next append."""
+
+    __slots__ = ("_k", "_n", "_v")
+    STEP = 4096   # growth quantum (positions); the buffer also keeps BLOCK_ROOM free
+    BLOCK_ROOM = 64   # tail room reserved for a draft block (widest shipped block is 16)
 
     def __init__(self):
-        self.k = None
-        self.v = None
+        self._k = None
+        self._v = None
+        self._n = 0
+
+    def _reserve(self, need: int, k: mx.array, v: mx.array) -> None:
+        if self._k is not None and need <= self._k.shape[2]:
+            return
+        size = -(-(need + self.BLOCK_ROOM) // self.STEP) * self.STEP
+        B, H, _, Dk = k.shape
+        nk = mx.zeros((B, H, size, Dk), dtype=k.dtype)
+        nv = mx.zeros((B, H, size, v.shape[3]), dtype=v.dtype)
+        if self._n:
+            nk[..., : self._n, :] = self._k[..., : self._n, :]
+            nv[..., : self._n, :] = self._v[..., : self._n, :]
+        self._k, self._v = nk, nv
 
     def append(self, k: mx.array, v: mx.array) -> None:
-        if self.k is None:
-            self.k, self.v = k, v
-        else:
-            self.k = mx.concatenate([self.k, k], axis=2)
-            self.v = mx.concatenate([self.v, v], axis=2)
+        s = k.shape[2]
+        self._reserve(self._n + s, k, v)
+        self._k[..., self._n : self._n + s, :] = k
+        self._v[..., self._n : self._n + s, :] = v
+        self._n += s
+
+    def with_block(self, k_blk: mx.array, v_blk: mx.array, window: int | None = None):
+        """``(K, V)`` views over ``[committed ctx, block]`` with the block written into the
+        scratch tail — what the concat produced, without copying the context. ``window``
+        keeps only the last ``window`` context rows (still a view: the drafter context
+        window, see :attr:`DSparkDrafter.ctx_window`)."""
+        q = k_blk.shape[2]
+        self._reserve(self._n + q, k_blk, v_blk)
+        self._k[..., self._n : self._n + q, :] = k_blk
+        self._v[..., self._n : self._n + q, :] = v_blk
+        end = self._n + q
+        start = max(0, self._n - window) if window else 0
+        return self._k[..., start:end, :], self._v[..., start:end, :]
 
     def trim_to(self, length: int) -> None:
         """Keep only the first ``length`` context positions (seq axis) — used by prefix
         caching to roll the drafter context back to a shared prefix. The retained K was
         roped at its absolute position, so it stays valid after the trim."""
-        if self.k is not None and length < self.k.shape[2]:
-            self.k = self.k[:, :, :length, :]
-            self.v = self.v[:, :, :length, :]
+        self._n = max(0, min(self._n, length))
+
+    # ``k`` / ``v`` are views of the committed prefix. Assigning them (prefix-cache restore,
+    # SSD spill reload) adopts the array as an exact-size buffer; the next append regrows.
+    @property
+    def k(self):
+        return None if self._k is None else self._k[..., : self._n, :]
+
+    @k.setter
+    def k(self, value) -> None:
+        self._k = value
+        self._n = 0 if value is None else int(value.shape[2])
+
+    @property
+    def v(self):
+        return None if self._v is None else self._v[..., : self._n, :]
+
+    @v.setter
+    def v(self, value) -> None:
+        self._v = value
 
     @property
     def length(self) -> int:
-        return 0 if self.k is None else self.k.shape[2]
+        return self._n
 
 
 class DSparkAttention(nn.Module):
@@ -101,6 +153,7 @@ class DSparkAttention(nn.Module):
         self.causal_block = getattr(config, "causal_block", False)
         self.sliding_window = getattr(config, "sliding_window", None)
         self.sink = getattr(config, "attention_sink", False)
+        self.ctx_window: int | None = None   # see DSparkDrafter.ctx_window
 
         h = config.hidden_size
         b = config.attention_bias
@@ -158,8 +211,11 @@ class DSparkAttention(nn.Module):
 
         k_blk, v_blk = self._kv(hidden)
         k_blk = self.rope(k_blk, offset=block_offset)
-        k = mx.concatenate([cache.k, k_blk], axis=2)
-        v = mx.concatenate([cache.v, v_blk], axis=2)
+        if isinstance(cache, CtxCache):                # in place: no whole-context copy
+            k, v = cache.with_block(k_blk, v_blk, window=self.ctx_window)
+        else:                                         # batched drafting (_BatchCtx)
+            k = mx.concatenate([cache.k, k_blk], axis=2)
+            v = mx.concatenate([cache.v, v_blk], axis=2)
 
         # DFlash-lineage heads mask the block attention (causal within the block, sliding window
         # over the context) and add a per-head sink logit. The default DSpark head does neither:
@@ -393,6 +449,28 @@ class DSparkDrafter(nn.Module):
         for layer, cache in zip(self.layers, ctx_caches):
             h = layer(h, block_offset, cache, mask)
         return self.norm(h)
+
+    @property
+    def ctx_window(self) -> int | None:
+        """Most recent context rows the block attends (None = the whole context).
+
+        A DeepSpec-style head cross-attends its block over the ENTIRE target context, and its
+        acceptance decays with depth — 2.6 at 2k, 1.98 at 32k on the DimInfer Qwen3.8-27B head
+        — while window-bounded drafters (DFlash 2's 2047) hold theirs. Attending only the last
+        few thousand rows restores it (the same head at 32k: window 4096 -> accept 2.60, i.e.
+        its 2k value), and bounds the drafter's per-round attention cost too. A drafting-only
+        change: the target verifies every token, so output is unaffected. DFlash-lineage heads
+        (causal block / sliding window in their config) already have a trained window and
+        ignore this. See NOTES "Engine pass 2026-09-27"."""
+        attn = self.layers[0].self_attn if self.layers else None
+        return None if attn is None else attn.ctx_window
+
+    @ctx_window.setter
+    def ctx_window(self, window: int | None) -> None:
+        w = int(window) if window else None
+        for layer in self.layers:
+            a = layer.self_attn
+            a.ctx_window = None if (a.sliding_window or a.causal_block) else w
 
     @property
     def max_draft(self) -> int:

@@ -354,6 +354,7 @@ class Engine:
         context_window: int | None = None,
         small_m: bool = False,
         sdpa_split: bool = False,
+        multirow_attn: bool = False,
         cpu_split: dict | None = None,
         executor: ThreadPoolExecutor | None = None,
         depth_capper=None,
@@ -386,6 +387,8 @@ class Engine:
         self.lookup_long_draft = lookup_long_draft         # match-scaled long-draft ceiling
         self.context_window = context_window               # target's trained positions, if known
         self.sdpa_split = sdpa_split                        # wide-verify SDPA split active (long-ctx)
+        self.multirow_attn = multirow_attn                  # multi-row attention kernel active
+        self.drafter_window = getattr(drafter, "ctx_window", None)   # DSpark ctx window (None = full)
         self.small_m = small_m                             # small-M MMA verify kernel active
         self.cpu_split = cpu_split                         # prefill CPU co-prefill config (None = off)
         self.cpu_split_suspended = None                    # the config the memory guard turned off (#31)
@@ -613,6 +616,8 @@ class Engine:
         small_m: bool | None = None,             # small-M MMA verify kernel: None=probe-gated
         #                                          default, False=force off (serve-side A/B)
         sdpa_split: bool | None = None,          # wide-verify SDPA split: None=probe-gated, False=off
+        multirow_attn: bool | None = None,       # multi-row attention kernel: None=probe-gated, False=off
+        drafter_window: int | None = None,       # DSpark drafter ctx window: None=pair default, 0=full
         warmup: bool = True,                     # run a throwaway generation on load to warm kernels
         on_warmup=None,                          # zero-arg callback fired right before the warmup pass
         memory_guard: bool = True,               # shed prefix cache + allocator cache under OS pressure
@@ -654,6 +659,11 @@ class Engine:
             if mode == "dspark":
                 draft, _ = load_drafter(drafter_repo, quantize=drafter_bits > 0,
                                         bits=max(drafter_bits, 2))
+                # context window for the draft block's cross-attention (see
+                # DSparkDrafter.ctx_window): restores the head's acceptance at depth
+                from .load import resolve_drafter_window
+
+                draft.ctx_window = resolve_drafter_window(drafter_window, target_repo)
             elif mode == "dflash":
                 draft, _ = load_dflash(drafter_repo, quantize=drafter_bits > 0,
                                        bits=max(drafter_bits, 2))
@@ -671,6 +681,13 @@ class Engine:
             # long-context verify. Also before calibrate() so the verify curve reflects it.
             sdpa_cfg = apply_sdpa_split(tgt, target_repo=target_repo,
                                         enabled=False if sdpa_split is False else None)
+            # multi-row decode attention (see multirow_attn.py): the GQA-packed MMA kernel
+            # for verify widths and the DSpark drafter's block — per measured shape. Also
+            # before calibrate() so the verify depth slope is measured with it live.
+            from .calibrate import apply_multirow_attn
+
+            mra_cfg = apply_multirow_attn(tgt, draft,
+                                          enabled=False if multirow_attn is False else None)
             # --max-draft auto: measure this machine+pair's cost curves once (disk-cached)
             # and let a CapController pick the cap per round. Only meaningful with a drafter.
             ctrl = None
@@ -689,10 +706,11 @@ class Engine:
             from .calibrate import apply_cpu_split
 
             split_cfg = apply_cpu_split(tgt, draft, target_repo=target_repo, frac=cpu_split)
-            return tgt, tok, draft, ctrl, bool(smm_ids), sdpa_cfg is not None, split_cfg
+            return (tgt, tok, draft, ctrl, bool(smm_ids), sdpa_cfg is not None, split_cfg,
+                    mra_cfg is not None)
 
-        tgt, tok, draft, cap_controller, small_m_active, sdpa_split_active, split_cfg = \
-            executor.submit(_load_models).result()
+        (tgt, tok, draft, cap_controller, small_m_active, sdpa_split_active, split_cfg,
+         multirow_active) = executor.submit(_load_models).result()
         user_pinned_cap = isinstance(max_draft_tokens, int)
         if max_draft_tokens == "auto":
             max_draft_tokens = None                     # controller drives, up to the full block
@@ -796,6 +814,7 @@ class Engine:
                   context_window=window,
                   small_m=small_m_active,
                   sdpa_split=sdpa_split_active,
+                  multirow_attn=multirow_active,
                   cpu_split=split_cfg,
                   executor=executor,
                   depth_capper=depth_capper)
@@ -1515,7 +1534,8 @@ class Engine:
             self.mode, self.target_repo, self.drafter_repo,
             kv_bits=getattr(self.target, "kv_bits", None),
             smm_live=bool(_gen.SMALL_M_IDS),
-            sdps_live=_gen.SDPA_SPLIT_CFG is not None)
+            sdps_live=_gen.SDPA_SPLIT_CFG is not None,
+            mra_live=_gen.MULTIROW_CFG is not None)
         if entry is None:
             return {"available": False, "key": key,
                     "reason": "not calibrated yet on this machine — loading the pair without "
@@ -1902,6 +1922,8 @@ class EngineHolder:
              context_window: int | None = None,
              small_m: bool | None = None,
              sdpa_split: bool | None = None,
+             multirow_attn: bool | None = None,
+             drafter_window: int | None = None,
              cpu_split: float | None = None,
              kv_bits: int | None = None,
              warmup: bool | None = None,
@@ -1967,6 +1989,10 @@ class EngineHolder:
                     kwargs["small_m"] = small_m
                 if sdpa_split is not None:
                     kwargs["sdpa_split"] = sdpa_split
+                if multirow_attn is not None:
+                    kwargs["multirow_attn"] = multirow_attn
+                if drafter_window is not None:
+                    kwargs["drafter_window"] = drafter_window   # 0 -> whole context
                 if cpu_split is not None:
                     kwargs["cpu_split"] = cpu_split       # 0 -> off, float -> forced fraction
                 if kv_bits is not None:
@@ -2227,6 +2253,14 @@ def make_handler(engine: Engine, api_key: str | None):
                     # mlx's multi-row cliff and it wasn't forced off) — pairs with serve
                     # --no-sdpa-split / the /admin/load "sdpa_split" override
                     "sdpa_split": bool(getattr(engine, "sdpa_split", False)),
+                    # whether the multi-row decode-attention kernel is live (a per-shape
+                    # probe measured a win and it wasn't forced off) — pairs with serve
+                    # --no-multirow-attn / the /admin/load "multirow_attn" override
+                    "multirow_attn": bool(getattr(engine, "multirow_attn", False)),
+                    # DSpark drafter context window in force (rows the draft block attends;
+                    # null = whole context / not a DSpark engine) — pairs with serve
+                    # --drafter-window / the /admin/load "drafter_window" override
+                    "drafter_window": getattr(engine, "drafter_window", None),
                     # prefill CPU co-prefill: the calibrated {min_rows, fracs} in force, or
                     # null when off — pairs with serve --cpu-split / the /admin/load
                     # "cpu_split" override (0 = off) for a prefill A/B without a restart
@@ -2408,6 +2442,18 @@ def make_handler(engine: Engine, api_key: str | None):
                 return self._send_error(400, "'sdpa_split' must be a boolean (false forces the "
                                              "single wide SDPA call; omit it to use the "
                                              "server's setting)")
+            multirow_attn = req.get("multirow_attn")
+            if multirow_attn is not None and not isinstance(multirow_attn, bool):
+                return self._send_error(400, "'multirow_attn' must be a boolean (false forces "
+                                             "mlx's own attention kernels; omit it to use the "
+                                             "server's setting)")
+            drafter_window = req.get("drafter_window")
+            if drafter_window is not None and (isinstance(drafter_window, bool)
+                                               or not isinstance(drafter_window, int)
+                                               or drafter_window < 0):
+                return self._send_error(400, "'drafter_window' must be a non-negative integer "
+                                             "(context rows the DSpark draft block attends; 0 = "
+                                             "the whole context; omit it for the pair default)")
             # KV-cache quantization for the target (issue #17 — the app had no way to set
             # --kv-bits). 0 = explicitly full precision; omit = keep the server's setting.
             kv_bits = req.get("kv_bits")
@@ -2446,7 +2492,9 @@ def make_handler(engine: Engine, api_key: str | None):
                                      lookup_drafts=lookup_drafts,
                                      confidence_threshold=confidence,
                                      context_window=context_window,
-                                     small_m=small_m, sdpa_split=sdpa_split, cpu_split=cpu_split,
+                                     small_m=small_m, sdpa_split=sdpa_split,
+                                     multirow_attn=multirow_attn,
+                                     drafter_window=drafter_window, cpu_split=cpu_split,
                                      kv_bits=kv_bits,
                                      warmup=warmup, memory_guard=memory_guard,
                                      enable_thinking=enable_thinking,
@@ -3308,6 +3356,11 @@ def run_server(engine, *, host: str = "127.0.0.1", port: int = 8080,
               f"{'on (probe-verified shapes)' if getattr(engine, 'small_m', False) else 'off'}")
         print(f"  sdpa split (long-ctx verify): "
               f"{'on (cliff measured)' if getattr(engine, 'sdpa_split', False) else 'off'}")
+        print(f"  multi-row attention kernel: "
+              f"{'on (per-shape probe)' if getattr(engine, 'multirow_attn', False) else 'off'}")
+        if getattr(engine, "mode", None) == "dspark":
+            w = getattr(engine, "drafter_window", None)
+            print(f"  drafter context window: {f'last {w} rows' if w else 'whole context'}")
         split = getattr(engine, "cpu_split", None)
         print("  prefill CPU co-prefill: " + (
             f"on from M={split['min_rows']} (CPU row fraction "

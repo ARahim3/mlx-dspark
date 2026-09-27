@@ -67,6 +67,67 @@ def test_attend_uses_native_gqa_equivalent_to_tiling():
     assert mx.allclose(shipped, ref, atol=1e-5).item()
 
 
+def _concat_attend(attn, hidden, block_offset, cache):
+    """The pre-prealloc attend: concatenate [ctx, block] K/V per call (the reference)."""
+    B, q_len, _ = hidden.shape
+    q = attn.q_proj(hidden).reshape(B, q_len, attn.n_heads, attn.head_dim)
+    q = attn.rope(attn.q_norm(q).transpose(0, 2, 1, 3), offset=block_offset)
+    k_blk, v_blk = attn._kv(hidden)
+    k_blk = attn.rope(k_blk, offset=block_offset)
+    k = mx.concatenate([cache.k, k_blk], axis=2)
+    v = mx.concatenate([cache.v, v_blk], axis=2)
+    out = mx.fast.scaled_dot_product_attention(q, k, v, scale=attn.scale)
+    return attn.o_proj(out.transpose(0, 2, 1, 3).reshape(B, q_len, -1))
+
+
+def test_ctx_cache_prealloc_is_bit_identical_to_concat_across_rounds():
+    """CtxCache writes in place (preallocated buffer; the block's K/V go into the scratch tail
+    instead of a whole-context concat per layer per round — 2.5 GB/round of copying at 32k on
+    the DimInfer head). Pin that it computes EXACTLY what the concatenating version did over
+    many rounds, across buffer growth (tiny STEP forces several reallocs), a trim_to (prefix
+    caching), and a k/v assignment (prefix-cache restore / SSD reload)."""
+    mx.random.seed(1)
+    attn = DSparkAttention(_AttnCfg())
+    mx.eval(attn.parameters())
+    H = _AttnCfg.hidden_size
+    old_step = CtxCache.STEP
+    CtxCache.STEP = 8
+    try:
+        cache = CtxCache()
+        attn.update_ctx(mx.random.normal((1, 11, H)), 0, cache)
+        for r in range(12):
+            hidden = mx.random.normal((1, 4, H))
+            got = attn.attend(hidden, cache.length, cache)
+            ref = _concat_attend(attn, hidden, cache.length, cache)
+            assert mx.array_equal(got, ref).item(), r
+            attn.update_ctx(mx.random.normal((1, 1 + r % 3, H)), cache.length, cache)
+            if r == 5:
+                cache.trim_to(9)                   # prefix-cache rollback
+                assert cache.length == 9 and cache.k.shape[2] == 9
+            if r == 8:                             # restore: adopt exact-size arrays
+                k, v = mx.array(cache.k), mx.array(cache.v)
+                fresh = CtxCache()
+                fresh.k, fresh.v = k, v
+                assert fresh.length == k.shape[2]
+                cache = fresh
+        assert cache.k.shape == cache.v.shape[:3] + (cache.k.shape[3],)
+    finally:
+        CtxCache.STEP = old_step
+
+
+def test_ctx_cache_views_hide_the_scratch_tail():
+    """`k`/`v` expose exactly the committed rows — never the block scratch written past them
+    (the batch engine and prefix-cache snapshots read these views directly)."""
+    attn = DSparkAttention(_AttnCfg())
+    mx.eval(attn.parameters())
+    cache = CtxCache()
+    attn.update_ctx(mx.random.normal((1, 5, _AttnCfg.hidden_size)), 0, cache)
+    before = mx.array(cache.k)
+    attn.attend(mx.random.normal((1, 3, _AttnCfg.hidden_size)), 5, cache)
+    assert cache.length == 5 and cache.k.shape[2] == 5
+    assert mx.array_equal(cache.k, before).item()
+
+
 def test_gated_q_proj_split_layout_and_gate_application():
     """qwen3_5-flavored drafters (Ornith): q_proj emits [q ‖ gate] interleaved per head and the
     attention output is scaled by sigmoid(gate) before o_proj. With the gate rows zeroed,
@@ -165,3 +226,36 @@ def test_causal_backbone_truncation_matches_full_width_rows():
     full = d.backbone(noise, 10, ctx)
     trunc = d.backbone(noise[:, :3, :], 10, ctx)
     assert not mx.allclose(full[:, :3, :], trunc, atol=1e-5).item()
+
+
+def test_ctx_window_equals_attending_the_truncated_context():
+    """drafter.ctx_window = W makes the block attend only the last W context rows — exactly
+    a drafter whose context cache held only those rows (K keeps its absolute rope positions,
+    so the kept rows' relative distances to the block are unchanged). A no-op while the
+    context is shorter than W, and ignored by heads with their own trained window."""
+    d = _tiny_drafter()
+    fused = mx.random.normal((1, 20, 2 * 32))
+    full = d.make_ctx_cache()
+    d.update_context(fused, ctx_offset=0, ctx_caches=full)
+    noise = mx.random.normal((1, 8, 32))
+    ref_full = d.backbone(noise, 20, full)
+
+    d.ctx_window = 6
+    assert d.ctx_window == 6
+    got = d.backbone(noise, 20, full)
+    # reference: a cache holding ONLY rows 14..19, projected at their absolute positions
+    tail = d.make_ctx_cache()
+    for layer, c in zip(d.layers, tail):
+        k, v = layer.self_attn._kv(d.fuse_target(fused))
+        c.append(layer.self_attn.rope(k, offset=0)[..., 14:, :], v[..., 14:, :])
+    d.ctx_window = None
+    ref_win = d.backbone(noise, 20, tail)
+    assert mx.allclose(got, ref_win, atol=1e-5).item()
+    assert not mx.allclose(got, ref_full, atol=1e-3).item()
+
+    d.ctx_window = 64                                   # longer than the context: no-op
+    assert mx.allclose(d.backbone(noise, 20, full), ref_full, atol=1e-6).item()
+
+    dsw = _tiny_drafter(causal_block=True, sliding_window=6)
+    dsw.ctx_window = 4                                  # DFlash-lineage: keeps its own window
+    assert dsw.ctx_window is None

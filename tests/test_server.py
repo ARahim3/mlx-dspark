@@ -1170,6 +1170,26 @@ def test_health_reports_kv_bits(server):
     assert _get(base, "/health")["kv_bits"] == 8
 
 
+def test_health_reports_multirow_and_drafter_window(server):
+    eng, base = server
+    h = _get(base, "/health")
+    assert h["multirow_attn"] is False and h["drafter_window"] is None   # fake engine
+    eng.multirow_attn, eng.drafter_window = True, 4096
+    h = _get(base, "/health")
+    assert h["multirow_attn"] is True and h["drafter_window"] == 4096
+
+
+def test_admin_load_rejects_bad_multirow_and_drafter_window(holder_server):
+    _holder, base = holder_server
+    for key, bad in (("multirow_attn", "yes"), ("multirow_attn", 1), ("drafter_window", -1),
+                     ("drafter_window", "4096"), ("drafter_window", True),
+                     ("drafter_window", 2.5)):
+        with pytest.raises(urllib.error.HTTPError) as e:
+            _post(base, "/admin/load", {"model": "repo", key: bad})
+        assert e.value.code == 400, (key, bad)
+        assert key in json.loads(e.value.read())["error"]["message"]
+
+
 def test_admin_load_rejects_bad_kv_bits(holder_server):
     _holder, base = holder_server
     for bad in (2, 16, "8", True):

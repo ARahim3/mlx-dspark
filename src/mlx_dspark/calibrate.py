@@ -40,7 +40,7 @@ _ORIG_SDPA_FOR_PROBE = mx.fast.scaled_dot_product_attention
 
 CACHE_DIR = os.path.expanduser("~/.cache/mlx_dspark")
 CACHE_FILE = "calibration.json"
-SCHEMA = 4   # 2: verify curve includes width 1; adds the measured per-round overhead
+# 2: verify curve includes width 1; adds the measured per-round overhead
 # 3: causal-block (DFlash-lineage) drafter curves are measured at draft_width(cap) — the
 # truncated backbone the loop now runs — so cached full-width curves must re-measure
 # (they priced Muse's drafter ~2.5x too high at small caps and flat in cap).
@@ -49,6 +49,12 @@ SCHEMA = 4   # 2: verify curve includes width 1; adds the measured per-round ove
 # "|smm" tag so kernel-on and kernel-off curves never masquerade as each other.
 # (The small-M *shape* cache stores shape_key strings, whose format is NOT in this key;
 # a format change there is self-healed at load — see apply_small_m — not schema-gated.)
+# 5 (2026-09-27): small-M moved to the skinny_qmm kernel (4-bit widths 5-16, 8-bit 6-16; the shape
+# verdicts AND every "|smm" 4-bit verify curve were raced/measured on the old 6-8 kernel),
+# and the multi-row attention kernel ("|mra") changes the verify depth slope. Stale
+# entries would price the new curves with the old kernels' costs, so everything re-measures
+# once (~10-20 s per pair on first load).
+SCHEMA = 5
 CTX_LEN = 512          # NOTE: the curves are ONLY valid near this depth. The old claim
 # here ("curve shape is nearly ctx-independent — SDPA is flat in width") is FALSE at
 # depth: multi-row SDPA re-reads the KV stream per query row, so verify(w) picks up a
@@ -65,6 +71,25 @@ TOKEN_ID = 7           # arbitrary; timings are content-independent
 DEPTH_PROBE = 16384    # second depth for the verify slope: far enough from CTX_LEN that
 # the per-token term dominates timing noise, cheap enough to build synthetically (~1 GB
 # of KV on Qwen3.8-27B, a few seconds)
+
+
+class _KernelScope:
+    """Enter several scoped patches in order (exit in reverse) — ``contextlib.ExitStack``
+    without the boilerplate at every measurement site."""
+
+    def __init__(self, *cms):
+        self._cms = cms
+        self._stack = None
+
+    def __enter__(self):
+        import contextlib
+        self._stack = contextlib.ExitStack()
+        for cm in self._cms:
+            self._stack.enter_context(cm)
+        return self
+
+    def __exit__(self, *exc):
+        return self._stack.__exit__(*exc)
 
 
 def _bench(fn, iters: int = 8, warmup: int = 3) -> float:
@@ -669,7 +694,7 @@ def _cache_key(mode: str, target_repo: str, drafter_repo: str | None,
 
 def cached_curve_entry(mode: str, target_repo: str, drafter_repo: str | None, *,
                        kv_bits: int | None = None, smm_live: bool = False,
-                       sdps_live: bool = False,
+                       sdps_live: bool = False, mra_live: bool = False,
                        cache_dir: str | None = None) -> tuple[str, dict | None]:
     """``(key, entry)`` for this pair's cost curves, or ``(key, None)`` if never measured.
 
@@ -683,9 +708,11 @@ def cached_curve_entry(mode: str, target_repo: str, drafter_repo: str | None, *,
     base = _cache_key(mode, target_repo, drafter_repo, kv_bits=kv_bits)
     # Try the key matching the live (small-M, sdpa-split) state first; then fall back across
     # the other tag combinations so a report still finds a differently-tagged cached entry.
-    live = ("|smm" if smm_live else "") + ("|sdps" if sdps_live else "")
+    live = (("|smm" if smm_live else "") + ("|sdps" if sdps_live else "")
+            + ("|mra" if mra_live else ""))
     cands, seen = [], set()
-    for suf in (live, "", "|smm", "|sdps", "|smm|sdps"):
+    for suf in (live, "", "|smm", "|sdps", "|smm|sdps", "|mra", "|smm|mra", "|sdps|mra",
+                "|smm|sdps|mra"):
         k = base + suf
         if k not in seen:
             seen.add(k)
@@ -1145,6 +1172,86 @@ def apply_sdpa_split(target, *, target_repo=None, enabled=None, cache_dir=None, 
 
 
 
+
+# ---- multi-row decode attention (multirow_attn.py) -----------------------------------
+
+# Verified end to end only on M4 (g16), like the small-M kernel — whose M5 (g17) stall the
+# microbench race could not see. Same hardware gate: a newer GPU generation must re-earn
+# the kernel by an end-to-end run; MLX_DSPARK_FORCE_MULTIROW=1 overrides for that A/B.
+_MULTIROW_MAX_GEN = 16
+
+
+def _drafter_attn_dims(drafter):
+    """``(hq, hk, d)`` of a DSpark drafter's context cross-attention when it can take the
+    kernel (unmasked block, no sinks), else None. DFlash-lineage heads (causal block,
+    sliding window, sinks) pass array masks and never reach the kernel; DFlash drafters'
+    own attention is sliding-window over <= 2k rows — neither is worth a probe."""
+    layers = getattr(drafter, "layers", None) or []
+    a = getattr(layers[0], "self_attn", None) if layers else None
+    if a is None or not hasattr(a, "n_kv_heads") or not hasattr(a, "head_dim"):
+        return None
+    if getattr(a, "causal_block", False) or getattr(a, "sliding_window", None) \
+            or getattr(a, "sink", False) or not hasattr(a, "update_ctx"):
+        return None
+    return int(a.n_heads), int(a.n_kv_heads), int(a.head_dim)
+
+
+def multirow_windows(shapes, *, cache_dir=None, refresh=False, verbose=True) -> list:
+    """Measured :class:`~mlx_dspark.multirow_attn.Window` per attention shape — raced and
+    numerics-checked once per (chip x mlx x shape), ~2 s each, cached."""
+    from .multirow_attn import Window, measure_window
+
+    dev = mx.device_info().get("device_name", "unknown")
+    out = []
+    for hq, hk, d in shapes:
+        key = f"v{SCHEMA}|{dev}|mlx{mx.__version__}|mra1|{hq}x{hk}x{d}"
+        hit = None if refresh else load_cached(key, cache_dir)
+        if hit is None:
+            if verbose:
+                print(f"calibrating multi-row attention kernel for {hq}x{hk}x{d} "
+                      "(one-time, cached)…", flush=True)
+            win, report = measure_window(hq, hk, d, verbose=verbose)
+            hit = {"window": win, "report": report}
+            save_cached(key, hit, cache_dir)
+            if verbose:
+                state = (f"q {win['min_q']}-{win['max_q']} from kv {win['min_kv']}"
+                         if win else f"off ({report.get('reason', 'no win')})")
+                print(f"  multirow-attn {hq}x{hk}x{d}: {state}", flush=True)
+        if hit.get("window"):
+            out.append(Window(hq, hk, d, **hit["window"]))
+    return out
+
+
+def apply_multirow_attn(target, drafter=None, *, enabled=None, cache_dir=None, verbose=True):
+    """Turn the multi-row decode-attention kernel on for this process
+    (``generate.MULTIROW_CFG``) and return the config, or ``None`` when off. ``enabled=None``
+    probes (and caches) a window per attention shape — the target's full-attention layers
+    and a DSpark drafter's context attention; ``False`` disables. Call BEFORE
+    :func:`calibrate` so the verify depth slope is measured with the kernel live. Sets a
+    process-wide global, not a library default (the small-M / split doctrine)."""
+    from . import generate as _gen
+    from .multirow_attn import MultirowConfig
+
+    if enabled is False:
+        _gen.MULTIROW_CFG = None
+        return None
+    gen = _gpu_gen()
+    if (gen is not None and gen > _MULTIROW_MAX_GEN
+            and os.environ.get("MLX_DSPARK_FORCE_MULTIROW", "").lower() not in ("1", "true")):
+        if verbose:
+            print(f"  multirow-attn: OFF — unverified on this GPU (applegpu_g{gen}); set "
+                  "MLX_DSPARK_FORCE_MULTIROW=1 to A/B it.", flush=True)
+        _gen.MULTIROW_CFG = None
+        return None
+    shapes = []
+    for dims in (_attn_dims(target), _drafter_attn_dims(drafter) if drafter else None):
+        if dims and dims not in shapes:
+            shapes.append(dims)
+    windows = multirow_windows(shapes, cache_dir=cache_dir, verbose=verbose)
+    _gen.MULTIROW_CFG = MultirowConfig(tuple(windows)) if windows else None
+    return _gen.MULTIROW_CFG
+
+
 # --------------------------------------------------------------------------- entry point
 
 
@@ -1178,12 +1285,20 @@ def calibrate(target, drafter, *, mode: str, target_repo: str, drafter_repo: str
     # kernel enabled (apply_small_m, before this), 4-bit verify is flat at widths 6-8 —
     # measured outside the context the controller would price wide caps ~1.5x too high.
     from . import generate as _gen
+    from .multirow_attn import multirow_attention
     from .sdpa_split import sdpa_split
     from .small_m_qmm import small_m_matmul
     smm_ids = _gen.SMALL_M_IDS
     sdps_cfg = _gen.SDPA_SPLIT_CFG            # the verify DEPTH SLOPE is measured under the
     #   split (it fires at the inflated KV depth, not the ctx-512 base curve), so the
     #   depth-aware capper prices the flattened cliff and stops shrinking wide caps at depth.
+    mra_cfg = _gen.MULTIROW_CFG               # same for the multi-row attention kernel
+
+    def kernels():
+        # the generate loops' order: split installed first, multirow over it (see
+        # generate._with_multirow), small-M alongside
+        return _KernelScope(small_m_matmul(smm_ids), sdpa_split(sdps_cfg),
+                            multirow_attention(mra_cfg))
 
     key = _cache_key(mode, target_repo, drafter_repo,
                      kv_bits=getattr(target, "kv_bits", None))
@@ -1191,12 +1306,14 @@ def calibrate(target, drafter, *, mode: str, target_repo: str, drafter_repo: str
         key += "|smm"
     if sdps_cfg is not None:
         key += "|sdps"          # split-on and split-off curves must not collide (see |smm)
+    if mra_cfg is not None:
+        key += "|mra"           # nor kernel-on and kernel-off depth slopes
     entry = load_cached(key, cache_dir)
     tap = list(cfg.target_layer_ids)
     if entry is None:
         if verbose:
             print(f"calibrating {mode} cap for this machine (one-time, cached)…", flush=True)
-        with small_m_matmul(smm_ids), sdpa_split(sdps_cfg):
+        with kernels():
             verify = measure_verify_curve(target, tap, widths)
             if mode == "dspark":
                 drafter_ms: dict | float = measure_dspark_drafter_curve(drafter, caps)
@@ -1224,7 +1341,7 @@ def calibrate(target, drafter, *, mode: str, target_repo: str, drafter_repo: str
         if verbose:
             print(f"calibrating batched verify grid (B={want_bs}, one-time, cached)…",
                   flush=True)
-        with small_m_matmul(smm_ids), sdpa_split(sdps_cfg):
+        with kernels():
             grid = measure_batch_verify_grid(target, list(cfg.target_layer_ids), want_bs, widths)
         vg = entry.setdefault("verify_grid", {})
         for B, row in grid.items():
@@ -1244,7 +1361,7 @@ def calibrate(target, drafter, *, mode: str, target_repo: str, drafter_repo: str
             avail = sorted(int(k) for k in entry["verify"])
             wsel = sorted({avail[0], avail[len(avail) // 2], avail[-1]})
             base = {w: float(entry["verify"][str(w)]) for w in wsel}
-            with small_m_matmul(smm_ids), sdpa_split(sdps_cfg):
+            with kernels():
                 slope = measure_verify_depth_slope(target, tap, wsel, base_curve=base)
             if slope is None:
                 vd["unsupported"] = True

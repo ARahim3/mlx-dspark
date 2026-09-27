@@ -246,6 +246,28 @@ class TestSwapConfidence:
         h.swap(model="repo2")
         assert captured["small_m"] is None               # unset -> probe-gated default
 
+    def test_swap_multirow_and_drafter_window_ride_the_swap(self, monkeypatch):
+        """/admin/load's multirow_attn / drafter_window overrides reach Engine.load; absent,
+        the server's stored kwargs pass through (None = probe-gated / pair default)."""
+        h = EngineHolder(FakeEngine("old"),
+                         load_kwargs={"multirow_attn": None, "drafter_window": None})
+        captured = {}
+
+        import mlx_dspark.server as server
+
+        def capture(**kw):
+            captured.update(kw)
+            return FakeEngine("new")
+
+        monkeypatch.setattr(server.Engine, "load", staticmethod(capture))
+        monkeypatch.setattr(server, "maybe_batch_engine", lambda e, b: e)
+
+        h.swap(model="repo", multirow_attn=False, drafter_window=0)
+        assert captured["multirow_attn"] is False and captured["drafter_window"] == 0
+        captured.clear()
+        h.swap(model="repo2")
+        assert captured["multirow_attn"] is None and captured["drafter_window"] is None
+
     def test_status_reports_download_progress_while_loading(self, monkeypatch):
         """While a swap is fetching weights, status() carries the download progress so
         /health can show a real bar and the client can offer Cancel."""
