@@ -374,7 +374,9 @@ def measure_window(hq: int, hk: int, d: int, *, dtype=mx.bfloat16,
     if d % 8 or d > MAX_D or hk == 0 or hq % hk:
         return None, {"reason": "shape"}
     scale = 1.0 / math.sqrt(d)
-    report: dict = {"shape": f"{hq}x{hk}x{d}", "points": {}}
+    # "probe" 2 = per-width launch handling (a refused wide q ends the window instead of
+    # disabling the shape); calibrate re-probes older "kernel unavailable" verdicts once.
+    report: dict = {"shape": f"{hq}x{hk}x{d}", "points": {}, "probe": 2}
     wins_at: dict[int, list[int]] = {}
     try:
         for kv in PROBE_KV:
@@ -387,9 +389,19 @@ def measure_window(hq: int, hk: int, d: int, *, dtype=mx.bfloat16,
                 k0, v0 = kvs[0]
                 ref = _ORIG_SDPA(q.astype(mx.float32), k0.astype(mx.float32),
                                  v0.astype(mx.float32), scale=scale, mask="causal")
-                o_m = multirow_sdpa(q, k0, v0, scale=scale, causal=True)
+                try:
+                    o_m = multirow_sdpa(q, k0, v0, scale=scale, causal=True)
+                    e_m = float(mx.abs(o_m.astype(mx.float32) - ref).max())
+                except Exception as e:  # noqa: BLE001
+                    # This q's launch geometry needs more threads per threadgroup than this
+                    # GPU allows for the compiled kernel (GitHub's virtualized M1: 384 vs the
+                    # 1024 an M4 Pro gives it). Wider q only needs more, so the window ends
+                    # below here — narrower q stay eligible instead of the whole shape going
+                    # off. A kernel that won't build at all still fails the first q -> None.
+                    report["points"][f"q{ql}@{kv}"] = "unavailable"
+                    report.setdefault("unavailable", f"q{ql}: {type(e).__name__}: {e}")
+                    break
                 o_x = _ORIG_SDPA(q, k0, v0, scale=scale, mask="causal")
-                e_m = float(mx.abs(o_m.astype(mx.float32) - ref).max())
                 e_x = float(mx.abs(o_x.astype(mx.float32) - ref).max())
                 if math.isnan(e_m) or e_m > 2.0 * e_x + 2e-3:     # NaN or off
                     report["reason"] = f"numerics q{ql} kv{kv}: {e_m:.4g} vs mlx {e_x:.4g}"
@@ -428,5 +440,6 @@ def measure_window(hq: int, hk: int, d: int, *, dtype=mx.bfloat16,
                 break
         window = {"min_q": PROBE_Q[0], "max_q": max_q, "min_kv": min_kv}
     else:
-        report["reason"] = "no win on this chip/mlx"
+        report["reason"] = (f"kernel unavailable: {report['unavailable']}"
+                            if "unavailable" in report else "no win on this chip/mlx")
     return window, report

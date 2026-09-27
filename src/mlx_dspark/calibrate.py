@@ -1196,6 +1196,17 @@ def _drafter_attn_dims(drafter):
     return int(a.n_heads), int(a.n_kv_heads), int(a.head_dim)
 
 
+def _stale_mra_refusal(hit: dict) -> bool:
+    """A cached "kernel unavailable" verdict from the v0.20.0 probe, where one refused wide-q
+    launch (a GPU's threads-per-threadgroup limit) switched the whole shape off. The
+    per-width probe (report ``probe`` >= 2) can recover the narrower widths, so those are
+    re-probed once; every other cached verdict — every window, every "no win" or numerics
+    refusal — stands, so a machine where 0.20.0 worked re-measures nothing."""
+    rep = hit.get("report") or {}
+    return (hit.get("window") is None and rep.get("probe", 1) < 2
+            and str(rep.get("reason", "")).startswith("kernel unavailable"))
+
+
 def multirow_windows(shapes, *, cache_dir=None, refresh=False, verbose=True) -> list:
     """Measured :class:`~mlx_dspark.multirow_attn.Window` per attention shape — raced and
     numerics-checked once per (chip x mlx x shape), ~2 s each, cached."""
@@ -1206,6 +1217,8 @@ def multirow_windows(shapes, *, cache_dir=None, refresh=False, verbose=True) -> 
     for hq, hk, d in shapes:
         key = f"v{SCHEMA}|{dev}|mlx{mx.__version__}|mra1|{hq}x{hk}x{d}"
         hit = None if refresh else load_cached(key, cache_dir)
+        if hit is not None and _stale_mra_refusal(hit):
+            hit = None
         if hit is None:
             if verbose:
                 print(f"calibrating multi-row attention kernel for {hq}x{hk}x{d} "

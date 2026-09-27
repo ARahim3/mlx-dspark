@@ -65,7 +65,16 @@ def test_matches_reference_as_well_as_mlx(B, hq, hk, q_len, L, d, causal):
     scale = d ** -0.5
     out = multirow_sdpa(q, k, v, scale=scale, causal=causal and q_len > 1)
     mask = "causal" if causal and q_len > 1 else None
-    mine = _err(out, q, k, v, mask is not None)
+    try:
+        mine = _err(out, q, k, v, mask is not None)
+    except ValueError as e:
+        # A geometry this GPU won't launch (GitHub's virtualized M1 caps the compiled kernel
+        # at 384 threads per threadgroup; the GQA-16 x 16-row case needs 1024). Production
+        # never launches it there: measure_window ends that shape's window below it
+        # (test_measure_window_stops_below_an_unlaunchable_q).
+        if "threads per threadgroup" not in str(e):
+            raise
+        pytest.skip(f"launch geometry unavailable on this GPU: {e}")
     theirs = _err(mra._ORIG_SDPA(q, k, v, scale=scale, mask=mask), q, k, v, mask is not None)
     assert out.shape == q.shape and out.dtype == q.dtype
     assert mine <= 2.0 * theirs + 2e-3, (mine, theirs)
@@ -157,3 +166,68 @@ def test_none_config_is_a_noop():
 def test_config_window_lookup():
     assert CFG.window(8, 2, 64) is not None
     assert CFG.window(8, 2, 128) is None
+
+
+_LIMIT = "Thread group size (1024) is greater than the maximum allowed threads per threadgroup (384)."
+
+
+def test_measure_window_stops_below_an_unlaunchable_q(monkeypatch):
+    # A GPU whose pipeline limit refuses the wide-q geometries (GitHub's virtualized M1)
+    # must get a window that ends below the first refused q — never admitting it, and not
+    # switching the whole shape off (v0.20.0 did: one refused q16 cost Qwen3.8 its q 2-8).
+    real = mra.multirow_sdpa
+
+    def limited(q, k, v, *, scale, causal):
+        if q.shape[2] >= 8:
+            raise ValueError(_LIMIT)
+        return real(q, k, v, scale=scale, causal=causal)
+
+    times = iter([2.0, 1.0] * 64)          # (mlx, kernel) per timed probe: the kernel wins
+    monkeypatch.setattr(mra, "multirow_sdpa", limited)
+    monkeypatch.setattr(mra, "_chain_ms", lambda fn, q, kvs: next(times))
+    monkeypatch.setattr(mra, "PROBE_KV", (1024,))
+    window, report = mra.measure_window(32, 2, 128)
+    assert window == {"min_q": 2, "max_q": 6, "min_kv": 1024}
+    assert report["points"]["q8@1024"] == "unavailable"
+    assert "threads per threadgroup" in report["unavailable"]
+
+
+def test_measure_window_refused_at_the_first_q_is_off(monkeypatch):
+    def refused(q, k, v, *, scale, causal):
+        raise ValueError(_LIMIT)
+
+    monkeypatch.setattr(mra, "multirow_sdpa", refused)
+    monkeypatch.setattr(mra, "PROBE_KV", (1024,))
+    window, report = mra.measure_window(32, 2, 128)
+    assert window is None
+    assert report["reason"].startswith("kernel unavailable")
+
+
+def test_only_stale_unavailable_verdicts_are_reprobed(tmp_path, monkeypatch):
+    # A v0.20.0 "kernel unavailable" verdict (no "probe" stamp) is re-probed once; windows
+    # and every other refusal stay cached, so a machine where 0.20.0 worked re-measures
+    # nothing, and the re-probed verdict (probe 2) is never re-probed again.
+    import importlib
+
+    C = importlib.import_module("mlx_dspark.calibrate")
+    dev = mx.device_info().get("device_name", "unknown")
+    key = lambda s: f"v{C.SCHEMA}|{dev}|mlx{mx.__version__}|mra1|{s}"  # noqa: E731
+    cache = str(tmp_path)
+    C.save_cached(key("32x2x128"), {"window": None, "report": {
+        "reason": "kernel unavailable: ValueError: " + _LIMIT}}, cache)
+    C.save_cached(key("24x4x256"), {"window": {"min_q": 2, "max_q": 16, "min_kv": 1024},
+                                    "report": {}}, cache)
+    C.save_cached(key("16x2x128"), {"window": None, "report": {"reason": "no win"}}, cache)
+    probed = []
+
+    def fake(hq, hk, d, **kw):
+        probed.append((hq, hk, d))
+        return {"min_q": 2, "max_q": 6, "min_kv": 1024}, {"probe": 2}
+
+    monkeypatch.setattr(mra, "measure_window", fake)
+    shapes = [(32, 2, 128), (24, 4, 256), (16, 2, 128)]
+    wins = C.multirow_windows(shapes, cache_dir=cache, verbose=False)
+    assert probed == [(32, 2, 128)]
+    assert {(w.hq, w.max_q) for w in wins} == {(32, 6), (24, 16)}
+    C.multirow_windows(shapes, cache_dir=cache, verbose=False)
+    assert probed == [(32, 2, 128)]                        # the re-probed verdict stands

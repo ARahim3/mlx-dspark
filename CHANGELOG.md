@@ -2,6 +2,12 @@
 
 All notable changes to `mlx-dspark`. Versions follow [SemVer](https://semver.org/) (pre-1.0: minor-ish features land as patch bumps).
 
+## [0.20.1] — 2026-09-28 — the multi-row attention kernel stays on for more GPUs
+
+### Fixed
+- **Multi-row attention kernel: a GPU with a lower threads-per-threadgroup limit now keeps the kernel for the verify widths it can run.** The kernel's widest geometries launch up to 1024 threads per threadgroup; a GPU that allows fewer for it (GitHub's virtualized M1 allows 384) refused those launches, and v0.20.0's one-time probe then switched the kernel off for that whole attention shape — Qwen3.8-27B would lose it even at the 2-8-row verifies that fit. The probe now handles each width separately: a refused width ends the window below it, narrower widths stay on (still only where they beat mlx by >5% and pass the numerics check), and the refused width is never used. Machines where v0.20.0's kernel ran are unaffected — same windows, nothing re-measured; a cached v0.20.0 "kernel unavailable" verdict is re-probed once. No crash was possible in either version: the CLI and server only launch probed geometries.
+- The kernel's numerics test skips geometries the GPU can't launch instead of failing (CI).
+
 ## [0.20.0] — 2026-09-28 — speculation holds at long context (1.85× at 32k), Gemma-4 12B 3.25×, Red Hat's Qwen3.8 DSpark head
 
 ### Added
