@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
+  <style>
+    .bg { fill: #f5f6fa; } .d { fill: #0c0e15; } .s { fill: #4b6bfb; }
+    @media (prefers-color-scheme: dark) { .bg { fill: #161a24; } .d { fill: #e8ebf4; } .s { fill: #7a92ff; } }
+  </style>
+  <rect class="bg" width="64" height="64" rx="15"/>
+  <text x="32" y="45" text-anchor="middle" font-family="-apple-system, 'SF Pro Display', 'Helvetica Neue', Arial, sans-serif" font-weight="800" font-size="36" letter-spacing="-2"><tspan class="d">d</tspan><tspan class="s">s</tspan></text>
+</svg>

@@ -1,0 +1,871 @@
+{
+ "serve": {
+  "prog": "mlx-dspark serve",
+  "description": "OpenAI-compatible API server.",
+  "epilog": "",
+  "options": [
+   {
+    "flags": [
+     "--mode"
+    ],
+    "metavar": "MODE",
+    "choices": [
+     "auto",
+     "dspark",
+     "dflash",
+     "lookup",
+     "baseline"
+    ],
+    "default": "auto",
+    "help": "'auto' (default) picks the target's measured-best speculation (the registry row's stamped mode, e.g. DFlash 2 on Qwen3.8-27B; else dspark -> dflash -> drafter-free lookup), so any repo serves"
+   },
+   {
+    "flags": [
+     "--model"
+    ],
+    "metavar": "MODEL",
+    "choices": null,
+    "default": null,
+    "help": "target model: an HF repo or local path (e.g. mlx-community/Qwen3-8B-8bit). Matched drafter auto-resolves for known targets; else pass --drafter. See `mlx-dspark models`."
+   },
+   {
+    "flags": [
+     "--no-model"
+    ],
+    "metavar": null,
+    "choices": null,
+    "default": null,
+    "help": "start without loading any model: the server comes up instantly, generation routes answer 503 until a client loads one via POST /admin/load (model pickers still work — /doctor and /admin/models answer model-free)"
+   },
+   {
+    "flags": [
+     "--drafter"
+    ],
+    "metavar": "DRAFTER",
+    "choices": null,
+    "default": null,
+    "help": "drafter repo/path (overrides auto-resolve)"
+   },
+   {
+    "flags": [
+     "--family"
+    ],
+    "metavar": "FAMILY",
+    "choices": [
+     "gemma4",
+     "qwen3"
+    ],
+    "default": null,
+    "help": ""
+   },
+   {
+    "flags": [
+     "--target"
+    ],
+    "metavar": "TARGET",
+    "choices": null,
+    "default": null,
+    "help": ""
+   },
+   {
+    "flags": [
+     "--max-draft"
+    ],
+    "metavar": "MAX_DRAFT",
+    "choices": null,
+    "default": null,
+    "help": "cap on tokens verified per round; <=0 = full block; 'auto' = adapt the cap per round. Omit to let dspark/dflash DERIVE the cap from this machine+model+quant's measured curves (static_cap, ~5 s once, cached); lookup=6."
+   },
+   {
+    "flags": [
+     "--default-max-tokens"
+    ],
+    "metavar": "DEFAULT_MAX_TOKENS",
+    "choices": null,
+    "default": 2048,
+    "help": "max_tokens used when a request doesn't send one (default 2048)"
+   },
+   {
+    "flags": [
+     "--max-tokens-cap"
+    ],
+    "metavar": "MAX_TOKENS_CAP",
+    "choices": null,
+    "default": 32768,
+    "help": "hard ceiling on per-request max_tokens (default 32768 — thinking models routinely need >8k)"
+   },
+   {
+    "flags": [
+     "--default-temperature"
+    ],
+    "metavar": "DEFAULT_TEMPERATURE",
+    "choices": null,
+    "default": null,
+    "help": "temperature for requests that don't send one (overrides the model's generation_config; note many mlx-community repos ship none, in which case omitted temperature means greedy unless this is set)"
+   },
+   {
+    "flags": [
+     "--default-top-p"
+    ],
+    "metavar": "DEFAULT_TOP_P",
+    "choices": null,
+    "default": null,
+    "help": "top_p for requests that don't send one (see --default-temperature)"
+   },
+   {
+    "flags": [
+     "--default-top-k"
+    ],
+    "metavar": "DEFAULT_TOP_K",
+    "choices": null,
+    "default": null,
+    "help": "top_k for requests that don't send one (see --default-temperature)"
+   },
+   {
+    "flags": [
+     "--confidence-threshold"
+    ],
+    "metavar": "CONFIDENCE_THRESHOLD",
+    "choices": null,
+    "default": 0.0,
+    "help": ""
+   },
+   {
+    "flags": [
+     "--drafter-bits"
+    ],
+    "metavar": "DRAFTER_BITS",
+    "choices": null,
+    "default": 4,
+    "help": ""
+   },
+   {
+    "flags": [
+     "--kv-bits"
+    ],
+    "metavar": "KV_BITS",
+    "choices": [
+     0,
+     4,
+     8
+    ],
+    "default": 0,
+    "help": "quantize the target KV cache (4/8 bits; 0 = off). Cuts the KV bandwidth bill on long contexts; mlx-lm text targets only (disables --max-batch)"
+   },
+   {
+    "flags": [
+     "--max-batch"
+    ],
+    "metavar": "MAX_BATCH",
+    "choices": null,
+    "default": 1,
+    "help": "micro-batch up to N concurrently-queued requests through one batched target forward (dense mlx-lm target + dspark/baseline; ~1.5-2.5x aggregate throughput at 2-4 concurrent). 1 = serialized (default)"
+   },
+   {
+    "flags": [
+     "--context-window"
+    ],
+    "metavar": "CONTEXT_WINDOW",
+    "choices": null,
+    "default": null,
+    "help": "cap the prompt length (default: the target's own trained limit). An over-long request is refused with the message Claude Code recognises as a context limit, so it compacts and retries instead of failing; lower it to keep the KV cache inside your RAM budget."
+   },
+   {
+    "flags": [
+     "--host"
+    ],
+    "metavar": "HOST",
+    "choices": null,
+    "default": "127.0.0.1",
+    "help": ""
+   },
+   {
+    "flags": [
+     "--port"
+    ],
+    "metavar": "PORT",
+    "choices": null,
+    "default": 8080,
+    "help": ""
+   },
+   {
+    "flags": [
+     "--api-key"
+    ],
+    "metavar": "API_KEY",
+    "choices": null,
+    "default": null,
+    "help": "if set, requests must send 'Authorization: Bearer <key>'"
+   },
+   {
+    "flags": [
+     "--no-thinking"
+    ],
+    "metavar": null,
+    "choices": null,
+    "default": null,
+    "help": "default responses to non-thinking mode (Qwen3 enable_thinking=False); clients can still override per-request"
+   },
+   {
+    "flags": [
+     "--reasoning-effort"
+    ],
+    "metavar": "REASONING_EFFORT",
+    "choices": [
+     "low",
+     "medium",
+     "high",
+     "xhigh"
+    ],
+    "default": null,
+    "help": "default reasoning depth for models whose chat template supports it (Qwen3.8-class reasoning_effort; templates that don't know the kwarg ignore it). Clients can override per-request; /health reports whether the loaded model supports it"
+   },
+   {
+    "flags": [
+     "--no-prefix-cache"
+    ],
+    "metavar": null,
+    "choices": null,
+    "default": null,
+    "help": "disable multi-turn prefix caching (reuse the shared conversation prefix's KV; on by default for dspark/lookup/baseline on dense or under-window sliding-window targets)"
+   },
+   {
+    "flags": [
+     "--wired-limit"
+    ],
+    "metavar": null,
+    "choices": null,
+    "default": null,
+    "help": "wire MLX's recommended working set (~75%% of RAM) so weights can't be paged out. OFF by default and rarely worth it: wired pages cannot be reclaimed, so on a machine whose working set is already large this can HANG macOS hard enough to need a power cycle (observed on an M4 Pro). Short of that it has corrupted the verify logits on the gemma-4/mlx-vlm route, which can commit wrong tokens rather than crash. It bought no measurable speed where tested (<1%%). Only consider it if the model nearly fills your RAM and you actually see paging stalls - and validate a long run before trusting it."
+   },
+   {
+    "flags": [
+     "--prefix-cache-slots"
+    ],
+    "metavar": "PREFIX_CACHE_SLOTS",
+    "choices": null,
+    "default": 2,
+    "help": "number of conversations kept in the prefix cache LRU (default 2, so an agent and a chat don't evict each other every turn)"
+   },
+   {
+    "flags": [
+     "--prefix-cache-rungs"
+    ],
+    "metavar": "N",
+    "choices": null,
+    "default": 8192,
+    "help": "checkpoint-mode prefix caching (hybrid/recurrent targets, wrapped gemma-4): also snapshot the recurrent state every N prompt tokens, so a request that diverges mid-prompt (new session on the same system prompt, compacted history) partially reuses the cache instead of missing outright (default 8192; 0 disables)"
+   },
+   {
+    "flags": [
+     "--lookup-drafts",
+     "--no-lookup-drafts"
+    ],
+    "metavar": null,
+    "choices": null,
+    "default": null,
+    "help": "hybrid n-gram drafting inside dspark mode. Unset = each loaded pair's measured default (re-resolved on every /admin/load swap); an explicit value pins it for the whole server"
+   },
+   {
+    "flags": [
+     "--lookup-long-draft"
+    ],
+    "metavar": "LOOKUP_LONG_DRAFT",
+    "choices": null,
+    "default": 32,
+    "help": "match-scaled long-draft ceiling for lookup drafts (default 32; set to 6 to disable — see `mlx-dspark generate -h`)"
+   },
+   {
+    "flags": [
+     "--wide-gemm-min"
+    ],
+    "metavar": "N",
+    "choices": null,
+    "default": null,
+    "help": "prefill wide-GEMM crossover row count (default: calibrated once and cached; 0 disables — see `mlx-dspark generate -h`)"
+   },
+   {
+    "flags": [
+     "--trust-remote-code"
+    ],
+    "metavar": null,
+    "choices": null,
+    "default": null,
+    "help": "allow a checkpoint to ship Python the loader imports (config.json model_file / auto_map). Refused by default: a crafted model repo would run code as you. Also MLX_DSPARK_TRUST_REMOTE_CODE=1"
+   },
+   {
+    "flags": [
+     "--cpu-split"
+    ],
+    "metavar": "FRAC",
+    "choices": null,
+    "default": null,
+    "help": "prefill CPU co-prefill row fraction (default: calibrated once and cached; 0 disables — see `mlx-dspark generate -h`). /health reports the live state; /admin/load takes a per-swap `cpu_split` override (0 = off)"
+   },
+   {
+    "flags": [
+     "--small-m",
+     "--no-small-m"
+    ],
+    "metavar": null,
+    "choices": null,
+    "default": null,
+    "help": "small-M MMA verify kernel (see `mlx-dspark generate --help`). Unset = on where the cached probe proves it faster on this machine; --no-small-m forces the stock kernel — the serve-side A/B that previously required downgrading. /health reports the live state; /admin/load takes a per-swap `small_m` boolean override."
+   },
+   {
+    "flags": [
+     "--sdpa-split",
+     "--no-sdpa-split"
+    ],
+    "metavar": null,
+    "choices": null,
+    "default": null,
+    "help": "wide-verify SDPA split (see `mlx-dspark generate --help`). Unset = on where a per-chip probe finds mlx's multi-row cliff; --no-sdpa-split forces the single call. /health reports the state."
+   },
+   {
+    "flags": [
+     "--multirow-attn",
+     "--no-multirow-attn"
+    ],
+    "metavar": null,
+    "choices": null,
+    "default": null,
+    "help": "multi-row decode-attention kernel (see `mlx-dspark generate --help`). Unset = on for attention shapes a per-chip probe proves faster; --no-multirow-attn uses mlx's kernels. /health reports the state; /admin/load takes a per-swap `multirow_attn` boolean."
+   },
+   {
+    "flags": [
+     "--drafter-window"
+    ],
+    "metavar": "N",
+    "choices": null,
+    "default": null,
+    "help": "DSpark drafter context window (see `mlx-dspark generate --help`); 0 = whole context, unset = the pair default. /health reports it; /admin/load takes a per-swap `drafter_window` integer."
+   },
+   {
+    "flags": [
+     "--warmup",
+     "--no-warmup"
+    ],
+    "metavar": null,
+    "choices": null,
+    "default": true,
+    "help": "on load, run a tiny throwaway generation to compile the Metal kernels and ramp the GPU clock so the FIRST real request is warm instead of eating the ~2 s cold-start. On by default; --no-warmup skips it. /health reports 'warming_up' during the pass and a 'warmup' flag once ready; /admin/load takes a per-swap boolean."
+   },
+   {
+    "flags": [
+     "--memory-guard",
+     "--no-memory-guard"
+    ],
+    "metavar": null,
+    "choices": null,
+    "default": true,
+    "help": "when macOS reports memory pressure, free the prefix cache's snapshots (WARN: rungs + older slots; CRITICAL: everything) and return MLX's retained buffers to the OS, at the next round boundary — trading a re-prefill for not swapping the model. On by default; /health reports 'memory_guard'; /admin/load takes a per-swap boolean."
+   },
+   {
+    "flags": [
+     "--prefix-cache-dir"
+    ],
+    "metavar": "PREFIX_CACHE_DIR",
+    "choices": null,
+    "default": null,
+    "help": "directory for the L2 SSD spill tier (enables spilling the cache to disk)"
+   },
+   {
+    "flags": [
+     "--prefix-cache-max-ram-mb"
+    ],
+    "metavar": "PREFIX_CACHE_MAX_RAM_MB",
+    "choices": null,
+    "default": 0,
+    "help": "spill the prefix cache to --prefix-cache-dir once it exceeds this many MB of RAM (0 = never spill; requires --prefix-cache-dir)"
+   }
+  ]
+ },
+ "claude": {
+  "prog": "mlx-dspark claude",
+  "description": "Launch Claude Code against a running `mlx-dspark serve`. Configures the launched process only — other Claude Code sessions are unaffected.",
+  "epilog": "Anything after `--` is passed straight to claude, e.g. `mlx-dspark claude -- --continue`.",
+  "options": [
+   {
+    "flags": [
+     "--url"
+    ],
+    "metavar": "URL",
+    "choices": null,
+    "default": "http://127.0.0.1:8080",
+    "help": "base URL of the running server (default http://127.0.0.1:8080)"
+   },
+   {
+    "flags": [
+     "--api-key"
+    ],
+    "metavar": "API_KEY",
+    "choices": null,
+    "default": null,
+    "help": "the server's --api-key, if it was started with one"
+   },
+   {
+    "flags": [
+     "--print-env"
+    ],
+    "metavar": null,
+    "choices": null,
+    "default": null,
+    "help": "print the environment as shell exports instead of launching"
+   },
+   {
+    "flags": [
+     "--print-settings"
+    ],
+    "metavar": null,
+    "choices": null,
+    "default": null,
+    "help": "print a .claude/settings.local.json 'env' block instead of launching (project-scoped: applies to that project only)"
+   }
+  ]
+ },
+ "generate": {
+  "prog": "mlx-dspark generate",
+  "description": "",
+  "epilog": "",
+  "options": [
+   {
+    "flags": [
+     "--mode"
+    ],
+    "metavar": "MODE",
+    "choices": [
+     "auto",
+     "dspark",
+     "dflash",
+     "lookup",
+     "baseline"
+    ],
+    "default": "auto",
+    "help": "auto (default) = this target's measured-best speculation (the registry row's stamped mode, e.g. DFlash 2 on Qwen3.8-27B; else dspark -> dflash -> drafter-free lookup, so ANY repo runs); dspark = DSpark spec decoding; dflash = z-lab DFlash / DFlash 2; lookup = drafter-free prompt-lookup spec decoding (any target); baseline = plain greedy target"
+   },
+   {
+    "flags": [
+     "--model"
+    ],
+    "metavar": "MODEL",
+    "choices": null,
+    "default": null,
+    "help": "target model: an HF repo or local path (e.g. mlx-community/Qwen3-8B-8bit). The matched drafter auto-resolves for known targets; else pass --drafter."
+   },
+   {
+    "flags": [
+     "--drafter"
+    ],
+    "metavar": "DRAFTER",
+    "choices": null,
+    "default": null,
+    "help": "drafter repo/path (overrides auto-resolve)"
+   },
+   {
+    "flags": [
+     "--family"
+    ],
+    "metavar": "FAMILY",
+    "choices": [
+     "gemma4",
+     "qwen3"
+    ],
+    "default": null,
+    "help": ""
+   },
+   {
+    "flags": [
+     "--target"
+    ],
+    "metavar": "TARGET",
+    "choices": null,
+    "default": null,
+    "help": ""
+   },
+   {
+    "flags": [
+     "--prompt"
+    ],
+    "metavar": "PROMPT",
+    "choices": null,
+    "default": "Explain how rainbows form, in a few sentences.",
+    "help": ""
+   },
+   {
+    "flags": [
+     "--wired-limit"
+    ],
+    "metavar": null,
+    "choices": null,
+    "default": null,
+    "help": "wire MLX's recommended working set (~75%% of RAM) so weights can't be paged out. OFF by default and rarely worth it: wired pages cannot be reclaimed, so on a machine whose working set is already large this can HANG macOS hard enough to need a power cycle (observed on an M4 Pro). Short of that it has corrupted the verify logits on the gemma-4/mlx-vlm route, which can commit wrong tokens rather than crash. It bought no measurable speed where tested (<1%%). Only consider it if the model nearly fills your RAM and you actually see paging stalls - and validate a long run before trusting it."
+   },
+   {
+    "flags": [
+     "--max-new-tokens"
+    ],
+    "metavar": "MAX_NEW_TOKENS",
+    "choices": null,
+    "default": 220,
+    "help": ""
+   },
+   {
+    "flags": [
+     "--max-draft"
+    ],
+    "metavar": "MAX_DRAFT",
+    "choices": null,
+    "default": null,
+    "help": "tokens verified per round (cap). Omit to let dspark/dflash DERIVE the cap from this machine+model+quant's measured curves (static_cap, ~5 s once, cached); 'auto' adapts it per round instead. lookup=6; dflash <=0 = full block."
+   },
+   {
+    "flags": [
+     "--temperature"
+    ],
+    "metavar": "TEMPERATURE",
+    "choices": null,
+    "default": 0.0,
+    "help": "0 = greedy (exact); >0 = speculative sampling (paper setup, lossless wrt target@T)"
+   },
+   {
+    "flags": [
+     "--top-p"
+    ],
+    "metavar": "TOP_P",
+    "choices": null,
+    "default": 1.0,
+    "help": "nucleus sampling (temperature > 0)"
+   },
+   {
+    "flags": [
+     "--top-k"
+    ],
+    "metavar": "TOP_K",
+    "choices": null,
+    "default": 0,
+    "help": "top-k sampling (temperature > 0)"
+   },
+   {
+    "flags": [
+     "--seed"
+    ],
+    "metavar": "SEED",
+    "choices": null,
+    "default": null,
+    "help": ""
+   },
+   {
+    "flags": [
+     "--confidence-threshold"
+    ],
+    "metavar": "CONFIDENCE_THRESHOLD",
+    "choices": null,
+    "default": 0.0,
+    "help": ""
+   },
+   {
+    "flags": [
+     "--drafter-bits"
+    ],
+    "metavar": "DRAFTER_BITS",
+    "choices": null,
+    "default": 4,
+    "help": ""
+   },
+   {
+    "flags": [
+     "--kv-bits"
+    ],
+    "metavar": "KV_BITS",
+    "choices": [
+     0,
+     4,
+     8
+    ],
+    "default": 0,
+    "help": "quantize the target KV cache (4/8 bits; 0 = off). Cuts the KV bandwidth bill on long contexts; mlx-lm text targets only"
+   },
+   {
+    "flags": [
+     "--lookup-drafts",
+     "--no-lookup-drafts"
+    ],
+    "metavar": null,
+    "choices": null,
+    "default": null,
+    "help": "hybrid n-gram drafting inside dspark mode. Unset = the pair's measured default (ON for most targets — free extra speedup on copy-heavy spans; OFF where the registry stamped it a net loss: MoE targets and the 4-bit 27B hybrids). Lossless either way."
+   },
+   {
+    "flags": [
+     "--wide-gemm-min"
+    ],
+    "metavar": "N",
+    "choices": null,
+    "default": null,
+    "help": "prefill only: row count from which QuantizedLinear dequantizes the weight once and runs a plain GEMM instead of quantized_matmul (mlx re-dequantizes per output tile, which is redundant at prefill widths). Default: calibrate the crossover for this machine+model once and cache it; 0 disables. Bit-identical, ~1.09x prefill"
+   },
+   {
+    "flags": [
+     "--trust-remote-code"
+    ],
+    "metavar": null,
+    "choices": null,
+    "default": null,
+    "help": "allow a checkpoint to ship Python the loader imports (config.json model_file / auto_map). Refused by default: a crafted model repo would run code as you. Also MLX_DSPARK_TRUST_REMOTE_CODE=1"
+   },
+   {
+    "flags": [
+     "--cpu-split"
+    ],
+    "metavar": "FRAC",
+    "choices": null,
+    "default": null,
+    "help": "prefill only: hand this fraction of every wide QuantizedLinear's rows to the CPU stream, concurrently with the GPU (the CPU's matrix units are a second GEMM engine prefill never used). Default: measure the best fraction per width for this machine+model once and cache it; 0 disables. Not bit-identical (fp-tie class, like chunked prefill); 1.41x prefill on an M4 Pro with Qwen3.8-27B-4bit"
+   },
+   {
+    "flags": [
+     "--small-m",
+     "--no-small-m"
+    ],
+    "metavar": null,
+    "choices": null,
+    "default": null,
+    "help": "small-M MMA verify kernel: dequantize each weight group once and reuse it across verify rows 6-8, where stock quantized_matmul re-pays the weight read per row (4-bit) or cliffs at width 6 (8-bit). Unset = on for shapes a one-time cached probe proves faster on this machine (4/8-bit gs64); --no-small-m disables. Output stays greedy-correct (verify-checked); ids can differ from the stock kernel at fp ties, like the batched path"
+   },
+   {
+    "flags": [
+     "--sdpa-split",
+     "--no-sdpa-split"
+    ],
+    "metavar": null,
+    "choices": null,
+    "default": null,
+    "help": "split a wide-verify attention (q_len in mlx's multi-row SDPA cliff, long KV) into <=5-row sub-calls that each stay on the fast path, then concatenate. ~1.5-2x on the long-context verify attention; per-row-equivalent (fp-tie, verify-checked). Unset = on where a one-time per-chip probe finds a cliff; --no-sdpa-split off."
+   },
+   {
+    "flags": [
+     "--multirow-attn",
+     "--no-multirow-attn"
+    ],
+    "metavar": null,
+    "choices": null,
+    "default": null,
+    "help": "multi-row decode-attention kernel for the speculative shapes (verify widths 2-16, the DSpark drafter's block over its context): packs every GQA x query row onto the GPU matrix units so each KV tile is read once. 1.5-4x on those attention calls, ~1.2x on a 32k-deep 27B verify; fp-tie class, verify-checked. Unset = on for attention shapes a one-time cached probe proves faster (and numerically sound) on this machine; --no-multirow-attn uses mlx's kernels."
+   },
+   {
+    "flags": [
+     "--drafter-window"
+    ],
+    "metavar": "N",
+    "choices": null,
+    "default": null,
+    "help": "DSpark drafter context window: the draft block cross-attends only the last N context rows (0 = the whole context). DeepSpec-style heads lose acceptance with depth when they attend everything; a window restores it (DimInfer head at 32k: accept 1.98 -> 2.60). Unset = the pair's default (4096 unless the registry row says otherwise). Drafting-only: output is unchanged."
+   },
+   {
+    "flags": [
+     "--lookup-long-draft"
+    ],
+    "metavar": "LOOKUP_LONG_DRAFT",
+    "choices": null,
+    "default": 32,
+    "help": "match-scaled long-draft ceiling for lookup drafts (dspark hybrid + lookup mode): a deep context match (real copy run) earns drafts up to this length (default 32 = the measured M-series verify-width plateau); set to the base (6) to disable. Speed-only, output unchanged"
+   },
+   {
+    "flags": [
+     "--no-chat-template"
+    ],
+    "metavar": null,
+    "choices": null,
+    "default": null,
+    "help": ""
+   },
+   {
+    "flags": [
+     "--no-stream"
+    ],
+    "metavar": null,
+    "choices": null,
+    "default": null,
+    "help": ""
+   }
+  ]
+ },
+ "benchmark": {
+  "prog": "mlx-dspark benchmark",
+  "description": "",
+  "epilog": "",
+  "options": [
+   {
+    "flags": [
+     "--model"
+    ],
+    "metavar": "MODEL",
+    "choices": null,
+    "default": null,
+    "help": "target repo/path (see `mlx-dspark models`)"
+   },
+   {
+    "flags": [
+     "--drafter"
+    ],
+    "metavar": "DRAFTER",
+    "choices": null,
+    "default": null,
+    "help": ""
+   },
+   {
+    "flags": [
+     "--modes"
+    ],
+    "metavar": "MODES",
+    "choices": null,
+    "default": "dspark,lookup",
+    "help": "comma-separated: dspark, dflash, lookup (baseline always runs)"
+   },
+   {
+    "flags": [
+     "--caps"
+    ],
+    "metavar": "CAPS",
+    "choices": null,
+    "default": "2,auto",
+    "help": "comma-separated caps for dspark/dflash: ints and/or 'auto'"
+   },
+   {
+    "flags": [
+     "--max-new-tokens"
+    ],
+    "metavar": "MAX_NEW_TOKENS",
+    "choices": null,
+    "default": 200,
+    "help": ""
+   },
+   {
+    "flags": [
+     "--trials"
+    ],
+    "metavar": "TRIALS",
+    "choices": null,
+    "default": 1,
+    "help": "repeat each prompt N times and report the MEDIAN. Between-trial noise is ~14%% on an M4 Pro (machine state, not content), so a single trial is not quotable — use 3+ for README numbers."
+   },
+   {
+    "flags": [
+     "--wired-limit"
+    ],
+    "metavar": null,
+    "choices": null,
+    "default": null,
+    "help": "wire MLX's recommended working set (~75%% of RAM) so weights can't be paged out. OFF by default and rarely worth it: wired pages cannot be reclaimed, so on a machine whose working set is already large this can HANG macOS hard enough to need a power cycle (observed on an M4 Pro). Short of that it has corrupted the verify logits on the gemma-4/mlx-vlm route, which can commit wrong tokens rather than crash. It bought no measurable speed where tested (<1%%). Only consider it if the model nearly fills your RAM and you actually see paging stalls - and validate a long run before trusting it."
+   },
+   {
+    "flags": [
+     "--lookup-drafts",
+     "--no-lookup-drafts"
+    ],
+    "metavar": null,
+    "choices": null,
+    "default": null,
+    "help": "dspark mode only: the 4-gram HYBRID lookup draft, where an n-gram hit supplies a free draft instead of running the drafter that round. Unset = the pair's measured default (registry rows stamped with lookup off carry it — every MoE and the 4-bit 27B hybrids: a free draft still costs verify rows). Distinct from `--modes lookup`, the standalone drafter-free mode. Pass --lookup-drafts / --no-lookup-drafts to force an arm for A/B."
+   },
+   {
+    "flags": [
+     "--small-m",
+     "--no-small-m"
+    ],
+    "metavar": null,
+    "choices": null,
+    "default": null,
+    "help": "small-M MMA verify kernel (see `mlx-dspark generate --help`). Unset = on where the cached probe proves it faster; --no-small-m forces the stock kernel for A/B. The setting prints in the header so arms can't be conflated."
+   },
+   {
+    "flags": [
+     "--sdpa-split",
+     "--no-sdpa-split"
+    ],
+    "metavar": null,
+    "choices": null,
+    "default": null,
+    "help": "wide-verify SDPA split (see `mlx-dspark generate --help`). Unset = on where the per-chip probe finds a cliff; --no-sdpa-split off. Prints in the header."
+   },
+   {
+    "flags": [
+     "--multirow-attn",
+     "--no-multirow-attn"
+    ],
+    "metavar": null,
+    "choices": null,
+    "default": null,
+    "help": "multi-row decode-attention kernel (see `mlx-dspark generate --help`). Unset = on where the per-shape probe proves it faster; --no-multirow-attn off. Prints in the header."
+   },
+   {
+    "flags": [
+     "--drafter-window"
+    ],
+    "metavar": "N",
+    "choices": null,
+    "default": null,
+    "help": "DSpark drafter context window (see `mlx-dspark generate --help`); 0 = whole context, unset = the pair default."
+   },
+   {
+    "flags": [
+     "--trust-remote-code"
+    ],
+    "metavar": null,
+    "choices": null,
+    "default": null,
+    "help": "allow a checkpoint to ship Python the loader imports (config.json model_file / auto_map). Refused by default: a crafted model repo would run code as you. Also MLX_DSPARK_TRUST_REMOTE_CODE=1"
+   },
+   {
+    "flags": [
+     "--cpu-split"
+    ],
+    "metavar": "FRAC",
+    "choices": null,
+    "default": null,
+    "help": "prefill CPU co-prefill row fraction (see `mlx-dspark generate -h`). Unset = calibrated default; 0 forces it off for an A/B. Prints in the header (it moves the prefill column, not decode)."
+   },
+   {
+    "flags": [
+     "--json"
+    ],
+    "metavar": "JSON",
+    "choices": null,
+    "default": null,
+    "help": "also write results to this JSON file"
+   }
+  ]
+ },
+ "models": {
+  "prog": "mlx-dspark models",
+  "description": "",
+  "epilog": "",
+  "options": []
+ },
+ "doctor": {
+  "prog": "mlx-dspark doctor",
+  "description": "",
+  "epilog": "",
+  "options": [
+   {
+    "flags": [
+     "--json"
+    ],
+    "metavar": null,
+    "choices": null,
+    "default": null,
+    "help": "emit the full report as JSON (same payload as the server's /doctor)"
+   },
+   {
+    "flags": [
+     "--models"
+    ],
+    "metavar": null,
+    "choices": null,
+    "default": null,
+    "help": "also list which registry models fit this Mac and are already downloaded"
+   }
+  ]
+ }
+}

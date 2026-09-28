@@ -1,0 +1,198 @@
+{% extends "base.html" %}
+{% import "macros.html" as ui %}
+{% block body_class %}home{% endblock %}
+{% block main %}
+<main id="main">
+
+<section class="hero">
+  <div class="hero-copy">
+    <a class="hero-badge" href="/reference/changelog/">Version {{ version }} is out</a>
+    <h1 class="hero-title">Up to 4× faster local models.<span class="soft">Every token exactly the same.</span></h1>
+    <p class="hero-sub">mlx-dspark speeds up language models on Apple Silicon with speculative decoding: a small drafter proposes the next few tokens, and your model checks them all in one pass.</p>
+    <div class="hero-actions">
+      <a class="btn btn-primary" href="/start/quickstart/">Get started</a>
+      <div class="install" data-install>
+        <div class="install-tabs" role="tablist" aria-label="Install with">
+          <button type="button" role="tab" aria-selected="true" data-cmd="pip install mlx-dspark">pip</button>
+          <button type="button" role="tab" aria-selected="false" tabindex="-1" data-cmd="uv pip install mlx-dspark">uv</button>
+          <button type="button" role="tab" aria-selected="false" tabindex="-1" data-cmd="brew install --cask mlx-dspark" data-note="The Mac app. Add the tap first: see the Mac app page.">Mac app</button>
+        </div>
+        <div class="install-line">
+          <code data-install-cmd>pip install mlx-dspark</code>
+          <button class="copy" type="button" aria-label="Copy install command"><span>Copy</span></button>
+        </div>
+      </div>
+    </div>
+    <p class="hero-meta"><span data-install-note>For Apple Silicon Macs with Python 3.10 or newer. MIT licensed.</span> <a href="#pick">Find a model for your Mac</a></p>
+  </div>
+</section>
+
+<section class="ide-wrap" aria-labelledby="race-caption">
+  <div class="race-picker">
+    <p class="race-picker-label" id="race-picker-label">Watch a model race. Pick one:</p>
+    <div class="race-chips" role="group" aria-labelledby="race-picker-label" data-race-chips>
+      <label class="race-more" data-race-more-wrap>
+        <span class="sr-only">More models</span>
+        <select data-race-more aria-label="More models"><option value="">More models</option></select>
+      </label>
+    </div>
+  </div>
+  <figure class="ide" data-race>
+    <div class="ide-titlebar">
+      <div class="ide-lights" aria-hidden="true"><span></span><span></span><span></span></div>
+      <p class="ide-title" data-race-title>Racing Qwen3.8-27B 8-bit</p>
+      <div class="ide-actions">
+        <button class="ide-btn" type="button" data-race-replay>
+          <svg aria-hidden="true" viewBox="0 0 16 16" width="13" height="13"><path d="M13.5 8a5.5 5.5 0 1 1-1.6-3.9M13.5 2.5v3h-3" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>
+          Replay
+        </button>
+      </div>
+    </div>
+    <div class="ide-panes">
+      <div class="pane pane-base">
+        <div class="pane-tabs"><span class="pane-tab"><i aria-hidden="true"></i>is_prime.py</span><span class="pane-label">Plain decoding</span></div>
+        <div class="pane-body" data-scroll>
+          <pre class="pane-gutter" aria-hidden="true" data-gutter>1</pre>
+          <pre class="pane-code" data-text></pre>
+          <div class="pane-line" aria-hidden="true" data-line></div>
+        </div>
+        <div class="pane-status"><span><b data-rate>…</b> tok/s</span><span><b data-passes>0</b> forward passes</span></div>
+      </div>
+      <div class="pane pane-spec">
+        <div class="pane-tabs"><span class="pane-tab"><i aria-hidden="true"></i>is_prime.py</span><span class="pane-label" data-spec-label>mlx-dspark</span></div>
+        <div class="pane-body" data-scroll>
+          <pre class="pane-gutter" aria-hidden="true" data-gutter>1</pre>
+          <pre class="pane-code" data-text></pre>
+          <div class="pane-line" aria-hidden="true" data-line></div>
+        </div>
+        <div class="pane-status"><span><b data-rate>…</b> tok/s</span><span><b data-passes>0</b> forward passes</span></div>
+      </div>
+    </div>
+    <div class="ide-status" data-verdict aria-live="polite">Both editors receive the same tokens. Only the number of passes through the model differs.</div>
+  </figure>
+  <div class="ide-caption" id="race-caption">
+    <span data-race-hint>Replayed at the measured code speed of each pair on an M4 Pro.</span>
+    <ul class="race-legend" aria-label="Legend">
+      <li><span class="tok draft">if</span> drafted</li>
+      <li><span class="tok ok">if</span> accepted</li>
+      <li><span class="tok rej">in</span> rejected</li>
+      <li><span class="tok fix">if</span> the model's own token</li>
+    </ul>
+  </div>
+</section>
+
+<section class="band round" aria-labelledby="round-title">
+  <div class="band-inner">
+    <h2 id="round-title" class="band-title">One round, slowed down.<span class="soft">Draft, verify, accept.</span></h2>
+    <ol class="round-steps">
+      <li>
+        <div class="round-fig" aria-hidden="true">
+          <span class="tok ok">for</span><span class="tok ok"> i</span><span class="tok draft"> in</span><span class="tok draft"> range</span><span class="tok draft">(</span><span class="tok draft">3</span><span class="tok draft">,</span><span class="tok draft"> n</span><span class="tok draft">)</span>
+        </div>
+        <h3>Draft</h3>
+        <p>A drafter a fraction of your model's size reads its hidden state and proposes the next block of tokens, all at once.</p>
+      </li>
+      <li>
+        <div class="round-fig" aria-hidden="true">
+          <span class="tok ok">for</span><span class="tok ok"> i</span><span class="tok check"> in</span><span class="tok check"> range</span><span class="tok check">(</span><span class="tok check">3</span><span class="tok check">,</span><span class="tok check"> n</span><span class="tok check">)</span>
+        </div>
+        <h3>Verify</h3>
+        <p>Your model scores every drafted position in a single forward pass. On a Mac that costs close to one normal step, because decoding is limited by reading the weights from memory, and one pass reads them once.</p>
+      </li>
+      <li>
+        <div class="round-fig" aria-hidden="true">
+          <span class="tok ok">for</span><span class="tok ok"> i</span><span class="tok ok"> in</span><span class="tok ok"> range</span><span class="tok ok">(</span><span class="tok ok">3</span><span class="tok ok">,</span><span class="tok rej"> n</span><span class="tok fix"> int</span>
+        </div>
+        <h3>Accept</h3>
+        <p>It keeps the drafts up to the first one it disagrees with, then adds its own next token. Worst case is one token per pass, like normal decoding. Best case is the whole block plus one.</p>
+      </li>
+    </ol>
+    <p class="round-note">Because your model checks every token, the output is the one it would have produced on its own: speculative decoding here is <strong>lossless</strong>, with greedy and sampled decoding alike. <a href="/concepts/speculative-decoding/">How it works in detail</a></p>
+  </div>
+</section>
+
+<section class="band pick" id="pick" aria-labelledby="pick-title">
+  <div class="band-inner">
+    <div class="band-head">
+      <h2 id="pick-title" class="band-title">Find the right model<span class="soft">for the Mac you have.</span></h2>
+      <p>Every model below is measured and vouched for: its drafter downloads automatically, with settings tuned to your machine on first run.</p>
+    </div>
+    {{ ui.picker() }}
+    <p class="picker-more"><a href="/start/choose-a-model/">More on choosing: quantization, drafters, and agents</a></p>
+  </div>
+</section>
+
+<section class="band results" aria-labelledby="results-title">
+  <div class="band-inner">
+    <div class="band-head">
+      <h2 id="results-title" class="band-title">Measured on a real Mac,<span class="soft">not promised.</span></h2>
+      <p>Speedup over plain decoding of the same model on three kinds of prompt. Each pair runs at the draft cap it derives by itself, with no flags. <a href="/models/results/">Full results and method</a></p>
+    </div>
+    {{ ui.dotplot() }}
+  </div>
+</section>
+
+<section class="band use" aria-labelledby="use-title">
+  <div class="band-inner use-grid">
+    <div class="use-copy">
+      <h2 id="use-title" class="band-title">Use it with the tools you have.<span class="soft">One server, three API dialects.</span></h2>
+      <p>One engine, four ways in. The server speaks the OpenAI, Anthropic and Responses APIs on one port, so the tools you already use connect by changing one URL.</p>
+      <ul class="use-list">
+        <li><a href="/use/claude-code/">Claude Code</a>, fully local, in one command</li>
+        <li><a href="/use/codex/">Codex</a> through the Responses API</li>
+        <li><a href="/use/agents-and-apps/">pi, OpenCode, Open WebUI, Continue</a> and anything OpenAI-compatible</li>
+        <li><a href="/use/python/">Python</a>, if you'd rather script it</li>
+      </ul>
+    </div>
+    <div class="tabs use-tabs" data-tabs>
+      <div class="tab" data-label="Terminal">
+{{ ui.code('mlx-dspark generate --model mlx-community/Qwen3-8B-8bit \\\n  --prompt "Explain how rainbows form."', "bash") }}
+      </div>
+      <div class="tab" data-label="Server">
+{{ ui.code('mlx-dspark serve --model mlx-community/Qwen3-8B-8bit\n\ncurl http://127.0.0.1:8080/v1/chat/completions \\\n  -H "Content-Type: application/json" \\\n  -d \'{"model": "Qwen3-8B-8bit",\n       "messages": [{"role": "user", "content": "Hi!"}]}\'', "bash") }}
+      </div>
+      <div class="tab" data-label="Claude Code">
+{{ ui.code('mlx-dspark serve --model mlx-community/Qwen3-8B-8bit --no-thinking\n\n# in a second terminal\nmlx-dspark claude', "bash") }}
+      </div>
+      <div class="tab" data-label="Python">
+{{ ui.code('from mlx_dspark import load_pair, speculative_generate\n\ntarget, tok, drafter, cfg = load_pair("mlx-community/Qwen3-8B-8bit")\nres = speculative_generate(target, tok, drafter, "Explain rainbows.")\nprint(res.text, res.mean_accept_len)', "python") }}
+      </div>
+    </div>
+  </div>
+</section>
+
+<section class="band app" aria-labelledby="app-title">
+  <div class="band-inner app-grid">
+    <div class="app-media">
+      <video class="theme-light-only" autoplay muted loop playsinline preload="metadata" poster="/static/media/race-light.jpg" aria-label="The Mac app racing plain decoding against DFlash 2 on Qwen3.8-27B: identical output, 4.58 times faster">
+        <source src="/static/media/race-light.mp4" type="video/mp4">
+      </video>
+      <video class="theme-dark-only" autoplay muted loop playsinline preload="metadata" poster="/static/media/race-dark.jpg" aria-label="The Mac app racing plain decoding against DFlash 2 on Qwen3.8-27B: identical output, 4.58 times faster">
+        <source src="/static/media/race-dark.mp4" type="video/mp4">
+      </video>
+    </div>
+    <div class="app-copy">
+      <h2 id="app-title" class="band-title">Or skip the terminal.<span class="soft">There is a Mac app.</span></h2>
+      <p>The native Mac app wraps the same engine: chat with saved sessions, a model manager that tells you whether a model fits <em>before</em> you download it, one-click setup for coding agents, and a Race that checks the lossless claim token by token on your own prompt.</p>
+{{ ui.code("brew tap ARahim3/mlx-dspark https://github.com/ARahim3/mlx-dspark\nbrew install --cask mlx-dspark", "bash") }}
+      <p><a href="/start/mac-app/">Install the Mac app</a> or grab the DMG from <a href="{{ site.site.releases }}">Releases</a>.</p>
+    </div>
+  </div>
+</section>
+
+<section class="band closing" aria-labelledby="closing-title">
+  <div class="band-inner closing-grid">
+    <h2 id="closing-title" class="band-title">One command to start.<span class="soft">Your Mac does the tuning.</span></h2>
+    <div>
+{{ ui.code("pip install mlx-dspark\nmlx-dspark serve --model mlx-community/Qwen3-8B-8bit", "bash") }}
+      <p class="muted">The first run downloads the model and its drafter, then spends about five seconds measuring your Mac to pick its settings. <a href="/start/quickstart/">Quickstart</a></p>
+    </div>
+  </div>
+</section>
+
+</main>
+{% endblock %}
+{% block scripts %}
+<script id="site-data" type="application/json">{{ client_models | json | safe }}</script>
+<script src="/static/js/widgets.js?v={{ version }}" defer></script>
+{% endblock %}

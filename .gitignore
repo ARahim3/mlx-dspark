@@ -13,6 +13,8 @@ checkpoints/
 # demo recording working files (the final docs/demo.gif is committed)
 *.mp4
 *.mov
+# …except the docs site's two published demo clips
+!docs/theme/static/media/*.mp4
 /make_social_demo.sh
 /overlay.png
 scratch/

@@ -1,0 +1,61 @@
+# Docs site: build docs/ with scripts/build_docs.py and publish it to GitHub Pages.
+# The build is model-free and mlx-free (the registry is read with `ast`), so it runs on a
+# plain Linux runner with three pure-Python deps. Pull requests build (the build fails if a
+# registry row has no entry in docs/data/models.json) but don't deploy.
+#
+# One-time setup: repo Settings › Pages › Build and deployment › Source = "GitHub Actions".
+name: Docs
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "docs/**"
+      - "scripts/build_docs.py"
+      - "src/mlx_dspark/load.py"
+      - "src/mlx_dspark/__init__.py"
+      - "CHANGELOG.md"
+      - ".github/workflows/docs.yml"
+  pull_request:
+    paths:
+      - "docs/**"
+      - "scripts/build_docs.py"
+      - "src/mlx_dspark/load.py"
+      - ".github/workflows/docs.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - name: Install the build deps
+        run: pip install "markdown>=3.6" "pygments>=2.17" "jinja2>=3.1"
+      - name: Build
+        run: python scripts/build_docs.py
+      - uses: actions/upload-pages-artifact@v5
+        with:
+          path: build/site
+
+  deploy:
+    if: github.event_name != 'pull_request'
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v5

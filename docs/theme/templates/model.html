@@ -1,0 +1,124 @@
+{% extends "page.html" %}
+{% import "macros.html" as ui %}
+{% block article %}
+{% set m = model %}
+<dl class="model-facts">
+  <div><dt>Made by</dt><dd>{{ m.vendor }}</dd></div>
+  <div><dt>Size</dt><dd>{{ m.params }}</dd></div>
+  <div><dt>Architecture</dt><dd>{{ m.arch }}</dd></div>
+  {% if m.context %}<div><dt>Context</dt><dd>{{ m.context }} tokens</dd></div>{% endif %}
+  <div><dt>Features</dt><dd class="chips">
+    {% if m.tools %}<span class="chip">Tool calling</span>{% endif %}
+    {% if m.thinking %}<span class="chip">Thinking</span>{% else %}<span class="chip">No thinking by default</span>{% endif %}
+  </dd></div>
+</dl>
+
+{% if m.caveat %}
+<div class="admonition warning"><p class="admonition-title">Before you download</p><p>{{ m.caveat }}</p></div>
+{% endif %}
+
+{% if m.variants | length > 1 %}
+<div class="variant-switch" role="tablist" aria-label="Quantization">
+  {% for v in m.variants %}
+  <button type="button" role="tab" id="vt-{{ loop.index }}" aria-controls="vp-{{ loop.index }}" aria-selected="{{ 'true' if loop.first else 'false' }}" {% if not loop.first %}tabindex="-1"{% endif %}>{{ v.quant }}<span>{{ v.ram }}</span></button>
+  {% endfor %}
+</div>
+{% endif %}
+
+{% for v in m.variants %}
+<section class="variant" id="vp-{{ loop.index }}" {% if m.variants | length > 1 %}role="tabpanel" aria-labelledby="vt-{{ loop.index }}"{% endif %} {% if not loop.first %}hidden{% endif %}>
+  {% set a = v.best %}
+  <h2 id="run-{{ v.quant | replace(' ', '-') | replace('(', '') | replace(')', '') }}">Run it{% if m.variants | length > 1 %} ({{ v.quant }}){% endif %}</h2>
+  {{ ui.code("mlx-dspark serve --model " ~ v.target ~ ((" " ~ v.extra_flags) if v.extra_flags else "") ~ ((" " ~ a.flags) if a and a.flags else ""), "bash") }}
+  <p class="muted small">Serves an OpenAI + Anthropic API on <code>http://127.0.0.1:8080</code>. For a one-off answer, use <code>mlx-dspark generate --model {{ v.target }} --prompt "…"</code>.
+  {% if v.resolves_note %} {{ v.resolves_note }}{% endif %}</p>
+
+  {% if a %}
+  <div class="stat-row">
+    <div class="stat stat-hero">
+      <span class="stat-value">{{ '%.2f' | format(a.speedup) }}×</span>
+      <span class="stat-label">faster than plain decoding, mean of chat, code and math</span>
+    </div>
+    <div class="stat">
+      <span class="stat-value">{% if a.tps_range %}{{ a.tps_range[0] }}–{{ a.tps_range[1] }}{% else %}{{ a.tps }}{% endif %}</span>
+      <span class="stat-label">tokens per second (plain: {{ a.baseline }})</span>
+    </div>
+    <div class="stat">
+      <span class="stat-value">{{ '%.2f' | format(a.accept) if a.accept else '—' }}</span>
+      <span class="stat-label">tokens accepted per round</span>
+    </div>
+    <div class="stat">
+      <span class="stat-value">{{ v.ram }}</span>
+      <span class="stat-label">peak memory at chat length</span>
+    </div>
+  </div>
+
+  {{ ui.content_bars(a) }}
+  {% endif %}
+
+  {% if v.arms | length > 1 %}
+  <h3 id="drafters-{{ loop.index }}">Two drafters, measured side by side</h3>
+  <div class="table-wrap"><table class="num">
+    <thead><tr><th>Drafter</th><th>Mode</th><th>Mean</th><th>Chat</th><th>Code</th><th>Math</th><th>Accept</th><th>tok/s</th></tr></thead>
+    <tbody>
+    {% for arm in v.arms %}
+      <tr{% if arm.default %} class="is-default"{% endif %}>
+        <td><a href="https://huggingface.co/{{ arm.drafter }}">{{ arm.label }}</a>{% if arm.default %} <span class="chip chip-spark">default</span>{% endif %}</td>
+        <td><code>--mode {{ arm.mode }}</code></td>
+        <td><strong>{{ '%.2f' | format(arm.speedup) }}×</strong></td>
+        <td>{{ '%.2f' | format(arm.content.chat) }}×</td>
+        <td>{{ '%.2f' | format(arm.content.code) }}×</td>
+        <td>{{ '%.2f' | format(arm.content.math) }}×</td>
+        <td>{{ '%.2f' | format(arm.accept) }}</td>
+        <td>{{ arm.tps }}</td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table></div>
+  {% endif %}
+
+  <h3 id="drafter-{{ loop.index }}">Drafter</h3>
+  <ul class="drafters">
+    {% for arm in v.arms %}
+    <li><a href="https://huggingface.co/{{ arm.drafter }}"><code>{{ arm.drafter }}</code></a>
+      {% if arm.default %}resolves automatically with <code>--mode auto</code> (the default){% else %}available with <code>--mode {{ arm.mode }}</code>{% endif %}.</li>
+    {% endfor %}
+    {% for mode, repo in v.drafters.items() %}{% if repo not in (v.arms | map(attribute='drafter') | list) %}
+    <li><a href="https://huggingface.co/{{ repo }}"><code>{{ repo }}</code></a> available with <code>--mode {{ mode }}</code>.</li>
+    {% endif %}{% endfor %}
+  </ul>
+  <p class="muted small">The drafter downloads with the model the first time you run it, and loads 4-bit quantized (acceptance doesn't depend on the drafter's precision).
+  {% if v.lookup_drafts == false %} Lookup drafts are off by default for this pair (measured as a net loss); <code>--lookup-drafts</code> turns them on.{% endif %}</p>
+
+  {% if v.long_context %}
+  <h3 id="long-context-{{ loop.index }}">At long context</h3>
+  <p>Decode speed with an agent-sized prompt, against plain decoding at the same depth (accepted tokens per round in parentheses). With no <code>--max-draft</code>, the cap shrinks automatically when a narrower verify pays.</p>
+  <div class="table-wrap"><table class="num">
+    <thead><tr>{% if v.long_context[0].arm and (v.arms | length > 1) %}<th>Drafter</th>{% endif %}<th>Context</th><th>Plain</th><th>Cap 3</th><th>Cap 7</th></tr></thead>
+    <tbody>
+    {% for r in v.long_context %}
+      <tr>{% if v.arms | length > 1 %}<td>{{ r.arm }}</td>{% endif %}<td>{{ r.depth }}</td><td>{{ r.baseline }} tok/s</td>
+        <td>{{ '%.2f' | format(r.cap3[0]) }}× <span class="muted">({{ r.cap3[1] }})</span></td>
+        <td>{{ '%.2f' | format(r.cap7[0]) }}× <span class="muted">({{ r.cap7[1] }})</span></td></tr>
+    {% endfor %}
+    </tbody>
+  </table></div>
+  {% endif %}
+
+  {% if v.prefill %}
+  <h3 id="prefill-{{ loop.index }}">Reading the prompt</h3>
+  <p>Prefill runs at <strong>{{ v.prefill.cpu_split or v.prefill.tps }} tok/s</strong>{% if v.prefill.cpu_split %} with CPU co-prefill ({{ v.prefill.tps }} without){% endif %}, so a 20,000-token prompt takes about {{ ((20000 / (v.prefill.cpu_split or v.prefill.tps)) | round | int) }} s the first time. After that the <a href="/concepts/prefix-caching/">prefix cache</a> skips it.</p>
+  {% endif %}
+
+  {{ ui.stamp(v.measured, stamp) }}
+</section>
+{% endfor %}
+
+{% if notes %}
+<div class="model-notes">
+{{ notes | safe }}
+</div>
+{% endif %}
+
+<p class="muted small">Numbers not matching your Mac? They shouldn't be identical: the draft cap is derived from <em>your</em> machine's measured curves. Run <code>mlx-dspark benchmark --model {{ m.variants[0].target }} --trials 3</code> to get your own. See <a href="/models/results/">how these are measured</a>.</p>
+{% endblock %}

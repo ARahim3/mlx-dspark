@@ -1,0 +1,10 @@
+{% extends "base.html" %}
+{% block body_class %}notfound{% endblock %}
+{% block main %}
+<main id="main" class="nf">
+  <p class="nf-code" aria-hidden="true"><span class="tok ok">4</span><span class="tok ok">0</span><span class="tok rej">4</span></p>
+  <h1>This page was rejected</h1>
+  <p>The address doesn't match any page. It may have moved when the docs were reorganized.</p>
+  <p><a class="btn btn-primary" href="/">Go to the home page</a> <button class="btn btn-quiet" type="button" data-search-open>Search the docs</button></p>
+</main>
+{% endblock %}

@@ -1,0 +1,939 @@
+{
+  "_about": "Measured numbers for the docs site's model pages, picker and charts. Joined with REGISTRY (src/mlx_dspark/load.py) by `registry` id at build time: target repo, RAM and drafters come from the registry and must not be repeated here. scripts/build_docs.py fails if a registry row has no entry here or an entry names a row that no longer exists. Numbers: M4 Pro 48 GB, `mlx-dspark benchmark --trials 3` (chat/code/math prompts, 200 tokens, warm, medians of 3, end-to-end tok/s) unless an arm says otherwise. `content` = per-prompt speedups; `speedup` = the mean across them.",
+  "stamp": {
+    "chip": "M4 Pro, 48 GB",
+    "method": "mlx-dspark benchmark --trials 3: three prompts (chat, code, math), 200 new tokens, warm, median of 3 runs, end-to-end tok/s, each pair at the cap it derives with no flags",
+    "fresh": "2026-09-27, mlx 0.32.2, current kernels"
+  },
+  "models": [
+    {
+      "slug": "qwen3.8-27b",
+      "name": "Qwen3.8-27B",
+      "vendor": "Alibaba Qwen",
+      "params": "27B",
+      "params_b": 27,
+      "kind": "hybrid",
+      "arch": "Hybrid: 48 linear-attention + 16 full-attention layers",
+      "context": "256k",
+      "tools": true,
+      "thinking": true,
+      "summary": "The project's best ratio: a 27B reasoning model at 3.7× on 8-bit, and the fastest 27B-class decode (~40 tok/s) on 4-bit, with Inco AI's DFlash 2 drafter.",
+      "variants": [
+        {
+          "registry": "qwen3.8-27b",
+          "quant": "4-bit",
+          "measured": {
+            "when": "2026-09-28",
+            "mlx": "0.32.2",
+            "fresh": true,
+            "how": "paired in one process (arms interleaved per prompt), High Power mode"
+          },
+          "picker_note": "27B quality at the fastest 27B-class decode here, in ~18 GB",
+          "arms": [
+            {
+              "mode": "dflash",
+              "label": "DFlash 2",
+              "drafter": "incoai/Qwen3.8-27B-DFlash2",
+              "default": true,
+              "cap": 7,
+              "accept": 5.09,
+              "baseline": 14.7,
+              "tps": 40.0,
+              "speedup": 2.72,
+              "content": {
+                "chat": 2.05,
+                "code": 3.12,
+                "math": 3.02
+              }
+            },
+            {
+              "mode": "dspark",
+              "label": "DSpark (Red Hat)",
+              "drafter": "RedHatAI/Qwen3.8-27B-speculator.dspark",
+              "cap": 7,
+              "accept": 4.83,
+              "baseline": 14.7,
+              "tps": 38.6,
+              "speedup": 2.63,
+              "content": {
+                "chat": 2.25,
+                "code": 2.81,
+                "math": 2.83
+              }
+            }
+          ],
+          "long_context": [
+            {
+              "arm": "DFlash 2",
+              "depth": "16k",
+              "baseline": 14.1,
+              "cap3": [
+                1.69,
+                2.74
+              ],
+              "cap7": [
+                1.79,
+                3.16
+              ]
+            },
+            {
+              "arm": "DFlash 2",
+              "depth": "32k",
+              "baseline": 12.9,
+              "cap3": [
+                1.66,
+                2.58
+              ],
+              "cap7": [
+                1.85,
+                3.24
+              ]
+            },
+            {
+              "arm": "DSpark (Red Hat)",
+              "depth": "16k",
+              "baseline": 14.2,
+              "cap3": [
+                1.89,
+                3.0
+              ],
+              "cap7": [
+                1.89,
+                3.38
+              ]
+            },
+            {
+              "arm": "DSpark (Red Hat)",
+              "depth": "32k",
+              "baseline": 13.1,
+              "cap3": [
+                1.76,
+                2.74
+              ],
+              "cap7": [
+                1.83,
+                3.32
+              ]
+            }
+          ],
+          "prefill": {
+            "tps": 130,
+            "cpu_split": 184
+          }
+        },
+        {
+          "registry": "qwen3.8-27b-8bit",
+          "quant": "8-bit",
+          "measured": {
+            "when": "2026-09-28",
+            "mlx": "0.32.2",
+            "fresh": true,
+            "how": "paired in one process (arms interleaved per prompt), High Power mode"
+          },
+          "picker_note": "the best speedup in the project",
+          "arms": [
+            {
+              "mode": "dflash",
+              "label": "DFlash 2",
+              "drafter": "incoai/Qwen3.8-27B-DFlash2",
+              "default": true,
+              "cap": 7,
+              "accept": 5.42,
+              "baseline": 8.2,
+              "tps": 30.8,
+              "speedup": 3.74,
+              "content": {
+                "chat": 3.07,
+                "code": 3.93,
+                "math": 4.23
+              }
+            },
+            {
+              "mode": "dspark",
+              "label": "DSpark (Red Hat)",
+              "drafter": "RedHatAI/Qwen3.8-27B-speculator.dspark",
+              "cap": 7,
+              "accept": 5.55,
+              "baseline": 8.2,
+              "tps": 31.1,
+              "speedup": 3.79,
+              "content": {
+                "chat": 3.03,
+                "code": 4.01,
+                "math": 4.32
+              }
+            }
+          ],
+          "prefill": {
+            "tps": 138,
+            "cpu_split": 182
+          }
+        }
+      ],
+      "notes": "Qwen3.8-27B is a 27B reasoning model with a **hybrid** backbone: 48 of its 64 layers are linear attention, which keeps a fixed-size recurrent state instead of a growing KV cache. That is why a \"256k-context\" 27B is usable at long context on a Mac at all.\n\n## Two drafters, one default\n\n`--mode auto` (the default, and what the Mac app uses) picks **DFlash 2** from Inco AI for both quants. DFlash 2 adds a candidate-path selector and dynamic convolutions to the DFlash backbone. Acceptance goes up by about 1.1 to 1.4 tokens per round without widening the verify, and that is the kind of gain that turns into real speed on Apple Silicon.\n\nRed Hat's DSpark head (`--mode dspark`) is a first-class alternative, not a fallback. It ties DFlash 2 at 8-bit (3.79× vs 3.74×) and holds acceptance at long context with its own trained 2048-token window.\n\n## Which quant\n\n- **8-bit** (~29 GB) has the best ratio in the project: 3.74× mean, 4.23× on math.\n- **4-bit** (~18 GB) has the highest absolute speed: 40 tok/s, the fastest decode of any 27B-class target here.\n\n## Long prompts\n\nThe KV cache costs **0.086 GB per 1k tokens** (identical for both quants, because the cache is bf16 regardless of weight bits). That comes to about 11 GB on top of the weights at 128k, and about 23 GB at the full 256k. Cap it with `--context-window` if RAM is the limit; requests past the cap get the \"prompt is too long\" error that agent clients compact on.\n\nThe template supports `reasoning_effort` (`low`, `medium`, `xhigh`). Set a server default with `--reasoning-effort`, or send it per request.\n\nLookup drafts are **off** by default for this pair (measured as a net loss on the 4-bit verify curve). Every divergence from plain greedy decoding is a floating-point tie, on both quants."
+    },
+    {
+      "slug": "gemma-4-12b",
+      "name": "Gemma-4 12B",
+      "vendor": "Google",
+      "params": "12B",
+      "params_b": 12,
+      "kind": "dense",
+      "arch": "Dense, sliding-window + global attention",
+      "tools": true,
+      "thinking": false,
+      "summary": "A big ratio and real speed: 3.25× mean and ~48–78 tok/s, with DeepSeek's official DSpark drafter.",
+      "variants": [
+        {
+          "registry": "gemma-4-12b",
+          "quant": "8-bit",
+          "measured": {
+            "when": "2026-09-27",
+            "mlx": "0.32.2",
+            "fresh": true
+          },
+          "picker_note": "big ratio and real speed",
+          "arms": [
+            {
+              "mode": "dspark",
+              "label": "DSpark",
+              "drafter": "deepseek-ai/dspark_gemma4_12b_block7",
+              "default": true,
+              "cap": 7,
+              "accept": 4.98,
+              "baseline": 18.4,
+              "tps": 59.8,
+              "speedup": 3.25,
+              "content": {
+                "chat": 2.62,
+                "code": 2.9,
+                "math": 4.24
+              }
+            }
+          ],
+          "prefill": {
+            "tps": 293,
+            "cpu_split": 381
+          }
+        }
+      ],
+      "notes": "Google's Gemma-4 12B instruct model, loaded through mlx-vlm, with **DeepSeek's official DSpark drafter**. The 2026-09 verify kernel moved its derived cap from 4 to 7, which took the mean from 2.82× to 3.25× (math 3.12× to 4.24×).\n\n## Copy-heavy editing goes further\n\nWhen the model re-emits or refactors code that is already in its context, lookup drafts reach **4.51×** on file re-emission (75 tok/s) and 4.33× on a rename refactor, with output still bit-identical.\n\n## Good to know\n\n- Gemma-4 does not think by default, so `--no-thinking` is a no-op here.\n- It uses a rotating (sliding-window) KV cache. Prefix caching is exact until the window first wraps, then switches to checkpoints automatically.\n- z-lab's DFlash drafter also loads (`--mode dflash`). On current MLX it measures below DSpark on this model, so treat it as the head-to-head option.\n- A 4-bit build of the target (`…-it-4bit`) resolves the same drafter. It gives a smaller ratio (~1.45× on older kernels) and more raw tokens per second.\n- Gemma-4's tool-call syntax and its `<|tool_response>` turn marker are handled natively. Claude Code works well with it, but it doesn't converge on pi's tool protocol."
+    },
+    {
+      "slug": "minicpm5-2b",
+      "name": "MiniCPM5-2B",
+      "vendor": "OpenBMB",
+      "params": "2B",
+      "params_b": 2,
+      "kind": "dense",
+      "arch": "Dense transformer (llama)",
+      "context": "128k",
+      "tools": true,
+      "thinking": true,
+      "summary": "The best pick for a small Mac: 3.16× mean at ~107–213 tok/s in ~6 GB, and a tool-calling model.",
+      "variants": [
+        {
+          "registry": "minicpm5-2b",
+          "quant": "bf16",
+          "measured": {
+            "when": "2026-09-27",
+            "mlx": "0.32.2",
+            "fresh": true
+          },
+          "picker_note": "the best small-Mac pick",
+          "arms": [
+            {
+              "mode": "dspark",
+              "label": "DSpark",
+              "drafter": "openbmb/MiniCPM5-2B-DSpark",
+              "default": true,
+              "cap": 7,
+              "accept": 4.87,
+              "baseline": 50.6,
+              "tps": 159.7,
+              "speedup": 3.16,
+              "content": {
+                "chat": 2.12,
+                "code": 3.15,
+                "math": 4.21
+              }
+            }
+          ],
+          "long_context": [
+            {
+              "arm": "DSpark",
+              "depth": "16k",
+              "baseline": 42.2,
+              "cap3": [
+                1.62,
+                2.21
+              ],
+              "cap7": [
+                1.54,
+                2.5
+              ]
+            },
+            {
+              "arm": "DSpark",
+              "depth": "32k",
+              "baseline": 36.0,
+              "cap3": [
+                2.06,
+                2.78
+              ],
+              "cap7": [
+                2.09,
+                3.51
+              ]
+            }
+          ],
+          "prefill": {
+            "tps": 1640
+          }
+        }
+      ],
+      "notes": "OpenBMB's 2B (a plain dense `llama`-architecture model with a 128k context, thinking and XML tool calls), paired with OpenBMB's **official DSpark head**.\n\nThe registry points at the **bf16** conversion because that is where the ratio is. On MLX 0.32 a bf16 verify is flat out to width 8, so the derived cap is the full block (7). Math runs at **213 tok/s**.\n\n## Good to know\n\n- Thinking is on by default. The reasoning is split into `reasoning_content` or Anthropic `thinking` blocks, and `enable_thinking: false` answers directly.\n- Tool calls come out in MiniCPM5's own `<function name=\"…\"><param name=\"…\">` form. The server translates them to OpenAI / Anthropic tool calls like every other syntax.\n- The confidence head doesn't pay here, and lookup drafts are a wash (left on).\n- Other quants resolve the same drafter but are unmeasured. A 2B model's bf16 baseline is already ~50 tok/s."
+    },
+    {
+      "slug": "lfm2.5-1.2b",
+      "name": "LFM2.5-1.2B",
+      "vendor": "Liquid AI",
+      "params": "1.2B",
+      "params_b": 1.2,
+      "kind": "conv-hybrid",
+      "arch": "Short-convolution + attention hybrid",
+      "tools": true,
+      "thinking": false,
+      "summary": "The raw-speed record: 333 tok/s mean (up to ~385) at 3.35×, in ~4 GB.",
+      "variants": [
+        {
+          "registry": "lfm2.5-1.2b",
+          "quant": "bf16",
+          "measured": {
+            "when": "2026-09-27",
+            "mlx": "0.32.2",
+            "fresh": true
+          },
+          "picker_note": "hundreds of tokens per second in ~4 GB",
+          "arms": [
+            {
+              "mode": "dspark",
+              "label": "DSpark",
+              "drafter": "LiquidAI/LFM2.5-1.2B-Instruct-DSpark",
+              "default": true,
+              "cap": 7,
+              "accept": 5.28,
+              "baseline": 99.6,
+              "tps": 333.5,
+              "speedup": 3.35,
+              "content": {
+                "chat": 2.4,
+                "code": 3.83,
+                "math": 3.82
+              }
+            }
+          ],
+          "prefill": {
+            "tps": 3240
+          }
+        }
+      ],
+      "notes": "Liquid AI's LFM2.5 is a **short-convolution + attention hybrid**: most layers are a tiny causal convolution with a 2-row state instead of attention. The small model is both easy to draft and cheap to verify, which is why it reaches 5.28 accepted tokens per round.\n\nThe drafter is Liquid AI's official DSpark head. It reuses the target's tied embedding and output head, so it ships only the backbone.\n\n## Good to know\n\n- bf16 is the sweet spot. MLX 0.32.1's wide-matrix kernels make wide verifies cheap for unquantized weights.\n- Tool calls come out in LFM2's `<|tool_call_start|>[func(arg=\"v\")]<|tool_call_end|>` form and are parsed into standard tool calls.\n- Prefill runs at ~3240 tok/s, so a 20k-token prompt takes about 6 s."
+    },
+    {
+      "slug": "lfm2.5-2.6b",
+      "name": "LFM2.5-2.6B",
+      "vendor": "Liquid AI",
+      "params": "2.6B",
+      "params_b": 2.6,
+      "kind": "conv-hybrid",
+      "arch": "Short-convolution + attention hybrid",
+      "tools": true,
+      "thinking": true,
+      "summary": "A small reasoning model at 2.79× mean and ~97–152 tok/s in ~7 GB.",
+      "variants": [
+        {
+          "registry": "lfm2.5-2.6b",
+          "quant": "bf16",
+          "measured": {
+            "when": "2026-09-27",
+            "mlx": "0.32.2",
+            "fresh": true
+          },
+          "arms": [
+            {
+              "mode": "dspark",
+              "label": "DSpark",
+              "drafter": "LiquidAI/LFM2.5-2.6B-DSpark",
+              "default": true,
+              "cap": 7,
+              "accept": 4.0,
+              "baseline": 43.6,
+              "tps": 121.7,
+              "speedup": 2.79,
+              "content": {
+                "chat": 2.24,
+                "code": 2.65,
+                "math": 3.49
+              }
+            }
+          ],
+          "prefill": {
+            "tps": 1420
+          }
+        }
+      ],
+      "notes": "The 2.6B is a pure reasoning model: its chat template always opens a `<think>` block. Turning thinking off (`--no-thinking`, `enable_thinking: false`, or the app toggle) closes the block for it, so it answers directly.\n\nSame family and drafter packaging as [LFM2.5-1.2B](/models/lfm2.5-1.2b/): a short-convolution + attention hybrid, with Liquid AI's official DSpark head reusing the target's embedding and output head."
+    },
+    {
+      "slug": "lfm2.5-8b-a1b",
+      "name": "LFM2.5-8B-A1B",
+      "vendor": "Liquid AI",
+      "params": "8B (1B active)",
+      "params_b": 8,
+      "kind": "moe",
+      "arch": "Conv hybrid, mixture of experts (~1B active)",
+      "tools": true,
+      "thinking": false,
+      "summary": "Supported and lossless, but a modest 1.26× that only pays at bf16. Plain 8-bit decoding is faster in absolute terms.",
+      "caveat": "Plain 8-bit decoding (~114 tok/s) is faster than bf16 with speculation (~82 tok/s). The drafter is for bf16-quality users.",
+      "variants": [
+        {
+          "registry": "lfm2.5-8b-a1b",
+          "quant": "bf16",
+          "recommended": false,
+          "measured": {
+            "when": "2026-08-22",
+            "mlx": "0.32.1",
+            "fresh": false
+          },
+          "arms": [
+            {
+              "mode": "dspark",
+              "label": "DSpark",
+              "drafter": "LiquidAI/LFM2.5-8B-A1B-DSpark",
+              "default": true,
+              "cap": 4,
+              "baseline": 65.0,
+              "tps": 82.0,
+              "speedup": 1.26,
+              "content": {
+                "chat": 1.04,
+                "code": 1.3,
+                "math": 1.44
+              }
+            }
+          ],
+          "prefill": {
+            "tps": 2170
+          }
+        }
+      ],
+      "notes": "A mixture-of-experts LFM2.5 with ~1B active parameters per token. It runs with zero extra model code and is lossless, but speculation has little to win: a ~1B-active step is already very cheap, and every extra verify row pulls in a fresh set of experts.\n\n- At **bf16** it's a modest win: 1.26× (1.44× on math, peaking at 1.67× on a single math prompt).\n- At **8-bit** it's a net loss (0.90–0.97× at every cap).\n- **Absolute speed:** plain 8-bit decoding (~114 tok/s) beats bf16 with speculation (~82 tok/s). If you want the fastest way to run this model, run the 8-bit plainly with `--mode baseline`.\n\nThis matches Liquid AI's own card (M4 Max, bf16 mean 1.18×). The per-token acceptance agrees too (~69%), so the ceiling is the MoE's verify cost, not the drafter."
+    },
+    {
+      "slug": "nanbeige4.2-3b",
+      "name": "Nanbeige4.2-3B",
+      "vendor": "Nanbeige",
+      "params": "3B",
+      "params_b": 3,
+      "kind": "looped",
+      "arch": "Looped depth: 22 layers run twice",
+      "tools": null,
+      "thinking": true,
+      "summary": "4.31× on math: a looped 3B whose expensive step is exactly where a drafter pays. Holds 2.2× at 32k context.",
+      "caveat": "A fresh download needs --trust-remote-code (the repos carry auto_map pointers; nothing is imported on this route).",
+      "variants": [
+        {
+          "registry": "nanbeige4.2-3b",
+          "quant": "bf16",
+          "measured": {
+            "when": "2026-09-27",
+            "mlx": "0.32.2",
+            "fresh": true
+          },
+          "extra_flags": "--trust-remote-code",
+          "arms": [
+            {
+              "mode": "dspark",
+              "label": "DSpark",
+              "drafter": "Nanbeige/Nanbeige4.2-3B-DSpark",
+              "default": true,
+              "cap": 7,
+              "accept": 3.95,
+              "baseline": 17.3,
+              "tps": 50.6,
+              "speedup": 2.92,
+              "content": {
+                "chat": 1.98,
+                "code": 2.5,
+                "math": 4.31
+              }
+            }
+          ],
+          "long_context": [
+            {
+              "arm": "DSpark",
+              "depth": "16k",
+              "baseline": 13.9,
+              "cap3": [
+                1.97,
+                2.36
+              ],
+              "cap7": [
+                1.89,
+                2.78
+              ]
+            },
+            {
+              "arm": "DSpark",
+              "depth": "32k",
+              "baseline": 10.6,
+              "cap3": [
+                2.21,
+                2.74
+              ],
+              "cap7": [
+                1.83,
+                3.2
+              ]
+            }
+          ],
+          "prefill": {
+            "tps": 526
+          }
+        }
+      ],
+      "notes": "Nanbeige4.2-3B runs its 22 layers **twice** with shared weights. Each decode step therefore reads a ~6B model's worth of weights, so plain decoding is only ~17 tok/s. That expensive step is exactly where a drafter pays: math reaches **74 tok/s**.\n\nThe drafter is Nanbeige's official DSpark head.\n\n## First run\n\nBoth repos carry `auto_map` pointers in `config.json`, which the remote-code check flags on a fresh download. Start this pair with `--trust-remote-code`. Nothing is actually imported: mlx-dspark uses its own model code and keeps the tokenizer's remote code off.\n\n```bash\nmlx-dspark serve --model MercuriusDream/Nanbeige4.2-3B-mlx-bf16 --trust-remote-code\n```\n\nmlx-lm doesn't ship the Nanbeige module in a release yet, so mlx-dspark vendors mlx-lm's implementation until it does."
+    },
+    {
+      "slug": "qwen3-8b",
+      "name": "Qwen3-8B",
+      "vendor": "Alibaba Qwen",
+      "params": "8B",
+      "params_b": 8,
+      "kind": "dense",
+      "arch": "Dense transformer",
+      "tools": true,
+      "thinking": true,
+      "summary": "The agent workhorse: 2.19× mean, and the fastest wall clock under Claude Code because its prefix cache trims cleanly.",
+      "variants": [
+        {
+          "registry": "qwen3-8b",
+          "quant": "8-bit",
+          "measured": {
+            "when": "2026-09-27",
+            "mlx": "0.32.2",
+            "fresh": true
+          },
+          "picker_note": "the proven agent workhorse",
+          "arms": [
+            {
+              "mode": "dspark",
+              "label": "DSpark",
+              "drafter": "deepseek-ai/dspark_qwen3_8b_block7",
+              "default": true,
+              "cap": 7,
+              "accept": 3.37,
+              "baseline": 29.5,
+              "tps": 64.5,
+              "speedup": 2.19,
+              "content": {
+                "chat": 1.71,
+                "code": 2.03,
+                "math": 2.83
+              }
+            }
+          ],
+          "prefill": {
+            "tps": 488,
+            "cpu_split": 636
+          }
+        }
+      ],
+      "notes": "Qwen3-8B with **DeepSeek's official DSpark drafter**. It's the model this project measured agents on.\n\n## Why it wins for agents\n\nIn a real Claude Code session (read a buggy file, fix it with the Edit tool), Qwen3-8B finished in about 2:20, nearly **2× faster** than two models with higher acceptance. Claude Code sends 18–26k tokens of system prompt and tool schemas with every request, so prefill dominates the clock. A dense model's prefix cache trims cleanly, so each turn reuses almost all of it.\n\nUse it with `--no-thinking` for agent work: with thinking on, the model reasons before every tool call. The same task took 3:17 and 2762 output tokens, against ~2:20 and 169 without.\n\n## Also\n\nz-lab's DFlash drafter (`z-lab/Qwen3-8B-DFlash-b16`) loads with `--mode dflash`. At this size it is a wash against DSpark (its full block is a net loss even in z-lab's own runner), so DSpark stays the default."
+    },
+    {
+      "slug": "qwen3-4b",
+      "name": "Qwen3-4B",
+      "vendor": "Alibaba Qwen",
+      "params": "4B",
+      "params_b": 4,
+      "kind": "dense",
+      "arch": "Dense transformer",
+      "tools": true,
+      "thinking": true,
+      "summary": "Small and quick: ~89–126 tok/s at 1.98× in ~8 GB, with DeepSeek's official drafter.",
+      "variants": [
+        {
+          "registry": "qwen3-4b",
+          "quant": "8-bit",
+          "measured": {
+            "when": "2026-09-27",
+            "mlx": "0.32.2",
+            "fresh": true
+          },
+          "arms": [
+            {
+              "mode": "dspark",
+              "label": "DSpark",
+              "drafter": "deepseek-ai/dspark_qwen3_4b_block7",
+              "default": true,
+              "cap": 7,
+              "accept": 3.23,
+              "baseline": 51.7,
+              "tps": 102.5,
+              "speedup": 1.98,
+              "content": {
+                "chat": 1.78,
+                "code": 1.72,
+                "math": 2.46
+              }
+            }
+          ],
+          "prefill": {
+            "tps": 886,
+            "cpu_split": 1141
+          }
+        }
+      ],
+      "notes": "Qwen3-4B with **DeepSeek's official DSpark drafter**, and z-lab's DFlash drafter available via `--mode dflash`. The plain baseline here matches `mlx_lm.generate` (51–52 tok/s either way), so the speedup is against a fair reference.\n\nBatching also works well on this dense model: 4 concurrent requests reach ~2.5× the aggregate throughput of serving them one at a time (`--max-batch 4`)."
+    },
+    {
+      "slug": "qwen3-14b",
+      "name": "Qwen3-14B",
+      "vendor": "Alibaba Qwen",
+      "params": "14B",
+      "params_b": 14,
+      "kind": "dense",
+      "arch": "Dense transformer",
+      "tools": true,
+      "thinking": true,
+      "summary": "2.03× mean with DeepSeek's official drafter. Measured before the September kernels, so likely higher today.",
+      "variants": [
+        {
+          "registry": "qwen3-14b",
+          "quant": "8-bit",
+          "measured": {
+            "when": "2026-07-22",
+            "mlx": "0.32.0",
+            "fresh": false
+          },
+          "arms": [
+            {
+              "mode": "dspark",
+              "label": "DSpark",
+              "drafter": "deepseek-ai/dspark_qwen3_14b_block7",
+              "default": true,
+              "cap": 4,
+              "accept": 2.87,
+              "baseline": 15.3,
+              "tps": 31.0,
+              "speedup": 2.03,
+              "content": {
+                "chat": 1.62,
+                "code": 2.11,
+                "math": 2.36
+              }
+            }
+          ]
+        }
+      ],
+      "notes": "Qwen3-14B with **DeepSeek's official DSpark drafter** (there's no z-lab DFlash adapter at this size).\n\nThese numbers predate the September 2026 verify kernel. That kernel moved every re-measured 8-bit model's derived cap from 4 to 7 (Qwen3-8B went 2.13× to 2.19×, Gemma-4 12B 2.82× to 3.25×), so this row is probably conservative. Run `mlx-dspark benchmark --model mlx-community/Qwen3-14B-8bit --trials 3` for today's number on your Mac."
+    },
+    {
+      "slug": "ornith-1.0-9b",
+      "name": "Ornith-1.0-9B",
+      "vendor": "DeepReinforce",
+      "params": "9B",
+      "params_b": 9,
+      "kind": "hybrid",
+      "arch": "Hybrid: linear + full attention",
+      "tools": true,
+      "thinking": true,
+      "summary": "The mid-size sweet spot for agentic coding: 2.40× mean at ~59–68 tok/s, and the first target here above 2× on chat.",
+      "variants": [
+        {
+          "registry": "ornith-1.0-9b",
+          "quant": "8-bit",
+          "measured": {
+            "when": "2026-07-18",
+            "mlx": "0.32.0",
+            "fresh": false
+          },
+          "picker_note": "the mid-size sweet spot",
+          "arms": [
+            {
+              "mode": "dspark",
+              "label": "DSpark (community)",
+              "drafter": "stanleyphoong/Ornith-1.0-9B-DSpark",
+              "default": true,
+              "cap": 4,
+              "accept": 3.64,
+              "baseline": 26.7,
+              "tps": 64.2,
+              "speedup": 2.4,
+              "content": {
+                "chat": 2.21,
+                "code": 2.53,
+                "math": 2.48
+              }
+            }
+          ]
+        }
+      ],
+      "notes": "Ornith-1.0-9B is an agentic-coding model on the Qwen3.5-style hybrid backbone. Its **community drafter** by stanleyphoong was rigorously qualified by its author (17 of 17 gates, 95% of the DSpark paper's reference acceptance), and it produces the best chat speedups in the table.\n\n## Good to know\n\n- Acceptance on tool-call JSON is the highest this project has measured anywhere: **5.07** tokens per round in a Claude Code session.\n- Copy-heavy editing: a rename refactor runs at **3.57×** (93 tok/s) with lookup drafts.\n- **4-bit** trades ratio for speed: about 1.4–1.55× but 60–76 tok/s (plain baseline 49.3). Pick 4-bit for peak tok/s, 8-bit for quality and the headline ratio. The same drafter resolves for both.\n- A bf16 target is slower in both ratio *and* absolute speed (1.54× on code at 22.9 tok/s). Don't bother.\n- Tool calls use the XML `<function=…>` form, translated to standard tool calls."
+    },
+    {
+      "slug": "qwen3.6-27b",
+      "name": "Qwen3.6-27B",
+      "vendor": "Alibaba Qwen",
+      "params": "27B",
+      "params_b": 27,
+      "kind": "hybrid",
+      "arch": "Hybrid: linear + full attention",
+      "tools": true,
+      "thinking": true,
+      "summary": "2.29× mean on the 8-bit target with a strong block-15 community drafter.",
+      "variants": [
+        {
+          "registry": "qwen3.6-27b",
+          "quant": "8-bit",
+          "measured": {
+            "when": "2026-07-25",
+            "mlx": "0.32.0",
+            "fresh": false
+          },
+          "arms": [
+            {
+              "mode": "dspark",
+              "label": "DSpark (community)",
+              "drafter": "satgeze/Qwen3.6-27B-DSpark",
+              "default": true,
+              "cap": 4,
+              "accept": 3.15,
+              "baseline": 8.4,
+              "tps": 19.2,
+              "speedup": 2.29,
+              "content": {
+                "chat": 2.26,
+                "code": 1.96,
+                "math": 2.67
+              }
+            }
+          ],
+          "prefill": {
+            "tps": 126
+          }
+        }
+      ],
+      "notes": "Qwen3.6-27B with satgeze's **community DSpark drafter**: a block-15 head (7 is typical), trained against the bf16 target and warm-started from z-lab's DFlash head for the same model.\n\nThe rule of thumb it follows: **match the target's precision to what the drafter was trained against.** A bf16-trained drafter wants the 8-bit target. The 4-bit target resolves the same drafter and should trade ratio for absolute speed, but it isn't measured.\n\nThese numbers predate the September 2026 verify kernel, which moved other 8-bit targets from cap 4 to 7."
+    },
+    {
+      "slug": "muse-glimmer-30b",
+      "name": "Muse-Glimmer-30B",
+      "vendor": "Meta",
+      "params": "30B",
+      "params_b": 30,
+      "kind": "dense",
+      "arch": "Dense multimodal, sliding + full attention",
+      "tools": true,
+      "thinking": true,
+      "summary": "A dense 30B at 2.47× on 8-bit (8-bit quality at about 4-bit speed), or 1.7× on the 4-bit build in ~26 GB.",
+      "variants": [
+        {
+          "registry": "muse-glimmer-30b",
+          "quant": "4-bit",
+          "measured": {
+            "when": "2026-08-12",
+            "mlx": "0.32.0",
+            "fresh": false
+          },
+          "arms": [
+            {
+              "mode": "dspark",
+              "label": "DSpark (community)",
+              "drafter": "DaoCloud/Muse-Glimmer-30B-DSpark",
+              "default": true,
+              "cap": 2,
+              "accept": 2.45,
+              "baseline": 14.0,
+              "speedup": 1.74,
+              "content": {
+                "chat": 1.57,
+                "code": 1.7,
+                "math": 1.94
+              }
+            }
+          ],
+          "ram_label": "~26 GB"
+        },
+        {
+          "quant": "8-bit",
+          "target": "mlx-community/Muse-Glimmer-30B-8bit",
+          "ram": "~40 GB",
+          "measured": {
+            "when": "2026-08-12",
+            "mlx": "0.32.0",
+            "fresh": false
+          },
+          "picker_note": "a dense 30B at 2.5×",
+          "resolves_note": "Resolves the same drafter as the 4-bit build.",
+          "arms": [
+            {
+              "mode": "dspark",
+              "label": "DSpark (community)",
+              "drafter": "DaoCloud/Muse-Glimmer-30B-DSpark",
+              "default": true,
+              "cap": 4,
+              "accept": 3.31,
+              "baseline": 8.2,
+              "tps": 20.2,
+              "speedup": 2.47,
+              "content": {
+                "chat": 1.97,
+                "code": 2.45,
+                "math": 2.99
+              }
+            }
+          ]
+        }
+      ],
+      "notes": "Meta's Muse-Glimmer-30B is a dense, multimodal 30B with 3:1 sliding/full attention. It needs **mlx-vlm ≥ 0.6.12**, which a fresh install of mlx-dspark already requires. The community drafter by DaoCloud reuses both the target's embedding and its output head.\n\n## Which quant\n\n- **8-bit** (~40 GB, fits a 48 GB Mac but tight) roughly doubles the 4-bit ratio: 2.47× mean at cap 4. It sits closer to the drafter's bf16 training verifier, and its verify curve stays flat to width 5. But 8-bit decode reads twice the bytes, so absolute speed is about the same as 4-bit on code. The better ratio buys **8-bit quality at about 4-bit speed**.\n- **4-bit** (~26 GB) is the registry default for smaller Macs: 1.74× mean at cap 2.\n- bf16 (~60 GB) doesn't fit a 48 GB Mac.\n\nLookup drafts are off by default for this pair. Its output scaling and logit softcap make near-ties more frequent than on a typical model, so it diverges from single-row greedy at more positions. Every one of those divergences is a sub-ulp floating-point tie."
+    },
+    {
+      "slug": "qwen3.6-35b-a3b",
+      "name": "Qwen3.6-35B-A3B",
+      "vendor": "Alibaba Qwen",
+      "params": "35B (3.8B active)",
+      "params_b": 35,
+      "kind": "moe",
+      "arch": "Hybrid mixture of experts (~3.8B active)",
+      "tools": true,
+      "thinking": true,
+      "summary": "Raw speed above all: ~91–145 tok/s from a 35B MoE. The ratio is modest (1.3×) because the baseline is already fast.",
+      "variants": [
+        {
+          "registry": "qwen3.6-35b-a3b",
+          "quant": "4-bit",
+          "measured": {
+            "when": "2026-07-26",
+            "mlx": "0.32.0",
+            "fresh": false
+          },
+          "picker_note": "the fastest raw decode among the big models",
+          "arms": [
+            {
+              "mode": "dspark",
+              "label": "DSpark (community)",
+              "drafter": "Koopah/Qwen3.6-35B-A3B-NVFP4-DSPARK",
+              "default": true,
+              "flags": "--confidence-threshold 0.3",
+              "cap": null,
+              "cap_label": "adaptive",
+              "accept": 4.72,
+              "baseline": 86.9,
+              "tps": 114.5,
+              "speedup": 1.32,
+              "content": {
+                "chat": 1.05,
+                "code": 1.24,
+                "math": 1.67
+              }
+            }
+          ],
+          "prefill": {
+            "tps": 960
+          }
+        }
+      ],
+      "notes": "Only ~3.8B of this model's 35B parameters are active per token, so plain decoding already runs at **86.9 tok/s**, faster than every other target here, including the 4B. The drafter is good: acceptance reaches 7.0 tokens per round on math. It still converts to only 1.32×, because speculation's value scales with what a target step *costs*, and here a step is ~11.5 ms while the dense 1.53B drafter costs ~5.7 ms of every round.\n\n## Flags that matter\n\n- `--confidence-threshold 0.3` lifts it from 1.27× (the zero-flag default) to 1.32×, and math from 1.50× to 1.67×. The verify curve rises from the first extra row *and* acceptance swings from 2.8 (chat) to 7.0 (math), so deciding per round how far to draft pays off. 0.7 over-throttles.\n- Lookup drafts are **off** by default: on a mixture of experts every extra verify row pulls in a fresh set of experts, so a free draft is not free.\n\nFor raw tokens per second nothing here decodes faster at this size."
+    },
+    {
+      "slug": "nemotron-3.5-lightning-30b-a3b",
+      "name": "Nemotron-3.5-Lightning-30B-A3B",
+      "vendor": "NVIDIA",
+      "params": "30B (3B active)",
+      "params_b": 30,
+      "kind": "moe",
+      "arch": "Mamba-2 + attention, mixture of experts (~3B active)",
+      "tools": null,
+      "thinking": true,
+      "summary": "NVIDIA's Mamba-2 + MoE hybrid with its official DSpark head: ~87–112 tok/s, 1.1–1.34× depending on content.",
+      "variants": [
+        {
+          "registry": "nemotron-3.5-lightning-30b-a3b",
+          "quant": "4-bit",
+          "measured": {
+            "when": "2026-08-12",
+            "mlx": "0.32.0",
+            "fresh": false
+          },
+          "arms": [
+            {
+              "mode": "dspark",
+              "label": "DSpark (NVIDIA)",
+              "drafter": "mlx-community/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-DSpark-bf16",
+              "default": true,
+              "cap": 3,
+              "accept": 3.28,
+              "baseline": 91.4,
+              "tps": 100.9,
+              "speedup": 1.1,
+              "content": {
+                "chat": 0.95,
+                "code": 1.23,
+                "math": 1.13
+              }
+            }
+          ]
+        }
+      ],
+      "notes": "A hybrid of **Mamba-2** state-space layers, attention and a mixture of experts (~3B active), with NVIDIA's official DSpark head. Mamba's recurrent state can't be trimmed like a KV cache, so mlx-dspark records each verify round's inputs and rebuilds the state at the exact accept point (bit-exact).\n\nThe speedup is unusually content-sensitive. The best per-prompt measurements at cap 4 reach **1.34×** on math and 1.27× on code. Suite chat is around break-even, which is why the derived cap is 3. As with every MoE here, the ceiling is the verify cost of routed experts, not the drafter.\n\nLookup drafts are off by default (a net loss on every MoE)."
+    },
+    {
+      "slug": "ternary-bonsai-27b",
+      "name": "Ternary-Bonsai-27B",
+      "vendor": "PrismML",
+      "params": "27B",
+      "params_b": 27,
+      "kind": "hybrid",
+      "arch": "Ternary (2-bit pack) hybrid",
+      "tools": null,
+      "thinking": true,
+      "summary": "A 27B reasoning model in ~8.5 GB. Speculation adds ~1.15× on code; use --max-draft auto.",
+      "variants": [
+        {
+          "registry": "ternary-bonsai-27b",
+          "quant": "2-bit (ternary)",
+          "measured": {
+            "when": "2026-07-16",
+            "mlx": "0.32.0",
+            "fresh": false
+          },
+          "extra_flags": "--max-draft auto",
+          "picker_note": "a 27B in ~12 GB, modest speedup",
+          "arms": [
+            {
+              "mode": "dspark",
+              "label": "DSpark",
+              "drafter": "Rahim/Ternary-Bonsai-27B-dspark",
+              "default": true,
+              "cap": 2,
+              "accept": 2.6,
+              "baseline": 25.4,
+              "tps": 27.2,
+              "speedup": 1.07,
+              "content": {
+                "chat": 1.01,
+                "code": 1.13,
+                "math": 1.07
+              }
+            }
+          ]
+        }
+      ],
+      "notes": "PrismML's Bonsai 27B is a 1.7-bit ternary rebuild of Qwen3.6-27B: a full 27B-class reasoning model in about 8.5 GB. PrismML publishes its DSpark drafter as GGUF only, and it doesn't accelerate on Macs through their own tooling. mlx-dspark runs it from a 1:1 repack (`Rahim/Ternary-Bonsai-27B-dspark`, quantized to 4-bit at load).\n\n## The honest ceiling\n\nExtra verify rows on a 2-bit model are compute-bound (they cost the same as on a 4-bit model), while its plain step is very fast. So chat hovers at break-even, and code gains about 1.15×. **`--max-draft auto`** is the recommended setting: it picks the cap from your Mac's measured curves plus live acceptance, and can *park* speculation on content where it would lose.\n\n```bash\nmlx-dspark generate --model prism-ml/Ternary-Bonsai-27B-mlx-2bit \\\n  --max-draft auto --prompt \"Implement binary search in Python.\"\n```\n\nThe **1-bit** pack runs through mlx-vlm ≥ 0.6.5, but speculation is a net loss there (0.71–0.77×), so mlx-dspark refuses it with a pointer to plain generation."
+    }
+  ]
+}

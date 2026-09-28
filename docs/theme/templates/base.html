@@ -1,0 +1,97 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>{% block title %}{% if page.slug %}{{ page.title }} | {{ site.site.name }}{% else %}{{ site.site.name }}: lossless speculative decoding for Apple Silicon{% endif %}{% endblock %}</title>
+<meta name="description" content="{{ page.description or site.site.description }}">
+<meta property="og:title" content="{% if page.slug %}{{ page.title }} | {% endif %}{{ site.site.name }}">
+<meta property="og:description" content="{{ page.description or site.site.description }}">
+<meta property="og:type" content="website">
+<meta property="og:site_name" content="{{ site.site.name }}">
+<meta property="og:url" content="{{ site.site.url.rstrip('/') }}{{ page.url }}">
+<meta property="og:image" content="{{ site.site.url.rstrip('/') }}/static/img/social-card.png">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:image:alt" content="mlx-dspark: up to 4× faster local models, every token exactly the same.">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:image" content="{{ site.site.url.rstrip('/') }}/static/img/social-card.png">
+<link rel="canonical" href="{{ site.site.url.rstrip('/') }}{{ page.url }}">
+<meta name="color-scheme" content="light dark">
+<meta name="theme-color" content="#F5F6FA" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#0F1219" media="(prefers-color-scheme: dark)">
+<link rel="icon" href="/static/img/favicon.svg" type="image/svg+xml">
+<link rel="preload" href="/static/fonts/dm-sans.woff2" as="font" type="font/woff2" crossorigin>
+<link rel="stylesheet" href="/static/css/site.css?v={{ version }}">
+<script>
+  // apply the saved theme before first paint (no flash); "system" stamps nothing
+  try { var t = localStorage.getItem("theme"); if (t === "light" || t === "dark") document.documentElement.dataset.theme = t; } catch (e) {}
+  document.documentElement.classList.add("js");
+</script>
+{% block head %}{% endblock %}
+</head>
+<body class="{% block body_class %}{% endblock %}" data-root="/">
+<a class="skip" href="#main">Skip to content</a>
+<header class="topbar">
+  <div class="topbar-inner">
+    <a class="wordmark" href="/" aria-label="mlx-dspark home"><span>mlx</span><span class="wm-spark">-dspark</span></a>
+    <nav class="topnav" aria-label="Primary">
+      <a href="/start/install/" {% if page.section and page.section != 'Models' %}aria-current="true"{% endif %}>Docs</a>
+      <a href="/models/" {% if page.section == 'Models' %}aria-current="true"{% endif %}>Models</a>
+      <a href="/start/mac-app/">Mac app</a>
+    </nav>
+    <div class="topbar-tools">
+      <button class="search-trigger" type="button" data-search-open aria-label="Search the docs">
+        <svg aria-hidden="true" viewBox="0 0 20 20" width="16" height="16"><circle cx="8.5" cy="8.5" r="5.5" fill="none" stroke="currentColor" stroke-width="1.8"/><path d="M13 13l4.5 4.5" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>
+        <span class="search-label">Search</span><kbd class="search-kbd">⌘K</kbd>
+      </button>
+      <button class="icon-btn theme-toggle" type="button" aria-label="Switch color theme" title="Switch color theme">
+        <svg class="i-sun" aria-hidden="true" viewBox="0 0 20 20" width="18" height="18"><circle cx="10" cy="10" r="3.6" fill="none" stroke="currentColor" stroke-width="1.7"/><g stroke="currentColor" stroke-width="1.7" stroke-linecap="round"><path d="M10 1.8v2M10 16.2v2M1.8 10h2M16.2 10h2M4.2 4.2l1.4 1.4M14.4 14.4l1.4 1.4M4.2 15.8l1.4-1.4M14.4 5.6l1.4-1.4"/></g></svg>
+        <svg class="i-moon" aria-hidden="true" viewBox="0 0 20 20" width="18" height="18"><path d="M16.5 12.3A7 7 0 0 1 7.7 3.5a7 7 0 1 0 8.8 8.8z" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round"/></svg>
+      </button>
+      <a class="icon-btn gh" href="{{ site.site.repo }}" aria-label="mlx-dspark on GitHub" title="GitHub">
+        <svg aria-hidden="true" viewBox="0 0 16 16" width="18" height="18"><path fill="currentColor" d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>
+      </a>
+      <button class="icon-btn nav-toggle" type="button" aria-label="Open the docs menu" aria-expanded="false" aria-controls="sidenav">
+        <svg aria-hidden="true" viewBox="0 0 20 20" width="20" height="20"><path d="M3 6h14M3 10h14M3 14h14" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>
+      </button>
+    </div>
+  </div>
+</header>
+
+{% block main %}{% endblock %}
+
+<footer class="footer">
+  <div class="footer-inner">
+    <div class="footer-brand">
+      <a class="wordmark small" href="/"><span>mlx</span><span class="wm-spark">-dspark</span></a>
+      <p>An independent MLX port of the inference path of DeepSeek's DSpark drafter, plus z-lab's DFlash and Inco AI's DFlash 2. MIT licensed. No model weights are bundled.</p>
+    </div>
+    <nav class="footer-links" aria-label="Project">
+      <a href="{{ site.site.repo }}">GitHub</a>
+      <a href="{{ site.site.pypi }}">PyPI</a>
+      <a href="{{ site.site.releases }}">Releases</a>
+      <a href="{{ site.site.repo }}/issues">Issues</a>
+      <a href="/reference/changelog/">Changelog</a>
+      <a href="{{ site.site.repo }}/blob/main/SECURITY.md">Security</a>
+    </nav>
+    <p class="footer-version">Documentation for version {{ version }}.</p>
+  </div>
+</footer>
+
+<div class="search" hidden role="dialog" aria-modal="true" aria-label="Search the docs">
+  <div class="search-backdrop" data-search-close></div>
+  <div class="search-panel">
+    <div class="search-field">
+      <svg aria-hidden="true" viewBox="0 0 20 20" width="18" height="18"><circle cx="8.5" cy="8.5" r="5.5" fill="none" stroke="currentColor" stroke-width="1.8"/><path d="M13 13l4.5 4.5" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>
+      <input type="search" placeholder="Search models, flags, endpoints…" aria-label="Search" autocomplete="off" spellcheck="false">
+      <kbd>esc</kbd>
+    </div>
+    <ul class="search-results" role="listbox" aria-label="Results"></ul>
+    <p class="search-empty" hidden>No matches. Try a model name, a flag like <code>--max-draft</code>, or an endpoint like <code>/v1/messages</code>.</p>
+  </div>
+</div>
+<script src="/static/js/site.js?v={{ version }}" defer></script>
+{% block scripts %}{% endblock %}
+</body>
+</html>

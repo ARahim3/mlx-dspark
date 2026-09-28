@@ -1,0 +1,87 @@
+<!doctype html>
+<!--
+  The social preview card, rendered to PNG with headless Chrome (not part of the site build):
+
+  C="/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+  "$C" --headless --hide-scrollbars --force-device-scale-factor=1 --window-size=1200,630 \
+    --screenshot=docs/theme/static/img/social-card.png "file://$PWD/docs/social/card.html"
+  "$C" --headless --hide-scrollbars --force-device-scale-factor=1 --window-size=1280,640 \
+    --screenshot=docs/social/github-social-preview.png "file://$PWD/docs/social/card.html"
+
+  social-card.png is the site's og:image; github-social-preview.png is for the repo's
+  Settings › General › Social preview (upload by hand).
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>mlx-dspark social card</title>
+<style>
+  @font-face { font-family: "DM Sans"; src: url("../theme/static/fonts/dm-sans.woff2") format("woff2"); font-weight: 100 1000; }
+  @font-face { font-family: "Monaspace Neon"; src: url("../theme/static/fonts/monaspace-neon-400.woff2") format("woff2"); font-weight: 400; }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; }
+  body {
+    display: grid; place-items: center; overflow: hidden;
+    background: radial-gradient(900px 520px at 88% 96%, rgba(75, 107, 251, 0.13), transparent 70%), #fcfcfd;
+    font-family: "DM Sans", sans-serif; color: #1b1d24; -webkit-font-smoothing: antialiased;
+  }
+  .stage { position: relative; width: 1200px; height: 630px; }
+  .copy { position: absolute; left: 76px; top: 64px; width: 540px; }
+  .wordmark { font-size: 30px; font-weight: 700; letter-spacing: -0.025em; }
+  .wordmark span { color: #4b6bfb; }
+  h1 { margin: 58px 0 0; font-size: 58px; line-height: 1.07; font-weight: 700; letter-spacing: -0.032em; }
+  h1 .soft { display: block; font-weight: 300; color: #5b606f; }
+  .sub { margin: 28px 0 0; font-size: 23px; line-height: 1.45; font-weight: 300; color: #5b606f; }
+  .url { position: absolute; left: 76px; bottom: 54px; font-size: 19px; color: #868b9b; }
+
+  .ide {
+    position: absolute; left: 668px; top: 92px; width: 640px; height: 620px;
+    background: #1c1e26; border: 1px solid #2a2d38; border-radius: 16px; overflow: hidden;
+    box-shadow: 0 2px 6px rgba(20, 23, 34, 0.06), 0 50px 100px -30px rgba(20, 23, 34, 0.45);
+  }
+  .bar { height: 48px; display: flex; align-items: center; gap: 9px; padding: 0 18px; background: #16181e; border-bottom: 1px solid #2a2d38; }
+  .bar i { width: 13px; height: 13px; border-radius: 50%; background: #ec6a5e; }
+  .bar i:nth-child(2) { background: #f4bf4f; } .bar i:nth-child(3) { background: #61c554; }
+  .bar span { margin-left: 18px; font-size: 16px; color: #8a90a4; }
+  .bar b { color: #d7dae5; font-weight: 500; }
+  .tabs { height: 40px; display: flex; background: #191b22; border-bottom: 1px solid #2a2d38; }
+  .tab { display: flex; align-items: center; gap: 8px; padding: 0 16px; font-size: 15px; color: #d7dae5; background: #1c1e26; border-right: 1px solid #2a2d38; }
+  .tab::before { content: ""; width: 10px; height: 10px; border-radius: 2px; background: linear-gradient(135deg, #5b8def 50%, #f2c94c 50%); }
+  .tabs .who { margin-left: auto; align-self: center; padding-right: 18px; font-size: 15px; color: #93a6ff; }
+  pre { margin: 0; padding: 16px 0; font: 18px/1.75 "Monaspace Neon", monospace; color: #d7dae5; }
+  .ln { display: block; padding-left: 18px; white-space: pre; }
+  .ln.cur { background: rgba(255, 255, 255, 0.04); }
+  .n { display: inline-block; width: 30px; margin-right: 16px; text-align: right; color: #4d5264; }
+  .k { color: #a9b5ff; } .s { color: #9fd4a9; } .m { color: #efb382; } .f { color: #85d3e6; } .b { color: #f0a6c8; } .o { color: #a4aabd; }
+  .d { outline: 1.5px dashed rgba(147, 166, 255, 0.75); outline-offset: -1px; background: rgba(147, 166, 255, 0.12); border-radius: 3px; }
+  .caret { display: inline-block; width: 2px; height: 1.2em; vertical-align: -0.22em; background: #d7dae5; margin: 0 1px; }
+  .verdict {
+    position: absolute; left: 632px; top: 486px; display: flex; align-items: center; gap: 10px;
+    padding: 14px 22px; border-radius: 14px; background: #3f5fe0; color: #fff; font-size: 21px; font-weight: 500;
+    box-shadow: 0 18px 40px -12px rgba(63, 95, 224, 0.55);
+  }
+  .verdict b { font-weight: 700; }
+</style>
+</head>
+<body>
+<div class="stage">
+  <div class="copy">
+    <div class="wordmark">mlx<span>-dspark</span></div>
+    <h1>Up to 4× faster<br>local models.<span class="soft">Every token<br>exactly the same.</span></h1>
+    <p class="sub">Lossless speculative decoding<br>for Apple Silicon, on MLX.</p>
+  </div>
+  <div class="url">arahim.dev/mlx-dspark</div>
+
+  <div class="ide" aria-hidden="true">
+    <div class="bar"><i></i><i></i><i></i><span>Racing <b>Qwen3.8-27B 8-bit</b></span></div>
+    <div class="tabs"><span class="tab">is_prime.py</span></div>
+    <pre><span class="ln"><span class="n">1</span><span class="k">def</span> <span class="f">is_prime</span><span class="o">(</span>n<span class="o">:</span> <span class="b">int</span><span class="o">)</span> <span class="o">-&gt;</span> <span class="b">bool</span><span class="o">:</span></span><span class="ln"><span class="n">2</span>    <span class="s">"""Check whether a number is prime."""</span></span><span class="ln"><span class="n">3</span>    <span class="k">if</span> n <span class="o">&lt;</span> <span class="m">2</span><span class="o">:</span></span><span class="ln"><span class="n">4</span>        <span class="k">return</span> <span class="b">False</span></span><span class="ln cur"><span class="n">5</span>    <span class="k">for</span> i <span class="k">in</span> <span class="b">range</span><span class="o">(</span><span class="m">3</span><span class="o">,</span><span class="caret"></span><span class="d"> <span class="b">int</span></span><span class="d"><span class="o">(</span>n</span><span class="d"><span class="o">**</span><span class="m">0.5</span><span class="o">)</span></span><span class="d"> <span class="o">+</span></span><span class="d"> <span class="m">1</span><span class="o">,</span></span></span><span class="ln"><span class="n">6</span></span><span class="ln"><span class="n">7</span></span></pre>
+  </div>
+  <div class="verdict"><span>✓</span><span>Identical output, <b>3.93×</b> faster</span></div>
+</div>
+<script>
+  // same card at any canvas size: the 1200×630 stage stays centred
+  document.body.style.width = innerWidth + "px";
+</script>
+</body>
+</html>

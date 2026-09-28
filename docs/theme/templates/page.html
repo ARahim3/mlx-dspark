@@ -1,0 +1,68 @@
+{% extends "base.html" %}
+{% block body_class %}docs{% endblock %}
+{% block main %}
+<div class="docs-shell{% if page.meta and page.meta.layout == 'wide' %} is-wide{% endif %}">
+  <aside class="sidenav" id="sidenav" aria-label="Documentation">
+    <nav>
+      {% for section in nav %}
+      <div class="sidenav-section">
+        <p class="sidenav-title">{{ section.title }}</p>
+        <ul>
+          {% for p in section.pages %}
+          <li><a href="{{ p.url }}" {% if p.url == page.url %}aria-current="page"{% endif %}>{{ p.nav_title }}</a></li>
+          {% endfor %}
+        </ul>
+      </div>
+      {% endfor %}
+      <div class="sidenav-section">
+        <p class="sidenav-title">Model pages</p>
+        <ul class="sidenav-models">
+          {% for m in models %}
+          <li><a href="/models/{{ m.slug }}/" {% if page.url == '/models/' ~ m.slug ~ '/' %}aria-current="page"{% endif %}>{{ m.name }}</a></li>
+          {% endfor %}
+        </ul>
+      </div>
+    </nav>
+  </aside>
+
+  <main id="main" class="doc">
+    <article class="prose">
+      <header class="doc-head">
+        {% if page.section %}<p class="doc-section">{{ page.section }}</p>{% endif %}
+        <h1>{{ page.title }}</h1>
+        {% if page.description %}<p class="lede">{{ page.description }}</p>{% endif %}
+      </header>
+      {% block article %}{{ content | safe }}{% endblock %}
+    </article>
+    {% if page.prev or page.next %}
+    <nav class="pager" aria-label="Previous and next page">
+      {% if page.prev %}<a class="pager-prev" href="{{ page.prev.url }}"><span>Previous</span>{{ page.prev.nav_title }}</a>{% else %}<span></span>{% endif %}
+      {% if page.next %}<a class="pager-next" href="{{ page.next.url }}"><span>Next</span>{{ page.next.nav_title }}</a>{% endif %}
+    </nav>
+    {% endif %}
+    <p class="edit-link"><a href="{{ site.site.repo }}/edit/main/{{ edit_path or ('docs/content/' ~ page.slug ~ '.md') }}">Suggest an edit to this page</a></p>
+  </main>
+
+  {% if not (page.meta and page.meta.layout == 'wide') %}
+  <aside class="toc" aria-label="On this page">
+    {% if toc %}
+    <p class="toc-title">On this page</p>
+    <ul>
+      {% for h in toc %}
+      <li><a href="#{{ h.id }}">{{ h.name }}</a>
+        {% if h.children %}<ul>{% for c in h.children %}<li><a href="#{{ c.id }}">{{ c.name }}</a></li>{% endfor %}</ul>{% endif %}
+      </li>
+      {% endfor %}
+    </ul>
+    {% endif %}
+  </aside>
+  {% endif %}
+</div>
+{% endblock %}
+{% block scripts %}
+{% if page.meta and page.meta.scripts %}
+<script id="site-data" type="application/json">{{ client_models | json | safe }}</script>
+{% for s in page.meta.scripts.split(',') %}<script src="/static/js/{{ s.strip() }}.js?v={{ version }}" defer></script>
+{% endfor %}
+{% endif %}
+{% endblock %}

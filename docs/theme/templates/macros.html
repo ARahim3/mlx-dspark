@@ -1,0 +1,64 @@
+{% macro code(text, lang="bash", title=None) -%}
+{{ highlight_block(text, lang, title) | safe }}
+{%- endmacro %}
+
+{# Per-content speedups as bars: the dashed ghost is plain decoding (1×), the solid bar is
+   mlx-dspark. One fixed scale (0–4.5×) everywhere on the site so bars compare across pages. #}
+{% macro content_bars(arm, scale=4.5) -%}
+{% if arm and arm.content %}
+<figure class="cbars" aria-label="Speedup by kind of prompt">
+  {% for kind in ["chat", "code", "math"] %}
+  {% set val = arm.content[kind] %}
+  <div class="cbar cbar-{{ kind }}">
+    <span class="cbar-label"><i class="mk mk-{{ kind }}" aria-hidden="true"></i>{{ kind | capitalize }}</span>
+    <span class="cbar-track">
+      <span class="cbar-ghost" style="width: {{ (100 / scale) | round(2) }}%"></span>
+      <span class="cbar-fill" style="width: {{ (val / scale * 100) | round(2) }}%"></span>
+    </span>
+    <span class="cbar-val">{{ '%.2f' | format(val) }}×</span>
+  </div>
+  {% endfor %}
+  <figcaption>Dashed: plain decoding (1×). Solid: mlx-dspark on the same prompt{% if arm.cap %}, draft cap {{ arm.cap }}{% elif arm.cap_label %}, {{ arm.cap_label }} cap{% endif %}{% if arm.flags %}, <code>{{ arm.flags }}</code>{% endif %}.</figcaption>
+</figure>
+{% endif %}
+{%- endmacro %}
+
+{% macro stamp(measured, site_stamp) -%}
+{% if measured %}
+<p class="stamp">
+  Measured {{ measured.when }} on an {{ site_stamp.chip }} with mlx {{ measured.mlx }}{% if measured.how %}, {{ measured.how }}{% endif %}.
+  {% if not measured.fresh %}This predates the September 2026 verify kernels, which raised every 8-bit model re-measured since, so it is probably conservative.{% endif %}
+</p>
+{% endif %}
+{%- endmacro %}
+
+{% macro picker(default_mem=32) -%}
+<div class="picker" data-picker>
+  <div class="picker-controls">
+    <fieldset class="seg" data-picker-mem>
+      <legend>Your Mac's memory</legend>
+      {% for gb in [8, 16, 24, 32, 48, 64, 96] %}
+      <label><input type="radio" name="mem" value="{{ gb }}" {% if gb == default_mem %}checked{% endif %}><span>{{ gb }}{% if gb == 96 %}+{% endif %} GB</span></label>
+      {% endfor %}
+    </fieldset>
+    <fieldset class="seg" data-picker-goal>
+      <legend>What matters most</legend>
+      <label><input type="radio" name="goal" value="balanced" checked><span>Best overall</span></label>
+      <label><input type="radio" name="goal" value="speedup"><span>Biggest speedup</span></label>
+      <label><input type="radio" name="goal" value="tps"><span>Most tokens per second</span></label>
+      <label><input type="radio" name="goal" value="agents"><span>Coding agents</span></label>
+      <label><input type="radio" name="goal" value="size"><span>Largest model</span></label>
+    </fieldset>
+  </div>
+  <ol class="picker-results" data-picker-results aria-live="polite"></ol>
+  <p class="picker-foot">Memory is each model's measured peak at chat length, judged against about 70% of your Mac's RAM (macOS and your other apps need the rest). Long conversations add KV cache on top: a 27B adds about 11 GB at 128k tokens.</p>
+</div>
+{%- endmacro %}
+
+{% macro dotplot() -%}
+<div class="dotplot" data-dotplot></div>
+<p class="dp-hint">Point at a model to see its numbers. Click it to open its page.</p>
+<noscript><p>The chart needs JavaScript. The same numbers are in <a href="/models/results/">the results table</a>.</p></noscript>
+{%- endmacro %}
+
+{% macro model_link(m) -%}<a href="/models/{{ m.slug }}/">{{ m.name }}</a>{%- endmacro %}

@@ -1,0 +1,33 @@
+# The docs site: navigation + site-wide settings. Built by scripts/build_docs.py.
+# Each nav entry is a page under docs/content/<slug>.md; its title comes from the page's
+# front matter. Model pages (/models/<slug>/) are generated from docs/data/models.json.
+
+[site]
+name = "mlx-dspark"
+description = "Lossless speculative decoding for local LLMs on Apple Silicon: DeepSeek's DSpark and z-lab's DFlash drafters on MLX. Same output, up to ~4× faster."
+url = "https://arahim.dev/mlx-dspark/"
+# where the site is served from (used only by the 404 page, which can be hit at any depth)
+base_path = "/mlx-dspark/"
+repo = "https://github.com/ARahim3/mlx-dspark"
+pypi = "https://pypi.org/project/mlx-dspark/"
+releases = "https://github.com/ARahim3/mlx-dspark/releases"
+
+[[nav]]
+title = "Get started"
+pages = ["start/install", "start/quickstart", "start/choose-a-model", "start/mac-app"]
+
+[[nav]]
+title = "Use it"
+pages = ["use/server", "use/claude-code", "use/codex", "use/agents-and-apps", "use/python", "use/command-line"]
+
+[[nav]]
+title = "Models"
+pages = ["models/index", "models/results", "models/bring-your-own"]
+
+[[nav]]
+title = "How it works"
+pages = ["concepts/speculative-decoding", "concepts/draft-caps", "concepts/long-context", "concepts/prefix-caching", "concepts/prefill", "concepts/batching"]
+
+[[nav]]
+title = "Reference"
+pages = ["reference/cli", "reference/http-api", "reference/environment", "reference/troubleshooting", "reference/changelog"]

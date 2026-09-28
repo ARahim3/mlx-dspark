@@ -29,12 +29,15 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest", "ruff"]
+# the docs site builder (scripts/build_docs.py); not needed to use the package
+docs = ["markdown>=3.6", "pygments>=2.17", "jinja2>=3.1"]
 
 [project.scripts]
 mlx-dspark = "mlx_dspark.cli:main"
 
 [project.urls]
 Homepage = "https://github.com/ARahim3/mlx-dspark"
+Documentation = "https://arahim.dev/mlx-dspark/"
 Repository = "https://github.com/ARahim3/mlx-dspark"
 Issues = "https://github.com/ARahim3/mlx-dspark/issues"
 
