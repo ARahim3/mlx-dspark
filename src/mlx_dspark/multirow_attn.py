@@ -183,7 +183,13 @@ _K1 = mx.fast.metal_kernel(name="dspark_mra_p1", input_names=["q", "k", "v", "sc
 _K2 = mx.fast.metal_kernel(name="dspark_mra_p2", input_names=["opart", "mpart", "lpart"],
                            output_names=["out"], source=_P2)
 
-MAX_SG = 32      # simdgroups per threadgroup (1024 threads)
+# Simdgroups per threadgroup. 32 ⇒ 1024 threads, which only M3/M4-era GPUs admit for this
+# kernel; M1/M2 (incl. M2 Pro) reject it with
+#   "Thread group size (1024) is greater than the maximum allowed threads per threadgroup
+#    (448)"   — measured Mac14,10, mlx-dspark 0.20.1, 2026-09-30,
+# and the ceiling moves with the compiled kernel (448 here, 640 for the qmm kernel).
+# 14 simdgroups = 448 threads is the largest value observed to launch on that generation.
+MAX_SG = 14
 MAX_D = 256
 _DTYPES = (mx.bfloat16, mx.float16)
 

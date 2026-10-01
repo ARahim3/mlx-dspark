@@ -181,18 +181,102 @@ def fits(mod) -> bool:
             and (int(w.shape[1]) * 32 // int(mod.bits)) % GROUP == 0 and int(w.shape[0]) % 8 == 0)
 
 
+def _probe_cap() -> int:
+    """Largest ``S`` this GPU will actually launch for THE REAL qmm kernel, measured once.
+
+    ``maxTotalThreadsPerThreadgroup`` on Apple Silicon is **not** one number per chip: it
+    depends on the kernel's register footprint, and it moves as ``S`` moves (more split-K
+    chunks ⇒ more live state ⇒ fewer threads admitted). Measured on Mac14,10 (M2 Pro) with
+    mlx-dspark 0.20.1: the stock ``S=32`` was rejected with
+    ``Thread group size (1024) is greater than the maximum allowed threads per threadgroup
+    (448)`` — and every fixed guess (832 → 26, 704 → 22, 512 → 16) was rejected in turn,
+    because the ceiling fell alongside the value being tested.
+
+    A separate 1-thread probe kernel is no help either: it compiles a different occupancy
+    profile and happily reports 1024 on the same machine.
+
+    So the only reliable measurement is the real kernel with a real shape, binary-searched
+    once per process. Costs ~0.5 s and is cached in ``_SIMDGROUPS_MAX``.
+    """
+    # Shapes mirror what the calibration and decode paths actually run: a wide-N expert
+    # tile, a wide-K projection, and a narrow hybrid gate. The ceiling is shape-dependent,
+    # so the probe keeps the smallest surviving value — that one is safe for all of them.
+    shapes = [(248320, 2048, 6), (2048, 512, 6), (512, 2048, 6)]
+    try:
+        samples = []
+        for n, k, rows in shapes:
+            samples.append((
+                (mx.random.normal((rows, k)) * 0.1).astype(mx.bfloat16),
+                mx.zeros((n, k // 8), dtype=mx.uint32),
+                mx.zeros((n, k // 64), dtype=mx.bfloat16),
+                mx.zeros((n, k // 64), dtype=mx.bfloat16),
+                n, k, rows,
+            ))
+    except Exception:
+        return 8
+
+    def launches(s: int) -> bool:
+        for x, w, sc, bi, n, k, rows in samples:
+            try:
+                nt = 2 if n % 16 == 0 else 1
+                template = [("T", mx.bfloat16), ("K", k), ("N", n), ("BITS", 4),
+                            ("NT", nt), ("RT", 1), ("S", s)]
+                grid = (math.ceil(n / (8 * nt)) * s * 32, math.ceil(rows / 8), 1)
+                out = _kernel()(inputs=[x, w, sc, bi], template=template, grid=grid,
+                                 threadgroup=(s * 32, 1, 1),
+                                 output_shapes=[(rows, n)], output_dtypes=[mx.bfloat16])
+                mx.eval(out[0])          # force THIS launch to execute — not just to be queued
+            except Exception:
+                return False
+        return True
+
+    # 32 is the highest the stock code uses; below 8 the kernel has no split-K left to give.
+    lo, hi, best = 1, 32, 1
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        if launches(mid):
+            best, lo = mid, mid + 1
+        else:
+            hi = mid - 1
+    return max(1, best)
+
+
+def _max_simdgroups() -> int:
+    """This GPU's measured simdgroup ceiling for the qmm kernel (probed once, cached).
+
+    Falls back to a conservative 8 (256 threads) if the probe cannot run at all, so an
+    unknown chip still launches the kernel instead of aborting the whole generation.
+    """
+    global _SIMDGROUPS_MAX
+    try:
+        return _SIMDGROUPS_MAX  # type: ignore[name-defined]
+    except NameError:
+        pass
+    try:
+        cap = _probe_cap()
+    except Exception:
+        cap = 8
+    _SIMDGROUPS_MAX = max(1, min(32, int(cap)))  # type: ignore[assignment]
+    return _SIMDGROUPS_MAX  # type: ignore[return-value]
+
+
 def geometry(n: int, rt: int = 1) -> tuple[int, int]:
     """``(NT, S)``: 8-output tiles per simdgroup and simdgroups (split-K chunks) per
     threadgroup. Wide outputs take 4 tiles × 8 chunks (the measured best on every
     4096+-output shape); narrow ones trade tiles for K-splits so the grid still fills the GPU
     — at N=48 (a hybrid's gate projections) a fixed 4×8 launches 2 threadgroups and ran 0.92×
     of stock. The split-K partials (S·RT·NT·64 floats) stay within 16 KB of threadgroup
-    memory for two row tiles and 16-32 KB for one."""
+    memory for two row tiles and 16-32 KB for one.
+
+    ``S`` is clamped to what this GPU actually admits for THIS kernel (see
+    :func:`_max_simdgroups`). A hard-coded 32 aborts the launch on M1/M2, which cap well
+    below the 1024 threads that M3/M4 allow."""
+    cap = _max_simdgroups()
     if n >= 4096:
-        return 4, 8
+        return 4, min(8, cap)
     if n >= 1024:
-        return (4 if rt == 1 else 2), 16
-    return (2 if rt == 1 and n % 16 == 0 else 1), 32
+        return (4 if rt == 1 else 2), min(16, cap)
+    return (2 if rt == 1 and n % 16 == 0 else 1), min(32, cap)
 
 
 def plan(rows: int, n: int, k: int, bits: int, dtype=mx.bfloat16):
