@@ -3389,8 +3389,10 @@ def run_server(engine, *, host: str = "127.0.0.1", port: int = 8080,
             print(f"  prefix cache: on{'  (+SSD spill)' if engine.prefix.l2_dir else ''}")
         else:
             print("  prefix cache: off (not reusable for this mode/target)")
-        guard = getattr(engine, "memory_guard", None)
-        print(f"  memory guard: {'on (sheds caches under macOS memory pressure)' if guard else 'off'}")
+        # No local binding: run_server's frame lives for the whole serve_forever(), so a local `guard`
+        # would keep the initial engine's MemoryGuard -> prefix cache -> target alive after a swap.
+        print(f"  memory guard: "
+              f"{'on (sheds caches under macOS memory pressure)' if getattr(engine, 'memory_guard', None) else 'off'}")
         # Stated up front so a serve session's kernel arm is on record (benchmark prints
         # the same); forced off via --no-small-m, per-swap via /admin/load {"small_m": ...}.
         print(f"  small-M verify kernel: "
