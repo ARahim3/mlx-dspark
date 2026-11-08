@@ -2,6 +2,14 @@
 
 All notable changes to `mlx-dspark`. Versions follow [SemVer](https://semver.org/) (pre-1.0: minor-ish features land as patch bumps).
 
+## [Unreleased]
+
+### Fixed
+- **A closed engine can no longer be kept alive by a stale reference to its prefix cache or memory guard.** `Engine.close()` now releases the prefix cache's factories (the target's bound `make_cache`) and a stopped `MemoryGuard` drops its cache, so after a hot swap nothing that still points at either object can hold the old target's weights — the mechanism behind the stale 27B copy that PR #42 (@azimnb-afk) found in `run_server`'s startup banner. A released cache raises a clear error if anything tries to use it.
+
+### Docs
+- README and the docs site: the Qwen3.8-27B 4-bit DSpark (Red Hat) row re-measured with its tree on — **2.63× → 2.80×** (38.6 → 41.1 tok/s end to end at cap 7, accept 4.83 → 5.08; chat 2.25× → 2.48×, code 2.81× → 2.97×, math 2.83× → 2.94×), same harness as the DFlash 2 row. DFlash 2 keeps the 4-bit lead (2.93×), chat is now a tie.
+
 ## [0.20.4] — 2026-11-08 — Qwen3.8-27B 2.72× → 2.93×: tree verify for DFlash 2 and DSpark heads, drafter overlap for every pair
 
 ### Faster

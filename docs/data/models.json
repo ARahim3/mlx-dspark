@@ -26,7 +26,7 @@
             "when": "2026-11-08",
             "mlx": "0.32.2",
             "fresh": true,
-            "how": "paired in one process (arms interleaved per prompt), High Power mode; the DFlash 2 arm re-measured 2026-11-08 for v0.20.4 (tree verify on), the DSpark arm 2026-09-28"
+            "how": "paired in one process (arms interleaved per prompt), High Power mode; both arms re-measured 2026-11-08 with tree verify on (v0.20.4)"
           },
           "picker_note": "27B quality at the fastest 27B-class decode here, in ~18 GB",
           "arms": [
@@ -51,14 +51,14 @@
               "label": "DSpark (Red Hat)",
               "drafter": "RedHatAI/Qwen3.8-27B-speculator.dspark",
               "cap": 7,
-              "accept": 4.83,
+              "accept": 5.08,
               "baseline": 14.7,
-              "tps": 38.6,
-              "speedup": 2.63,
+              "tps": 41.1,
+              "speedup": 2.8,
               "content": {
-                "chat": 2.25,
-                "code": 2.81,
-                "math": 2.83
+                "chat": 2.48,
+                "code": 2.97,
+                "math": 2.94
               }
             }
           ],

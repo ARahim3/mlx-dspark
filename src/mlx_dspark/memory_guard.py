@@ -115,7 +115,11 @@ class MemoryGuard:
         return self
 
     def stop(self) -> None:
+        """Stop polling and let go of the prefix cache: a stopped guard that is still
+        referenced somewhere (a frame local, a user's variable) must not keep the cache — and
+        through its factories the model — alive (PR #42)."""
         self._stop.set()
+        self.prefix = None
 
     @property
     def level(self) -> str:

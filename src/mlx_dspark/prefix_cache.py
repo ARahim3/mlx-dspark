@@ -256,6 +256,12 @@ class _Slot:
         self.nontrim: list[int] = nontrim or []   # layer idxs non-trimmable at snapshot time
 
 
+def _released(*_args, **_kwargs):
+    """Stands in for a released PrefixCache's factories (see :meth:`PrefixCache.release`)."""
+    raise RuntimeError("this PrefixCache was released with its engine (Engine.close); "
+                       "it can no longer build or restore caches")
+
+
 class PrefixCache:
     def __init__(self, make_cache, make_ctx=None, *, min_reuse: int = 16,
                  l2_dir: str | None = None, max_ram_bytes: int = 0, slots: int = 2,
@@ -450,6 +456,20 @@ class PrefixCache:
         self._pending_rungs = {}
         self._anchor = 0
         self._clear_spill_files()
+
+    def release(self) -> None:
+        """Reset AND drop the cache factories, so this object can no longer reach the model.
+
+        ``make_cache`` is the target's bound ``make_cache`` method: anything that still holds
+        this cache (a memory guard, a frame local, a library user's variable) kept the whole
+        target's weights reachable after the engine that owned it was closed — one stale 27B
+        copy per process after the first ``/admin/load`` (PR #42, @azimnb-afk). After this,
+        the factories raise instead of silently rebuilding caches for a model that is gone.
+        Idempotent; ``Engine.close()`` calls it."""
+        self.reset()
+        self.make_cache = _released
+        self.make_ctx = _released
+        self.released = True
 
     def shed(self, level: str = "warn") -> dict:
         """Give memory back under OS pressure (see :mod:`~mlx_dspark.memory_guard`).

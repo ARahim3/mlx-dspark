@@ -1294,8 +1294,8 @@ class Engine:
             self.memory_guard = None
         self._executor.shutdown(wait=True)
         if self.prefix is not None:
-            self.prefix.reset()
-            self.prefix = None
+            self.prefix.release()            # reset + drop its factories: nothing that still
+            self.prefix = None               # holds the cache can reach the weights (PR #42)
         self.target = None
         self.drafter = None
         self.cap_controller = None

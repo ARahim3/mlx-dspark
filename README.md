@@ -680,13 +680,13 @@ semantics: 200 tok, end-to-end tok/s, 3-trial medians), High Power mode, current
 
 | method (cap 7) | mean | chat | code | math | accept | tok/s |
 |---|---|---|---|---|---|---|
-| DSpark (`RedHatAI`) | 2.63× | 2.25× | 2.81× | 2.83× | 4.83 | 38.6 |
-| **DFlash 2** (tree verify, v0.20.4) | **2.93×** | **2.49×** | **3.17×** | **3.13×** | **5.37** | **43.1** |
+| DSpark (`RedHatAI`, tree verify) | 2.80× | 2.48× | 2.97× | 2.94× | 5.08 | 41.1 |
+| **DFlash 2** (tree verify) | **2.93×** | **2.49×** | **3.17×** | **3.13×** | **5.37** | **43.1** |
 
-The 4-bit DFlash 2 row was re-measured on 2026-11-08 for v0.20.4 (tree verify, the drafter overlap
-and the deferred commit; same harness, High Power mode) — up from 2.72× / 40.0 tok/s on 2026-09-28.
-The DSpark rows and the 8-bit table are the 2026-09-28 numbers and predate those gains; the DSpark
-head gets the overlap, the deferred commit and its own tree in v0.20.4 too (about +7% in paired runs).
+Both 4-bit rows were re-measured on 2026-11-08 with v0.20.4's tree verify, drafter overlap and
+deferred commit (same harness, High Power mode): DFlash 2 up from 2.72× / 40.0 tok/s, the Red Hat
+DSpark head up from 2.63× / 38.6 tok/s on 2026-09-28. The 8-bit table is still the 2026-09-28
+measurement and predates those gains.
 
 DFlash 2 adds a **candidate path selector** (top-16 target-head candidates per slot, a bilinear
 lattice walked from the verified anchor) and per-sublayer **dynamic convolutions** to the DFlash
