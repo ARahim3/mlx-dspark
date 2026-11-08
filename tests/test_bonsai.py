@@ -363,6 +363,11 @@ def test_hybrid_rollback_state_matches_committed_forward():
     t.run(mx.array([prompt]), cache, [0])
     t.verify(mx.array([[6, 7, 8, 9]]), cache, [0])
     t.rollback(cache, 2, [7])
+    # the rebuild is DEFERRED to the next verify (Target.rollback); a reader of the stored
+    # state outside a verify flushes first — the loops do at their exit, run()/plain() do
+    assert t._pending is not None and t._pending.cache is cache
+    t.flush_pending()
+    assert t._pending is None
 
     t2 = Target(_tiny_hybrid(), tokenizer=None)      # same seed -> same weights
     cache2 = t2.make_cache()

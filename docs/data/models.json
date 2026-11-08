@@ -23,10 +23,10 @@
           "registry": "qwen3.8-27b",
           "quant": "4-bit",
           "measured": {
-            "when": "2026-09-28",
+            "when": "2026-11-08",
             "mlx": "0.32.2",
             "fresh": true,
-            "how": "paired in one process (arms interleaved per prompt), High Power mode"
+            "how": "paired in one process (arms interleaved per prompt), High Power mode; the DFlash 2 arm re-measured 2026-11-08 for v0.20.4 (tree verify on), the DSpark arm 2026-09-28"
           },
           "picker_note": "27B quality at the fastest 27B-class decode here, in ~18 GB",
           "arms": [
@@ -36,14 +36,14 @@
               "drafter": "incoai/Qwen3.8-27B-DFlash2",
               "default": true,
               "cap": 7,
-              "accept": 5.09,
+              "accept": 5.37,
               "baseline": 14.7,
-              "tps": 40.0,
-              "speedup": 2.72,
+              "tps": 43.1,
+              "speedup": 2.93,
               "content": {
-                "chat": 2.05,
-                "code": 3.12,
-                "math": 3.02
+                "chat": 2.49,
+                "code": 3.17,
+                "math": 3.13
               }
             },
             {

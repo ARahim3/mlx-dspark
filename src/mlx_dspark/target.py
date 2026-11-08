@@ -15,11 +15,63 @@ plain(ids, cache)->logits (no capture), and the spec-round pair verify()/rollbac
 
 from __future__ import annotations
 
+import os
 import sys
 from contextlib import contextmanager
+from dataclasses import dataclass
 
 import mlx.core as mx
 
+
+class _RowRoPE:
+    """A layer's rope applied at per-ROW positions ``offset + depth[row]`` (tree verify). The
+    rows become batch entries so ``mx.fast.rope``'s per-batch offsets apply — bit-identical to
+    a single-row call per row. Wraps the layer's own rope object (any mlx-lm rope variant that
+    forwards ``offset`` to ``mx.fast.rope``)."""
+
+    def __init__(self, rope, depth: mx.array):
+        self.rope, self.depth = rope, depth
+        self.calls = 0                       # tree_selftest's structural check
+
+    def __call__(self, x, offset=0):
+        self.calls += 1
+        # x [1, H, W, D] -> [W, H, 1, D]: one batch entry per row
+        y = self.rope(x.transpose(2, 1, 0, 3), offset=self.depth + offset)
+        return y.transpose(2, 1, 0, 3)
+
+
+def _compact_kv(c, start: int, rows: mx.array, keep: int) -> None:
+    """Move KV rows ``start + rows`` to ``start .. start+keep-1`` in place (tree commit).
+    Gathered before the write (MLX is functional), so overlapping moves are safe. Handles the
+    plain cache (keys/values arrays) and the quantized one (tuples of packed/scales/biases)."""
+    src = rows + start
+
+    def mv(buf):
+        buf[..., start:start + keep, :] = buf[..., src, :]
+
+    for side in (c.keys, c.values):
+        for buf in (side if isinstance(side, tuple) else (side,)):
+            mv(buf)
+
+
+# Deferred commit (gated-DeltaNet hybrids, Target.rollback / commit_tree): a round's accepted rows
+# are folded into the stored recurrence state by the NEXT verify's kernel, in front of its own
+# rows — one state read + one write per round — instead of a rollback re-run (a second read +
+# write, ~2.8 ms per round on a 27B; every tree round paid it, a chain on every partial accept).
+# MLX_DSPARK_EAGER_COMMIT=1 restores the eager re-run for an A/B: same tokens, same states.
+DEFERRED_COMMIT = os.environ.get("MLX_DSPARK_EAGER_COMMIT", "").lower() not in ("1", "true")
+
+
+@dataclass
+class _Pending:
+    """Rows of a gated-DeltaNet hybrid's last verify that were accepted but are not in the
+    stored recurrence state yet: per linear layer, in layer order (the order the non-trimmable
+    caches appear in ``cache``), the exact ``gated_delta_update`` inputs of those rows.
+    ``cache[i][1]`` is the state they start from. Folded by the next verify's hook
+    (``Target._capture_linear`` / ``_tree_linear``) or by ``Target.flush_pending``."""
+
+    cache: list
+    rows: list          # [(q, k, v, a, b, A_log, dt_bias, use_kernel, kw)] per linear layer
 
 class Target:
     def __init__(self, model, tokenizer, *, kv_bits: int | None = None,
@@ -105,6 +157,9 @@ class Target:
                 next(ly.conv for ly in model.layers if not ly.is_attention_layer))
         # hybrid spec-verify state (see verify()/rollback()); per-generation, reset by
         # reset_spec() at loop start so a served Target never leaks state across requests.
+        self._pending: _Pending | None = None    # deferred-commit rows (gated-DeltaNet)
+        self._capturing = False                  # inside verify(): run()/plain() don't flush
+        self._fold_ok: bool | None = None        # fold_selftest verdict, once per model
         self.reset_spec()
 
     # -- cache --
@@ -131,6 +186,7 @@ class Target:
     # -- forward with hidden-state tap --
     def run(self, ids: mx.array, cache, tap: list[int]):
         """ids [1,L] -> (logits [1,L,V], fused_hidden [1,L,n_tap*H])."""
+        self._flush_if_pending_for(cache)
         if self._muse:
             return self._run_muse_glimmer(ids, cache, tap)
         if self.is_vlm:
@@ -410,6 +466,7 @@ class Target:
 
     # -- plain forward (no capture) for the greedy baseline --
     def plain(self, ids: mx.array, cache):
+        self._flush_if_pending_for(cache)
         if self.is_vlm:
             return self.model.language_model(inputs=ids, cache=cache).logits
         return self.model(ids, cache=cache)
@@ -451,30 +508,67 @@ class Target:
 
     def reset_spec(self) -> None:
         """Clear per-generation spec state (hybrid capture). Loops call this at start so
-        a long-lived served Target never carries state across generations."""
+        a long-lived served Target never carries state across generations. Pending
+        deferred-commit rows (the loops flush at their exit; this is the backstop) are folded
+        into their own cache first."""
+        self.flush_pending()
         self._stash = None       # ([per-layer gated_delta args], [per-layer conv input])
         self._spec_width = 0
 
+    def _flush_if_pending_for(self, cache) -> None:
+        """A forward outside verify() on a cache with pending rows reads the stored state
+        directly — fold them first. Inside verify()/verify_tree() the hooks fold them."""
+        p = self._pending
+        if p is not None and p.cache is cache and not self._capturing:
+            self.flush_pending()
+
     @contextmanager
-    def _capture_linear(self):
-        """Scoped hooks recording each linear layer's recurrence args + conv input for
-        the forward built inside the context. Pure pass-through (records references,
-        calls the originals) — verify_tap()'s bit-exactness probe runs with the hooks
-        active, so a semantic drift in this plumbing fails loudly at load."""
+    def _capture_linear(self, cache=None):
+        """Scoped hooks recording each linear layer's recurrence args + conv input for the
+        forward built inside the context, and folding the PENDING rows (``_Pending`` for this
+        ``cache``: rows earlier rounds accepted but never folded into the stored state) in front
+        of the new rows — through the tree kernel where it serves the shape (one state read, one
+        state write: the deferred commit), else the stock recurrence twice (fold, then forward:
+        the eager cost, the same result). With nothing pending the hooks are a pure pass-through
+        for the logits and leave the STORED state untouched (the new rows pend at rollback) —
+        verify_tap()'s bit-exactness probe runs with them active."""
+        from mlx_lm.models.gated_delta import compute_g
+
+        from .tree_gdn import chain_parent, eligible, tree_gated_delta
+
         gdn = self._gdn_modules[0]
         mod = sys.modules[type(gdn).__module__]
         conv_cls = type(gdn.conv1d)
         orig_gdu = mod.gated_delta_update
         orig_conv = conv_cls.__call__
         rec_delta, rec_conv = [], []
+        pend = (self._pending.rows if self._pending is not None and self._pending.cache is cache
+                else None)
+        self._fold_kernel_hits = 0
 
-        def rec_gdu(q, k, v, a, b, A_log, dt_bias, state=None, mask=None,
-                    use_kernel=True):
-            # use_kernel is recorded so the rollback re-run takes the SAME
-            # implementation path the forward took (bit-exact prefix re-run)
-            rec_delta.append((q, k, v, a, b, A_log, dt_bias, state, mask, use_kernel))
-            return orig_gdu(q, k, v, a, b, A_log, dt_bias, state, mask,
-                            use_kernel=use_kernel)
+        def rec_gdu(q, k, v, a, b, A_log, dt_bias, state=None, mask=None, use_kernel=True,
+                    **kw):
+            li = len(rec_delta)
+            # use_kernel is recorded so the fold takes the SAME implementation path the
+            # forward took (bit-exact re-run)
+            rec_delta.append((q, k, v, a, b, A_log, dt_bias, state, mask, use_kernel, kw))
+            if pend is None:
+                out, _ = orig_gdu(q, k, v, a, b, A_log, dt_bias, state, mask,
+                                  use_kernel=use_kernel, **kw)
+                return out, state                # stored state stays; the rows pend at rollback
+            qp, kp, vp, ap, bp = pend[li][:5]
+            if self._fold_ok and use_kernel and not kw and mask is None and state is not None:
+                g = compute_g(A_log, a, dt_bias)
+                if eligible(q, v, g, state):
+                    self._fold_kernel_hits += 1
+                    return tree_gated_delta(
+                        q, k, v, g, mx.sigmoid(b), state, chain_parent(int(q.shape[1])),
+                        pending=(qp, kp, vp, compute_g(A_log, ap, dt_bias), mx.sigmoid(bp)))
+            _, base = orig_gdu(qp, kp, vp, ap, bp, A_log, dt_bias, state, None,
+                               use_kernel=use_kernel, **kw)
+            out, _ = orig_gdu(q, k, v, a, b, A_log, dt_bias, base, mask,
+                              use_kernel=use_kernel, **kw)
+            return out, base
 
         def rec_conv_call(conv_self, x, *args, **kwargs):
             if getattr(conv_self, "_mlx_dspark_capture", False):
@@ -561,13 +655,23 @@ class Target:
         self._stash = None
         want = int(ids.shape[1])
         if want == 1:
-            # no drafts (lookup miss / plain step): fully committed, nothing to capture
+            # no drafts (lookup miss / plain step): fully committed, nothing to capture — the
+            # stock forward reads the stored state, so pending rows are folded first
+            self.flush_pending()
             return fwd(ids)
-        capture = (self._capture_mamba if self._recurrence == "mamba2"
-                   else self._capture_shortconv if self._recurrence == "shortconv"
-                   else self._capture_linear)
-        with capture() as stash:
-            logits, fused = fwd(ids)
+        if self._recurrence == "gated_delta" and self._fold_ok is None:
+            self._fold_ok = self.fold_selftest()
+        capture = (self._capture_mamba() if self._recurrence == "mamba2"
+                   else self._capture_shortconv() if self._recurrence == "shortconv"
+                   else self._capture_linear(cache))
+        self._capturing = True
+        try:
+            with capture as stash:
+                logits, fused = fwd(ids)
+        finally:
+            self._capturing = False
+        if self._pending is not None and self._pending.cache is cache:
+            self._pending = None             # folded into this forward (lazily, into cache[1])
         self._stash = stash
         self._spec_width = want
         return logits, fused
@@ -575,12 +679,32 @@ class Target:
     def rollback(self, cache, n_rejected: int, accepted: list[int]) -> None:
         """Undo the rejected tail of the last verify. ``accepted`` = the accepted draft
         tokens (unused — kept for call-site symmetry; the hybrid rebuild slices the
-        recorded arrays lazily, so the on-GPU greedy path never adds a device sync)."""
+        recorded arrays lazily, so the on-GPU greedy path never adds a device sync).
+
+        Gated-DeltaNet hybrids DEFER the state rebuild: the kept rows (anchor + accepted
+        drafts — all of them on a full accept, since the forward left the stored state
+        untouched) are recorded as pending and folded by the next verify's kernel in front of
+        its own rows: one state read + write per round instead of the re-run's second pair.
+        Every other reader of the stored state flushes first (:meth:`flush_pending`: plain
+        steps, run()/plain(), reset_spec(), the loops' exit). ``MLX_DSPARK_EAGER_COMMIT=1``
+        folds right here instead (the A/B)."""
         if not self.is_hybrid:
             if n_rejected > 0:
                 for c in cache:
                     if c is not None and hasattr(c, "trim"):
                         c.trim(n_rejected)
+            return
+        if self._recurrence == "gated_delta":
+            if self._stash is None:
+                if n_rejected > 0:
+                    raise RuntimeError(
+                        "rollback() with rejected tokens but no preceding verify() capture "
+                        "on a hybrid target")
+                return                     # a width-1 step: committed in full by its forward
+            self._defer_gated_delta(cache, self._spec_width - n_rejected)
+            if not DEFERRED_COMMIT:
+                self.flush_pending()
+            self._stash = None
             return
         if n_rejected > 0:
             if self._stash is None:
@@ -590,31 +714,94 @@ class Target:
             keep = self._spec_width - n_rejected     # anchor + accepted drafts, >= 1
             if self._recurrence == "mamba2":
                 self._rollback_mamba(cache, keep)
-            elif self._recurrence == "shortconv":
-                self._rollback_shortconv(cache, keep)
             else:
-                self._rollback_gated_delta(cache, keep)
+                self._rollback_shortconv(cache, keep)
         self._stash = None
 
-    def _rollback_gated_delta(self, cache, keep: int) -> None:
-        from mlx_lm.models.gated_delta import gated_delta_update
-
+    def _defer_gated_delta(self, cache, keep: int) -> None:
+        """KV layers: trim the rejected rows. Linear layers: the kept rows' recurrence inputs
+        become the pending rows (the stored state is still the pre-round one — the forward's
+        hook left it, see _capture_linear); the conv window is rebuilt now (cheap, exact)."""
         rec_delta, rec_conv = self._stash
-        li = 0
+        rows, li = [], 0
         for c in cache:
             if self._is_trimmable(c):
                 c.trim(self._spec_width - keep)
                 continue
-            q, k, v, a, b, A_log, dt_bias, state, mask, use_kernel = rec_delta[li]
+            q, k, v, a, b, A_log, dt_bias, _state, _mask, use_kernel, kw = rec_delta[li]
+            rows.append((q[:, :keep], k[:, :keep], v[:, :keep], a[:, :keep], b[:, :keep],
+                         A_log, dt_bias, use_kernel, kw))
             conv_input = rec_conv[li]
-            m = mask[:, :keep] if mask is not None else None
-            _, new_state = gated_delta_update(
-                q[:, :keep], k[:, :keep], v[:, :keep], a[:, :keep], b[:, :keep],
-                A_log, dt_bias, state, m, use_kernel=use_kernel)
             n_keep = conv_input.shape[1] - self._spec_width   # conv kernel size - 1
             c[0] = mx.contiguous(conv_input[:, keep:keep + n_keep, :])
-            c[1] = new_state
             li += 1
+        self._pending = _Pending(cache, rows)
+
+    def flush_pending(self) -> None:
+        """Fold the pending rows into the stored recurrence state NOW, with the stock
+        recurrence on the implementation path their forward took: afterwards the caches hold
+        exactly what a chain verify of the committed tokens leaves — what every reader outside
+        a verify (prefix-cache snapshots, plain steps, the next generation) expects. No-op when
+        nothing is pending."""
+        p = self._pending
+        if p is None:
+            return
+        from mlx_lm.models.gated_delta import gated_delta_update
+
+        li = 0
+        for c in p.cache:
+            if self._is_trimmable(c):
+                continue
+            q, k, v, a, b, A_log, dt_bias, use_kernel, kw = p.rows[li]
+            _, c[1] = gated_delta_update(q, k, v, a, b, A_log, dt_bias, c[1], None,
+                                         use_kernel=use_kernel, **kw)
+            li += 1
+        self._pending = None
+
+    def fold_selftest(self, atol: float = 1.0) -> bool:
+        """Prove the deferred commit on THIS model once, before verify() trusts the kernel
+        fold: two rounds (verify, defer two rows, verify again — the second folds the pending
+        rows in front of its own) through the tree kernel vs the same two rounds folded by the
+        stock recurrence. Structural: the kernel must have served every linear layer. Numeric:
+        same argmax and |Δlogit| <= ``atol`` (bitwise on mlx-lm's simd_sum and packed kernels —
+        the tolerance is the fp-tie headroom two kernels are allowed, not an expectation), and
+        the base state the fold wrote within fp32 noise (read right after the fold). Fails closed to the eager fold (stock kernel
+        twice: the pre-deferral cost, identical results)."""
+        prompt, tap = [1, 2, 3, 4, 5, 6], [0]
+        saved = (self._pending, self._stash, self._spec_width, self._fold_ok)
+        self._pending = None
+
+        def two_rounds(fold_ok: bool):
+            self._fold_ok = fold_ok
+            cache = self.make_cache()
+            self.run(mx.array([prompt]), cache, tap)
+            self.verify(mx.array([[7, 8, 9]]), cache, tap)
+            self._defer_gated_delta(cache, 2)                    # rows [7, 8] pend
+            logits, _ = self.verify(mx.array([[10, 11, 12]]), cache, tap)
+            hits = self._fold_kernel_hits
+            # the base the fold wrote, read right here: rows folded later decay a wrong base
+            # away (the gate), so a check after them would miss it
+            states = [c[1] for c in cache if not self._is_trimmable(c)]
+            mx.eval(logits, *states)
+            return logits, states, hits
+
+        try:
+            la, sa, hits = two_rounds(True)
+            lb, sb, _ = two_rounds(False)
+            ok = hits == len(self._gdn_modules) > 0
+            d = float(mx.abs(la.astype(mx.float32) - lb.astype(mx.float32)).max())
+            ok = ok and bool((mx.argmax(la, -1) == mx.argmax(lb, -1)).all()) and d <= atol
+            worst = 0.0
+            for x, y in zip(sa, sb):
+                scale = max(1.0, float(mx.abs(y).max()))
+                worst = max(worst, float(mx.abs(x - y).max()) / scale)
+            ok = ok and worst <= 1e-4
+            self._fold_selftest_worst = (d, worst)
+        except Exception:  # noqa: BLE001 — a probe failure means "eager fold", not a crash
+            ok = False
+        finally:
+            self._pending, self._stash, self._spec_width, self._fold_ok = saved
+        return ok
 
     def _rollback_mamba(self, cache, keep: int) -> None:
         """Rebuild each Nemotron-H Mamba-2 cache at the accept point (``keep`` = anchor +
@@ -680,6 +867,363 @@ class Target:
     def _is_trimmable(c) -> bool:
         fn = getattr(c, "is_trimmable", None)
         return bool(fn()) if callable(fn) else hasattr(c, "trim")
+
+    # -- tree verify (best-first draft trees, see tree.py) ---------------------------------
+    #
+    # A tree of N drafted nodes verifies in ONE forward of width N+1 (row 0 = the anchor),
+    # the same cost as a chain of cap N. Three per-family changes, each a scoped patch over
+    # mlx-lm's OWN modules, make every node compute what a chain verify along its own root
+    # path computes (each measured bit-identical in isolation: per-row rope offsets, gathered
+    # conv windows, the path-batched gated-delta kernel):
+    #   attention    rope at position L + depth instead of L + row (a per-row-offset wrapper
+    #                around the layer's own rope); an ancestor mask over the tree's rows (the
+    #                committed prefix is visible to every row). K/V rows land in tree order;
+    #                commit_tree() moves the accepted path into place and trims the rest.
+    #   conv1d       each row's causal window is gathered along its own root path
+    #                (DraftTree.conv_index) and convolved as a batch of kernel-length windows.
+    #   gated delta  the recurrence runs path-batched — one batch row per leaf path, the
+    #                pre-round state broadcast; each node reads its output from a path that
+    #                contains it. Verify leaves no usable state; commit_tree() re-runs the
+    #                recurrence over the accepted path from the pre-round state (the same
+    #                capture-and-rerun rollback chains use).
+    # tree_selftest() proves the plumbing on THIS model before the loop trusts it — a missed
+    # patch (say, a family that applies rope elsewhere) would put rows at wrong positions,
+    # i.e. the target would "decide" with the wrong model, so it fails closed to chains.
+
+    @property
+    def supports_tree(self) -> bool:
+        """Structural eligibility for tree verify: mlx-lm text targets whose attention layers
+        take ``self_attn.rope`` + a mask — dense families and the qwen3_5 gated-DeltaNet
+        hybrids. VLM, Mamba-2, short-conv, looped (nanbeige) and muse targets run chains."""
+        return (not self.is_vlm and not self._muse and not self._nanbeige
+                and self._recurrence in (None, "gated_delta"))
+
+    def tree_ready(self) -> bool:
+        """``supports_tree`` AND the one-time :meth:`tree_selftest` passed on this model."""
+        if not self.supports_tree:
+            return False
+        ok = getattr(self, "_tree_ok", None)
+        if ok is None:
+            try:
+                ok = self.tree_selftest()
+            except Exception:  # noqa: BLE001 — a probe failure means "use chains", not a crash
+                ok = False
+            self._tree_ok = ok
+        return ok
+
+    @property
+    def tree_kernel_live(self) -> bool:
+        """After :meth:`tree_ready`: True when this model's tree verifies run the recurrence
+        through the tree kernel on every linear layer, or the model has no recurrence. False =
+        the exact path-batched fallback (no verified kernel on this GPU generation, odd head
+        dims), which re-reads and re-writes the fp32 state once per LEAF — a cost a chain never
+        pays and ``calibrate.static_tree`` must measure before trusting a tree here."""
+        if self._recurrence != "gated_delta":
+            return True
+        calls = getattr(self, "_tree_calls", None) or {}
+        return calls.get("gdu", 0) > 0 and calls.get("kernel", 0) == calls["gdu"]
+
+    def _tree_conv_k(self) -> int:
+        """The linear layers' conv kernel size (the window DeviceTree.conv_idx must index)."""
+        if self._recurrence == "gated_delta":
+            return int(self._gdn_modules[0].conv_kernel_size)
+        return 4
+
+    @staticmethod
+    def _kv_offset(cache) -> int:
+        for c in cache:
+            off = getattr(c, "offset", None)
+            if off is not None and Target._is_trimmable(c):
+                return int(off)
+        raise ValueError("tree verify needs at least one KV-cached attention layer")
+
+    @contextmanager
+    def _tree_rope(self, depth: mx.array):
+        """Swap every attention layer's rope for a per-row-position wrapper (restored on exit)."""
+        patched = []
+        for layer in self._inner.model.layers:
+            attn = getattr(layer, "self_attn", None)
+            if attn is None or "rope" not in attn:
+                continue
+            orig = attn.rope
+            attn.rope = _RowRoPE(orig, depth)
+            patched.append((attn, orig))
+        try:
+            yield [attn.rope for attn, _ in patched]
+        finally:
+            for attn, orig in patched:
+                attn.rope = orig
+
+    @contextmanager
+    def _tree_linear(self, tree, cache=None):
+        """Gated-DeltaNet hybrids: the tree recurrence + per-path conv windows for the forward
+        built inside the context, recording each linear layer's inputs for commit_tree(); the
+        PENDING rows of ``cache`` (deferred commit, see rollback) are folded in front of the tree
+        — by the tree kernel's pending segment, or by the stock recurrence on the fallback. A
+        no-op context on dense targets."""
+        self._tree_kernel_hits = 0        # linear layers the tree kernel served (vs the fallback)
+        if self._recurrence != "gated_delta":
+            yield None
+            return
+        from mlx_lm.models.gated_delta import compute_g
+
+        from .tree_gdn import eligible as _tree_kernel_ok
+        from .tree_gdn import tree_gated_delta
+
+        gdn = self._gdn_modules[0]
+        mod = sys.modules[type(gdn).__module__]
+        conv_cls = type(gdn.conv1d)
+        orig_gdu = mod.gated_delta_update
+        orig_conv = conv_cls.__call__
+        conv_idx = tree.conv_idx                                              # [W, K]
+        parent = tree.parent
+        pend = (self._pending.rows if self._pending is not None and self._pending.cache is cache
+                else None)
+        rec_delta, rec_conv = [], []
+        batch: dict = {}
+
+        def fold_stock(pr, A_log, dt_bias, state, use_kernel, kw):
+            qp, kp, vp, ap, bp = pr[:5]
+            _, base = orig_gdu(qp, kp, vp, ap, bp, A_log, dt_bias, state, None,
+                               use_kernel=use_kernel, **kw)
+            return base
+
+        def path_batched(q, k, v, a, b, A_log, dt_bias, state, use_kernel, kw):
+            # exact on any kernel: one batch row per leaf path (re-reads the state per leaf);
+            # needs the tree on the host — the off-kernel fallback only (CPU, odd head dims)
+            if not batch:
+                host = tree.to_host()
+                paths = host.leaf_paths()
+                dmax = max(len(p) for p in paths)
+                p_of, d_of = host.row_slots()
+                batch.update(n=len(paths), pidx=mx.array(p_of, dtype=mx.int32),
+                             didx=mx.array(d_of, dtype=mx.int32),
+                             gidx=mx.array([p + [p[-1]] * (dmax - len(p)) for p in paths],
+                                           dtype=mx.int32))
+            gidx = batch["gidx"]
+            st = (None if state is None
+                  else mx.broadcast_to(state, (batch["n"],) + tuple(state.shape[1:])))
+            out, _ = orig_gdu(q[0][gidx], k[0][gidx], v[0][gidx], a[0][gidx],
+                              b[0][gidx], A_log, dt_bias, st, None,
+                              use_kernel=use_kernel, **kw)
+            return out[batch["pidx"], batch["didx"]][None], state   # the base, not a leaf's end
+
+        def tree_gdu(q, k, v, a, b, A_log, dt_bias, state=None, mask=None, use_kernel=True,
+                     **kw):
+            li = len(rec_delta)
+            rec_delta.append((q, k, v, a, b, A_log, dt_bias, state, use_kernel, kw))
+            pr = None if pend is None else pend[li]
+            if use_kernel and not kw and state is not None:
+                # the gate and step size exactly as gated_delta_update derives them
+                g = compute_g(A_log, a, dt_bias)
+                if _tree_kernel_ok(q, v, g, state):
+                    self._tree_kernel_hits += 1
+                    pt = None
+                    if pr is not None and self._fold_ok:
+                        pt = (pr[0], pr[1], pr[2], compute_g(A_log, pr[3], dt_bias),
+                              mx.sigmoid(pr[4]))
+                    elif pr is not None:
+                        state = fold_stock(pr, A_log, dt_bias, state, use_kernel, kw)
+                    return tree_gated_delta(q, k, v, g, mx.sigmoid(b), state, parent,
+                                            pending=pt)
+            if pr is not None:
+                state = fold_stock(pr, A_log, dt_bias, state, use_kernel, kw)
+            return path_batched(q, k, v, a, b, A_log, dt_bias, state, use_kernel, kw)
+
+        def tree_conv(conv_self, x, *args, **kwargs):
+            if not getattr(conv_self, "_mlx_dspark_capture", False):
+                return orig_conv(conv_self, x, *args, **kwargs)
+            rec_conv.append(x)                             # [1, K-1 + W, C]
+            y = orig_conv(conv_self, x[0][conv_idx], *args, **kwargs)        # [W, 1, C]
+            return y.reshape(1, y.shape[0], y.shape[-1])
+
+        mod.gated_delta_update = tree_gdu
+        conv_cls.__call__ = tree_conv
+        try:
+            yield rec_delta, rec_conv
+        finally:
+            mod.gated_delta_update = orig_gdu
+            conv_cls.__call__ = orig_conv
+
+    @contextmanager
+    def _tree_kv(self, cache):
+        """Record the new K/V rows each KV-cached layer appends during the tree verify — the
+        exact (post-rope) rows written — so commit_tree() can re-append the accepted ones from
+        THESE arrays. Gathering them back out of the cache buffer instead would keep the buffer
+        referenced by the very graph that writes it, so MLX could not update it in place and
+        copied the whole thing (measured +3.8 ms per commit at 16k context, ~1 GB moved)."""
+        rows: dict[int, tuple] = {}
+        mine = {id(c) for c in cache if self._is_trimmable(c)}
+        patched = []
+        for cls in {type(c) for c in cache if self._is_trimmable(c)}:
+            orig = cls.update_and_fetch
+            own = "update_and_fetch" in cls.__dict__
+
+            def rec(c_self, keys, values, _orig=orig):
+                if id(c_self) in mine:
+                    rows[id(c_self)] = (keys, values)
+                return _orig(c_self, keys, values)
+
+            cls.update_and_fetch = rec
+            patched.append((cls, orig, own))
+        try:
+            yield rows
+        finally:
+            for cls, orig, own in patched:
+                if own:
+                    cls.update_and_fetch = orig
+                else:
+                    del cls.update_and_fetch              # it was inherited: restore that
+
+    def _body_tree(self, ids, cache, tap, mask):
+        """The replicated text forward with the tree mask on attention layers (linear layers
+        take none — their tree structure lives in the _tree_linear hooks)."""
+        mm = self._inner.model
+        tapset = set(tap) if tap is not None else ()
+        h = mm.embed_tokens(ids)
+        captured = []
+        for i, (layer, c) in enumerate(zip(mm.layers, cache)):
+            h = layer(h, None if getattr(layer, "is_linear", False) else mask, c)
+            if i in tapset:
+                captured.append(h)
+        return mm.norm(h), (mx.concatenate(captured, axis=-1) if tap is not None else None)
+
+    def verify_tree(self, tree, cache, tap: list[int] | None):
+        """Tree verify forward over ``tree.tokens`` (row 0 = anchor, then the drafted nodes in
+        topological order). Returns ``(logits [1, W, V], fused [1, W, n_tap*H] | None)`` per
+        row, like :meth:`verify`; follow with :meth:`commit_tree`."""
+        from .multirow_attn import tree_mask
+        from .tree import DeviceTree, to_device
+
+        dt = tree if isinstance(tree, DeviceTree) else to_device(tree, self._tree_conv_k())
+        L = self._kv_offset(cache)
+        w = dt.width
+        mask = mx.concatenate([mx.ones((w, L), dtype=mx.bool_), dt.anc], axis=1)[None, None]
+        self._tree_stash = None
+        if self._recurrence == "gated_delta" and self._fold_ok is None:
+            self._fold_ok = self.fold_selftest()
+        self._capturing = True
+        try:
+            with self._tree_rope(dt.depth) as ropes, self._tree_linear(dt, cache) as stash, \
+                    self._tree_kv(cache) as kv_rows, tree_mask(mask, dt.bits):
+                hn, fused = self._body_tree(dt.tokens[None], cache, tap, mask)
+                logits = self._head_mlxlm(hn)
+        finally:
+            self._capturing = False
+        if self._pending is not None and self._pending.cache is cache:
+            self._pending = None             # folded into this forward (lazily, into cache[1])
+        self._tree_stash = (w, L, stash, kv_rows)
+        # structural record for tree_selftest: every patch must actually have been used
+        self._tree_calls = {"rope": [r.calls for r in ropes],
+                            "gdu": len(stash[0]) if stash else 0,
+                            "conv": len(stash[1]) if stash else 0,
+                            "kernel": getattr(self, "_tree_kernel_hits", 0)}
+        return logits, fused
+
+    def commit_tree(self, cache, path: list[int]) -> None:
+        """Leave the caches holding exactly ``[prefix ‖ path rows]`` after :meth:`verify_tree`
+        (``path`` = accepted rows incl. the root, topological order — :meth:`DraftTree.walk`):
+          KV layers   the path's K/V rows move to positions L..L+len(path)-1 (a no-op when
+                      the path is already rows 0..k), then the rest is trimmed;
+          linear      the path's recurrence inputs become the PENDING rows (deferred commit —
+                      the stored state is the one the forward wrote: the state after the rows
+                      that were pending before it, which these rows start from); the conv
+                      window = the last (kernel-1) rows of [pre-round window ‖ path].
+        Same result as a chain verify of the path followed by its rollback."""
+        if getattr(self, "_tree_stash", None) is None:
+            raise RuntimeError("commit_tree() without a preceding verify_tree()")
+        w, L, stash, kv_rows = self._tree_stash
+        keep = len(path)
+        contiguous = list(path) == list(range(keep))
+        pidx = mx.array(path, dtype=mx.int32)
+        rows, li = [], 0
+        for c in cache:
+            if self._is_trimmable(c):
+                if contiguous:                       # the common case (main path first)
+                    c.trim(w - keep)
+                elif id(c) in kv_rows:
+                    k_new, v_new = kv_rows[id(c)]    # back to the prefix, then re-append the
+                    c.trim(w)                        # accepted rows from the verify's own
+                    c.update_and_fetch(k_new[..., pidx, :], v_new[..., pidx, :])   # arrays
+                else:
+                    _compact_kv(c, L, pidx, keep)
+                    c.trim(w - keep)
+                continue
+            rec_delta, rec_conv = stash
+            q, k, v, a, b, A_log, dt_bias, _state0, use_kernel, kw = rec_delta[li]
+
+            def sel(x):
+                return x[:, :keep] if contiguous else x[:, pidx]
+
+            rows.append((sel(q), sel(k), sel(v), sel(a), sel(b), A_log, dt_bias, use_kernel, kw))
+            conv_input = rec_conv[li]
+            n_keep = conv_input.shape[1] - w                 # conv kernel - 1
+            crow = list(range(n_keep)) + [n_keep + r for r in path]
+            c[0] = mx.contiguous(conv_input[:, mx.array(crow[-n_keep:], dtype=mx.int32)])
+            li += 1
+        if rows:
+            self._pending = _Pending(cache, rows)
+            if not DEFERRED_COMMIT:
+                self.flush_pending()
+        self._tree_stash = None
+
+    def tree_selftest(self, atol: float = 1.0) -> bool:
+        """Prove tree verify on THIS model, once, before the loop trusts it.
+
+        Structural (magnitude-independent): every attention layer's rope wrapper ran exactly
+        twice (queries, keys) and, on a hybrid, every linear layer's conv + recurrence went
+        through the tree hooks — a family that applies rope elsewhere or a renamed mlx-lm
+        function fails here outright. Numeric: every row of a branched tree must give the
+        same argmax as a chain verify of its root path, within ``atol`` (the measured
+        kernel-path noise on Qwen3.8-27B-4bit is <= 0.31 — tree and chain take different qmm
+        widths and mask paths, the same fp-tie class as two different caps); committing a
+        NON-contiguous path must leave caches that give the chain-committed next-step logits."""
+        from .tree import DraftTree
+
+        prompt = [1, 2, 3, 4, 5, 6]
+        #            0   1   2   3   4   5       (rows)
+        tree = DraftTree(tokens=[7, 8, 9, 10, 11, 12], parent=[-1, 0, 1, 0, 3, 1])
+        tap = [0]
+
+        def prefilled():
+            c = self.make_cache()
+            self.run(mx.array([prompt]), c, tap)
+            return c
+
+        def close(a, b) -> tuple[bool, float]:
+            a, b = a.astype(mx.float32), b.astype(mx.float32)
+            d = float(mx.abs(a - b).max())
+            return bool((mx.argmax(a, -1) == mx.argmax(b, -1)).all()) and d <= atol, d
+
+        self.reset_spec()
+        cache = prefilled()
+        t_logits, _ = self.verify_tree(tree, cache, tap)
+        mx.eval(t_logits)
+        calls = self._tree_calls
+        n_attn = sum(1 for ly in self._inner.model.layers
+                     if getattr(ly, "self_attn", None) is not None)
+        ok = len(calls["rope"]) == n_attn > 0 and all(c == 2 for c in calls["rope"])
+        if self._recurrence == "gated_delta":
+            n_lin = len(self._gdn_modules)
+            ok = ok and calls["gdu"] == n_lin and calls["conv"] == n_lin
+        worst = 0.0
+        for leaf_path in tree.leaf_paths():
+            ref_c = prefilled()
+            ref, _ = self.verify(mx.array([[tree.tokens[r] for r in leaf_path]]), ref_c, tap)
+            self.reset_spec()
+            good, d = close(t_logits[0, mx.array(leaf_path)], ref[0])
+            ok, worst = ok and good, max(worst, d)
+        # commit a non-contiguous path, then one more committed step vs the chain reference
+        path = [0, 3, 4]
+        self.commit_tree(cache, path)
+        got_next, _ = self.run(mx.array([[13]]), cache, tap)
+        ref_next, _ = self.run(mx.array([[tree.tokens[r] for r in path] + [13]]), prefilled(),
+                               tap)
+        good, d = close(got_next[0, -1:], ref_next[0, -1:])
+        ok, worst = ok and good, max(worst, d)
+        self.reset_spec()
+        self._tree_selftest_worst = worst
+        return ok
 
     # -- tap sanity probe (drafter modes) --
     def verify_tap(self) -> None:

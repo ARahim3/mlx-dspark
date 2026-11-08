@@ -277,6 +277,15 @@
    },
    {
     "flags": [
+     "--tree"
+    ],
+    "metavar": "{auto,on,off,N}",
+    "choices": null,
+    "default": "auto",
+    "help": "dflash/dspark modes: best-first tree verify (see `mlx-dspark generate -h`). auto (default) = derived per loaded pair and machine; per-swap override via /admin/load {\"tree\": ...}"
+   },
+   {
+    "flags": [
      "--wide-gemm-min"
     ],
     "metavar": "N",
@@ -598,6 +607,15 @@
    },
    {
     "flags": [
+     "--tree"
+    ],
+    "metavar": "{auto,on,off,N}",
+    "choices": null,
+    "default": "auto",
+    "help": "greedy dflash/dspark rounds (DFlash 2 and DSpark drafters): verify a best-first TREE over the drafter's candidate lattice instead of one chain. 'auto' (default) = a tree of the chain's own width (no extra verify cost; +6.8%% decode on Qwen3.8-27B-4bit, M4 Pro), widened only where this machine's measured curve makes wide verifies cheap; 'off' = the chain; N = force an N-node tree. Lossless; falls back to chains when the target can't take trees."
+   },
+   {
+    "flags": [
      "--wide-gemm-min"
     ],
     "metavar": "N",
@@ -768,6 +786,15 @@
     "choices": null,
     "default": null,
     "help": "dspark mode only: the 4-gram HYBRID lookup draft, where an n-gram hit supplies a free draft instead of running the drafter that round. Unset = the pair's measured default (registry rows stamped with lookup off carry it — every MoE and the 4-bit 27B hybrids: a free draft still costs verify rows). Distinct from `--modes lookup`, the standalone drafter-free mode. Pass --lookup-drafts / --no-lookup-drafts to force an arm for A/B."
+   },
+   {
+    "flags": [
+     "--tree"
+    ],
+    "metavar": "{auto,on,off,N}",
+    "choices": null,
+    "default": "auto",
+    "help": "dflash/dspark runs: best-first tree verify (see `mlx-dspark generate -h`); --tree off for the chain arm of an A/B"
    },
    {
     "flags": [

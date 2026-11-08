@@ -48,7 +48,7 @@ The OpenAI endpoints also fill the standard `usage.prompt_tokens_details.cached_
 
 | Route | Returns |
 |---|---|
-| `GET /health` | Always open, even with `--api-key` and mid-swap. `status` is `ok`, `loading` or `no_model`. When ready: model, mode, target and drafter, `max_draft`, `lookup_drafts`, `confidence_threshold`, `context_window`, `kv_bits`, the kernel and prefill switches (`small_m`, `multirow_attn`, `sdpa_split`, `cpu_split`, `drafter_window`), `warmup`, `memory_guard`, `max_output_tokens`, `supports_reasoning_effort`, `thinking_default`, `reasoning_effort`, and a `warnings` list (memory pressure, context-window RAM). While loading: `phase` (`loading` or `warming_up`) and `download` progress. |
+| `GET /health` | Always open, even with `--api-key` and mid-swap. `status` is `ok`, `loading` or `no_model`. When ready: model, mode, target and drafter, `max_draft`, `lookup_drafts`, `tree` (`setting` and the resolved `nodes`: null = chains, 0 = the chain's width), `confidence_threshold`, `context_window`, `kv_bits`, the kernel and prefill switches (`small_m`, `multirow_attn`, `sdpa_split`, `cpu_split`, `drafter_window`), `warmup`, `memory_guard`, `max_output_tokens`, `supports_reasoning_effort`, `thinking_default`, `reasoning_effort`, and a `warnings` list (memory pressure, context-window RAM). While loading: `phase` (`loading` or `warming_up`) and `download` progress. |
 | `GET /metrics` | Aggregate counters, allocator memory, macOS memory pressure and swap, the last roofline verdict, memory-guard state. |
 | `GET /machine` | Chip, measured memory bandwidth, the loaded model's bytes per token and single-stream ceiling, and a verdict. Answers without a model too. |
 | `GET /calibration` | This Mac's measured cost curves for the loaded pair. |
@@ -84,6 +84,7 @@ Only `model` is required. Every other key is an override for this load; omit it 
 | `mode` | string | `auto`, `dspark`, `dflash`, `lookup` or `baseline`. |
 | `max_draft` | int or `"auto"` | Pin the cap, or adapt per round. |
 | `lookup_drafts` | bool | Hybrid lookup drafts on or off. |
+| `tree` | `"auto"`, `"on"`, `"off"`, bool or int | Tree verify (DFlash 2 and DSpark drafters): `auto` (derived for this pair and Mac), `on` (a tree of the chain's width), `off` (the chain) or a node count. |
 | `confidence_threshold` | number, 0–1 | 0 disables. |
 | `context_window` | int | Cap the prompt length (a RAM lever). |
 | `kv_bits` | 0, 4 or 8 | Quantized KV cache; 0 = full precision. |

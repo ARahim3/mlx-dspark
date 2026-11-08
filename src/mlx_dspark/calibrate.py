@@ -92,6 +92,18 @@ class _KernelScope:
         return self._stack.__exit__(*exc)
 
 
+def _live_kernel_scope() -> _KernelScope:
+    """The generate loops' kernel context (small-M GEMM, SDPA split, multi-row attention) in
+    their order — split first, multi-row over it, small-M alongside (generate._with_multirow).
+    Every curve is measured inside it, because that is what generation runs (rule 4)."""
+    from . import generate as _gen
+    from .multirow_attn import multirow_attention
+    from .sdpa_split import sdpa_split
+    from .small_m_qmm import small_m_matmul
+    return _KernelScope(small_m_matmul(_gen.SMALL_M_IDS), sdpa_split(_gen.SDPA_SPLIT_CFG),
+                        multirow_attention(_gen.MULTIROW_CFG))
+
+
 def _bench(fn, iters: int = 8, warmup: int = 3) -> float:
     for _ in range(warmup):
         mx.eval(fn())
@@ -126,6 +138,77 @@ def measure_verify_curve(target, tap: list[int], widths: list[int],
 
         curve[m] = _bench(fn)
     return curve
+
+
+def measure_tree_curve(target, tap: list[int], nodes: list[int], slots: int,
+                       ctx_len: int = CTX_LEN) -> dict[int, float]:
+    """ms per TREE verify forward (``Target.verify_tree`` — the path production runs: the tree
+    recurrence kernel, or the path-batched fallback where there is none) for a synthetic
+    ``n``-node tree with the prior leaf count (``tree.synthetic_tree``), keyed by node count.
+    Same harness as :func:`measure_verify_curve`: warm ``ctx_len`` cache, rolled back after
+    every forward. A chain verify of the same width is NOT a stand-in for this: the fallback
+    pays a state read + write per leaf, and a 31-node tree holds ~10."""
+    from .tree import synthetic_tree, to_device
+
+    cache = target.make_cache()
+    mx.eval(target.run(mx.array([[TOKEN_ID] * ctx_len]), cache, tap)[0])
+    conv_k = target._tree_conv_k()
+    curve: dict[int, float] = {}
+    for n in sorted(nodes):
+        dt = to_device(synthetic_tree(n, slots, anchor=TOKEN_ID), conv_k)
+        mx.eval(dt.tokens, dt.parent, dt.depth, dt.anc, dt.bits, dt.conv_idx)
+
+        def fn(dt=dt, w=dt.width):
+            logits, _ = target.verify_tree(dt, cache, tap)
+            for c in cache:                      # roll back so every iteration is identical
+                if c is not None and hasattr(c, "trim"):
+                    c.trim(w)
+            return logits
+
+        curve[n] = _bench(fn)
+    target._tree_stash = None                    # drop the last verify's captured rows
+    return curve
+
+
+def measure_tree_fallback_ratio(target, tap: list[int], cap: int,
+                                ctx_len: int = CTX_LEN) -> float:
+    """Tree verify / chain verify at the chain's own width, timed back to back on one warm cache
+    (chain, tree, chain; the tree against the chain mean) so thermal state cancels:
+    ``synthetic_tree(cap)`` with the prior leaf count (2 leaves at 7 nodes — the real tree
+    branches in 13–61% of rounds, so this is conservative) vs a ``cap + 1``-row chain.
+    ``static_tree`` prices the equal-width tree with it on a GPU whose recurrence runs the
+    per-leaf fallback. M4 Pro, Qwen3.8-27B-4bit: tree kernel 1.007–1.015; fallback forced
+    1.05–1.07 (+2 ms gather, +2 ms per extra leaf) — and the fallback also needs the tree on
+    the host before the verify graph can be built, which forfeits the drafter overlap in
+    every tree round, a cost this microbench cannot see. Ratios above the margin are losses
+    for certain; ratios inside it are not quite proof."""
+    from .tree import synthetic_tree, to_device
+
+    cache = target.make_cache()
+    mx.eval(target.run(mx.array([[TOKEN_ID] * ctx_len]), cache, tap)[0])
+    w = cap + 1
+    x = mx.array([[TOKEN_ID] * w])
+    dt = to_device(synthetic_tree(cap, cap, anchor=TOKEN_ID), target._tree_conv_k())
+    mx.eval(dt.tokens, dt.parent, dt.depth, dt.anc, dt.bits, dt.conv_idx)
+
+    def rollback():
+        for c in cache:
+            if c is not None and hasattr(c, "trim"):
+                c.trim(w)
+
+    def chain():
+        logits, _ = target.run(x, cache, tap)
+        rollback()
+        return logits
+
+    def tree():
+        logits, _ = target.verify_tree(dt, cache, tap)
+        rollback()
+        return logits
+
+    c1, t, c2 = _bench(chain), _bench(tree), _bench(chain)
+    target._tree_stash = None
+    return t / ((c1 + c2) / 2.0)
 
 
 def _inflate_kv(cache, depth: int) -> None:
@@ -1295,7 +1378,7 @@ def apply_multirow_attn(target, drafter=None, *, enabled=None, cache_dir=None, v
 
 def calibrate(target, drafter, *, mode: str, target_repo: str, drafter_repo: str | None,
               cache_dir: str | None = None, verbose: bool = True,
-              batch_widths: list[int] | None = None) -> CapController:
+              batch_widths: list[int] | None = None, tree_wide: bool = False) -> CapController:
     """Measure (or load from the disk cache) this machine+pair's cost curves and return a
     ready :class:`CapController`. ``mode`` is ``"dspark"`` or ``"dflash"``. ``batch_widths``
     (e.g. ``[2, 4]`` when serving with ``--max-batch 4``) additionally measures the batched
@@ -1323,9 +1406,6 @@ def calibrate(target, drafter, *, mode: str, target_repo: str, drafter_repo: str
     # kernel enabled (apply_small_m, before this), 4-bit verify is flat at widths 6-8 —
     # measured outside the context the controller would price wide caps ~1.5x too high.
     from . import generate as _gen
-    from .multirow_attn import multirow_attention
-    from .sdpa_split import sdpa_split
-    from .small_m_qmm import small_m_matmul
     smm_ids = _gen.SMALL_M_IDS
     sdps_cfg = _gen.SDPA_SPLIT_CFG            # the verify DEPTH SLOPE is measured under the
     #   split (it fires at the inflated KV depth, not the ctx-512 base curve), so the
@@ -1333,10 +1413,7 @@ def calibrate(target, drafter, *, mode: str, target_repo: str, drafter_repo: str
     mra_cfg = _gen.MULTIROW_CFG               # same for the multi-row attention kernel
 
     def kernels():
-        # the generate loops' order: split installed first, multirow over it (see
-        # generate._with_multirow), small-M alongside
-        return _KernelScope(small_m_matmul(smm_ids), sdpa_split(sdps_cfg),
-                            multirow_attention(mra_cfg))
+        return _live_kernel_scope()          # the generate loops' kernel context (rule 4)
 
     key = _cache_key(mode, target_repo, drafter_repo,
                      kv_bits=getattr(target, "kv_bits", None))
@@ -1412,6 +1489,30 @@ def calibrate(target, drafter, *, mode: str, target_repo: str, drafter_repo: str
         entry["verify_depth"] = vd
         save_cached(key, entry, cache_dir)
 
+    # Wide-tree node counts (static_tree): measured ONLY where this machine's own 12-row chain
+    # point says wide verifies are cheap — never on M1-M4, whose 4-bit 27B pays +65% from 8 to
+    # 9-16 rows (the gate fails on the existing curve, so no extra calibration there). Measured
+    # as TREE verifies (synthetic trees with the prior leaf count), not chain verifies of the
+    # same width: without the tree recurrence kernel the path-batched fallback pays a state
+    # read + write per leaf that no chain shows, and a 31-node tree holds ~10 leaves. The
+    # equal-width point (max_cap nodes) is measured too — the base a wider tree must beat.
+    if tree_wide and mode == "dflash" and target.tree_ready():
+        have = {int(k): float(v) for k, v in entry["verify"].items()}
+        have_tree = {int(k) for k in (entry.get("tree_verify") or {})}
+        missing = [n for n in (max_cap,) + TREE_WIDE_NODES if n not in have_tree]
+        if missing and 12 in have and have[12] <= TREE_WIDE_GATE * _interp(have, max_cap + 1):
+            if verbose:
+                print(f"calibrating tree verify at {missing} nodes (one-time, cached)…",
+                      flush=True)
+            with kernels():
+                tree_ms = measure_tree_curve(target, tap, missing, max_cap)
+            # a key of its own: the cap controller, knee detection and the depth-slope width
+            # pick read entry["verify"] and must not see widths no chain ever runs
+            tv = entry.setdefault("tree_verify", {})
+            for n, v in tree_ms.items():
+                tv[str(n)] = v
+            save_cached(key, entry, cache_dir)
+
     verify = {int(k): float(v) for k, v in entry["verify"].items()}
     drafter_ms = (entry["drafter"] if not isinstance(entry["drafter"], dict)
                   else {int(k): float(v) for k, v in entry["drafter"].items()})
@@ -1475,3 +1576,165 @@ def static_cap(target, drafter, *, mode: str, target_repo: str, drafter_repo: st
     except Exception:  # noqa: BLE001 — calibration is an optimization, never a gate
         return fallback
     return ctrl.static_best(STATIC_PRIOR_P)
+
+
+# ---- tree verify budget (tree.py) ------------------------------------------------------
+
+TREE_WIDE_NODES = (11, 15, 23, 31)  # wide-tree node counts, measured as TREE verifies past the gate
+TREE_WIDE_GATE = 1.25             # 12-row chain verify <= 1.25x the chain's width: worth pricing
+TREE_WIDE_MARGIN = 1.03           # a wide tree must beat the equal-width one by >3% (model)
+TREE_FALLBACK_MARGIN = 1.03       # the equal-width tree on the recurrence FALLBACK (no tree
+#   kernel): on only if its verify, measured back to back with the chain's, costs <= 3% more
+
+
+def parse_tree_setting(value) -> str | int:
+    """A CLI/API tree setting -> ``"auto" | "on" | "off"`` or a node count (int >= 1).
+    ``None`` = auto, booleans = on/off, ``0`` = on (equal width). Raises ``ValueError``."""
+    if value is None:
+        return "auto"
+    if isinstance(value, bool):
+        return "on" if value else "off"
+    if isinstance(value, int):
+        from .tree import TREE_MAX_NODES
+
+        if not 0 <= value <= TREE_MAX_NODES:
+            raise ValueError(f"tree node count must be 0-{TREE_MAX_NODES}, got {value}")
+        return value if value > 0 else "on"
+    s = str(value).strip().lower()
+    if s in ("auto", "on", "off"):
+        return s
+    if s.isdigit():
+        return parse_tree_setting(int(s))
+    raise ValueError(f"tree must be auto, on, off or a node count, got {value!r}")
+
+
+def wide_tree_nodes(verify_ms: dict[int, float], draft_ms: float, cap: int,
+                    tree_ms: dict[int, float] | None = None,
+                    margin: float = TREE_WIDE_MARGIN) -> int:
+    """The best tree WIDER than ``cap`` by prior gain (``tree.tree_gain``) per measured round
+    cost, or 0 (= stay at the chain's width). ``tree_ms`` = measured TREE verify ms by node
+    count (``measure_tree_curve``: the real path, kernel or per-leaf fallback); only node
+    counts measured there are priced — a chain verify of the same width never stands in, and
+    nothing is extrapolated, since the curve's shape past the measured points is exactly the
+    hardware property in question. The base is the equal-width tree's own measured cost when
+    present, else the chain's (the two were a wash with the tree kernel on an M4 Pro)."""
+    from .tree import TREE_GAIN_PRIOR, tree_gain
+
+    tree_ms = tree_ms or {}
+    base_ms = tree_ms.get(cap, _interp(verify_ms, cap + 1))
+    base = 1.0 / (base_ms + draft_ms)
+    best, best_rate = 0, base * margin
+    for n in sorted(TREE_GAIN_PRIOR):
+        if n <= cap or n not in tree_ms:
+            continue
+        rate = tree_gain(n, cap) / (tree_ms[n] + draft_ms)
+        if rate > best_rate:
+            best, best_rate = n, rate
+    return best
+
+
+def tree_capable(drafter) -> bool:
+    """Drafters that expose a candidate lattice for tree verify: DFlash 2 (its selector) and
+    DSpark heads (``DSparkDrafter.tree_lattice``: the chain plus the top base candidates,
+    Markov-scored). DFlash 1 has neither."""
+    return (getattr(drafter, "candidate_selector", None) is not None
+            or hasattr(drafter, "tree_lattice"))
+
+
+def static_tree(target, drafter, *, setting="auto", target_repo: str,
+                drafter_repo: str | None, cap: int | None = None,
+                cache_dir: str | None = None, verbose: bool = False,
+                mode: str = "dflash") -> int | None:
+    """Resolve a spec pair's (``mode`` dflash or dspark) tree-verify budget: ``None`` = chains, ``0`` = a best-first tree
+    of the chain's own width every round, ``N`` = an N-node tree at the full cap.
+
+    Needs a DFlash 2 selector drafter and a target that passes ``Target.tree_ready`` (the
+    one-time plumbing self-test). ``auto`` turns the equal-width tree on — it never costs an
+    extra verify row, so with the tree recurrence kernel live it needs no price (replay +8.4%
+    tokens/round on Qwen3.8-27B; measured +6.8% decode at equal round time on an M4 Pro) —
+    and widens it only where this machine's measured TREE verifies make the wider pass pay
+    (``wide_tree_nodes``). Where the recurrence runs the path-batched fallback instead
+    (``Target.tree_kernel_live`` False: no verified kernel on this GPU generation, odd head
+    dims) a tree pays a state read + write per leaf, so the equal-width tree is turned on only
+    if ONE paired measurement (``measure_tree_fallback_ratio``, tree vs chain back to back)
+    puts it within ``TREE_FALLBACK_MARGIN`` of the chain; dense targets have no recurrence and
+    no fallback. That paired ratio is the only measurement this ever takes — it never starts a
+    curve calibration (a one-shot absolute curve on a hot GPU mis-derives, CLAUDE.md rule 5; a
+    back-to-back ratio cancels that). Must run on the MLX thread (forwards)."""
+    setting = parse_tree_setting(setting)
+    if setting == "off" or not tree_capable(drafter):
+        return None
+    try:
+        if not target.tree_ready():
+            return None
+    except Exception:  # noqa: BLE001 — trees are an optimization, never a gate
+        return None
+    if setting == "on":
+        return 0
+    if isinstance(setting, int):
+        return setting
+    from . import generate as _gen
+
+    block_cap = (int(drafter.max_draft) if mode == "dspark"
+                 else max(1, int(getattr(drafter.config, "block_size", 8)) - 1))
+    cap = block_cap if cap is None else max(1, min(int(cap), block_cap))
+
+    def lookup():
+        # (dspark curves stop at width block + 1, so their 12-row gate never opens: a DSpark
+        # pair runs the equal-width tree and is never widened — wide trees are dead on M1–M4
+        # anyway, and the M5 derivation needs the tree kernel verified there first)
+        return cached_curve_entry(
+            mode, target_repo, drafter_repo, kv_bits=getattr(target, "kv_bits", None),
+            smm_live=bool(_gen.SMALL_M_IDS), sdps_live=_gen.SDPA_SPLIT_CFG is not None,
+            mra_live=_gen.MULTIROW_CFG is not None, cache_dir=cache_dir)
+
+    if not getattr(target, "tree_kernel_live", True):
+        try:
+            key, entry = lookup()
+            fb = (entry or {}).get("tree_fallback") or {}
+            if int(fb.get("cap", -1)) != cap:
+                if verbose:
+                    print("measuring the tree's recurrence-fallback cost (no tree kernel on "
+                          "this GPU; tree vs chain back to back, cached)…", flush=True)
+                tap = list(drafter.config.target_layer_ids)
+                with _live_kernel_scope():
+                    ratio = measure_tree_fallback_ratio(target, tap, cap)
+                fb = {"cap": cap, "ratio": float(ratio)}
+                if entry is not None:            # cached on the pair's curve entry, if any
+                    entry["tree_fallback"] = fb
+                    save_cached(key, entry, cache_dir)
+                if verbose:
+                    verdict = "tree on" if ratio <= TREE_FALLBACK_MARGIN else "chains"
+                    print(f"  tree/chain verify at {cap} nodes: {ratio:.3f} ({verdict})",
+                          flush=True)
+            if float(fb["ratio"]) > TREE_FALLBACK_MARGIN:
+                return None
+        except Exception:  # noqa: BLE001 — an unpriced fallback runs chains, never crashes
+            return None
+    if cap < block_cap:
+        return 0                          # wide trees are priced at the full block only
+    # auto: price a wider tree from the CACHED curve only — never start a calibration just for
+    # this (a pinned --max-draft skips static_cap's, and a benchmark sweep would calibrate on a
+    # hot GPU, which mis-derives — CLAUDE.md rule 5); the wide node counts themselves are
+    # measured (as tree verifies) only when the cached 12-row chain point already says wide
+    # verifies are cheap here.
+    try:
+        _, entry = lookup()
+        if entry is None:
+            return 0
+        verify = {int(k): float(v) for k, v in entry["verify"].items()}
+        tree_ms = {int(k): float(v) for k, v in (entry.get("tree_verify") or {}).items()}
+        if (12 in verify and verify[12] <= TREE_WIDE_GATE * _interp(verify, cap + 1)
+                and any(n not in tree_ms for n in (cap,) + TREE_WIDE_NODES)):
+            calibrate(target, drafter, mode=mode, target_repo=target_repo,
+                      drafter_repo=drafter_repo, cache_dir=cache_dir, verbose=verbose,
+                      tree_wide=True)            # backfills tree_verify on this entry
+            _, entry = lookup()
+            tree_ms = {int(k): float(v)
+                       for k, v in ((entry or {}).get("tree_verify") or {}).items()}
+        d = entry["drafter"]
+        draft_ms = float(d) if not isinstance(d, dict) else _interp(
+            {int(k): float(v) for k, v in d.items()}, cap)
+    except Exception:  # noqa: BLE001
+        return 0
+    return wide_tree_nodes(verify, draft_ms, cap, tree_ms)

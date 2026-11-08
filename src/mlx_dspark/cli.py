@@ -106,6 +106,14 @@ def cmd_generate(argv: list[str]) -> None:
                          "measured default (ON for most targets — free extra speedup on "
                          "copy-heavy spans; OFF where the registry stamped it a net loss: "
                          "MoE targets and the 4-bit 27B hybrids). Lossless either way.")
+    ap.add_argument("--tree", default="auto", type=_tree_arg, metavar="{auto,on,off,N}",
+                    help="greedy dflash/dspark rounds (DFlash 2 and DSpark drafters): verify a best-first TREE "
+                         "over the drafter's candidate lattice instead of one chain. 'auto' "
+                         "(default) = a tree of the chain's own width (no extra verify cost; "
+                         "+6.8%% decode on Qwen3.8-27B-4bit, M4 Pro), widened only where this "
+                         "machine's measured curve makes wide verifies cheap; 'off' = the "
+                         "chain; N = force an N-node tree. Lossless; falls back to chains "
+                         "when the target can't take trees.")
     ap.add_argument("--wide-gemm-min", type=int, default=None, metavar="N",
                     help="prefill only: row count from which QuantizedLinear dequantizes the "
                          "weight once and runs a plain GEMM instead of quantized_matmul "
@@ -261,10 +269,19 @@ def cmd_generate(argv: list[str]) -> None:
             if not lookup:
                 print("  lookup drafts off (measured default for this pair; "
                       "--lookup-drafts forces on)")
+        from .calibrate import static_tree, tree_capable
+
+        tree_nodes = static_tree(target, drafter, setting=args.tree, target_repo=target_repo,
+                                 drafter_repo=drafter_repo, cap=cap, mode="dspark")
+        if args.temperature <= 0 and tree_capable(drafter):
+            print("  tree: " + ("off (chain)" if tree_nodes is None else
+                                "best-first, the chain's width" if tree_nodes == 0 else
+                                f"best-first, {tree_nodes} nodes")
+                  + " (override with --tree)")
         res = speculative_generate(
             target, tok, drafter, args.prompt,
             max_new_tokens=args.max_new_tokens, max_draft_tokens=cap,
-            cap_controller=cap_controller, lookup_drafts=lookup,
+            cap_controller=cap_controller, tree=tree_nodes, lookup_drafts=lookup,
             lookup_long_draft=args.lookup_long_draft,
             confidence_threshold=args.confidence_threshold,
             temperature=args.temperature, top_p=args.top_p, top_k=args.top_k, seed=args.seed,
@@ -287,14 +304,25 @@ def cmd_generate(argv: list[str]) -> None:
             cap = static_cap(target, drafter, mode="dflash", target_repo=target_repo,
                              drafter_repo=drafter_repo, fallback=fb)
             print(f"  cap {cap} (measured for this model+quant; override with --max-draft)")
+        from .calibrate import static_tree, tree_capable
+
+        tree_nodes = static_tree(target, drafter, setting=args.tree, target_repo=target_repo,
+                                 drafter_repo=drafter_repo, cap=cap)
+        if args.temperature <= 0 and tree_capable(drafter):
+            print("  tree: " + ("off (chain)" if tree_nodes is None else
+                                "best-first, the chain's width" if tree_nodes == 0 else
+                                f"best-first, {tree_nodes} nodes")
+                  + " (override with --tree)")
         res = dflash_generate(
             target, tok, drafter, args.prompt,
             max_new_tokens=args.max_new_tokens, max_draft_tokens=cap,
-            cap_controller=cap_controller,
+            cap_controller=cap_controller, tree=tree_nodes,
             temperature=args.temperature, top_p=args.top_p, top_k=args.top_k,
             seed=args.seed, apply_chat_template=not args.no_chat_template, on_text=on_text,
         )
         extra = f" · accept {res.mean_accept_len:.2f}/round · {res.target_forwards} target fwds"
+        if res.tree_rounds:
+            extra += f" · {res.tree_rounds} tree rounds"
     elif args.mode == "lookup":
         cap = 6 if (max_draft is None or not isinstance(max_draft, int) or max_draft <= 0) \
             else max_draft
@@ -431,6 +459,10 @@ def cmd_serve(argv: list[str]) -> None:
     ap.add_argument("--lookup-long-draft", type=int, default=32,
                     help="match-scaled long-draft ceiling for lookup drafts (default 32; "
                          "set to 6 to disable — see `mlx-dspark generate -h`)")
+    ap.add_argument("--tree", default="auto", type=_tree_arg, metavar="{auto,on,off,N}",
+                    help="dflash/dspark modes: best-first tree verify (see `mlx-dspark generate -h`). "
+                         "auto (default) = derived per loaded pair and machine; per-swap "
+                         "override via /admin/load {\"tree\": ...}")
     ap.add_argument("--wide-gemm-min", type=int, default=None, metavar="N",
                     help="prefill wide-GEMM crossover row count (default: calibrated once and "
                          "cached; 0 disables — see `mlx-dspark generate -h`)")
@@ -517,6 +549,7 @@ def cmd_serve(argv: list[str]) -> None:
         "prefix_cache_rungs": args.prefix_cache_rungs,
         "lookup_drafts": args.lookup_drafts,     # None = per-pair registry default
         "lookup_long_draft": args.lookup_long_draft,
+        "tree": args.tree,                       # auto = derived per pair + machine
         "wired_limit": args.wired_limit,
         "wide_gemm_min": args.wide_gemm_min,
         "cpu_split": args.cpu_split,             # None = calibrated default, 0 = off
@@ -671,6 +704,18 @@ def cmd_claude(argv: list[str]) -> None:
 # --------------------------------------------------------------------------- benchmark
 
 
+def _tree_arg(value: str) -> str:
+    """argparse type for --tree: validate early (a bad value is a usage error, not a crash
+    after the model load)."""
+    from .calibrate import parse_tree_setting
+
+    try:
+        parse_tree_setting(value)
+    except ValueError as e:
+        raise argparse.ArgumentTypeError(str(e)) from None
+    return value
+
+
 BENCH_PROMPTS = {
     "chat": "Explain how rainbows form.",
     "code": "Write a Python function to check if a string is a palindrome.",
@@ -722,6 +767,9 @@ def cmd_benchmark(argv: list[str]) -> None:
                          "free draft still costs verify rows). Distinct from `--modes "
                          "lookup`, the standalone drafter-free mode. Pass --lookup-drafts / "
                          "--no-lookup-drafts to force an arm for A/B.")
+    ap.add_argument("--tree", default="auto", type=_tree_arg, metavar="{auto,on,off,N}",
+                    help="dflash/dspark runs: best-first tree verify (see `mlx-dspark generate -h`); "
+                         "--tree off for the chain arm of an A/B")
     ap.add_argument("--small-m", action=argparse.BooleanOptionalAction, default=None,
                     help="small-M MMA verify kernel (see `mlx-dspark generate --help`). "
                          "Unset = on where the cached probe proves it faster; "
@@ -874,6 +922,14 @@ def cmd_benchmark(argv: list[str]) -> None:
         apply_wide_gemm(target, drafter, target_repo=target_repo, verbose=False)
         apply_cpu_split(target, drafter, target_repo=target_repo, frac=args.cpu_split,
                         verbose=False)
+        tn = None
+        if mode in ("dflash", "dspark"):
+            # resolved ONCE, before any timed run: its self-test runs forwards, and pricing
+            # must never trigger a calibration mid-sweep on a hot GPU (rule 5)
+            from .calibrate import static_tree
+
+            tn = static_tree(target, drafter, setting=args.tree, target_repo=target_repo,
+                             drafter_repo=drafter_repo, mode=mode)
         for cap in caps:
             ctrl = None
             md: int | None = None
@@ -887,17 +943,19 @@ def cmd_benchmark(argv: list[str]) -> None:
             # drafter/md/ctrl bound as defaults: each lambda is consumed by run() inside this
             # iteration, but binding makes that explicit rather than implicit (ruff B023)
             if mode == "dspark":
-                tag = "" if lookup_drafts else " nolookup"
-                run(f"dspark cap={cap}{tag}", lambda p, d=drafter, md=md, ctrl=ctrl:
+                tag = ("" if lookup_drafts else " nolookup") + (
+                    "" if tn is None else (" tree" if tn == 0 else f" tree{tn}"))
+                run(f"dspark cap={cap}{tag}", lambda p, d=drafter, md=md, ctrl=ctrl, tn=tn:
                     speculative_generate(
                         target, tok, d, p, max_new_tokens=args.max_new_tokens,
                         max_draft_tokens=md if md else None, cap_controller=ctrl,
-                        lookup_drafts=lookup_drafts))
+                        lookup_drafts=lookup_drafts, tree=tn))
             else:
-                run(f"dflash cap={cap}", lambda p, d=drafter, md=md, ctrl=ctrl:
+                tag = "" if tn is None else (" tree" if tn == 0 else f" tree{tn}")
+                run(f"dflash cap={cap}{tag}", lambda p, d=drafter, md=md, ctrl=ctrl, tn=tn:
                     dflash_generate(
                         target, tok, d, p, max_new_tokens=args.max_new_tokens,
-                        max_draft_tokens=md if md else None, cap_controller=ctrl))
+                        max_draft_tokens=md if md else None, cap_controller=ctrl, tree=tn))
         drafter = None                     # release before the next mode's drafter loads
 
     if args.json:

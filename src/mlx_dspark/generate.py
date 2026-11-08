@@ -26,6 +26,7 @@ from .multirow_attn import multirow_attention as _multirow_scope
 from .sampling import sample_probs, truncate_probs
 from .sdpa_split import sdpa_split as _sdpa_split_scope
 from .small_m_qmm import small_m_matmul
+from .tree import device_tree
 from .wide_gemm import wide_matmul
 
 TAP = None  # set from drafter config at call time
@@ -93,6 +94,7 @@ class GenResult:
     seconds: float
     finish_reason: str = "stop"  # "stop" (eos/stop-string) | "length" (hit max_new_tokens)
     lookup_rounds: int = 0       # rounds whose draft came from the free n-gram lookup
+    tree_rounds: int = 0         # rounds verified as a branched best-first tree (tree.py)
     logprobs: list | None = None  # per-token [{token_id, logprob, top:[(id, logprob), …]}], if requested
     prefill_seconds: float = 0.0  # wall time in prompt-eval (prefill); decode = seconds - this.
     #                               0.0 (the default for any un-instrumented caller) means "not
@@ -637,8 +639,16 @@ def dflash_generate(
     on_prefill=None,
     prefill_marks=None,
     on_prefill_chunk=None,
+    tree: int | None = None,
 ) -> GenResult:
     """Speculative decoding with a **z-lab DFlash** (block-diffusion) drafter.
+
+    ``tree`` (greedy DFlash 2 only; library default off): verify a best-first TREE over the
+    selector's lattice instead of the greedy chain — ``0`` = the chain's own width each round
+    (the M1-M4 lever: same verify cost, better-spent rows), ``N`` = an N-node tree at the full
+    cap (a calibrated wide tree for chips whose wide verifies are cheap; see
+    ``calibrate.static_tree``). Lossless like the chain; falls back to chains when the target
+    can't take trees (``Target.tree_ready``). See ``tree.py``.
 
     DFlash differs from DSpark in two ways that matter to this loop:
       - it feeds ``[anchor] + (block-1) masks`` and reads logits at the **mask** positions
@@ -681,6 +691,14 @@ def dflash_generate(
     cap_ceiling = kdraft if max_draft_tokens is None else max(1, min(max_draft_tokens, kdraft))
     cap = cap_ceiling
     eos_ids = eos_token_ids(tokenizer)
+    # Tree verify (greedy DFlash 2 only): the selector lattice -> a best-first tree of the
+    # SAME width as the chain (tree=0), or `tree` nodes at the full cap (a calibrated wide
+    # tree); the target proves the plumbing once (tree_ready) or the loop keeps chains.
+    tree_on = (tree is not None and temperature <= 0.0
+               and getattr(drafter, "candidate_selector", None) is not None
+               and target_model.tree_ready())
+    conv_k = target_model._tree_conv_k() if tree_on else 4
+    tree_rounds = 0
 
     ids = prompt_ids if prompt_ids is not None else encode_prompt(
         tokenizer, prompt, use_chat=apply_chat_template)
@@ -859,6 +877,8 @@ def dflash_generate(
             cap = max(1, min(cap_controller.cap, cap_ceiling))
         block = mx.array([[pending] + [mask_id] * (bs - 1)])
         sel = getattr(drafter, "candidate_selector", None)   # DFlash 2 path when present
+        tree_path = None                                 # set by a tree round (tree.py)
+        branched = False
         if temperature > 0.0:
             # two-phase: the accept test needs the q distributions on hand
             if sel is not None:
@@ -886,6 +906,29 @@ def dflash_generate(
 
             n, repl = _spec_sample_accept(v_logits[0], drafted, q_probs, temperature, top_p, top_k)
             committed = drafted[:n] + [repl]             # accepted prefix + residual/bonus
+        elif tree_on:
+            # Tree round, ONE graph and one sync like the chain: the lattice -> a best-first
+            # tree of n_nodes built on the GPU (tree.device_tree, ~0.3 ms) -> one verify forward
+            # of width n_nodes + 1, the same width as a cap-n_nodes chain. The drafter + tree
+            # build launch asynchronously so Python builds the verify graph meanwhile.
+            cand_a, sc_a, _ = drafter.select_lattice(block, pending_ctx, dcache, cap=cap,
+                                                     anchor_id=pending)
+            # widen past the chain only at the FULL block (where the wide tree was priced) —
+            # never when a depth capper / pinned cap shrank this round's cap (the server
+            # passes that shrunk cap as max_draft_tokens, so cap_ceiling can't tell)
+            n_nodes = tree if (tree > cap and cap == kdraft) else cap
+            dtree = device_tree(cand_a, sc_a, n_nodes, pending, conv_k)
+            mx.async_eval(dtree.tokens, dtree.parent)
+            v_logits, v_fused = target_model.verify_tree(dtree, cache, tap)
+            tt_arr = mx.argmax(v_logits[0], axis=-1)
+            mx.eval(tt_arr, dtree.tokens, dtree.parent)
+            htree = dtree.to_host()
+            tree_path, bonus = htree.walk(tt_arr.tolist())
+            n = len(tree_path) - 1
+            drafted = htree.tokens[1:]
+            committed = [htree.tokens[r] for r in tree_path[1:]] + [bonus]
+            branched = not htree.is_chain()
+            tree_rounds += branched
         else:
             # fused greedy path: draft + verify + accept reach the device as one graph with
             # a single sync per round (see speculative_generate for the same pattern).
@@ -897,6 +940,10 @@ def dflash_generate(
             else:
                 head = drafter(block, pending_ctx, dcache, logits_start=1)[0][:cap]
                 draft_arr = mx.argmax(head, axis=-1)
+            # Launch the drafter now: the GPU drafts (~12 ms on a 27B pair) while Python builds
+            # the verify graph (~3.4 ms of graph construction the GPU used to sit idle for —
+            # measured +4.2% decode on Qwen3.8-27B-4bit, token-identical). Pure scheduling.
+            mx.async_eval(draft_arr)
             verify_ids = mx.concatenate(
                 [mx.array([pending], dtype=draft_arr.dtype), draft_arr]).reshape(1, -1)
             v_logits, v_fused = target_model.verify(verify_ids, cache, tap)
@@ -911,14 +958,22 @@ def dflash_generate(
         target_forwards += 1
         accept_lengths.append(len(committed))
         if cap_controller is not None:
-            cap_controller.update(n, len(drafted))
+            # a tree's accept depth is bounded by the lattice depth (cap), not its node count
+            cap_controller.update(n, cap if tree_path is not None else len(drafted))
         if on_round is not None:
-            on_round(drafted=len(drafted), accepted=n, committed=len(committed),
-                     cap=cap, source="drafter")
+            # a tree's nodes are not chain positions: report the lattice depth (cap) so the
+            # per-position acceptance telemetry stays a chain-position histogram
+            on_round(drafted=min(len(drafted), cap) if tree_path is not None else len(drafted),
+                     accepted=n, committed=len(committed),
+                     cap=cap, source="tree" if branched else "drafter")
 
         # ---- update target cache + draft ctx ----
-        target_model.rollback(cache, len(drafted) - n, drafted[:n])
-        pending_ctx = v_fused[:, : n + 1, :]             # [anchor, accepted] -> next draft ctx
+        if tree_path is not None:
+            target_model.commit_tree(cache, tree_path)
+            pending_ctx = v_fused[:, mx.array(tree_path), :]     # [anchor, accepted path]
+        else:
+            target_model.rollback(cache, len(drafted) - n, drafted[:n])
+            pending_ctx = v_fused[:, : n + 1, :]         # [anchor, accepted] -> next draft ctx
 
         appended = []
         for tok in committed:
@@ -930,6 +985,7 @@ def dflash_generate(
             index.extend(appended)                       # keep the copy index current
         pending = out_ids[-1]        # eos mid-committed ends the loop (not committed[-1])
         st.update(out_ids)
+    target_model.flush_pending()      # deferred-commit rows -> stored state (storable caches)
     st.flush()
 
     secs = time.time() - t0
@@ -944,6 +1000,7 @@ def dflash_generate(
         seconds=secs,
         prefill_seconds=t_prefill - t0,
         lookup_rounds=lookup_rounds,
+        tree_rounds=tree_rounds,
         finish_reason=_finish_reason(out_ids, max_new_tokens, pending, eos_ids, st),
     )
 
@@ -1133,6 +1190,7 @@ def speculative_generate(
     confidence_threshold: float = 0.0,
     max_draft_tokens: int | None = 2,
     cap_controller=None,
+    tree: int | None = None,
     lookup_drafts: bool = True,
     lookup_max_draft: int = 6,
     lookup_long_draft: int = 32,
@@ -1222,6 +1280,16 @@ def speculative_generate(
         ctx_caches = drafter.make_ctx_cache()
         reuse_len = 0
     target_model.reset_spec()                          # hybrid targets: clear capture state
+    # Tree verify (greedy DSpark rounds, tree.py): the drafter's chain plus its top side
+    # candidates, Markov-scored (DSparkDrafter.tree_lattice), as a best-first tree of the SAME
+    # width as the chain (tree=0) or `tree` nodes at the full block, verified in one forward
+    # (Target.verify_tree; replay +4.7% tokens/round on the Red Hat Qwen3.8 head). The target
+    # proves the plumbing once (tree_ready) or the loop keeps chains; sampling, logprobs,
+    # penalties, the confidence head and lookup rounds keep chains.
+    tree_on = (tree is not None and temperature <= 0.0 and logprobs is None
+               and hasattr(drafter, "tree_lattice") and target_model.tree_ready())
+    conv_k = target_model._tree_conv_k() if tree_on else 4
+    tree_rounds = 0
     st = _Streamer(tokenizer, eos_ids, on_text, stop)
     t0 = time.time()
 
@@ -1268,6 +1336,8 @@ def speculative_generate(
     st.update(out_ids)
     while len(out_ids) < max_new_tokens and pending not in eos_ids and not st.stopped:
         lk_draft = []
+        tree_path = None                                 # set by a tree round (tree.py)
+        branched = False
         if index is not None:
             # clamp to the remaining budget: no verify width wasted past max_new_tokens
             lk_draft = index.propose(
@@ -1439,19 +1509,46 @@ def speculative_generate(
                 # matches), so the whole round — draft heads + verify forward + accept —
                 # reaches the device as one batched graph with a single sync.
                 draft_arr = drafter.sample_block(base_logits, first_prev_token=pending)
-                verify_ids = mx.concatenate(
-                    [mx.array([pending], dtype=draft_arr.dtype), draft_arr]).reshape(1, -1)
-                v_logits, v_fused = target_model.verify(verify_ids, cache, tap)
-                tt_arr = mx.argmax(v_logits[0], axis=-1)
-                match = (draft_arr == tt_arr[: draft_arr.shape[0]]).astype(mx.int32)
-                n_arr = mx.cumprod(match).sum()
-                mx.eval(n_arr, tt_arr, draft_arr)
-                n = int(n_arr.item())
-                draft = draft_arr.tolist()
-                tt = tt_arr.tolist()
-                committed = draft[:n] + [tt[n]]                # accepted prefix + bonus
+                if tree_on and cap >= 2:
+                    # Tree round, ONE graph and one sync like the chain (see dflash_generate):
+                    # the chain + its side candidates -> a best-first tree built on the GPU ->
+                    # one verify of width n_nodes + 1 (= the cap-n_nodes chain's). Drafter + tree
+                    # launch asynchronously so Python builds the verify graph meanwhile; wider
+                    # than the chain only at the FULL block, where a wide tree was priced.
+                    cand_t, sc = drafter.tree_lattice(base_logits, draft_arr, pending)
+                    n_nodes = tree if (tree > cap and cap == kdraft) else cap
+                    dtree = device_tree(cand_t, sc, n_nodes, pending, conv_k)
+                    mx.async_eval(dtree.tokens, dtree.parent)
+                    v_logits, v_fused = target_model.verify_tree(dtree, cache, tap)
+                    tt_arr = mx.argmax(v_logits[0], axis=-1)
+                    mx.eval(tt_arr, dtree.tokens, dtree.parent)
+                    htree = dtree.to_host()
+                    tree_path, bonus = htree.walk(tt_arr.tolist())
+                    n = len(tree_path) - 1
+                    draft = htree.tokens[1:]
+                    committed = [htree.tokens[r] for r in tree_path[1:]] + [bonus]
+                    branched = not htree.is_chain()
+                    tree_rounds += branched
+                else:
+                    # draft on the GPU while Python builds the verify graph (pure scheduling,
+                    # token-identical: +3.4% Qwen3.8-27B-4bit RedHat head, +4.1% MiniCPM5-2B)
+                    mx.async_eval(draft_arr)
+                    verify_ids = mx.concatenate(
+                        [mx.array([pending], dtype=draft_arr.dtype), draft_arr]).reshape(1, -1)
+                    v_logits, v_fused = target_model.verify(verify_ids, cache, tap)
+                    tt_arr = mx.argmax(v_logits[0], axis=-1)
+                    match = (draft_arr == tt_arr[: draft_arr.shape[0]]).astype(mx.int32)
+                    n_arr = mx.cumprod(match).sum()
+                    mx.eval(n_arr, tt_arr, draft_arr)
+                    n = int(n_arr.item())
+                    draft = draft_arr.tolist()
+                    tt = tt_arr.tolist()
+                    committed = draft[:n] + [tt[n]]            # accepted prefix + bonus
         target_forwards += 1
         accept_lengths.append(len(committed))
+        # a tree's nodes are not chain positions: the controller and the per-position telemetry
+        # see the lattice depth (cap) instead
+        drafted_n = min(len(draft), cap) if tree_path is not None else len(draft)
         if lk_draft:
             lk_gate.update(len(draft), n, max(1, lookup_max_draft))
         if cap_controller is not None:
@@ -1460,23 +1557,30 @@ def speculative_generate(
                 # only drafter/parked rounds inform the cap (lookup drafts have their own
                 # acceptance); the measured round period grounds the controller's cost
                 # model in observed reality (replay cascades, syncs, Python overhead)
-                cap_controller.update(n, len(draft), round_ms=(now - _rt) * 1e3,
+                cap_controller.update(n, drafted_n, round_ms=(now - _rt) * 1e3,
                                       committed=len(committed))
             _rt = now
         if on_round is not None:
             # A round is milliseconds, so this dict + queue put is noise; guard it anyway so
             # the default path (no listener) costs exactly one `is not None` test.
-            on_round(drafted=len(draft), accepted=n, committed=len(committed),
+            on_round(drafted=drafted_n, accepted=n, committed=len(committed),
                      cap=cap,
-                     source=("lookup" if lk_draft else
+                     source=("lookup" if lk_draft else "tree" if branched else
                              "plain" if not draft else "drafter"))
 
         # ---- 4. update caches/context ----
-        target_model.rollback(cache, len(draft) - n, draft[:n])
-        # commit [pending, accepted drafts] (positions n_cached..n_cached+n) as context
-        drafter.update_context(
-            v_fused[:, : n + 1, :], ctx_offset=n_cached, ctx_caches=ctx_caches
-        )
+        if tree_path is not None:
+            target_model.commit_tree(cache, tree_path)
+            # the accepted path's fused rows [anchor, accepted...] become context
+            drafter.update_context(
+                v_fused[:, mx.array(tree_path), :], ctx_offset=n_cached, ctx_caches=ctx_caches
+            )
+        else:
+            target_model.rollback(cache, len(draft) - n, draft[:n])
+            # commit [pending, accepted drafts] (positions n_cached..n_cached+n) as context
+            drafter.update_context(
+                v_fused[:, : n + 1, :], ctx_offset=n_cached, ctx_caches=ctx_caches
+            )
         n_cached = n_cached + n + 1
         # schedule (don't block): the ctx projections run while Python commits tokens and
         # streams text; the next round's single sync waits on them anyway.
@@ -1501,6 +1605,7 @@ def speculative_generate(
             src = "lookup" if lk_draft else "drafter"
             print(f"  round {len(accept_lengths):3d}: {src} drafted {len(draft)}, "
                   f"accepted {n}, committed {len(committed)}")
+    target_model.flush_pending()      # deferred-commit rows -> stored state (storable caches)
     st.flush()
 
     secs = time.time() - t0
@@ -1517,5 +1622,6 @@ def speculative_generate(
         prefill_seconds=t_prefill - t0,
         finish_reason=_finish_reason(out_ids, max_new_tokens, pending, eos_ids, st),
         lookup_rounds=lookup_rounds,
+        tree_rounds=tree_rounds,
         logprobs=lp_list,
     )

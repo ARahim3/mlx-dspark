@@ -358,6 +358,8 @@ class Engine:
         cpu_split: dict | None = None,
         executor: ThreadPoolExecutor | None = None,
         depth_capper=None,
+        tree_nodes: int | None = None,
+        tree_setting: str | int = "auto",
     ):
         self.target = target
         self.tokenizer = tokenizer
@@ -385,6 +387,11 @@ class Engine:
         self._boundary_probes_cache = None                 # [(gen-suffix tail ids, unstable)]
         self.lookup_drafts = lookup_drafts                 # hybrid n-gram drafts in dspark mode
         self.lookup_long_draft = lookup_long_draft         # match-scaled long-draft ceiling
+        # dflash tree verify (tree.py): None = chains, 0 = best-first tree of the chain's
+        # width, N = an N-node tree; resolved at load (calibrate.static_tree) from the
+        # setting ("auto" by default) — reported on /health like max_draft
+        self.tree_nodes = tree_nodes
+        self.tree_setting = tree_setting
         self.context_window = context_window               # target's trained positions, if known
         self.sdpa_split = sdpa_split                        # wide-verify SDPA split active (long-ctx)
         self.multirow_attn = multirow_attn                  # multi-row attention kernel active
@@ -607,6 +614,7 @@ class Engine:
         prefix_cache_rungs: int = 8192,
         lookup_drafts: bool | None = None,       # None = this pair's registry default
         lookup_long_draft: int = 32,
+        tree: str | int | None = "auto",         # dflash tree verify: auto/on/off/N nodes
         wired_limit: bool = False,
         batch_widths: list[int] | None = None,   # e.g. [2, max_batch]: calibrate (B,cap) grid
         kv_bits: int | None = None,              # quantize the target KV cache (4/8)
@@ -759,6 +767,18 @@ class Engine:
                     return None
 
             depth_capper = executor.submit(_mk_capper).result()
+        # dflash tree verify budget (on the MLX thread: the one-time self-test runs forwards)
+        from .calibrate import parse_tree_setting
+
+        tree = parse_tree_setting(tree)
+        tree_nodes = None
+        if mode in ("dflash", "dspark") and draft is not None:
+            from .calibrate import static_tree
+
+            tree_nodes = executor.submit(
+                static_tree, tgt, draft, setting=tree, target_repo=target_repo,
+                drafter_repo=drafter_repo, mode=mode,
+                cap=max_draft_tokens if isinstance(max_draft_tokens, int) else None).result()
         model_id = target_repo.rstrip("/").split("/")[-1]
         template_defaults = {} if enable_thinking is None else {"enable_thinking": enable_thinking}
         if reasoning_effort is not None:
@@ -817,7 +837,8 @@ class Engine:
                   multirow_attn=multirow_active,
                   cpu_split=split_cfg,
                   executor=executor,
-                  depth_capper=depth_capper)
+                  depth_capper=depth_capper,
+                  tree_nodes=tree_nodes, tree_setting=tree)
         eng.warmup_enabled = warmup
         eng.load_notes = load_notes
         eng.machine = machine
@@ -1011,7 +1032,7 @@ class Engine:
                     presence_penalty=presence_penalty, frequency_penalty=frequency_penalty,
                     logprobs=logprobs, seed=seed, stop=stop, on_text=on_text,
                     on_round=on_round, on_prefill=on_prefill, prefill_marks=prefill_marks,
-                    on_prefill_chunk=on_prefill_chunk,
+                    on_prefill_chunk=on_prefill_chunk, tree=self.tree_nodes,
                 )
             elif self.mode == "dflash":
                 res = dflash_generate(
@@ -1022,7 +1043,7 @@ class Engine:
                     temperature=temperature, top_p=top_p, top_k=top_k,
                     seed=seed, stop=stop, on_text=on_text, on_round=on_round,
                     on_prefill=on_prefill, prefill_marks=prefill_marks,
-                    on_prefill_chunk=on_prefill_chunk,
+                    on_prefill_chunk=on_prefill_chunk, tree=self.tree_nodes,
                 )
             elif self.mode == "lookup":
                 res = lookup_generate(
@@ -1447,12 +1468,12 @@ class Engine:
                 lookup_drafts=self.lookup_drafts, lookup_long_draft=self.lookup_long_draft,
                 confidence_threshold=(self.confidence_threshold if confidence is None
                                       else confidence),
-                on_text=on_text)
+                on_text=on_text, tree=self.tree_nodes)
         if mode == "dflash":
             return dflash_generate(
                 self.target, self.tokenizer, self.drafter, prompt_ids=prompt_ids,
                 max_new_tokens=max_tokens, max_draft_tokens=cap, cap_controller=ctrl,
-                on_text=on_text)
+                on_text=on_text, tree=self.tree_nodes)
         if mode == "lookup":
             return lookup_generate(
                 self.target, self.tokenizer, prompt_ids=prompt_ids,
@@ -1918,6 +1939,7 @@ class EngineHolder:
     def swap(self, *, model: str, mode: str | None = None,
              max_draft: int | str | None = None,
              lookup_drafts: bool | None = None,
+             tree: str | int | None = None,
              confidence_threshold: float | None = None,
              context_window: int | None = None,
              small_m: bool | None = None,
@@ -1983,6 +2005,8 @@ class EngineHolder:
                     kwargs["max_draft_tokens"] = max_draft
                 if lookup_drafts is not None:
                     kwargs["lookup_drafts"] = lookup_drafts
+                if tree is not None:
+                    kwargs["tree"] = tree
                 if confidence_threshold is not None:
                     kwargs["confidence_threshold"] = confidence_threshold
                 if small_m is not None:
@@ -2235,6 +2259,10 @@ def make_handler(engine: Engine, api_key: str | None):
                     # resolved per pair at load (registry rows measured with lookup off carry
                     # it) — reported so a client shows the actual configuration, like max_draft
                     "lookup_drafts": bool(getattr(engine, "lookup_drafts", True)),
+                    # dflash tree verify: the setting and what it resolved to for this pair
+                    # on this machine (null = chains, 0 = the chain's width, N = nodes)
+                    "tree": {"setting": getattr(engine, "tree_setting", "auto"),
+                             "nodes": getattr(engine, "tree_nodes", None)},
                     # 0.0 = off; settable per swap via /admin/load so a client can serve a
                     # pair at a measured cap+confidence bundle (e.g. Qwen3.8-27B-4bit's
                     # best is cap 7 + 0.3)
@@ -2405,6 +2433,18 @@ def make_handler(engine: Engine, api_key: str | None):
             if lookup_drafts is not None and not isinstance(lookup_drafts, bool):
                 return self._send_error(400, "'lookup_drafts' must be a boolean (omit it to "
                                              "use the pair's measured default)")
+            tree = req.get("tree")
+            if tree is not None:
+                from .calibrate import parse_tree_setting
+
+                try:
+                    if isinstance(tree, float):
+                        raise ValueError(tree)
+                    parse_tree_setting(tree)
+                except ValueError:
+                    return self._send_error(400, "'tree' must be \"auto\", \"on\", \"off\", "
+                                                 "true/false or a node count (omit it for "
+                                                 "the derived default)")
             confidence = req.get("confidence_threshold")
             if confidence is not None:
                 if not isinstance(confidence, (int, float)) or not 0.0 <= confidence <= 1.0:
@@ -2490,7 +2530,7 @@ def make_handler(engine: Engine, api_key: str | None):
                                              f"{', '.join(REASONING_EFFORTS)}")
             try:
                 status = engine.swap(model=model, mode=mode, max_draft=max_draft,
-                                     lookup_drafts=lookup_drafts,
+                                     lookup_drafts=lookup_drafts, tree=tree,
                                      confidence_threshold=confidence,
                                      context_window=context_window,
                                      small_m=small_m, sdpa_split=sdpa_split,

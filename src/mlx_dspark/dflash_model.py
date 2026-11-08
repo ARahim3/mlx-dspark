@@ -464,6 +464,24 @@ class DFlashDraftModel(nn.Module):
         ``(draft_ids [cap], candidate_ids [cap, K], q_rows [cap, K])`` — scatter q_rows at
         candidate_ids for the dense q the spec-sampling accept consumes."""
         sel = self.candidate_selector
+        candidate_ids, scores, _ = self._lattice(block, target_hidden, cache, cap, anchor_id)
+        if uniforms is None:
+            return sel.walk_greedy(scores, candidate_ids), None, None
+        draft_ids, q_rows = sel.walk_sampled(scores, candidate_ids, uniforms, temperature)
+        return draft_ids, candidate_ids, q_rows
+
+    def select_lattice(self, block, target_hidden, cache, *, cap: int, anchor_id: int):
+        """DFlash 2 drafting for TREE verify: ``(candidate_ids [cap, K], scores [cap, K, K],
+        chain [cap])`` — the lattice :meth:`select_block` walks (same backbone, head top-K and
+        selector, one shared code path) plus the greedy chain it would have returned. Lazy: the
+        loop builds the tree from it on the GPU (``tree.device_tree``) inside the same graph."""
+        candidate_ids, scores, _ = self._lattice(block, target_hidden, cache, cap, anchor_id)
+        return candidate_ids, scores, self.candidate_selector.walk_greedy(scores, candidate_ids)
+
+    def _lattice(self, block, target_hidden, cache, cap: int, anchor_id: int):
+        """Backbone -> post-norm hidden of the ``cap`` mask slots -> target-head top-K ->
+        selector transition scores. Returns ``(candidate_ids, scores, hidden)``."""
+        sel = self.candidate_selector
         hidden = self.forward_hidden(block, target_hidden, cache, logits_start=1)[0][:cap]
         # trim a padded target head to the real vocab (reference: weight[:org_vocab_size])
         # — a candidate id beyond it would gather garbage codebook rows
@@ -471,11 +489,7 @@ class DFlashDraftModel(nn.Module):
         k = sel.top_k
         candidate_ids = mx.argpartition(logits, kth=-k, axis=-1)[:, -k:].astype(mx.int32)
         unary = self._transform_unary(mx.take_along_axis(logits, candidate_ids, axis=-1))
-        scores = sel.lattice(candidate_ids, unary, hidden, anchor_id)
-        if uniforms is None:
-            return sel.walk_greedy(scores, candidate_ids), None, None
-        draft_ids, q_rows = sel.walk_sampled(scores, candidate_ids, uniforms, temperature)
-        return draft_ids, candidate_ids, q_rows
+        return candidate_ids, sel.lattice(candidate_ids, unary, hidden, anchor_id), hidden
 
 
 class DFlashCtxWindow:

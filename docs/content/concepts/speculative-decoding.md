@@ -56,6 +56,18 @@ Lookup (no drafter)
 
 `--mode auto`, the default, picks each pair's measured best: the registry's stamped mode, otherwise DSpark, then DFlash, then lookup.
 
+### Trees instead of chains (DFlash 2 and DSpark)
+
+DFlash 2's selector keeps the big model's top 16 candidates at each of its 7 draft positions, but a classic round verifies just one chain through them. By default (`--tree auto`) mlx-dspark verifies a **best-first tree** instead: the 7 most probable draft nodes by the selector's own path probabilities, laid out so the greedy chain comes first. When the drafter is sure, that tree *is* the chain. When it isn't, the tree hedges with a second branch, and the model often takes it.
+
+A 7-node tree is checked in one forward pass of the same width as the 7-token chain, so it costs the same. On the hybrid targets (Qwen3.8, Qwen3.6, Ornith, Bonsai) the accepted tokens' recurrence state is committed inside the next round's verify rather than by a separate pass, so every round reads and writes that state once, tree or chain. On Qwen3.8-27B 4-bit (M4 Pro), it gains **+13–19% on open chat and longer code**, roughly nothing on code and math the drafter already predicts well, and **+6.7% on average**.
+
+Why not bigger trees, like the 32-node trees datacenter engines use? On an H100, verifying 64 rows costs about the same as verifying one. On an M4 Pro, a 4-bit 27B costs 95 ms to verify 8 rows and 160 ms for 9–16: past about 8 rows the GPU runs out of compute before it runs out of memory bandwidth. So mlx-dspark measures your Mac's verify curve and widens the tree only where the wider pass pays. That could happen on M5-class GPUs, whose neural accelerators add matmul compute. On a GPU where the tree's recurrence kernel isn't verified yet (M5 today), a tree also pays an extra cost per branch; `auto` measures that once against the chain and keeps the chain unless the tree stays within 3%.
+
+DSpark heads get the same tree: the drafter's own chain stays candidate 0 of every slot, and the next-best tokens of each slot, scored by the head's Markov term, fill the side branches. On Qwen3.8-27B with Red Hat's DSpark head the replay puts that at about +5% tokens per round at the chain's cost.
+
+It's lossless like the chain, because the model still decides every token; the tree only puts more alternatives in front of it at once. Greedy decoding only (sampling keeps the chain). `--tree off` restores the chain, and `--tree N` forces an N-node tree.
+
 ### Lookup drafts
 
 Inside DSpark mode, lookup also runs as a **hybrid**. When the current text matches something earlier in the context, that free continuation is verified instead of running the drafter that round, so copy-heavy spans commit several tokens per round. When the match runs deep (8 tokens or more), drafts grow up to about twice the matched length, to 32 tokens: verifying 16–32 rows costs only about 2.5× a single step on Apple Silicon, so a verbatim span can commit 20–30 tokens per pass. That's how file re-emission on Gemma-4 12B goes from 3.0× to **4.5×**.

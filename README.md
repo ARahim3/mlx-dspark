@@ -55,7 +55,7 @@ chat/code/math), the Muse row per-content best (footnoted); full tables, baselin
 | **LFM2.5-1.2B** (bf16, conv-hybrid)[^lfm2] | **3.83×** code · **3.82×** math · **2.40×** chat | **~240–385 tok/s** |
 | **LFM2.5-2.6B** (bf16, conv-hybrid)[^lfm2] | **3.49×** math · **2.65×** code · **2.24×** chat | ~97–152 tok/s |
 | **Muse-Glimmer-30B** (8-bit, dense)[^muse] | **3.27×** math · **2.50×** code · **2.22×** chat | ~18–26 tok/s |
-| **Qwen3.8-27B** (4-bit, DFlash 2)[^q38] | **3.09×** code · **3.01×** math · **2.05×** chat | **~31–45 tok/s** |
+| **Qwen3.8-27B** (4-bit, DFlash 2)[^q38] | **3.17×** code · **3.13×** math · **2.49×** chat | **~37–47 tok/s** |
 | **Qwen3-8B** (8-bit) | **2.83×** math · **2.03×** code · 1.71× chat | ~50–83 tok/s |
 | **Qwen3.6-27B** (8-bit) | **2.67×** math · **2.26×** chat · 1.96× code | ~16–22 tok/s |
 | **Ornith-1.0-9B** (8-bit) | **2.53×** code · **2.48×** math · **2.21×** chat | ~59–68 tok/s |
@@ -680,8 +680,13 @@ semantics: 200 tok, end-to-end tok/s, 3-trial medians), High Power mode, current
 
 | method (cap 7) | mean | chat | code | math | accept | tok/s |
 |---|---|---|---|---|---|---|
-| DSpark (`RedHatAI`) | 2.63× | **2.25×** | 2.81× | 2.83× | 4.83 | 38.6 |
-| **DFlash 2** | **2.72×** | 2.05× | **3.12×** | **3.02×** | **5.09** | **40.0** |
+| DSpark (`RedHatAI`) | 2.63× | 2.25× | 2.81× | 2.83× | 4.83 | 38.6 |
+| **DFlash 2** (tree verify, v0.20.4) | **2.93×** | **2.49×** | **3.17×** | **3.13×** | **5.37** | **43.1** |
+
+The 4-bit DFlash 2 row was re-measured on 2026-11-08 for v0.20.4 (tree verify, the drafter overlap
+and the deferred commit; same harness, High Power mode) — up from 2.72× / 40.0 tok/s on 2026-09-28.
+The DSpark rows and the 8-bit table are the 2026-09-28 numbers and predate those gains; the DSpark
+head gets the overlap, the deferred commit and its own tree in v0.20.4 too (about +7% in paired runs).
 
 DFlash 2 adds a **candidate path selector** (top-16 target-head candidates per slot, a bilinear
 lattice walked from the verified anchor) and per-sublayer **dynamic convolutions** to the DFlash

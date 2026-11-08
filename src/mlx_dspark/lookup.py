@@ -260,6 +260,7 @@ def lookup_generate(
         index.extend(appended)
         pending = out_ids[-1]        # eos mid-committed ends the loop (not committed[-1])
         st.update(out_ids)
+    target_model.flush_pending()      # deferred-commit rows -> stored state (storable caches)
     st.flush()
 
     secs = time.time() - t0

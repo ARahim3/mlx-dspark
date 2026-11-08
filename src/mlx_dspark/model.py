@@ -403,6 +403,7 @@ class DSparkDrafter(nn.Module):
         # set_draft_vocab_map(). Leading underscore keeps it out of mlx's parameter filter —
         # it is an index table, and must be neither quantized nor name-checked as a weight.
         self._draft_to_target = None
+        self._target_to_draft = None   # its inverse (-1 where the target id has no draft id)
 
     def embed(self, ids: mx.array) -> mx.array:
         if self.embed_tokens is not None:
@@ -547,12 +548,66 @@ class DSparkDrafter(nn.Module):
         self._draft_to_target = (
             mx.arange(n, dtype=mx.int32) + d2t_offsets.astype(mx.int32)
         )
+        t2d = mx.full((int(self.config.vocab_size),), -1, dtype=mx.int32)
+        t2d[self._draft_to_target] = mx.arange(n, dtype=mx.int32)
+        self._target_to_draft = t2d
 
     def to_target_ids(self, draft_ids: mx.array) -> mx.array:
         """Map draft-vocabulary ids to target ids (identity on a full-vocab head)."""
         if self._draft_to_target is None:
             return draft_ids
         return self._draft_to_target[draft_ids]
+
+    def _to_draft_ids(self, target_ids: mx.array) -> mx.array:
+        """Target ids -> this head's draft ids (identity on a full-vocab head)."""
+        if self._draft_to_target is None:
+            return target_ids
+        return self._target_to_draft[target_ids]
+
+    # Side candidates per lattice slot for tree verify (tree_lattice). Replayed on the Red Hat
+    # Qwen3.8-27B head: 16 -> +4.7% tokens/round at the chain's width, 32 -> +5.2% (NOTES
+    # "DSpark trees"); 16 matches DFlash 2's selector width.
+    TREE_K = 16
+
+    def _markov_rows(self, draft_ids: mx.array) -> mx.array:
+        """``markov_w2`` rows for ``draft_ids`` [...] -> [..., R], dequantized: the Markov bias a
+        candidate receives under a parent is this row's dot product with ``markov_w1[parent]``."""
+        w = self.markov_head.markov_w2
+        if hasattr(w, "scales"):
+            return mx.dequantize(w.weight[draft_ids], w.scales[draft_ids], w.biases[draft_ids],
+                                 group_size=w.group_size, bits=w.bits)
+        return w.weight[draft_ids]
+
+    def tree_lattice(self, base_logits: mx.array, chain: mx.array, anchor: int,
+                     k: int | None = None) -> tuple[mx.array, mx.array]:
+        """The verify-tree lattice of a draft block, in ``tree.device_tree``'s shape:
+        ``(cand [S, K] int32 TARGET ids, scores [S, K, K] fp32)`` with ``scores[s, j, c]`` =
+        the score of candidate ``c`` at slot ``s`` under parent candidate ``j`` of slot
+        ``s - 1`` (slot 0: row 0 = the anchor). Candidate 0 of every slot is the drafter's
+        own greedy ``chain`` token (``sample_block``'s full-vocab argmax), so the lattice's
+        greedy walk IS the chain and the tree's main path loses nothing to truncation; the
+        other K-1 are the top base-logit candidates with the chain token removed. Score =
+        base logit + the Markov bias ``markov_w2[c] . markov_w1[parent]`` (none without a
+        Markov head) — exactly the quantity ``sample_block`` takes the argmax of. Lazy, one
+        graph with the drafter."""
+        k = int(k or self.TREE_K)
+        n_slots = int(base_logits.shape[0])
+        chain_d = self._to_draft_ids(chain).astype(mx.int32)                   # [S] draft ids
+        neg = mx.full((n_slots, 1), -float("inf"), dtype=base_logits.dtype)
+        masked = mx.put_along_axis(base_logits, chain_d[:, None], neg, axis=-1)
+        side = mx.argpartition(masked, kth=-(k - 1), axis=-1)[:, -(k - 1):].astype(mx.int32)
+        cand_d = mx.concatenate([chain_d[:, None], side], axis=1)              # [S, K]
+        vals = mx.take_along_axis(base_logits, cand_d, axis=-1).astype(mx.float32)
+        cand_t = self.to_target_ids(cand_d).astype(mx.int32)
+        if self.markov_head is None:
+            return cand_t, mx.broadcast_to(vals[:, None, :], (n_slots, k, k))
+        # parents of slot s = slot s-1's candidates (target ids: markov_w1 indexes those);
+        # slot 0's parent is the anchor in every row (row 0 is the one read)
+        prev_t = mx.concatenate([mx.full((1, k), int(anchor), dtype=mx.int32), cand_t[:-1]],
+                                axis=0)                                        # [S, K]
+        e1 = self.markov_head.prev_embeddings(prev_t).astype(mx.float32)       # [S, K, R]
+        e2 = self._markov_rows(cand_d).astype(mx.float32)                      # [S, K, R]
+        return cand_t, vals[:, None, :] + e1 @ e2.transpose(0, 2, 1)          # [S, Kp, Kc]
 
     def widen_to_target(self, q: mx.array) -> mx.array:
         """Widen a draft-space probability vector to the target vocabulary, zeros elsewhere.

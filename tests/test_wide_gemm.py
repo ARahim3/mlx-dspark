@@ -27,8 +27,9 @@ from mlx_dspark.wide_gemm import (
 )
 
 # Inside the bit-identical region for every dtype. The boundary is the OUTPUT tile grid,
-# not K: N=1024 at M=256 disagrees in half precision (see the module docstring), which is
-# what makes the runtime check load-bearing rather than decorative.
+# not K: N=1024 disagrees in half precision at small M (at 256 through mlx 0.32.3, at 512
+# on 0.32.4 — see the module docstring), which is what makes the runtime check
+# load-bearing rather than decorative.
 K, N, ROWS = 4096, 4096, 256
 
 
@@ -130,19 +131,28 @@ def test_widest_quantized_linear_picks_the_biggest():
     assert found["weight"].shape[0] == 2048
 
 
-def test_crossover_never_returns_a_threshold_that_is_not_identical():
+def test_crossover_never_returns_a_threshold_that_is_not_identical(monkeypatch):
     """The invariant the default-on behaviour rests on: whatever threshold calibration
     hands back, the paths agree bit-for-bit AT that threshold. Here the only shape is a
-    small output grid (N=1024), which differs at M=256 — so calibration must either
-    refuse outright or return a wider threshold where it does agree."""
+    small output grid (N=1024) that differs at M=256 — so calibration must either refuse
+    outright or return a wider threshold where it does agree.
+
+    The divergence is simulated: which widths really differ is a property of the mlx
+    build (N=1024 differed at 256 through 0.32.3; 0.32.4 agrees there and still differs
+    at 512), and pinning one build's rounding here broke CI on a harmless mlx release."""
+    import mlx_dspark.wide_gemm as wg
     base = nn.Linear(K, 1024, bias=False)
     base.set_dtype(mx.bfloat16)
     model = nn.Sequential(nn.QuantizedLinear.from_linear(base, group_size=64, bits=8))
     mx.eval(model.parameters())
-    assert verified_shapes([model], SAFE_MIN_ROWS, widths=()) == []   # differs at 256
+    real = wg._matches
+    monkeypatch.setattr(wg, "_matches", lambda mod, M: M != SAFE_MIN_ROWS and real(mod, M))
+    assert verified_shapes([model], SAFE_MIN_ROWS, widths=()) == []
     got = measure_crossover(model)
-    # either it refuses outright, or the shapes it hands back really are identical there
-    assert got is None or verified_shapes([model], got[0], widths=()) == got[1]
+    # either it refuses outright, or it moved wider and the shapes it hands back really
+    # are identical there
+    assert got is None or (got[0] > SAFE_MIN_ROWS
+                           and verified_shapes([model], got[0], widths=()) == got[1])
 
 
 def test_verify_identity_accepts_a_shape_where_they_agree():

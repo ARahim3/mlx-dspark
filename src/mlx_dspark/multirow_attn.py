@@ -180,6 +180,19 @@ _P2 = r"""
 _K1 = mx.fast.metal_kernel(name="dspark_mra_p1", input_names=["q", "k", "v", "scale"],
                            output_names=["opart", "mpart", "lpart"], source=_P1,
                            ensure_row_contiguous=False)   # K/V are strided KV-cache views
+
+# Tree-verify variant (Target.verify_tree): the last QL keys are the tree's own rows; query
+# row qi sees key L-QL+j iff bit j of anc[qi] is set (ancestor-or-self), every prefix key
+# always. The only change to the causal kernel is this visibility test.
+_MASK_LINE = "s[j] = (key < kt || key > kmax || key >= k1) ? -INFINITY : s[j] * sc;"
+_TREE_LINE = ("s[j] = (key < kt || key >= k1 || (key >= L - QL && "
+              "!((anc[qi] >> (uint)(key - (L - QL))) & 1u))) ? -INFINITY : s[j] * sc;")
+assert _MASK_LINE in _P1
+_K1_TREE = mx.fast.metal_kernel(name="dspark_mra_p1_tree",
+                                input_names=["q", "k", "v", "scale", "anc"],
+                                output_names=["opart", "mpart", "lpart"],
+                                source=_P1.replace(_MASK_LINE, _TREE_LINE),
+                                ensure_row_contiguous=False)
 _K2 = mx.fast.metal_kernel(name="dspark_mra_p2", input_names=["opart", "mpart", "lpart"],
                            output_names=["out"], source=_P2)
 
@@ -208,9 +221,11 @@ def plan(hq: int, hk: int, q_len: int, d: int, kv_len: int, batch: int = 1) -> d
 
 
 def multirow_sdpa(q: mx.array, k: mx.array, v: mx.array, *, scale: float,
-                  causal: bool) -> mx.array:
+                  causal: bool, tree_anc: mx.array | None = None) -> mx.array:
     """``scaled_dot_product_attention(q, k, v, scale, mask="causal" if causal else None)``
-    for the few-row shapes (see :func:`eligible`). ``k``/``v`` may be strided cache views."""
+    for the few-row shapes (see :func:`eligible`). ``k``/``v`` may be strided cache views.
+    ``tree_anc`` (uint32 [q_len]): tree-verify visibility bits over the last q_len keys
+    instead of the causal rule (see :func:`tree_mask`)."""
     B, Hq, qL, D = q.shape
     Hk, L = k.shape[1], k.shape[2]
     p = plan(Hq, Hk, qL, D, L, B)
@@ -219,8 +234,12 @@ def multirow_sdpa(q: mx.array, k: mx.array, v: mx.array, *, scale: float,
     if RP != R:
         qq = mx.pad(qq, [(0, 0), (0, 0), (0, RP - R), (0, 0)])
     qq = mx.contiguous(qq)
-    opart, mpart, lpart = _K1(
-        inputs=[qq, k, v, mx.array([scale], dtype=mx.float32)],
+    kern, inputs = _K1, [qq, k, v, mx.array([scale], dtype=mx.float32)]
+    if tree_anc is not None:
+        kern, causal = _K1_TREE, False
+        inputs.append(tree_anc)
+    opart, mpart, lpart = kern(
+        inputs=inputs,
         template=[("T", q.dtype), ("DH", D), ("RP", RP), ("QL", qL), ("CHUNK", p["CHUNK"]),
                   ("CAUSAL", bool(causal)), ("DS", p["DS"]), ("NSG", p["NSG"]),
                   ("NRG", p["NRG"])],
@@ -297,13 +316,35 @@ def eligible(q, k, v, mask, sinks, cfg: MultirowConfig) -> bool:
 
 _ACTIVE: MultirowConfig | None = None
 _PREV = None     # what the patch falls through to (the split patch, or mlx's own)
+_TREE: tuple | None = None   # (the exact mask array verify_tree passes, uint32 bits [W])
+
+
+@contextlib.contextmanager
+def tree_mask(mask: mx.array, anc_bits: mx.array):
+    """Declare ``mask`` (``[.., W, L]`` bool: every prefix key visible, the last W keys by
+    ancestry) as a tree-verify mask whose tail is ``anc_bits`` (uint32 per row) — so calls
+    carrying THAT array object take the kernel's tree variant instead of falling through to
+    mlx's masked paths (which at depth cost the unfused cliff the kernel exists to avoid).
+    Identity-matched: any other array mask is untouched."""
+    global _TREE
+    prev = _TREE
+    _TREE = (mask, anc_bits)
+    try:
+        yield
+    finally:
+        _TREE = prev
 
 
 def _patched_call(q, k, v, *, scale, mask=None, sinks=None, **kw):
     cfg = _ACTIVE
-    if cfg is not None and not kw and eligible(q, k, v, mask, sinks, cfg):
-        return multirow_sdpa(q, k, v, scale=scale,
-                             causal=isinstance(mask, str) and q.shape[2] > 1)
+    if cfg is not None and not kw:
+        tree = _TREE
+        if (tree is not None and mask is tree[0] and q.ndim == 4 and q.shape[2] <= 32
+                and eligible(q, k, v, None, sinks, cfg)):
+            return multirow_sdpa(q, k, v, scale=scale, causal=False, tree_anc=tree[1])
+        if eligible(q, k, v, mask, sinks, cfg):
+            return multirow_sdpa(q, k, v, scale=scale,
+                                 causal=isinstance(mask, str) and q.shape[2] > 1)
     prev = _PREV or _ORIG_SDPA
     return prev(q, k, v, scale=scale, mask=mask, sinks=sinks, **kw)
 
