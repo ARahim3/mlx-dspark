@@ -451,7 +451,7 @@
      "baseline"
     ],
     "default": "auto",
-    "help": "auto (default) = this target's measured-best speculation (the registry row's stamped mode, e.g. DFlash 2 on Qwen3.8-27B; else dspark -> dflash -> drafter-free lookup, so ANY repo runs); dspark = DSpark spec decoding; dflash = z-lab DFlash / DFlash 2; lookup = drafter-free prompt-lookup spec decoding (any target); baseline = plain greedy target"
+    "help": "auto (default) = this target's measured-best speculation (the registry row's stamped mode, e.g. DFlash 2 on Qwen3.8-27B; else dspark -> dflash -> drafter-free lookup, so ANY repo runs); dspark = DSpark spec decoding; dflash = z-lab DFlash / DFlash 2 / Tencent DSpine; lookup = drafter-free prompt-lookup spec decoding (any target); baseline = plain greedy target"
    },
    {
     "flags": [

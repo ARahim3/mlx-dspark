@@ -51,6 +51,28 @@ Apache-2.0 — the authoritative semantics, per the standing shipped-serving-pat
 Both are config-gated (``dflash_config.selector_rank`` / ``conv_kernel_size``); DFlash 1
 checkpoints load and run byte-identically to before.
 
+**DSpine** (Tencent, 2026-09/11 — Zhang et al., "Draft in Parallel, Condition Through Depth:
+Adjacent Causal Injection for Speculative Decoding", arXiv:2609.36173; code
+https://github.com/Tencent/DSpine, Apache-2.0; checkpoints ``tencent/*-DSpine-b16``) keeps the
+DFlash backbone (block-CAUSAL attention, ``dflash_config.draft_block_causal``) and adds one
+trained module, ported here from the authors' reference (``sglang_dspine/models/dspine.py`` +
+``kernels/dspine.py`` and their ``dspine_mlx`` port — the authoritative semantics):
+
+- :class:`DSpineCodeBridge` — after EVERY draft layer each block position receives a gated
+  message built from its immediate predecessor's *predicted feature* (the layer output
+  projected into a fixed "transfer space" made of the target lm_head's whitened rows), so the
+  causal conditioning chain unfolds over depth while the block is still drafted in one pass.
+  The anchor sends its exact token code. The write replaces the next layer's input RMSNorm.
+- the **last-write refinement**: after the backbone, each slot's top-K head candidates are
+  rescored conditioned on the predecessor's *decided* token — the final write redone with the
+  exact code of each candidate sender — giving a ``[slot, sender, candidate]`` transition table
+  that the same greedy / sampled walk DFlash 2's selector uses (and the tree builder) turns into
+  a chain. No selector weights: the table is the backbone's own head read through the bridge.
+
+Because every layer is block-causal and the bridge only passes messages forward, a round can
+draft just ``cap + 1`` rows and get exactly the full block's first rows (:meth:`draft_width`),
+so the drafter's cost tracks the cap instead of the trained block (16 on the published heads).
+
 Architecture (differs from the DSpark drafter in ``model.py``): a Qwen3-style backbone
 (silu MLP, separate v_proj, per-head q/k RMSNorm, default RoPE, sliding-window attention
 on some layers) that **reuses the target model's embed_tokens + lm_head** (tied), consumes
@@ -59,6 +81,7 @@ whole block of mask positions in a single parallel (block-diffusion) pass.
 """
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -147,6 +170,18 @@ class DFlashConfig:
     output_multiplier: float = 1.0   # scales the selector's unary logits (muse_glimmer); the
     # bilinear term is trained against the TRANSFORMED logit scale, so unlike the DSpark
     # reuse-head rule (raw lm_head only) the multiplier/softcap must be applied here.
+    # Block attention direction — z-lab's / SGLang's top-level `is_causal`, DSpine's
+    # `dflash_config.draft_block_causal`. None = the z-lab default: sliding-window layers attend
+    # the block causally, full-attention layers bidirectionally (block diffusion). True / False
+    # force every layer. The shipped DFlash 2 heads declare `is_causal: false` (bidirectional
+    # block over a windowed context); DSpine heads declare causal.
+    block_causal: bool | None = None
+    # DSpine code bridge (0 = absent -> plain DFlash / DFlash 2)
+    bridge_code_size: int = 0        # C: the transfer space (codebook columns)
+    bridge_rank: int = 0             # R: the message dimension
+    bridge_eps: float = 1e-6
+    bridge_layers: tuple[int, ...] = ()   # 0-based draft layers carrying a write (all, in practice)
+    bridge_top_k: int = 0            # K: candidates per slot in the last-write refinement
 
 
 def _build_rope(head_dim, rope_theta, max_position_embeddings, rope_scaling):
@@ -168,6 +203,9 @@ class DFlashAttention(nn.Module):
         self.scale = config.head_dim ** -0.5
         self.is_sliding = config.layer_types[layer_idx] == "sliding_attention"
         self.sliding_window = config.sliding_window if self.is_sliding else None
+        # z-lab / SGLang: `is_causal` when declared, else sliding layers causal, full layers not
+        self.block_causal = (self.is_sliding if config.block_causal is None
+                             else bool(config.block_causal))
         self.q_proj = nn.Linear(dim, n_heads * config.head_dim, bias=False)
         self.k_proj = nn.Linear(dim, n_kv_heads * config.head_dim, bias=False)
         self.v_proj = nn.Linear(dim, n_kv_heads * config.head_dim, bias=False)
@@ -212,14 +250,24 @@ class DFlashAttention(nn.Module):
         ctx_len = keys.shape[2]
         keys = mx.concatenate([keys, prop_keys], axis=2)
         values = mx.concatenate([values, prop_values], axis=2)
-        mask = None
-        if self.is_sliding:
-            mask = (
-                "causal" if ctx_len + L <= self.sliding_window
-                else create_causal_mask(L, offset=ctx_len, window_size=self.sliding_window)
-            )
+        mask = self._block_mask(L, ctx_len)
         output = mx.fast.scaled_dot_product_attention(queries, keys, values, scale=self.scale, mask=mask)
         return self.o_proj(output.transpose(0, 2, 1, 3).reshape(B, L, -1))
+
+    def _block_mask(self, L: int, ctx_len: int):
+        """The ``L`` block rows' mask over ``[ctx rows | block rows]`` (keys), z-lab's semantics:
+        a causal block sees ctx + block rows ``0..t``; a bidirectional block sees every block row;
+        a sliding layer sees only the ctx rows within its window either way. ``None`` = all keys,
+        ``"causal"`` = SDPA's bottom-right-aligned causal mask, else a boolean [L, ctx + L]."""
+        window = self.sliding_window
+        fits = not self.is_sliding or ctx_len + L <= window
+        if self.block_causal:
+            return "causal" if fits else create_causal_mask(L, offset=ctx_len, window_size=window)
+        if fits:
+            return None
+        query = ctx_len + mx.arange(L)[:, None]
+        key = mx.arange(ctx_len + L)[None]
+        return ((key < ctx_len) & (query - key < window)) | (key >= ctx_len)
 
 
 class DFlashGroupedConv(nn.Module):
@@ -298,30 +346,156 @@ class CandidateSelector(nn.Module):
 
     def walk_greedy(self, scores, candidate_ids):
         """Chain-argmax path -> drafted token ids [g], fully in-graph (no sync)."""
-        g = scores.shape[0]
-        idx = mx.argmax(scores[0, 0])           # slot 0: every predecessor row is the anchor
-        picks = [candidate_ids[0, idx]]
-        for s in range(1, g):
-            idx = mx.argmax(scores[s, idx])
-            picks.append(candidate_ids[s, idx])
-        return mx.stack(picks)
+        return walk_greedy(scores, candidate_ids)
 
     def walk_sampled(self, scores, candidate_ids, uniforms, temperature: float):
         """Sampled walk -> (drafted ids [g], q rows [g, K] the tokens were drawn from)."""
-        g, k = candidate_ids.shape
-        t = max(float(temperature), 1e-5)
-        init = mx.softmax(scores[0, 0] / t, axis=-1)                          # [K]
-        idx = mx.minimum((uniforms[0] >= mx.cumsum(init)).sum(), k - 1)
-        picks, q_rows = [candidate_ids[0, idx]], [init]
-        if g > 1:
-            trans = mx.softmax(scores[1:] / t, axis=-1)                       # [g-1, K, K]
-            maps = mx.minimum(
-                (uniforms[1:, None, None] >= mx.cumsum(trans, axis=-1)).sum(axis=-1), k - 1)
-            for s in range(1, g):
-                q_rows.append(trans[s - 1, idx])     # realized row BEFORE stepping
-                idx = maps[s - 1, idx]
-                picks.append(candidate_ids[s, idx])
-        return mx.stack(picks), mx.stack(q_rows)
+        return walk_sampled(scores, candidate_ids, uniforms, temperature)
+
+
+def walk_greedy(scores, candidate_ids):
+    """Chain-argmax over a ``[slots, K predecessor, K candidate]`` transition lattice (DFlash 2's
+    selector scores or DSpine's refinement table): slot 0's predecessor rows are all the anchor,
+    each later slot's row is the chosen predecessor's. -> drafted ids [slots], in-graph."""
+    g = scores.shape[0]
+    idx = mx.argmax(scores[0, 0])           # slot 0: every predecessor row is the anchor
+    picks = [candidate_ids[0, idx]]
+    for s in range(1, g):
+        idx = mx.argmax(scores[s, idx])
+        picks.append(candidate_ids[s, idx])
+    return mx.stack(picks)
+
+
+def walk_sampled(scores, candidate_ids, uniforms, temperature: float):
+    """Sampled walk over the same lattice (one uniform per slot, shared across predecessor rows,
+    inverse CDF of the softmaxed row) -> (drafted ids [g], q rows [g, K] the tokens were drawn
+    from — the proposal the spec-sampling accept needs)."""
+    g, k = candidate_ids.shape
+    t = max(float(temperature), 1e-5)
+    init = mx.softmax(scores[0, 0] / t, axis=-1)                          # [K]
+    idx = mx.minimum((uniforms[0] >= mx.cumsum(init)).sum(), k - 1)
+    picks, q_rows = [candidate_ids[0, idx]], [init]
+    if g > 1:
+        trans = mx.softmax(scores[1:] / t, axis=-1)                       # [g-1, K, K]
+        maps = mx.minimum(
+            (uniforms[1:, None, None] >= mx.cumsum(trans, axis=-1)).sum(axis=-1), k - 1)
+        for s in range(1, g):
+            q_rows.append(trans[s - 1, idx])     # realized row BEFORE stepping
+            idx = maps[s - 1, idx]
+            picks.append(candidate_ids[s, idx])
+    return mx.stack(picks), mx.stack(q_rows)
+
+
+_F32_TINY = 1.1754943508222875e-38      # torch.finfo(float32).tiny — the reference's RMS floor
+
+
+class DSpineCodeBridge(nn.Module):
+    """DSpine's adjacent causal injection: one gated write after every draft layer.
+
+    Parameter names and shapes match the checkpoint under ``selected_prefix_bridge.`` so it
+    loads 1:1. With ``u`` = a layer's output rows [B, T, H] (the pre-write residual stream) and
+    ``C[v]`` the fixed codebook (the target lm_head's rows, l2-normalized, PCA-whitened to ``C``
+    dims, normalized again — paper App. A; shipped in the checkpoint):
+
+        z_t = sqrt(C) · normalize(R_ℓ · u_t / (RMS(u_t) + eps))   the predicted feature; the
+                                                                   anchor (t = 0) sends sqrt(C)·C[x]
+        g_t = sigmoid(G_q z_t + G_p z_{t-1} + b)                   receiver + sender gate
+        m_t = g_t ⊙ A z_{t-1}                                      the predecessor's message
+        h_t = u_t + RMS(u_t) · W_ℓ m_t          for t >= 1; the anchor row is never written
+
+    then the NEXT layer's input RMSNorm (the final norm after the last layer) is applied to
+    ``h`` — fused into the write in the reference, so the following layer takes its input
+    pre-normed (:meth:`DFlashDecoderLayer.__call__` ``x_normed``). ``G_q`` (``gate``, with the
+    bias ``b``), ``G_p`` (``predecessor_gate``) and ``A`` (``prev``) are shared across layers;
+    ``R_ℓ`` (``early_read_weights[ℓ]``, ``read_weight`` for the last layer) and ``W_ℓ``
+    (``feature_write_weights[ℓ]``) are per layer. ``out`` is the retired "terminal" projection
+    the checkpoints ship zeroed (``selected_prefix_terminal: false``): loaded, never used.
+
+    Math follows ``sglang_dspine/kernels/dspine.py`` operation for operation; the rounding points
+    are the backbone's dtype (bf16 on the published heads, fp32 in the tests), not the reference
+    kernels' — the target verifies every token, so only acceptance could differ, and only in the
+    fp-tie class.
+    """
+
+    def __init__(self, config: DFlashConfig):
+        super().__init__()
+        self.code_size = int(config.bridge_code_size)
+        self.rank = int(config.bridge_rank)
+        self.num_layers = int(config.num_hidden_layers)
+        self.eps = float(config.bridge_eps)
+        self.layers = frozenset(int(i) for i in config.bridge_layers)
+        self.sqrt_c = math.sqrt(self.code_size)
+        H, C, R, L = config.hidden_size, self.code_size, self.rank, self.num_layers
+        self.prev = nn.Linear(C, R, bias=False)               # A
+        self.gate = nn.Linear(C, R, bias=True)                # G_q (+ b)
+        self.predecessor_gate = nn.Linear(C, R, bias=False)   # G_p
+        self.out = nn.Linear(R, C, bias=False)                # terminal projection: zero, unused
+        self.codebook = mx.zeros((config.vocab_size, C))
+        self.read_weight = mx.zeros((C, H))
+        self.early_read_weights = mx.zeros((max(L - 1, 1), C, H))
+        self.feature_write_weights = mx.zeros((L, H, R))
+        self._packed = None                                   # [3R, C] = [G_q; G_p; A], derived
+
+    def read_weight_for(self, layer: int):
+        return self.read_weight if layer == self.num_layers - 1 else self.early_read_weights[layer]
+
+    def packed_weight(self):
+        """The three shared projections as one ``[3R, C]`` matrix (built on first use; call
+        :meth:`reset` after replacing ``gate`` / ``predecessor_gate`` / ``prev`` weights)."""
+        if self._packed is None:
+            self._packed = mx.concatenate(
+                [self.gate.weight, self.predecessor_gate.weight, self.prev.weight], axis=0)
+        return self._packed
+
+    def reset(self) -> None:
+        self._packed = None
+
+    def __call__(self, hidden, block_ids, layer: int, next_norm, want_stash: bool = False):
+        """One write after ``layer``. ``hidden`` [B, T, H] = the layer's output rows; ``block_ids``
+        [B, T] (column 0 = the anchor token). Returns ``(next_norm(h), h, stash)`` where ``stash``
+        (``want_stash``, the last layer) = the pre-write state of rows 1.. the refinement redoes
+        the write from — ``{"raw": u, "rms": RMS(u), "q": G_q z}``, fp32, aligned with
+        ``logits_start=1``."""
+        dt = hidden.dtype
+        f = hidden.astype(mx.float32)
+        rms = mx.sqrt(mx.maximum(mx.mean(f * f, axis=-1), _F32_TINY))              # [B, T]
+        normalized = (f / (rms[..., None] + self.eps)).astype(dt)
+        projected = (normalized @ self.read_weight_for(layer).T).astype(mx.float32)  # [B, T, C]
+        norm = mx.sqrt(mx.sum(projected * projected, axis=-1, keepdims=True))
+        codes = self.sqrt_c * projected / (norm + self.eps)
+        anchor_codes = self.sqrt_c * self.codebook[block_ids[:, 0]].astype(mx.float32)
+        codes = mx.concatenate([anchor_codes[:, None, :], codes[:, 1:, :]], axis=1)
+        packed = (codes.astype(dt) @ self.packed_weight().T).astype(mx.float32)     # [B, T, 3R]
+        q, s, v = mx.split(packed, [self.rank, 2 * self.rank], axis=-1)
+        gate = mx.sigmoid(q[:, 1:] + s[:, :-1] + self.gate.bias.astype(mx.float32))
+        message = (gate * v[:, :-1]).astype(dt)                                     # [B, T-1, R]
+        delta = (message @ self.feature_write_weights[layer].T).astype(mx.float32)  # [B, T-1, H]
+        h = mx.concatenate([f[:, :1], f[:, 1:] + rms[:, 1:, None] * delta], axis=1).astype(dt)
+        stash = {"raw": f[:, 1:], "rms": rms[:, 1:], "q": q[:, 1:]} if want_stash else None
+        return next_norm(h), h, stash
+
+    def transition_table(self, raw, rms, q, candidate_ids, anchor_id: int, head_rows,
+                         norm_weight, norm_eps: float):
+        """The last-write refinement as a ``[slots, K sender, K candidate]`` fp32 table: for slot
+        t and each candidate sender s of slot t-1 (slot 0's senders are all the anchor), redo the
+        final write from the stashed ``raw`` / ``rms`` / ``q`` rows with the EXACT code
+        ``sqrt(C)·C[s]`` in place of the predicted feature, apply the final norm, and score slot
+        t's own candidates with their target-head rows (``head_rows(ids) -> [..., H]``). Rows of
+        the table are conditional logits over the K candidates (the reference's sampling table;
+        its greedy kernel drops the per-row norm scale, which leaves every argmax unchanged)."""
+        k = candidate_ids.shape[1]
+        anchor = mx.full((1, k), int(anchor_id), dtype=candidate_ids.dtype)
+        sid = mx.concatenate([anchor, candidate_ids[:-1]], axis=0)                  # [n, K]
+        exact = self.sqrt_c * self.codebook[sid].astype(mx.float32)                  # [n, K, C]
+        gate = mx.sigmoid(q[:, None, :] + exact @ self.predecessor_gate.weight.astype(mx.float32).T
+                          + self.gate.bias.astype(mx.float32))                       # [n, K, R]
+        value = exact @ self.prev.weight.astype(mx.float32).T
+        w_last = self.feature_write_weights[self.num_layers - 1].astype(mx.float32)  # [H, R]
+        refined = raw[:, None, :] + rms[:, None, None] * ((gate * value) @ w_last.T)  # [n, K, H]
+        normalized = (refined * mx.rsqrt(mx.mean(refined * refined, axis=-1, keepdims=True)
+                                         + float(norm_eps)) * norm_weight.astype(mx.float32))
+        rows = head_rows(candidate_ids).astype(mx.float32)                           # [n, K, H]
+        return normalized @ rows.swapaxes(1, 2)                                      # [n, Ks, Kc]
 
 
 class DFlashDecoderLayer(nn.Module):
@@ -340,8 +514,10 @@ class DFlashDecoderLayer(nn.Module):
             self.attention_conv = None
             self.mlp_conv = None
 
-    def __call__(self, x, x_ctx, rope, cache):
-        a = self.input_layernorm(x)
+    def __call__(self, x, x_ctx, rope, cache, x_normed=None):
+        # ``x_normed``: this layer's input already normalized by a fused DSpine write (the
+        # bridge applies the next layer's input_layernorm); ``x`` stays the residual stream.
+        a = self.input_layernorm(x) if x_normed is None else x_normed
         if self.attention_conv is not None:
             a, out_coeff = self.attention_conv.prepare(a)
         attn = self.self_attn(a, x_ctx, rope, cache)
@@ -376,9 +552,31 @@ class DFlashDraftModel(nn.Module):
                               config.selector_rank, config.selector_top_k)
             if config.selector_rank else None
         )
+        self.selected_prefix_bridge = DSpineCodeBridge(config) if config.bridge_rank else None
         self.embed_tokens = None
         self.lm_head = None
+        self._head_rows_src = None       # the module whose rows ARE the head (see head_rows)
         self.embed_scale = 1.0
+
+    @property
+    def selects_paths(self) -> bool:
+        """Drafts one coherent chain through a candidate lattice (DFlash 2's selector or
+        DSpine's refinement) via :meth:`select_block` / :meth:`select_lattice`, instead of
+        per-slot argmax — what the generate loop, the tree builder and the calibrator key on."""
+        return self.candidate_selector is not None or self.selected_prefix_bridge is not None
+
+    @property
+    def block_causal(self) -> bool:
+        """Every layer attends the block causally (rows 0..t never see rows > t)."""
+        return all(layer.self_attn.block_causal for layer in self.layers)
+
+    def draft_width(self, cap: int) -> int:
+        """Block rows to feed for a round verifying ``cap`` drafts: the anchor + ``cap`` masks on
+        a block-causal head (exact truncation — attention and the bridge's messages both flow
+        forward only, so the first rows equal the full block's; DSpine), the trained block for
+        block diffusion (a bidirectional block depends on all of its rows)."""
+        bs = int(self.config.block_size)
+        return max(2, min(bs, int(cap) + 1)) if self.block_causal else bs
 
     def bind(self, target_model):
         """Wire the drafter to the *target's* embed_tokens + lm_head (DFlash reuses them)."""
@@ -395,8 +593,32 @@ class DFlashDraftModel(nn.Module):
         self.embed_tokens = inner.embed_tokens
         self.embed_scale = getattr(self.embed_tokens, "embed_scale", getattr(inner, "embed_scale", 1.0))
         lm = getattr(target_model, "language_model", target_model)
-        self.lm_head = getattr(target_model, "lm_head", None) or getattr(lm, "lm_head", None) or self.embed_tokens.as_linear
+        head = getattr(target_model, "lm_head", None) or getattr(lm, "lm_head", None)
+        if head is not None:
+            self.lm_head = head
+            self._head_rows_src = head
+        else:                                   # tied: the embedding table IS the head
+            self.lm_head = self.embed_tokens.as_linear
+            self._head_rows_src = self.embed_tokens
         return self
+
+    def head_rows(self, ids):
+        """Dense rows of the bound target head for token ``ids`` (any int shape -> [..., H]),
+        dequantized from a quantized head's packed rows (what DSpine's refinement scores its
+        candidates with; a gather, not a vocab-wide projection)."""
+        src = self._head_rows_src
+        if src is None:
+            raise RuntimeError("bind() the drafter to a target before reading head rows")
+        if hasattr(src, "scales"):              # nn.QuantizedLinear / nn.QuantizedEmbedding
+            biases = getattr(src, "biases", None)
+            return mx.dequantize(src.weight[ids], src.scales[ids],
+                                 None if biases is None else biases[ids],
+                                 group_size=src.group_size, bits=src.bits,
+                                 mode=getattr(src, "mode", "affine"))
+        weight = getattr(src, "weight", None)
+        if weight is None:
+            raise TypeError(f"{type(src).__name__} exposes no head weight rows")
+        return weight[ids]
 
     def make_cache(self):
         caches = []
@@ -428,13 +650,30 @@ class DFlashDraftModel(nn.Module):
         """Backbone forward -> post-final-norm hidden [B, L - logits_start, H]. (Slicing
         before or after the per-token norm is identical; sliced first so DFlash 2's
         selector never norms rows nobody reads.)"""
+        return self._forward(inputs, target_hidden, cache, logits_start)[0]
+
+    def _forward(self, inputs, target_hidden, cache, logits_start: int = 0,
+                 want_stash: bool = False):
+        """:meth:`forward_hidden` plus, on a DSpine head, the last write's pre-write stash
+        (rows 1.., see :meth:`DSpineCodeBridge.__call__`) its refinement redoes; ``None`` else."""
         h = self.embed_tokens(inputs) * self.embed_scale
         h_ctx = self.project_ctx(target_hidden)
-        for layer, c in zip(self.layers, cache):
-            h = layer(h, h_ctx, self.rope, c)
-        if logits_start:
-            h = h[:, logits_start:]
-        return self.norm(h)
+        bridge = self.selected_prefix_bridge
+        last = len(self.layers) - 1
+        normed, stash = None, None
+        for i, (layer, c) in enumerate(zip(self.layers, cache)):
+            h = layer(h, h_ctx, self.rope, c, x_normed=normed)
+            normed = None
+            if bridge is not None and i in bridge.layers:
+                next_norm = self.layers[i + 1].input_layernorm if i < last else self.norm
+                normed, h, st = bridge(h, inputs, i, next_norm,
+                                       want_stash=want_stash and i == last)
+                stash = st if st is not None else stash
+        if normed is None:                       # no fused final write: norm the rows read
+            if logits_start:
+                h = h[:, logits_start:]
+            return self.norm(h), stash
+        return (normed[:, logits_start:] if logits_start else normed), stash
 
     def __call__(self, inputs, target_hidden, cache, logits_start: int = 0):
         logits = self.lm_head(self.forward_hidden(inputs, target_hidden, cache, logits_start))
@@ -463,11 +702,10 @@ class DFlashDraftModel(nn.Module):
         ``(draft_ids [cap], None, None)`` fully in-graph; sampled returns
         ``(draft_ids [cap], candidate_ids [cap, K], q_rows [cap, K])`` — scatter q_rows at
         candidate_ids for the dense q the spec-sampling accept consumes."""
-        sel = self.candidate_selector
         candidate_ids, scores, _ = self._lattice(block, target_hidden, cache, cap, anchor_id)
         if uniforms is None:
-            return sel.walk_greedy(scores, candidate_ids), None, None
-        draft_ids, q_rows = sel.walk_sampled(scores, candidate_ids, uniforms, temperature)
+            return walk_greedy(scores, candidate_ids), None, None
+        draft_ids, q_rows = walk_sampled(scores, candidate_ids, uniforms, temperature)
         return draft_ids, candidate_ids, q_rows
 
     def select_lattice(self, block, target_hidden, cache, *, cap: int, anchor_id: int):
@@ -476,11 +714,14 @@ class DFlashDraftModel(nn.Module):
         selector, one shared code path) plus the greedy chain it would have returned. Lazy: the
         loop builds the tree from it on the GPU (``tree.device_tree``) inside the same graph."""
         candidate_ids, scores, _ = self._lattice(block, target_hidden, cache, cap, anchor_id)
-        return candidate_ids, scores, self.candidate_selector.walk_greedy(scores, candidate_ids)
+        return candidate_ids, scores, walk_greedy(scores, candidate_ids)
 
     def _lattice(self, block, target_hidden, cache, cap: int, anchor_id: int):
         """Backbone -> post-norm hidden of the ``cap`` mask slots -> target-head top-K ->
-        selector transition scores. Returns ``(candidate_ids, scores, hidden)``."""
+        the ``[cap, K, K]`` transition scores: DFlash 2's selector lattice, or DSpine's
+        last-write refinement table. Returns ``(candidate_ids, scores, hidden)``."""
+        if self.selected_prefix_bridge is not None:
+            return self._bridge_lattice(block, target_hidden, cache, cap, anchor_id)
         sel = self.candidate_selector
         hidden = self.forward_hidden(block, target_hidden, cache, logits_start=1)[0][:cap]
         # trim a padded target head to the real vocab (reference: weight[:org_vocab_size])
@@ -490,6 +731,21 @@ class DFlashDraftModel(nn.Module):
         candidate_ids = mx.argpartition(logits, kth=-k, axis=-1)[:, -k:].astype(mx.int32)
         unary = self._transform_unary(mx.take_along_axis(logits, candidate_ids, axis=-1))
         return candidate_ids, sel.lattice(candidate_ids, unary, hidden, anchor_id), hidden
+
+    def _bridge_lattice(self, block, target_hidden, cache, cap: int, anchor_id: int):
+        """DSpine: backbone (``cap + 1`` rows on a causal block) -> head top-K per slot ->
+        the refinement table over them (raw head logits: the write replaces the head's INPUT,
+        so the scores live on the head's own scale)."""
+        bridge = self.selected_prefix_bridge
+        hidden, stash = self._forward(block, target_hidden, cache, logits_start=1, want_stash=True)
+        hidden = hidden[0][:cap]
+        logits = self.lm_head(hidden)[..., : self.config.vocab_size]          # [cap, V]
+        k = self.config.bridge_top_k
+        candidate_ids = mx.argpartition(logits, kth=-k, axis=-1)[:, -k:].astype(mx.int32)
+        scores = bridge.transition_table(
+            stash["raw"][0][:cap], stash["rms"][0][:cap], stash["q"][0][:cap],
+            candidate_ids, anchor_id, self.head_rows, self.norm.weight, self.norm.eps)
+        return candidate_ids, scores, hidden
 
 
 class DFlashCtxWindow:

@@ -664,8 +664,92 @@ def _flatten_params(module) -> list[tuple[str, mx.array]]:
     return tree_flatten(module.parameters())
 
 
+# DSpine checkpoints carry int64 version stamps beside the weights (not parameters of the
+# module): each must be 1 — the only semantics implemented here (block-causal attention,
+# exact-sender last-write refinement, independent per-layer writes, terminal projection off).
+_DSPINE_VERSION_TENSORS = (
+    "draft_block_causal_version", "last_write_refine_version",
+    "selected_prefix_bridge.independent_write_version",
+    "selected_prefix_bridge.terminal_disabled_version",
+)
+
+
+def _dspine_fields(cfg: dict, dfc: dict, repo: str) -> dict:
+    """Validate a DSpine (``dflash_config.selected_prefix_code_bridge``) checkpoint's inference
+    contract and return the bridge fields for :class:`DFlashConfig`. Mirrors the checks the
+    reference serving code makes (``sglang_dspine/models/dspine.py``: ``DSpineCodeBridge``,
+    ``resolve_dspine_head_topk``, ``DSpineDraftModel``): everything else in ``dflash_config``
+    (teacher schedules, gt training, checkpointing flags) is training-time only."""
+    def refuse(why: str):
+        raise ValueError(f"{repo}: DSpine drafter not supported — {why}. Open an issue: "
+                         f"https://github.com/ARahim3/mlx-dspark/issues")
+
+    bridge = dfc.get("selected_prefix_code_bridge")
+    if not isinstance(bridge, dict) or not all(k in bridge for k in ("code_size", "rank")):
+        refuse("selected_prefix_code_bridge must name code_size and rank")
+    if dfc.get("selected_prefix_terminal", True):
+        refuse("only terminal-disabled bridges (selected_prefix_terminal: false) are implemented")
+    if dfc.get("selected_prefix_feature_writes") is not True:
+        refuse("selected_prefix_feature_writes must be true")
+    if dfc.get("selected_prefix_feature_write_mode") != "independent":
+        refuse(f"selected_prefix_feature_write_mode={dfc.get('selected_prefix_feature_write_mode')!r}"
+               " (only independent per-layer writes)")
+    if dfc.get("draft_block_causal") is not True:
+        refuse("the bridge needs block-causal draft attention (draft_block_causal: true)")
+    if dfc.get("selected_prefix_decode_mode", "serial") != "serial":
+        refuse(f"selected_prefix_decode_mode={dfc.get('selected_prefix_decode_mode')!r} "
+               "(only the serial last-write refinement)")
+    if dfc.get("selected_prefix_feature_reliability") is not None:
+        refuse("reliability probes are not part of the inference path")
+    if dfc.get("selected_prefix_feature_next_token_rows", False):
+        refuse("next-token-row layouts are a DSpark layout; the refinement is defined for "
+               "anchor-row (DFlash) semantics")
+    if dfc.get("selected_prefix_terminal_residual_rank"):
+        refuse("the terminal token residual is not implemented")
+    if dfc.get("selector_rank") or dfc.get("selector_top_k") or dfc.get("conv_kernel_size"):
+        refuse("a DSpine head carries no DFlash 2 selector or grouped convolutions")
+    num_layers = int(cfg["num_hidden_layers"])
+    raw_layers = dfc.get("selected_prefix_feature_layers")
+    if not isinstance(raw_layers, list) or not raw_layers:
+        refuse("selected_prefix_feature_layers missing")
+    layers = tuple(sorted(int(x) - 1 for x in raw_layers))           # 1-based in the config
+    if any(not 0 <= i < num_layers for i in layers):
+        refuse(f"selected_prefix_feature_layers {raw_layers} out of range for {num_layers} layers")
+    if num_layers - 1 not in layers:
+        refuse("the last draft layer must carry a write (the refinement redoes it)")
+    widths: dict[str, int] = {}
+    refine = dfc.get("selected_prefix_last_write_refine")
+    if refine is not None:
+        if (not isinstance(refine, dict) or refine.get("kind") != "exact_sender"
+                or int(refine.get("version", 1)) != 1 or not float(refine.get("weight", 1.0)) >= 0
+                or "head_topk" not in refine):
+            refuse(f"selected_prefix_last_write_refine must be {{kind: exact_sender, version: 1, "
+                   f"head_topk, weight >= 0}}, got {refine!r}")
+        widths["last_write_refine"] = int(refine["head_topk"])
+    second = cfg.get("code_bridge_second_pass")
+    if second is not None:
+        if (not isinstance(second, dict) or second.get("mode") != "serial_table"
+                or int(second.get("first_exact", -1)) != num_layers - 1 or "head_topk" not in second):
+            refuse(f"code_bridge_second_pass must be {{mode: serial_table, first_exact: "
+                   f"{num_layers - 1}, head_topk}}, got {second!r}")
+        widths["second_pass"] = int(second["head_topk"])
+    if not widths:
+        refuse("the config names no refinement width (selected_prefix_last_write_refine.head_topk "
+               "or code_bridge_second_pass.head_topk)")
+    if len(set(widths.values())) != 1:
+        refuse(f"refinement widths disagree: {widths}")
+    top_k = next(iter(widths.values()))
+    if top_k < 2 or top_k > 64:
+        refuse(f"head_topk={top_k} outside 2..64")
+    return {"bridge_code_size": int(bridge["code_size"]), "bridge_rank": int(bridge["rank"]),
+            "bridge_eps": float(bridge.get("eps", 1e-6)), "bridge_layers": layers,
+            "bridge_top_k": top_k}
+
+
 def load_dflash(repo_or_path: str, *, quantize: bool = True, bits: int = 4, group_size: int = 64):
-    """Return (drafter, config) for a z-lab DFlash checkpoint (block-diffusion drafter).
+    """Return (drafter, config) for a z-lab DFlash checkpoint (block-diffusion drafter), a
+    DFlash 2 head, or a Tencent DSpine head (``dflash_config.selected_prefix_code_bridge`` — the
+    DFlash backbone plus the code bridge; see ``dflash_model.DSpineCodeBridge``).
 
     Unlike the DSpark drafter, DFlash has no own embed/lm_head — it reuses the target's
     (call ``drafter.bind(target.model)`` before generating; ``dflash_generate`` does this).
@@ -713,6 +797,13 @@ def load_dflash(repo_or_path: str, *, quantize: bool = True, bits: int = 4, grou
             f"selector_rank/selector_top_k — refusing to run a DFlash 2 head as DFlash 1 "
             f"(the selector is where its acceptance comes from)."
         )
+    # DSpine (tencent/*-DSpine-b16): the code bridge, declared in dflash_config. Absent -> none.
+    dspine = _dspine_fields(cfg, dfc, repo_or_path) if dfc.get("selected_prefix_code_bridge") else {}
+    # Block attention direction: DSpine's dflash_config flag, else z-lab's / SGLang's top-level
+    # `is_causal`; None keeps the z-lab default (sliding layers causal, full layers not).
+    block_causal = dfc.get("draft_block_causal")
+    if block_causal is None:
+        block_causal = cfg.get("is_causal")
     config = DFlashConfig(
         hidden_size=cfg["hidden_size"], num_hidden_layers=cfg["num_hidden_layers"],
         num_attention_heads=cfg["num_attention_heads"], num_key_value_heads=cfg["num_key_value_heads"],
@@ -731,12 +822,24 @@ def load_dflash(repo_or_path: str, *, quantize: bool = True, bits: int = 4, grou
         conv_kernel_size=int(dfc.get("conv_kernel_size") or 0),
         conv_group_size=int(dfc.get("conv_group_size") or 16),
         output_multiplier=float(dfc.get("output_multiplier") or 1.0),
+        block_causal=None if block_causal is None else bool(block_causal),
+        **dspine,
     )
     drafter = DFlashDraftModel(config)
 
     weights: dict[str, mx.array] = {}
     for st in glob.glob(os.path.join(path, "*.safetensors")):
         weights.update(mx.load(st))
+    if dspine:
+        for name in _DSPINE_VERSION_TENSORS:
+            stamp = weights.pop(name, None)
+            if stamp is None or int(stamp.item()) != 1:
+                raise ValueError(
+                    f"{repo_or_path}: DSpine checkpoint stamp {name} = "
+                    f"{None if stamp is None else int(stamp.item())}; mlx-dspark implements "
+                    f"version 1 of each (block-causal attention, exact-sender last-write "
+                    f"refinement, independent writes, terminal projection disabled)."
+                )
     model_keys = {k for k, _ in _flatten_params(drafter)}
     ckpt_keys = set(weights.keys())
     if model_keys != ckpt_keys:
@@ -749,6 +852,11 @@ def load_dflash(repo_or_path: str, *, quantize: bool = True, bits: int = 4, grou
                if unexpected else "")
         )
     drafter.load_weights(list(weights.items()))
+    if dspine and bool(mx.any(drafter.selected_prefix_bridge.out.weight != 0).item()):
+        raise ValueError(
+            f"{repo_or_path}: DSpine checkpoint says selected_prefix_terminal: false but ships a "
+            f"non-zero terminal projection (selected_prefix_bridge.out) — a terminal-corrected "
+            f"bridge, which mlx-dspark does not implement.")
 
     if quantize:
         # quantize only the backbone Linears — embed/lm_head come from the (already
@@ -756,10 +864,13 @@ def load_dflash(repo_or_path: str, *, quantize: bool = True, bits: int = 4, grou
         # kernel_projections and selector hidden_projection stay bf16 like the reference
         # (they produce multiplicative coefficients / lattice scores — semantics-sensitive
         # and tiny, ~130 MB total on the 27B head); the [vocab, rank] codebooks are raw
-        # arrays (gather-only) that nn.quantize never touches.
+        # arrays (gather-only) that nn.quantize never touches. DSpine's bridge stays bf16 too
+        # (the reference quantizes fc + layers only; its ~1.5M Linear params are gate/message
+        # projections whose rounding the refinement table depends on).
         nn.quantize(drafter, group_size=group_size, bits=bits,
                     class_predicate=lambda p, m: isinstance(m, nn.Linear)
-                    and "_conv" not in p and "candidate_selector" not in p)
+                    and "_conv" not in p and "candidate_selector" not in p
+                    and "selected_prefix_bridge" not in p)
 
     mx.eval(drafter.parameters())
     return drafter, config

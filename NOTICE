@@ -43,6 +43,15 @@ contributed to SGLang (sgl-project/sglang, `srt/models/dflash.py` and
 (https://inco.ai/blog/dflash2/); its checkpoints (e.g. `incoai/Qwen3.8-27B-DFlash2`,
 Apache-2.0) are downloaded at runtime from their publisher.
 
+The same file's **DSpine** components (DSpineCodeBridge, the last-write refinement table and
+the block-causal draft path) are an MLX port of Tencent's DSpine reference implementation
+(https://github.com/Tencent/DSpine — `sglang_dspine/models/dspine.py`, `kernels/dspine.py`
+and the authors' `dspine_mlx` package; Apache License 2.0, Copyright (C) 2026 Tencent).
+Paper: Zhang et al., "Draft in Parallel, Condition Through Depth: Adjacent Causal Injection
+for Speculative Decoding", arXiv:2609.36173. No DSpine source code is included; the math is
+reimplemented against our own generate / verify loop. DSpine checkpoints (e.g.
+`tencent/Qwen3.8-27B-DSpine-b16`, Apache-2.0) are downloaded at runtime from Tencent.
+
 ---
 
 Small-M quantized-matmul kernel (credits; no third-party code included)

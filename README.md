@@ -476,6 +476,7 @@ a silent mis-load):
 | **DeepSpec-native standalone drafter** (qwen3/gemma4 backbone, any size/quant) | `deepseek-ai/dspark_qwen3_32b_block7` | ✅ runs via `--drafter` — no registry entry needed (4B/8B/14B/gemma-12B are measured *and* registered, so they need no flag; larger sizes should run — reports welcome) |
 | **z-lab DFlash adapter** for a qwen3/gemma4-family target | `z-lab/Qwen3-8B-DFlash-b16` | ✅ runs via `--mode dflash --drafter` |
 | **DFlash 2** (Inco AI: candidate selector + dynamic convs) | `incoai/Qwen3.8-27B-DFlash2` | ✅ runs via `--mode dflash --drafter`; the Qwen3.8-27B heads are measured *and* registered (auto-resolve, and `--mode auto` picks them as that target's best) |
+| **DSpine** (Tencent: a block-causal DFlash backbone with adjacent causal injection + predecessor-conditioned decoding, [paper](https://arxiv.org/abs/2609.36173), Apache-2.0) | `tencent/Qwen3.8-27B-DSpine-b16` | ✅ runs via `--mode dflash --drafter`, trees and `--max-draft auto` included. On `mlx-community/Qwen3.8-27B-4bit` (M4 Pro) **2.70×** at the measured cap 7 (3.04× code / 2.86× math / 2.22× chat, accept 5.08, 38.4 tok/s) — its full 15-draft block accepts 7.15 but a 9+-row verify costs 1.65× more on this GPU (2.23× at cap 15), so DFlash 2 (2.93×) stays the registered default |
 | **PrismML dspark GGUF** (Bonsai-27B) | `prism-ml/Ternary-Bonsai-27B-gguf` → `*-dspark-bf16.gguf` | ✅ pre-converted repacks auto-resolve (`Rahim/*-dspark`); any future GGUF-only drop runs via `--drafter gguf:<repo>/<file>.gguf` (converted locally, once) |
 | **vLLM "speculators" format** (`dspark` algorithm) | `makora-ai/gemma4-26b-a4b-dspark`, `mgoin/Qwen3-8B-speculator.dspark` | ✅ runs via `--drafter` — the config schema is translated on load (the tensor names are already DeepSpec's). Includes EAGLE-3-style **reduced draft vocabularies** (`draft_vocab_size` + a `d2t` table). Other speculators algorithms (eagle/eagle3) are refused by name. `makora-ai/gemma4-26b-a4b-dspark` (Google's 26B/4B-active MoE) measures **1.27×** on `mlx-community/gemma-4-26b-a4b-it-8bit` (`--max-draft 2 --no-lookup-drafts`: 1.38× code / 1.37× math / 1.06× chat, 46.9→59.5 tok/s) — not registered for auto-resolution while the ratio is under review |
 | **LiquidAI LFM2.5-DSpark** (`Lfm2DSparkDraftModel`, for the lfm2 / lfm2_moe conv+attention hybrid targets) | `LiquidAI/LFM2.5-2.6B-DSpark` | ✅ measured *and* registered (auto-resolves, any quant). A plain qwen3 backbone in a fifth packaging (taps nested in `dflash_config`, no `projector_type`), reusing the target's tied embed+head with interleaved rope. LFM2 is the first conv-recurrence target (a new `shortconv` capture/rollback). The 2.6B/1.2B are strong wins; the 8B-A1B MoE is a modest win at bf16 (~1.3×, net loss at 8bit — the MoE verify ceiling) |
@@ -799,8 +800,10 @@ same depth, acceptance in parentheses:
 | | 32k | 10.6 tok/s | **2.21×** (2.74) | 1.83× (3.20) |
 | **MiniCPM5-2B** (bf16) + DSpark | 16k | 42.2 tok/s | **1.62×** (2.21) | 1.54× (2.50) |
 | | 32k | 36.0 tok/s | 2.06× (2.78) | **2.09×** (3.51) |
-| **Qwen3.8-27B** (4-bit) + DFlash 2 (default) | 16k | 14.1 tok/s | 1.69× (2.74) | **1.79×** (3.16) |
-| | 32k | 12.9 tok/s | 1.66× (2.58) | **1.85×** (3.24) |
+| **Qwen3.8-27B** (4-bit) + DFlash 2 (default)[^lc1108] | 16k | 14.1 tok/s | 1.70× (2.72) | **2.27×** (3.91) |
+| | 32k | 13.2 tok/s | 1.50× (2.58) | **2.13×** (3.71) |
+| **Qwen3.8-27B** (4-bit) + DSpine (`tencent`, `--drafter`)[^lc1108] | 16k | 13.7 tok/s | 1.82× (3.05) | **2.10×** (3.86) |
+| | 32k | 12.7 tok/s | 1.70× (2.78) | **1.96×** (3.61) |
 | **Qwen3.8-27B** (4-bit) + DSpark (`RedHatAI`, `--mode dspark`) | 16k | 14.2 tok/s | **1.89×** (3.00) | **1.89×** (3.38) |
 | | 32k | 13.1 tok/s | 1.76× (2.74) | **1.83×** (3.32) |
 
@@ -808,7 +811,12 @@ same depth, acceptance in parentheses:
 
 Speedups at depth are lower than at chat depth for a structural reason: attention over a long KV
 cache is extra verify work that a single decode step pays only once, and the baseline itself slows
-with depth (Qwen3.8-27B-4bit: ~15 tok/s at 2k, 12.9 at 32k). You don't need to pick the cap —
+with depth (Qwen3.8-27B-4bit: ~15 tok/s at 2k, 12.9 at 32k).
+
+[^lc1108]: Re-measured 2026-11-08 with the tree verify on (v0.20.4), same harness and content; the
+    other rows are the 2026-09-27 chain measurements. DSpine (Tencent) holds the same acceptance at
+    depth as DFlash 2 but its drafter attends a 4× wider context window, so each round is ~12 ms
+    dearer; DFlash 2 stays the default. You don't need to pick the cap —
 with no `--max-draft` the derived cap is depth-aware (it shrinks the verify width when the measured
 depth slope says a narrower verify pays), and `--max-draft auto` adapts per round. All arms are
 greedy-lossless; where an arm diverges from plain decoding it is at a floating-point tie (the

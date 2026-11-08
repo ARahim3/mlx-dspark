@@ -63,7 +63,8 @@ def cmd_generate(argv: list[str]) -> None:
                     help="auto (default) = this target's measured-best speculation (the "
                          "registry row's stamped mode, e.g. DFlash 2 on Qwen3.8-27B; else "
                          "dspark -> dflash -> drafter-free lookup, so ANY repo runs); "
-                         "dspark = DSpark spec decoding; dflash = z-lab DFlash / DFlash 2; "
+                         "dspark = DSpark spec decoding; dflash = z-lab DFlash / DFlash 2 / "
+                         "Tencent DSpine; "
                          "lookup = drafter-free prompt-lookup spec decoding (any target); "
                          "baseline = plain greedy target")
     ap.add_argument("--model", default=None,
@@ -184,7 +185,7 @@ def cmd_generate(argv: list[str]) -> None:
         ap.error(str(e))
     args.mode = mode
 
-    labels = {"dspark": "DSpark speculative", "dflash": "DFlash (z-lab) speculative",
+    labels = {"dspark": "DSpark speculative", "dflash": "DFlash-lineage speculative",
               "lookup": "Prompt-lookup speculative (drafter-free)",
               "baseline": "Baseline (plain greedy)"}
     label = labels[args.mode]

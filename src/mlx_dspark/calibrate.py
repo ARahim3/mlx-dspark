@@ -408,6 +408,40 @@ def measure_dflash_drafter_cost(drafter, ctx_len: int = CTX_LEN) -> float:
     return _bench(lambda: drafter(block, step_ctx, dcache, logits_start=1))
 
 
+def dflash_cost_by_cap(drafter) -> bool:
+    """Whether a dflash-mode drafter's round cost depends on the cap: a block-CAUSAL head that
+    drafts through its lattice (DSpine) runs ``draft_width(cap)`` rows and scores ``cap`` slots,
+    so it gets a per-cap curve like a DSpark head; block diffusion (DFlash 1/2) always runs the
+    whole block and keeps the scalar."""
+    return bool(getattr(drafter, "block_causal", False)
+                and getattr(drafter, "selects_paths", False)
+                and hasattr(drafter, "draft_width"))
+
+
+def measure_dflash_drafter_curve(drafter, caps: list[int],
+                                 ctx_len: int = CTX_LEN) -> dict[int, float]:
+    """ms per draft round at each cap for a block-causal lattice head (DSpine), through the
+    production path (``select_block``: backbone over ``draft_width(cap)`` rows, head top-K and
+    the refinement table over ``cap`` slots, the greedy walk) — the controller must price what
+    the loop will run, and here that cost tracks the cap (CLAUDE.md rule 3 / SCHEMA note 3)."""
+    cfg = drafter.config
+    n_tap = len(cfg.target_layer_ids)
+    dcache = drafter.make_cache()
+    ctx = mx.random.normal((1, ctx_len, n_tap * cfg.hidden_size)).astype(mx.bfloat16)
+    full = mx.array([[TOKEN_ID] + [int(cfg.mask_token_id)] * (int(cfg.block_size) - 1)])
+    mx.eval(drafter(full, ctx, dcache, logits_start=1))      # appends ctx to the draft cache
+    step_ctx = mx.random.normal((1, 2, n_tap * cfg.hidden_size)).astype(mx.bfloat16)
+    curve: dict[int, float] = {}
+    for cap in sorted({int(c) for c in caps}):
+        block = mx.array([[TOKEN_ID] + [int(cfg.mask_token_id)] * (drafter.draft_width(cap) - 1)])
+
+        def fn(cap=cap, block=block):
+            return drafter.select_block(block, step_ctx, dcache, cap=cap, anchor_id=TOKEN_ID)[0]
+
+        curve[cap] = _bench(fn)
+    return curve
+
+
 def knee_width(verify_ms: dict[int, float]) -> int:
     """The verify-cost curve's convex knee: the smallest width whose marginal cost jumps clearly
     above the cheap region below it (MLX's quantized matmul leaving its few-rows path for GEMM
@@ -1397,7 +1431,11 @@ def calibrate(target, drafter, *, mode: str, target_repo: str, drafter_repo: str
         caps = list(range(1, max_cap + 1))       # plain step, needed to price cap 0
     elif mode == "dflash":
         max_cap = int(cfg.block_size) - 1
-        widths = sorted({2, 3, 4, 5, 7, 9, 12, max_cap + 1})    # sample + interpolate
+        # sample + interpolate; 8 AND 9 are always measured: the 4-bit verify curve steps
+        # between them (the small-M / skinny_qmm tile edge), and interpolating across the
+        # step overcharged cap 7 by ~30 ms on a block-16 head (DSpine: width 8 unsampled,
+        # read as the midpoint of 97 and 160 ms -> derived cap 6 instead of 7)
+        widths = sorted(w for w in {2, 3, 4, 5, 7, 8, 9, 12, max_cap + 1} if w <= max_cap + 1)
         caps = []
     else:
         raise ValueError(f"auto cap supports dspark/dflash, not {mode!r}")
@@ -1433,6 +1471,10 @@ def calibrate(target, drafter, *, mode: str, target_repo: str, drafter_repo: str
             if mode == "dspark":
                 drafter_ms: dict | float = measure_dspark_drafter_curve(drafter, caps)
                 overhead = measure_dspark_round_overhead(target, drafter, verify, drafter_ms)
+            elif dflash_cost_by_cap(drafter):
+                # DSpine: the backbone runs cap + 1 rows, so the drafter cost is a curve
+                drafter_ms = measure_dflash_drafter_curve(drafter, [w - 1 for w in widths])
+                overhead = 0.0
             else:
                 drafter_ms = measure_dflash_drafter_cost(drafter)
                 overhead = 0.0
@@ -1634,10 +1676,11 @@ def wide_tree_nodes(verify_ms: dict[int, float], draft_ms: float, cap: int,
 
 
 def tree_capable(drafter) -> bool:
-    """Drafters that expose a candidate lattice for tree verify: DFlash 2 (its selector) and
+    """Drafters that expose a candidate lattice for tree verify: DFlash 2 (its selector), DSpine
+    (its last-write refinement table — both via ``select_lattice``, ``selects_paths``) and
     DSpark heads (``DSparkDrafter.tree_lattice``: the chain plus the top base candidates,
-    Markov-scored). DFlash 1 has neither."""
-    return (getattr(drafter, "candidate_selector", None) is not None
+    Markov-scored). DFlash 1 has none."""
+    return (bool(getattr(drafter, "selects_paths", False))
             or hasattr(drafter, "tree_lattice"))
 
 

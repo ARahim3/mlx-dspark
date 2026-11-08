@@ -671,6 +671,13 @@ def dflash_generate(
     selector's sparse q dense for the same ``_spec_sample_accept``. Same block/verify
     conventions otherwise — the verify side cannot tell the two apart.
 
+    **DSpine** heads (Tencent; ``selected_prefix_bridge`` present) take the same
+    ``select_block`` / ``select_lattice`` path — their lattice is the last-write refinement
+    table instead of a selector — and, being block-CAUSAL, draft only ``cap + 1`` rows
+    (``drafter.draft_width``): the truncated block's rows equal the full block's, so the
+    drafter cost follows the cap, not the trained block of 16. ``drafter.selects_paths`` is
+    the switch for both.
+
     ``lookup_drafts`` (off by default): hybrid n-gram copy drafting, ported from the dspark
     loop. On a 4-gram+ suffix match a free verbatim continuation (up to ``lookup_long_draft``
     on a deep copy run, else ``lookup_max_draft``) is verified INSTEAD of the DFlash drafter
@@ -695,7 +702,7 @@ def dflash_generate(
     # SAME width as the chain (tree=0), or `tree` nodes at the full cap (a calibrated wide
     # tree); the target proves the plumbing once (tree_ready) or the loop keeps chains.
     tree_on = (tree is not None and temperature <= 0.0
-               and getattr(drafter, "candidate_selector", None) is not None
+               and getattr(drafter, "selects_paths", False)
                and target_model.tree_ready())
     conv_k = target_model._tree_conv_k() if tree_on else 4
     tree_rounds = 0
@@ -875,13 +882,15 @@ def dflash_generate(
             # any depth and ratchets up — measured 1.04x vs cap 3's 1.48x at 32k)
             cap_controller.set_depth(len(ids) + len(out_ids))
             cap = max(1, min(cap_controller.cap, cap_ceiling))
-        block = mx.array([[pending] + [mask_id] * (bs - 1)])
-        sel = getattr(drafter, "candidate_selector", None)   # DFlash 2 path when present
+        # a block-causal head (DSpine) drafts anchor + cap rows; block diffusion the whole block
+        width = drafter.draft_width(cap) if hasattr(drafter, "draft_width") else bs
+        block = mx.array([[pending] + [mask_id] * (width - 1)])
+        paths = bool(getattr(drafter, "selects_paths", False))   # DFlash 2 / DSpine lattice path
         tree_path = None                                 # set by a tree round (tree.py)
         branched = False
         if temperature > 0.0:
             # two-phase: the accept test needs the q distributions on hand
-            if sel is not None:
+            if paths:
                 # DFlash 2: sampled selector walk. q lives on the K candidates per slot,
                 # scattered dense for the shared accept (reference: dflash_worker_v2's
                 # _selector_sampling_accept). The selector q IS the proposal distribution
@@ -934,7 +943,7 @@ def dflash_generate(
             # a single sync per round (see speculative_generate for the same pattern).
             # DFlash 2's greedy selector walk is chain-argmax over tiny [K, K] lattices —
             # it stays in-graph, so the single sync per round survives.
-            if sel is not None:
+            if paths:
                 draft_arr = drafter.select_block(
                     block, pending_ctx, dcache, cap=cap, anchor_id=pending)[0]
             else:
