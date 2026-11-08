@@ -255,8 +255,8 @@ def lookup_generate(
         for tok in committed:
             out_ids.append(tok)
             appended.append(tok)
-            if tok in eos_ids:
-                break
+            if tok in eos_ids or len(out_ids) >= max_new_tokens:
+                break                # eos, or the budget: a round may commit past it
         index.extend(appended)
         pending = out_ids[-1]        # eos mid-committed ends the loop (not committed[-1])
         st.update(out_ids)

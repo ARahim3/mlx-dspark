@@ -383,8 +383,8 @@ class _RowTracker:
             self.accept_lengths[b].append(accept_len)
         for tok in tokens:
             self.out_ids[b].append(tok)
-            if tok in self.eos:
-                break
+            if tok in self.eos or len(self.out_ids[b]) >= self.mnt[b]:
+                break            # eos, or this row's budget: a round may commit past it
         self.streamers[b].update(self.out_ids[b])
         self._check(b)
 

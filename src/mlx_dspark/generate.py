@@ -867,8 +867,8 @@ def dflash_generate(
             for tok in committed:
                 out_ids.append(tok)
                 appended.append(tok)
-                if tok in eos_ids:
-                    break
+                if tok in eos_ids or len(out_ids) >= max_new_tokens:
+                    break            # eos, or the budget: a round may commit past it
             index.extend(appended)
             pending = out_ids[-1]
             st.update(out_ids)
@@ -988,8 +988,8 @@ def dflash_generate(
         for tok in committed:
             out_ids.append(tok)
             appended.append(tok)
-            if tok in eos_ids:
-                break
+            if tok in eos_ids or len(out_ids) >= max_new_tokens:
+                break                # eos, or the budget: a round may commit past it
         if index is not None:
             index.extend(appended)                       # keep the copy index current
         pending = out_ids[-1]        # eos mid-committed ends the loop (not committed[-1])
@@ -1599,8 +1599,8 @@ def speculative_generate(
         for tok in committed:
             out_ids.append(tok)
             appended.append(tok)
-            if tok in eos_ids:
-                break
+            if tok in eos_ids or len(out_ids) >= max_new_tokens:
+                break                # eos, or the budget: a round may commit past it
         pen.add(appended)
         if lp_list is not None and appended:
             # raw target logits at the committed verify positions (0..len(appended)-1)
