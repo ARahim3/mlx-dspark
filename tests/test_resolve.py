@@ -123,9 +123,11 @@ def test_resolve_mode_auto_unknown_target_falls_back_to_lookup():
     assert mode == "lookup" and drf is None and tgt == "some-org/Weird-Model-3B-4bit"
 
 
-def test_resolve_mode_auto_with_explicit_drafter_is_dspark():
+def test_resolve_mode_auto_with_explicit_drafter_is_dspark(monkeypatch):
+    import mlx_dspark.load as L
     from mlx_dspark.load import resolve_mode
 
+    monkeypatch.setattr(L, "_drafter_config", lambda repo: None)   # unreadable config: no network
     mode, _tgt, drf = resolve_mode("some-org/Weird-Model-3B", mode="auto", drafter="org/d")
     assert mode == "dspark" and drf == "org/d"
 
@@ -250,3 +252,68 @@ def test_drafter_window_default_and_explicit_override():
         assert L.resolve_drafter_window(1024, "x/zz-test-row-4bit") == 1024
     finally:
         L.REGISTRY.remove(row)
+
+
+# --------------------------------------------------------------------------- drafter_lineage
+# `--drafter X` under `--mode auto` used to mean "a DSpark head"; a DFlash-lineage checkpoint then
+# failed in the DSpark loader after the 15 GB target had loaded. The lineage is read from
+# config.json: every DSpark packaging ships a Markov head, no DFlash / DFlash 2 / DSpine head does.
+
+import json  # noqa: E402
+
+_DSPINE = {"architectures": ["DFlashDraftModel"], "model_type": "qwen3", "block_size": 16,
+           "dflash_config": {"draft_block_causal": True, "mask_token_id": 1,
+                             "selected_prefix_code_bridge": {"code_size": 16, "rank": 8},
+                             "target_layer_ids": [1]}}
+_DFLASH2 = {"architectures": ["DFlash2DraftModel"], "model_type": "qwen3",
+            "dflash_config": {"block_size": 8, "selector_rank": 256, "selector_top_k": 16,
+                              "mask_token_id": 1, "target_layer_ids": [1]}}
+_DFLASH1 = {"architectures": ["DFlashDraftModel"], "model_type": "qwen3", "block_size": 16,
+            "dflash_config": {"mask_token_id": 1, "target_layer_ids": [1]}}
+_DEEPSPEC = {"architectures": ["Qwen3DSparkModel"], "markov_rank": 256, "mask_token_id": 1,
+             "target_layer_ids": [1]}
+_SPECFORGE = {"architectures": ["DSparkDraftModel"], "markov_rank": 256,
+              "dflash_config": {"projector_type": "dspark", "mask_token_id": 1, "target_layer_ids": [1]}}
+_NEMOTRON = {"architectures": ["Qwen3DSparkModel"],
+             "dflash_config": {"markov_rank": 512, "mask_token_id": 1, "target_layer_ids": [1]}}
+_HYBRID = {"architectures": ["DFlashDraftModel"], "markov_rank": 256,     # DFlash + Markov community head
+           "dflash_config": {"mask_token_id": 1, "target_layer_ids": [1]}}
+
+
+def _cfg_dir(tmp_path, name, cfg):
+    d = tmp_path / name
+    d.mkdir()
+    (d / "config.json").write_text(json.dumps(cfg))
+    return str(d)
+
+
+@pytest.mark.parametrize("name, cfg, want", [
+    ("dspine", _DSPINE, "dflash"), ("dflash2", _DFLASH2, "dflash"), ("dflash1", _DFLASH1, "dflash"),
+    ("deepspec", _DEEPSPEC, "dspark"), ("specforge", _SPECFORGE, "dspark"),
+    ("nemotron", _NEMOTRON, "dspark"), ("hybrid", _HYBRID, "dspark"),
+])
+def test_drafter_lineage_from_a_local_config(tmp_path, name, cfg, want):
+    from mlx_dspark.load import drafter_lineage, resolve_mode
+
+    path = _cfg_dir(tmp_path, name, cfg)
+    assert drafter_lineage(path) == want
+    mode, tgt, drf = resolve_mode("some-org/Weird-Model-3B", mode="auto", drafter=path)
+    assert (mode, tgt, drf) == (want, "some-org/Weird-Model-3B", path)
+
+
+def test_drafter_lineage_defaults_to_dspark_when_unreadable(tmp_path, monkeypatch):
+    import mlx_dspark.load as L
+
+    assert L.drafter_lineage("gguf:prism-ml/x/y.gguf") == "dspark"       # the PrismML converter
+    monkeypatch.setattr(L, "_drafter_config", lambda repo: None)
+    assert L.drafter_lineage("org/no-such-repo") == "dspark"
+    monkeypatch.setattr(L, "_drafter_config", lambda repo: {"architectures": ["Qwen3ForCausalLM"]})
+    assert L.drafter_lineage("org/not-a-drafter") == "dspark"
+
+
+def test_explicit_mode_is_never_second_guessed(tmp_path):
+    from mlx_dspark.load import resolve_mode
+
+    path = _cfg_dir(tmp_path, "dspine", _DSPINE)
+    assert resolve_mode("some-org/T", mode="dspark", drafter=path)[0] == "dspark"
+    assert resolve_mode("some-org/T", mode="dflash", drafter=path)[0] == "dflash"

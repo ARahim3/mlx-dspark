@@ -392,9 +392,10 @@ def resolve_mode(model: str | None = None, *, mode: str = "auto", drafter: str |
     if mode != "auto":
         tgt, drf = resolve(model, mode=mode, drafter=drafter, family=family, target=target)
         return mode, tgt, drf
-    if drafter:                                    # explicit drafter + auto -> DSpark adapter
-        tgt, drf = resolve(model, mode="dspark", drafter=drafter, family=family, target=target)
-        return "dspark", tgt, drf
+    if drafter:                                    # explicit drafter + auto -> its lineage's loop
+        lineage = drafter_lineage(drafter)
+        tgt, drf = resolve(model, mode=lineage, drafter=drafter, family=family, target=target)
+        return lineage, tgt, drf
     tgt, _ = resolve(model, mode="baseline", family=family, target=target)
     entry = _registry_entry(tgt)
     if entry is not None:
@@ -406,6 +407,54 @@ def resolve_mode(model: str | None = None, *, mode: str = "auto", drafter: str |
         if entry.get("dflash"):
             return "dflash", tgt, entry["dflash"]
     return "lookup", tgt, None
+
+
+def _drafter_config(repo_or_path: str) -> dict | None:
+    """The drafter's ``config.json`` as a dict: a local copy where one exists (:func:`local_dir`,
+    the hub cache), else ONE small hub fetch of that file alone (never the weights). ``None`` when
+    it cannot be read — the caller falls back to the historical default."""
+    import json
+
+    from huggingface_hub import hf_hub_download
+
+    try:
+        local = local_dir(repo_or_path)
+        if local is not None:
+            path = os.path.join(local, "config.json")
+        else:
+            try:
+                path = hf_hub_download(repo_or_path, "config.json", local_files_only=True)
+            except Exception:  # noqa: BLE001 — not cached: one 2 KB request
+                path = hf_hub_download(repo_or_path, "config.json")
+        with open(path) as f:
+            return json.load(f)
+    except Exception:  # noqa: BLE001 — unreadable / unreachable: let the loader's error speak
+        return None
+
+
+_DFLASH_ARCHITECTURES = ("DFlashDraftModel", "DFlash2DraftModel")
+
+
+def drafter_lineage(repo_or_path: str) -> str:
+    """``"dflash"`` for a DFlash-lineage head (z-lab DFlash, DFlash 2, DSpine), ``"dspark"``
+    otherwise — from ``config.json`` alone, so ``--drafter`` under ``--mode auto`` lands in the
+    right loop instead of the DSpark loader failing after the target has loaded.
+
+    The discriminator is the Markov head: every DSpark packaging (DeepSpec, vLLM speculators,
+    SpecForge/SGLang, LFM2.5, the Nemotron / Nanbeige / MiniCPM5 heads) ships ``markov_rank``
+    (top level or inside ``dflash_config``) and no DFlash-lineage head does; a SpecForge DSpark
+    head additionally tags ``dflash_config.projector_type``. A ``gguf:`` scheme is PrismML's
+    DSpark converter. Unreadable configs keep the historical default (dspark)."""
+    if not repo_or_path or repo_or_path.startswith("gguf:"):
+        return "dspark"
+    cfg = _drafter_config(repo_or_path)
+    if not cfg:
+        return "dspark"
+    dfc = cfg.get("dflash_config") or {}
+    if cfg.get("markov_rank") or dfc.get("markov_rank") or dfc.get("projector_type"):
+        return "dspark"
+    archs = cfg.get("architectures") or []
+    return "dflash" if any(a in _DFLASH_ARCHITECTURES for a in archs) else "dspark"
 
 
 def apply_wired_limit() -> None:
