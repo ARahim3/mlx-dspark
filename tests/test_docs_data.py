@@ -62,3 +62,36 @@ def test_every_default_arm_has_the_numbers_the_site_charts():
 def test_content_pages_have_titles(page):
     text = page.read_text()
     assert text.startswith("---\n") and "\ntitle:" in text.split("\n---\n", 1)[0], page.name
+
+
+# ---- table wrappers: one per table, never a stray </div> (the 2026-11-08 layout break) ----
+
+def test_wrap_tables_wraps_bare_tables_once_and_leaves_hand_wrapped_ones_alone():
+    b = _builder()
+    bare = "<p>a</p>\n<table>\n<tr><td>1</td></tr>\n</table>\n<p>b</p>"
+    out = b.wrap_tables(bare)
+    assert out.count('<div class="table-wrap">') == 1 and out.count("</div>") == 1
+    hand = '<div class="table-wrap"><table class="num">\n<tr><td>1</td></tr>\n</table></div>\n<p>b</p>'
+    assert b.wrap_tables(hand) == hand                       # already wrapped: untouched
+    both = hand + "\n" + bare
+    out = b.wrap_tables(both)
+    assert out.count('<div class="table-wrap">') == 2 and out.count("</div>") == 2
+    assert "</table></div></div>" not in out
+
+
+def test_built_pages_keep_their_divs_balanced(tmp_path):
+    """Every generated page opens as many <div> as it closes — a stray close pushes the rest of
+    the page out of the content column (what happened to results / models / long-context /
+    prefill between the site's launch and 2026-11-08)."""
+    import re
+
+    b = _builder()
+    b.build(tmp_path)
+    pages = sorted(tmp_path.rglob("index.html"))
+    assert pages, "the build produced no pages"
+    for page in pages:
+        html = page.read_text(encoding="utf-8")
+        opened = len(re.findall(r"<div\b", html))
+        closed = html.count("</div>")
+        assert opened == closed, f"{page.relative_to(tmp_path)}: {opened} <div> vs {closed} </div>"
+        assert "</table></div></div>" not in html, page.relative_to(tmp_path)

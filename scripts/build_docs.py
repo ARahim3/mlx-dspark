@@ -281,13 +281,28 @@ def render_markdown(text: str, jenv, ctx: dict) -> tuple[str, list[dict]]:
     md = make_markdown()
     body = md.convert(text)
     body = unstash(body, stash)
-    body = re.sub(r"<table>", '<div class="table-wrap"><table>', body)
-    body = re.sub(r"</table>", "</table></div>", body)
+    body = wrap_tables(body)
     toc = [{"id": t["id"], "name": _strip_tags(t["name"]),
             "children": [{"id": c["id"], "name": _strip_tags(c["name"])} for c in t["children"]]}
            for t in md.toc_tokens]
     # toc_tokens start at the shallowest heading present; pages have no body h1
     return body, toc
+
+
+def wrap_tables(body: str) -> str:
+    """Give every table a horizontal-scroll wrapper — unless the page already wrapped it by
+    hand (``<div class="table-wrap"><table class="num">`` in the Markdown). The old version
+    closed a wrapper after EVERY ``</table>``, hand-wrapped ones included, so each of those
+    emitted a stray ``</div>`` that closed the content column and pushed the rest of the page
+    out of the layout (results, models index, long-context and prefill pages, live from the
+    2026-09-28 launch until 2026-11-08)."""
+    def repl(m: re.Match) -> str:
+        before = body[max(0, m.start() - 80):m.start()].rstrip()
+        if before.endswith('<div class="table-wrap">'):
+            return m.group(0)
+        return '<div class="table-wrap">' + m.group(0) + "</div>"
+
+    return re.sub(r"<table\b.*?</table>", repl, body, flags=re.S)
 
 
 def _strip_tags(s: str) -> str:
