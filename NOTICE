@@ -84,6 +84,33 @@ installed mlx-lm provides the module itself.
 
 ---
 
+Inkling 2 (Thinking Machines) support
+-------------------------------------
+
+`src/mlx_dspark/inkling.py` (the DSpark head Inkling 2 ships in its own repository) follows
+the math of vLLM's Inkling 2 DSpark implementation (Apache License 2.0, Copyright
+contributors to the vLLM project) as ported to MLX by mlx-vlm
+(`mlx_vlm/speculative/drafters/inkling2_dspark`, https://github.com/Blaizzy/mlx-vlm). No
+source file is included; the module is written against mlx-dspark's own drafter interface.
+
+`src/mlx_dspark/inkling_kernels.py` adapts the FP4 / FP8 quantized types and the wide
+matrix-vector layout of MLX (`mlx/backend/metal/kernels/fp_quantized.h`, MIT License,
+Copyright © 2023 Apple Inc.), via mlx-vlm's `models/masked_quantized.py` (MIT License).
+
+`src/mlx_dspark/inkling_fused.py` contains two forward bodies adapted from mlx-vlm's
+Inkling 2 model (`mlx_vlm/models/inkling2/language.py`: `DecoderLayer.__call__` and
+`Attention.__call__`; Apache License 2.0, Copyright 2026 The HuggingFace Team, itself
+adapted for MLX from Transformers' Inkling2), with runs of small operations replaced by
+mlx-dspark's own Metal kernels, and the short-convolution expression of mlx-vlm's
+`models/inkling2/kernels.py` (MIT License). The kernels' reductions follow the layouts of
+MLX's own `rms_norm.metal` and `reduction/reduce_row.h` (MIT License, Copyright © 2024
+Apple Inc.) so that their results are bit-identical to the stock operations.
+
+Inkling 2 checkpoints (e.g. `thinkingmachines/Inkling-2-Mini`, Apache-2.0) are downloaded
+at runtime from their publisher.
+
+---
+
 Target models (Gemma-4, Qwen3) are downloaded at runtime from their respective
 publishers and are subject to their own licenses (e.g. the Gemma Terms of Use and the
 Qwen license).

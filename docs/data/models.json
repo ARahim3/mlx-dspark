@@ -927,7 +927,7 @@
       "arch": "Looped MoE: the middle 12 of 24 layers run three times, 8 of 128 experts per token",
       "tools": null,
       "thinking": true,
-      "summary": "1.69× on math, 1.44× on code: Thinking Machines ships the DSpark head inside the model repo, so there is nothing extra to download.",
+      "summary": "1.34× on math, 1.22× on code, over a plain decode that mlx-dspark already runs 24% faster than the stock code: Thinking Machines ships the DSpark head inside the model repo, so there is nothing extra to download.",
       "caveat": "Needs an mlx-vlm with the looped inkling2 model, which no release ships yet (0.8.0 has the plain one only): install mlx-vlm from git until one does.",
       "variants": [
         {
@@ -944,21 +944,21 @@
               "label": "DSpark",
               "drafter": "thinkingmachines/Inkling-2-Mini (bundled)",
               "default": true,
-              "cap": 3,
-              "accept": 2.52,
-              "baseline": 24.8,
-              "tps": 34.4,
-              "speedup": 1.39,
+              "cap": 2,
+              "accept": 2.14,
+              "baseline": 29.7,
+              "tps": 35.1,
+              "speedup": 1.18,
               "content": {
-                "chat": 1.04,
-                "code": 1.44,
-                "math": 1.69
+                "chat": 0.99,
+                "code": 1.22,
+                "math": 1.34
               }
             }
           ]
         }
       ],
-      "notes": "Inkling-2-Mini is a 26B mixture-of-experts model (3.4B active per token) whose middle 12 layers run **three times** per token. It is published as one mixed-precision checkpoint: NVFP4 and MXFP8 experts, bf16 everywhere else. mlx-dspark runs that checkpoint as released; there is no separate quant to pick.\n\nThinking Machines ships the speculative drafter **inside the model repo** (`mtp.safetensors`), so `--model thinkingmachines/Inkling-2-Mini` is the whole setup: the drafter resolves to the model itself.\n\nLike every mixture-of-experts target, each extra drafted row pulls in fresh experts, so the derived cap is short (3) and chat is a wash. mlx-dspark verifies those rows with its own expert kernel, which loads each expert once for all the rows routed to it.\n\n## First run\n\nNo mlx-vlm release can load this model yet. Install it from git until one ships:\n\n```bash\nuv pip install 'mlx-vlm @ git+https://github.com/Blaizzy/mlx-vlm'\nmlx-dspark serve --model thinkingmachines/Inkling-2-Mini\n```\n\nThe checkpoint is about 20 GB, and the model card recommends 32 GB of memory or more."
+      "notes": "Inkling-2-Mini is a 26B mixture-of-experts model (3.4B active per token) whose middle 12 layers run **three times** per token. It is published as one mixed-precision checkpoint: NVFP4 and MXFP8 experts, bf16 everywhere else. mlx-dspark runs that checkpoint as released; there is no separate quant to pick.\n\nThinking Machines ships the speculative drafter **inside the model repo** (`mtp.safetensors`), so `--model thinkingmachines/Inkling-2-Mini` is the whole setup: the drafter resolves to the model itself.\n\nLike every mixture-of-experts target, each extra drafted row pulls in fresh experts, so the derived cap is short (2) and chat is a tie. mlx-dspark verifies those rows with its own expert kernel, which loads each expert once for all the rows routed to it.\n\nThe baseline in these numbers is mlx-dspark's own fused forward, not the stock one. This model's stock code launches about 7,000 small GPU kernels per token; mlx-dspark folds the runs between the big matrix products into single kernels (about 2,500 launches), which makes plain decoding 24% faster (24.0 to 29.7 tok/s) and every verify pass cheaper. Over the stock forward the same drafter shows 1.40×; here it shows 1.18× on a faster baseline (33.5 to 35.1 tok/s end to end).\n\n## First run\n\nNo mlx-vlm release can load this model yet. Install it from git until one ships:\n\n```bash\nuv pip install 'mlx-vlm @ git+https://github.com/Blaizzy/mlx-vlm'\nmlx-dspark serve --model thinkingmachines/Inkling-2-Mini\n```\n\nThe checkpoint is about 20 GB, and the model card recommends 32 GB of memory or more."
     },
     {
       "slug": "ternary-bonsai-27b",

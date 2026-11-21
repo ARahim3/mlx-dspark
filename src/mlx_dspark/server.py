@@ -1563,7 +1563,8 @@ class Engine:
             kv_bits=getattr(self.target, "kv_bits", None),
             smm_live=bool(_gen.SMALL_M_IDS),
             sdps_live=_gen.SDPA_SPLIT_CFG is not None,
-            mra_live=_gen.MULTIROW_CFG is not None)
+            mra_live=_gen.MULTIROW_CFG is not None,
+            tag=getattr(self.target, "calibration_tag", ""))
         if entry is None:
             return {"available": False, "key": key,
                     "reason": "not calibrated yet on this machine — loading the pair without "

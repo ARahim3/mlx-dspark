@@ -292,15 +292,18 @@ REGISTRY = [
     # head (inkling.py): per-layer context fusion, 8-row bidirectional block with a pure anchor slot,
     # the rnn_hidden Markov head folded through the target's head — draft blocks identical to the
     # reference head (51/51). Verify runs inside mlx-vlm's own speculative-cache transaction; the MoE
-    # at verify widths and the fp32 head run mlx-dspark kernels (inkling_kernels.py). Measured
-    # 2026-11-21 (M4 Pro, mlx 0.32.4, Automatic power mode, `benchmark --trials 3`, zero flags): **cap
-    # 3 = 1.39x** (1.04x chat / 1.44x code / 1.69x math, accept 2.52, baseline 24.8 tok/s); lookup off
-    # (MoE: a free draft still pulls fresh experts per row). Lossless (token forcing at cap 3: 1.04%
-    # near-tie rate vs plain greedy's own 1.17%, no large-margin event). Decode is bound by encoding ~13k graph
-    # primitives per step, not by bandwidth: see NOTES "Inkling-2-Mini ported".
+    # at verify widths and the fp32 head run mlx-dspark kernels (inkling_kernels.py), and decode /
+    # verify forwards run the fused pieces of inkling_fused.py (~2,500 GPU launches per token
+    # instead of ~7,000: plain decode 24.0 -> 29.7 tok/s). Measured 2026-11-21 (M4 Pro, mlx 0.32.4,
+    # Automatic power mode, `benchmark --trials 3`, zero flags), baseline = the fused forward:
+    # **cap 2 = 1.18x** (0.99x chat / 1.22x code / 1.34x math, accept 2.14, baseline 29.7 tok/s);
+    # over the stock forward the same head is 1.40x at cap 3 (33.5 tok/s vs 35.1 here). Lookup off
+    # (MoE: a free draft still pulls fresh experts per row). Lossless (token forcing against the
+    # STOCK forward: 0.91% near-tie rate vs stock greedy's own 1.37%, no excess large-margin
+    # event). See NOTES "Inkling-2-Mini ported", "Inkling fused forward".
     {"id": "inkling-2-mini", "target": "thinkingmachines/Inkling-2-Mini",
      "dspark": "thinkingmachines/Inkling-2-Mini", "bundled_head": True, "lookup_drafts": False,
-     "ram": "~22 GB", "speedup": "~1.4× (1.7× math)"},
+     "ram": "~22 GB", "speedup": "~1.2× (1.3× math)"},
 ]
 
 # legacy `--family` / load_pair("qwen3") values -> a concrete target repo (deprecated).

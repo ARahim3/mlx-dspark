@@ -61,7 +61,7 @@ chat/code/math), the Muse row per-content best (footnoted); full tables, baselin
 | **Ornith-1.0-9B** (8-bit) | **2.53×** code · **2.48×** math · **2.21×** chat | ~59–68 tok/s |
 | **Qwen3-4B** (8-bit) | **2.46×** math · 1.78× chat · 1.72× code | ~89–126 tok/s |
 | **Qwen3-14B** (8-bit) | **2.36×** math · **2.11×** code · 1.62× chat | ~25–36 tok/s |
-| **Inkling-2-Mini** (NVFP4, looped MoE)[^inkling] | **1.69×** math · **1.44×** code · 1.04× chat | ~26–42 tok/s |
+| **Inkling-2-Mini** (NVFP4, looped MoE)[^inkling] | **1.34×** math · **1.22×** code · 0.99× chat | ~30–39 tok/s |
 | **Qwen3.6-35B-A3B** (4-bit, MoE)[^moe] | **1.67×** math · 1.24× code · 1.05× chat | **~91–145 tok/s** |
 | **Nemotron-3.5-Lightning-30B-A3B** (4-bit, MoE+Mamba)[^nemotron] | **1.34×** math · **1.27×** code · 1.07× chat | **~87–112 tok/s** |
 | **Ternary-Bonsai-27B** (2-bit) | **1.13×** code | ~26–29 tok/s |
@@ -656,7 +656,7 @@ different measured curves.
 | **Qwen3-8B** | 7 | 3.37 | 29.5 tok/s | 64.5 tok/s | **2.19×** | 1.71× / 2.03× / 2.83× |
 | **Qwen3-14B**[^qwen14b] | 4 | 2.87 | 15.3 tok/s | 31.0 tok/s | **2.03×** | 1.62× / 2.11× / 2.36× |
 | **Qwen3-4B** | 7 | 3.23 | 51.7 tok/s | 102.5 tok/s | **1.98×** | 1.78× / 1.72× / 2.46× |
-| **Inkling-2-Mini** (NVFP4, looped MoE)[^inkling] | 3 | 2.52 | 24.8 tok/s | 34.4 tok/s | **1.39×** | 1.04× / 1.44× / 1.69× |
+| **Inkling-2-Mini** (NVFP4, looped MoE)[^inkling] | 2 | 2.14 | 29.7 tok/s | 35.1 tok/s | **1.18×** | 0.99× / 1.22× / 1.34× |
 | **Qwen3.6-35B-A3B** (4-bit, MoE, hybrid)[^community][^moe] | conf | 4.72 | 86.9 tok/s | 114.5 tok/s | **1.32×** | 1.05× / 1.24× / 1.67× |
 | **Nemotron-3.5-Lightning-30B-A3B** (4-bit, MoE+Mamba, hybrid)[^nemotron] | 3 | 3.28 | 91.4 tok/s | 100.9 tok/s | **1.10×** | 0.95× / 1.23× / 1.13× |
 | **Ternary-Bonsai-27B** (2-bit, hybrid) | 2 | 2.60 | 25.4 tok/s | 27.2 tok/s | **1.07×** | 1.01× / 1.13× / 1.07× |
@@ -1336,11 +1336,15 @@ are bundled.
     resolves to the target itself. **Needs mlx-vlm from git** until a release ships the looped
     `inkling2` model (0.8.0 has the plain one only). Measured 2026-11-21 on mlx 0.32.4 in Automatic (not High)
     power mode, lookup drafts off (this pair's shipped default, like every MoE row). Verify uses
-    mlx-dspark's own expert kernel, which loads each expert once for every draft row routed to it
-    (verify at 4 rows 85.6 → 63.3 ms with the output-head kernel), so the derived cap is 3 rather
-    than 2; the drafter reads its own 8-bit copy of the output head. Decoding this model is bound by the sheer number of small GPU operations per token
-    (~13k), not by memory bandwidth, which is why the ratio is MoE-modest. Lossless by token
-    forcing (1.04% near-tie disagreements vs plain greedy's own 1.17%, none large).
+    mlx-dspark's own expert kernel, which loads each expert once for every draft row routed to it;
+    the drafter reads its own 8-bit copy of the output head. **The baseline in this row is already
+    mlx-dspark's fused forward**: mlx-vlm's stock code launches about 7,000 small GPU kernels per
+    token on this model, mlx-dspark about 2,500, which makes plain decoding 24% faster (24.0 →
+    29.7 tok/s) and every verify pass cheaper. That is why the ratio is lower than the 1.40× the
+    same drafter shows over the stock forward (33.5 tok/s there, 35.1 here): the drafter was
+    mostly amortizing overhead that is now gone for every token. The derived cap is 2. Lossless
+    by token forcing against the stock forward (0.91% near-tie disagreements vs stock greedy's
+    own 1.37%, none large).
 [^nemotron]: **Nemotron-3.5-Lightning-30B-A3B** — the first **Mamba-2 + MoE hybrid** target
     (`nemotron_h`, NVIDIA's official DSpark head), the project's first non-attention recurrence,
     with an exact Mamba-2 spec rollback. Lookup drafts off everywhere (a net loss on it, as on

@@ -33,6 +33,9 @@ description: The environment variables the engine reads, and where it keeps thin
 `MLX_DSPARK_INKLING_FAST_HEAD=0`
 : Inkling 2 only: compute the fp32 logits through mlx-vlm's stock path, which keeps a 1.85 GB fp32 copy of the output head, instead of mlx-dspark's kernel that reads the bf16 head directly. Slower and uses more memory. For comparison runs only.
 
+`MLX_DSPARK_INKLING_FUSED=0`
+: Inkling 2 only: run mlx-vlm's stock layer and attention code for decode steps and verify passes instead of mlx-dspark's fused forward, which replaces runs of small GPU operations with single kernels (a decode step launches about 2,500 GPU kernels instead of about 7,000). Slower. For comparison runs only.
+
 `MLX_DSPARK_INKLING_DRAFT_HEAD_BITS`
 : Inkling 2 only: bits of the drafter's own copy of the output head, which its draft logits go through (default 8; 0 uses the model's bf16 head). Drafting only — the model still checks every token. 8 bits leaves acceptance unchanged and makes each draft round about 1.7 ms cheaper; 4 bits is faster still but starts to cost acceptance.
 

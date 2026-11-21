@@ -77,6 +77,9 @@ class Target:
     # class defaults, so a Target built without __init__ (tests' Target.__new__ doubles) is a
     # plain non-Inkling target with no open verify transaction
     _inkling = False
+    # appended to the calibration cache key: a target whose own forward has variants with
+    # different verify curves names the live one here (Inkling 2's fused forward: "|ikf")
+    calibration_tag = ""
     _txn = None
     prefill_chunk: int | None = None   # None = generate.PREFILL_CHUNK (see _target_chunk)
 
@@ -133,6 +136,24 @@ class Target:
             # MLX_DSPARK_INKLING_FAST_HEAD=0 is the A/B.
             if os.environ.get("MLX_DSPARK_INKLING_FAST_HEAD", "1").lower() not in ("0", "false"):
                 install_fast_head(model.language_model)
+            # Decode- and verify-width calls launch ~7,000 small GPU kernels per forward on the
+            # stock path; inkling_fused folds the runs between the big matmuls into single
+            # launches (each piece self-tested against this mlx-vlm's stock forward at load, and
+            # left on the stock path if it does not hold). MLX_DSPARK_INKLING_FUSED=0 is the A/B.
+            self.inkling_fused: dict[str, bool] = {}
+            if (os.environ.get("MLX_DSPARK_INKLING_FUSED", "1").lower() not in ("0", "false")
+                    and mx.metal.is_available() and mx.default_device() == mx.gpu):
+                from .inkling_fused import install as install_fused
+                from .inkling_fused import selftest as fused_selftest
+
+                install_fused(model.language_model, enabled=False)
+                self.inkling_fused = fused_selftest(model.language_model)
+                if any(self.inkling_fused.values()):
+                    self.calibration_tag = "|ikf"
+                off = sorted(k for k, ok in self.inkling_fused.items() if not ok)
+                if off:
+                    print(f"[inkling] fused forward: {', '.join(off)} failed the self-test "
+                          "against this mlx-vlm and stay on the stock path", file=sys.stderr)
         self._txn = None          # the open transaction of the last multi-row Inkling verify
         # nanbeige (Nanbeige4.2): a looped-depth transformer — num_hidden_layers dense
         # blocks applied num_loops times with shared weights, per-loop KV caches, and the

@@ -297,6 +297,22 @@ class TestCachedCurveEntry:
         assert cached_curve_entry("dspark", "T", "D",
                                   smm_live=False, cache_dir=cache)[0] == base
 
+    def test_a_target_tag_reads_only_its_own_curves(self, tmp_path):
+        # Inkling 2's fused forward has another verify curve than its stock forward: a tagged
+        # target must never price caps from untagged curves, nor the reverse.
+        from mlx_dspark.calibrate import cached_curve_entry
+        base, cache = self._base(tmp_path)
+        save_cached(base + "|smm", {"verify": {"1": 2.0}}, cache)
+        key, entry = cached_curve_entry("dspark", "T", "D", smm_live=True, tag="|ikf",
+                                        cache_dir=cache)
+        assert entry is None and key == base + "|ikf"
+        save_cached(base + "|smm|ikf", {"verify": {"1": 1.0}}, cache)
+        key, entry = cached_curve_entry("dspark", "T", "D", smm_live=True, tag="|ikf",
+                                        cache_dir=cache)
+        assert key == base + "|smm|ikf" and entry["verify"]["1"] == 1.0
+        key, entry = cached_curve_entry("dspark", "T", "D", smm_live=True, cache_dir=cache)
+        assert key == base + "|smm" and entry["verify"]["1"] == 2.0
+
     def test_never_measured_returns_base_key_and_none(self, tmp_path):
         from mlx_dspark.calibrate import cached_curve_entry
         base, cache = self._base(tmp_path)

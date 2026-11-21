@@ -815,7 +815,7 @@ def _cache_key(mode: str, target_repo: str, drafter_repo: str | None,
 def cached_curve_entry(mode: str, target_repo: str, drafter_repo: str | None, *,
                        kv_bits: int | None = None, smm_live: bool = False,
                        sdps_live: bool = False, mra_live: bool = False,
-                       cache_dir: str | None = None) -> tuple[str, dict | None]:
+                       tag: str = "", cache_dir: str | None = None) -> tuple[str, dict | None]:
     """``(key, entry)`` for this pair's cost curves, or ``(key, None)`` if never measured.
 
     Curves calibrated with the small-M verify kernel live are stored under a ``"|smm"``-tagged
@@ -824,6 +824,9 @@ def cached_curve_entry(mode: str, target_repo: str, drafter_repo: str | None, *,
     ``/calibration`` endpoint read only the untagged key and reported "not calibrated" on
     every kernel-on machine from v0.12.0 on — a calibrated machine with an invisible cache.
     The returned key names which variant was found, so a client can tell.
+
+    ``tag`` is the target's own kernel state (``Target.calibration_tag``, e.g. Inkling 2's fused
+    forward): a tagged pair reads only tagged curves, never ones timed on another forward.
     """
     base = _cache_key(mode, target_repo, drafter_repo, kv_bits=kv_bits)
     # Try the key matching the live (small-M, sdpa-split) state first; then fall back across
@@ -833,7 +836,7 @@ def cached_curve_entry(mode: str, target_repo: str, drafter_repo: str | None, *,
     cands, seen = [], set()
     for suf in (live, "", "|smm", "|sdps", "|smm|sdps", "|mra", "|smm|mra", "|sdps|mra",
                 "|smm|sdps|mra"):
-        k = base + suf
+        k = base + suf + tag
         if k not in seen:
             seen.add(k)
             cands.append(k)
@@ -841,7 +844,7 @@ def cached_curve_entry(mode: str, target_repo: str, drafter_repo: str | None, *,
         entry = load_cached(key, cache_dir)
         if entry is not None:
             return key, entry
-    return base, None
+    return base + tag, None
 
 
 def load_cached(key: str, cache_dir: str | None = None) -> dict | None:
@@ -1466,6 +1469,7 @@ def calibrate(target, drafter, *, mode: str, target_repo: str, drafter_repo: str
         key += "|sdps"          # split-on and split-off curves must not collide (see |smm)
     if mra_cfg is not None:
         key += "|mra"           # nor kernel-on and kernel-off depth slopes
+    key += getattr(target, "calibration_tag", "")     # nor a target's own forward variants
     entry = load_cached(key, cache_dir)
     tap = list(cfg.target_layer_ids)
     if entry is None:
@@ -1734,7 +1738,8 @@ def static_tree(target, drafter, *, setting="auto", target_repo: str,
         return cached_curve_entry(
             mode, target_repo, drafter_repo, kv_bits=getattr(target, "kv_bits", None),
             smm_live=bool(_gen.SMALL_M_IDS), sdps_live=_gen.SDPA_SPLIT_CFG is not None,
-            mra_live=_gen.MULTIROW_CFG is not None, cache_dir=cache_dir)
+            mra_live=_gen.MULTIROW_CFG is not None,
+            tag=getattr(target, "calibration_tag", ""), cache_dir=cache_dir)
 
     if not getattr(target, "tree_kernel_live", True):
         try:
