@@ -85,6 +85,8 @@ def test_built_pages_keep_their_divs_balanced(tmp_path):
     prefill between the site's launch and 2026-11-08)."""
     import re
 
+    for dep in ("markdown", "pygments", "jinja2"):  # the `docs` extra; CI's `.[dev]` lacks it
+        pytest.importorskip(dep)
     b = _builder()
     b.build(tmp_path)
     pages = sorted(tmp_path.rglob("index.html"))
