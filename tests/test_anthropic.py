@@ -645,6 +645,7 @@ class _FakeEngine:
     cap_controller = None
     context_window = None
     is_muse = False           # mirrors Engine.is_muse (muse_glimmer channel parsing off)
+    is_inkling = False        # mirrors Engine.is_inkling (Inkling 2 sub-messages off)
     # Borrow the real Engine's reasoning-effort logic (pure over self.tokenizer) so the
     # server's output_config.effort wiring (issue #25) is exercised against real behavior.
     supports_reasoning_effort = S.Engine.supports_reasoning_effort

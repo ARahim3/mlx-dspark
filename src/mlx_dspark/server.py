@@ -587,6 +587,13 @@ class Engine:
         non-streaming split/tool-parse functions auto-detect from muse's unique markers."""
         return bool(getattr(self.target, "_muse", False))
 
+    @property
+    def is_inkling(self) -> bool:
+        """True when the loaded target is Thinking Machines Inkling 2: its output is
+        ``<|message_model|>…<|content_KIND|>…<|end_message|>`` sub-messages (reasoning, answer,
+        tool calls), split by :class:`~mlx_dspark.anthropic_api.InklingChannelParser`."""
+        return bool(getattr(self.target, "_inkling", False))
+
     # --- construction ---
     @classmethod
     def load(
@@ -2924,13 +2931,15 @@ def make_handler(engine: Engine, api_key: str | None):
             ``<think>``-style pairs, self-opened or prefilled by the chat template."""
             if engine.is_muse:
                 return A.MuseChannelParser()
+            if engine.is_inkling:
+                return A.InklingChannelParser()
             return A.ThinkingStreamSplitter(in_thinking=self._prompt_opens_thinking(prompt_ids))
 
         def _messages_stream(self, prompt_ids, params, model, want_thinking=True, schemas=None):
             stream = A.MessageStream(model=model, input_tokens=len(prompt_ids),
                                      thinking=want_thinking, schemas=schemas,
                                      in_thinking=self._prompt_opens_thinking(prompt_ids),
-                                     muse=engine.is_muse)
+                                     muse=engine.is_muse, inkling=engine.is_inkling)
             self._sse_start()
             for name, payload in stream.start():
                 self._sse(payload, name)

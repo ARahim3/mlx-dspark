@@ -130,6 +130,9 @@ def measure_verify_curve(target, tap: list[int], widths: list[int],
         # loop vars bound as defaults: fn is consumed inside this iteration, but binding
         # makes that explicit rather than relying on it (ruff B023)
         def fn(x=x, m=m):
+            bench = getattr(target, "bench_verify", None)
+            if bench is not None:                # the target prices its own verify path
+                return bench(x, cache, tap)      # (Inkling 2: the transactional verify)
             logits, _ = target.run(x, cache, tap)
             for c in cache:                      # roll back so every iteration is identical
                 if c is not None and hasattr(c, "trim"):
@@ -1425,6 +1428,8 @@ def calibrate(target, drafter, *, mode: str, target_repo: str, drafter_repo: str
         drafter.bind_lm_head(target.lm_head_proj)
     if not getattr(cfg, "has_own_embed", True) and getattr(drafter, "_ext_embed", None) is None:
         drafter.bind_embed(target.draft_embed)
+    if getattr(drafter, "bind_target", None) is not None:  # price the head the loop will use
+        drafter.bind_target(target)
     if mode == "dspark":
         max_cap = int(cfg.block_size)
         widths = list(range(1, max_cap + 2))     # verify width = cap + 1; width 1 = the

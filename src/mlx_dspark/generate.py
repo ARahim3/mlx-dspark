@@ -1054,6 +1054,15 @@ CPU_SPLIT = None           # prefill CPU co-prefill: {"min_rows": N, "fracs": {w
 # 1.41x prefill at a 0.3 fraction, greedy continuation token-identical.
 
 
+def _target_chunk(target) -> int:
+    """The prefill chunk for this target: its own ``prefill_chunk`` when it carries one, else
+    the module knob (read at call time). Inkling 2 sets 512: its attention materializes a dense
+    relative-position mask per global layer, ``[heads, chunk, context]``, so a 2048-row chunk
+    was slower than 512 (352 vs 367 tok/s at 8k) and needed ~3x the transient memory (+9.0 vs
+    +3.2 GB at 8k, growing with depth). Every other family measured best at 2048."""
+    return getattr(target, "prefill_chunk", None) or PREFILL_CHUNK
+
+
 def _cache_arrays(cache) -> list:
     """Every mx.array living in a cache list, however the layer caches nest their state
     (KVCache tuples, ArraysCache lists with None holes, CacheList of caches). Used to
@@ -1080,7 +1089,7 @@ def _prefill_plain(target, ids: list[int], cache, chunk: int | None = None,
     the sync the loop already does to bound activations — so it is honest (that much of
     the prompt is genuinely computed) and free (no synchronization is added; the final
     chunk needs none because generation starting IS its completion signal)."""
-    chunk = chunk or PREFILL_CHUNK      # read the module knob at call time
+    chunk = chunk or _target_chunk(target)
     stops = _mark_stops(marks, base, len(ids))
     logits = None
     many = len(ids) > chunk or bool(stops)
@@ -1113,7 +1122,7 @@ def _prefill_tapped(target, ids: list[int], cache, tap, drafter=None, ctx_caches
     drafter the fused chunks are concatenated (DFlash needs the whole prompt's fused).
     ``marks``/``on_mark`` and the progress hook ``on_chunk``: see :func:`_prefill_plain`
     (``ctx_offset`` is the base)."""
-    chunk = chunk or PREFILL_CHUNK      # read the module knob at call time
+    chunk = chunk or _target_chunk(target)
     stops = _mark_stops(marks, ctx_offset, len(ids))
     logits = fused = None
     parts = []
@@ -1268,6 +1277,9 @@ def speculative_generate(
         drafter.bind_lm_head(target_model.lm_head_proj)
     if not getattr(cfg, "has_own_embed", True):
         drafter.bind_embed(target_model.draft_embed)
+    bind_target = getattr(drafter, "bind_target", None)   # drafters needing more of the target
+    if bind_target is not None:                            # (Inkling 2: its head's weights)
+        bind_target(target_model)
     tap = list(cfg.target_layer_ids)
     mask_id = cfg.mask_token_id
     # A DFlash-derived head spends slot 0 on the anchor, so it can propose block_size-1.

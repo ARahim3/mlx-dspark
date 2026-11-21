@@ -918,6 +918,49 @@
       "notes": "A hybrid of **Mamba-2** state-space layers, attention and a mixture of experts (~3B active), with NVIDIA's official DSpark head. Mamba's recurrent state can't be trimmed like a KV cache, so mlx-dspark records each verify round's inputs and rebuilds the state at the exact accept point (bit-exact).\n\nThe speedup is unusually content-sensitive. The best per-prompt measurements at cap 4 reach **1.34×** on math and 1.27× on code. Suite chat is around break-even, which is why the derived cap is 3. As with every MoE here, the ceiling is the verify cost of routed experts, not the drafter.\n\nLookup drafts are off by default (a net loss on every MoE)."
     },
     {
+      "slug": "inkling-2-mini",
+      "name": "Inkling-2-Mini",
+      "vendor": "Thinking Machines",
+      "params": "26B (3.4B active)",
+      "params_b": 26,
+      "kind": "moe",
+      "arch": "Looped MoE: the middle 12 of 24 layers run three times, 8 of 128 experts per token",
+      "tools": null,
+      "thinking": true,
+      "summary": "1.69× on math, 1.44× on code: Thinking Machines ships the DSpark head inside the model repo, so there is nothing extra to download.",
+      "caveat": "Needs an mlx-vlm with the inkling2 model, which no release ships yet (merged after 0.8.0): install mlx-vlm from git until one does.",
+      "variants": [
+        {
+          "registry": "inkling-2-mini",
+          "quant": "NVFP4 experts",
+          "measured": {
+            "when": "2026-11-21",
+            "mlx": "0.32.4",
+            "fresh": true
+          },
+          "arms": [
+            {
+              "mode": "dspark",
+              "label": "DSpark",
+              "drafter": "thinkingmachines/Inkling-2-Mini (bundled)",
+              "default": true,
+              "cap": 3,
+              "accept": 2.52,
+              "baseline": 24.8,
+              "tps": 34.4,
+              "speedup": 1.39,
+              "content": {
+                "chat": 1.04,
+                "code": 1.44,
+                "math": 1.69
+              }
+            }
+          ]
+        }
+      ],
+      "notes": "Inkling-2-Mini is a 26B mixture-of-experts model (3.4B active per token) whose middle 12 layers run **three times** per token. It is published as one mixed-precision checkpoint: NVFP4 and MXFP8 experts, bf16 everywhere else. mlx-dspark runs that checkpoint as released; there is no separate quant to pick.\n\nThinking Machines ships the speculative drafter **inside the model repo** (`mtp.safetensors`), so `--model thinkingmachines/Inkling-2-Mini` is the whole setup: the drafter resolves to the model itself.\n\nLike every mixture-of-experts target, each extra drafted row pulls in fresh experts, so the derived cap is short (3) and chat is a wash. mlx-dspark verifies those rows with its own expert kernel, which loads each expert once for all the rows routed to it.\n\n## First run\n\nNo mlx-vlm release can load this model yet. Install it from git until one ships:\n\n```bash\nuv pip install 'mlx-vlm @ git+https://github.com/Blaizzy/mlx-vlm'\nmlx-dspark serve --model thinkingmachines/Inkling-2-Mini\n```\n\nThe checkpoint is about 20 GB, and the model card recommends 32 GB of memory or more."
+    },
+    {
       "slug": "ternary-bonsai-27b",
       "name": "Ternary-Bonsai-27B",
       "vendor": "PrismML",

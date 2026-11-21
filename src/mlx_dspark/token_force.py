@@ -98,8 +98,8 @@ def score_forced(target, prompt_ids: Sequence[int], output_ids: Sequence[int], *
     length), so the forward runs over ``prompt + output[:-1]``:
 
     - rows ``[0, P-1)`` are only context: they go through the body-only prefill
-      (``want_logits=False``), chunked at ``prefill_chunk`` (default
-      ``generate.PREFILL_CHUNK``), which skips the vocab projection entirely;
+      (``want_logits=False``), chunked at ``prefill_chunk`` (default: the
+      target's own chunk, ``generate._target_chunk``), which skips the vocab projection entirely;
     - rows ``[P-1, P-1+L)`` are scored ``chunk`` at a time with the full head
       (``head_last_row=False``); each ``[chunk, V]`` logits block is reduced to argmax and
       margin per row and freed before the next chunk runs, so peak memory is one block, not
@@ -108,7 +108,7 @@ def score_forced(target, prompt_ids: Sequence[int], output_ids: Sequence[int], *
     A fresh cache is used; ``target`` is left untouched. Runs outside every scoped kernel
     patch (small-M, SDPA split, multi-row, wide-GEMM, CPU co-prefill), i.e. on mlx's stock
     kernels, whatever the process has applied for generation."""
-    from .generate import PREFILL_CHUNK, _cache_arrays
+    from .generate import _cache_arrays, _target_chunk
 
     P, L = len(prompt_ids), len(output_ids)
     if P == 0:
@@ -118,7 +118,7 @@ def score_forced(target, prompt_ids: Sequence[int], output_ids: Sequence[int], *
         return ForcedScores([], [], [])
     if chunk < 1:
         raise ValueError("chunk must be >= 1")
-    pc = prefill_chunk or PREFILL_CHUNK
+    pc = prefill_chunk or _target_chunk(target)
     seq = [int(t) for t in prompt_ids] + [int(t) for t in output_ids[:-1]]
     out = [int(t) for t in output_ids]
     cache = target.make_cache()

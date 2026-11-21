@@ -74,6 +74,12 @@ class _Pending:
     rows: list          # [(q, k, v, a, b, A_log, dt_bias, use_kernel, kw)] per linear layer
 
 class Target:
+    # class defaults, so a Target built without __init__ (tests' Target.__new__ doubles) is a
+    # plain non-Inkling target with no open verify transaction
+    _inkling = False
+    _txn = None
+    prefill_chunk: int | None = None   # None = generate.PREFILL_CHUNK (see _target_chunk)
+
     def __init__(self, model, tokenizer, *, kv_bits: int | None = None,
                  kv_group_size: int = 64):
         self.model = model
@@ -94,6 +100,40 @@ class Target:
         # (_body_muse_glimmer, the same approach the mlx-lm paths take), reusing the model's
         # own layer modules + per-layer sliding/full masks; verify_tap() proves it faithful.
         self._muse = self.is_vlm and getattr(model, "model_type", "") == "muse_glimmer"
+        # Thinking Machines Inkling 2 (mlx-vlm inkling2 / inkling2_loop — Inkling-2-Mini runs its
+        # middle 12 layers three times: 48 layer visits, one CacheList(KV | RotatingKV, conv
+        # ArraysCache) per visit). The language model has a native capture hook, so the tap is
+        # the model's own forward (visit v = the stream ENTERING visit v; 48 = the normed
+        # output). Its short-conv states cannot be trimmed, so verify runs inside mlx-vlm's own
+        # speculative-cache transaction (per-prefix conv states recorded in the forward,
+        # rotating-KV updates logged) and rollback commits the kept prefix — see verify().
+        self._inkling = self.is_vlm and str(getattr(model, "model_type", "")).startswith(
+            "inkling2")
+        if self._inkling:
+            self.family = "inkling2"
+            # dense relative-position masks per global layer: 512-row prefill chunks are faster
+            # and ~3x leaner than the default 2048 (generate._target_chunk)
+            self.prefill_chunk = 512
+            # Verify-width MoE: each expert's weights dequantized once per run of draft rows
+            # routed to it (inkling_kernels.grouped_moe; decode rows keep the stock qmv).
+            # Per-instance, Inkling only; MLX_DSPARK_INKLING_GROUPED_MOE=0 is the A/B.
+            from .inkling_kernels import (
+                install_cached_global_scales,
+                install_fast_head,
+                install_grouped_moe,
+            )
+
+            # constant per-expert scale factors computed once instead of per call (exact;
+            # ~400 fewer graph primitives per decode step)
+            install_cached_global_scales(model.language_model)
+            install_grouped_moe(model.language_model, enabled=os.environ.get(
+                "MLX_DSPARK_INKLING_GROUPED_MOE", "1").lower() not in ("0", "false"))
+            # fp32 logits from the bf16 head without the stock 1.85 GB fp32 copy: half the
+            # head traffic every step, and row-invariant (verify logits == decode logits).
+            # MLX_DSPARK_INKLING_FAST_HEAD=0 is the A/B.
+            if os.environ.get("MLX_DSPARK_INKLING_FAST_HEAD", "1").lower() not in ("0", "false"):
+                install_fast_head(model.language_model)
+        self._txn = None          # the open transaction of the last multi-row Inkling verify
         # nanbeige (Nanbeige4.2): a looped-depth transformer — num_hidden_layers dense
         # blocks applied num_loops times with shared weights, per-loop KV caches, and the
         # final RMSNorm at the end of every loop pass. The drafter's target_layer_ids index
@@ -406,7 +446,9 @@ class Target:
         overwhelms them and d0 collapses ~85% -> ~29% with no error anywhere (the standard DSpark
         head adds markov to raw ``lm_head`` logits — every own-head family does the same). So the
         reuse path returns raw logits here while :meth:`run`/:meth:`verify` keep the full head."""
-        if self._muse:
+        if self._muse or self._inkling:
+            # Inkling 2's head drafts from the raw bf16 head too (its verify path promotes to
+            # fp32 and softcaps; the draft head adds its Markov bias first, then softcaps)
             return self.model.language_model.lm_head(hidden)
         if self.is_vlm:
             return self.model.language_model.logits_from_hidden(hidden)
@@ -420,7 +462,13 @@ class Target:
         ``embed_norm`` here: feeding the normalized input embedding measured a clear acceptance
         loss (accept 3.73 raw vs 2.86 normed on code), because the drafter's own input_layernorm
         already normalizes and the residual it carries is the raw table output, not the normed
-        one. Other families fold their scaling into the table (gemma ×√H, qwen ×1)."""
+        one. Other families fold their scaling into the table (gemma ×√H, qwen ×1).
+
+        Inkling 2 is the exception that proves the rule: its head was trained on the target's
+        FULL input embedding (``embed_norm ∘ embed_tokens`` — the reference's
+        ``target.model.embed``), so that is what it gets."""
+        if self._inkling:
+            return self.model.language_model.model.embed(ids)
         inner = self.model.language_model.model if self.is_vlm else self._inner.model
         return inner.embed_tokens(ids) * getattr(inner, "embed_scale", 1.0)
 
@@ -447,6 +495,12 @@ class Target:
         if self._muse:
             hn, fused = self._body_muse_glimmer(ids, cache, tap)
             head = self._head_muse_glimmer
+        elif self._inkling:
+            lm = self.model.language_model
+            res = lm.model(ids, cache=cache, capture_layer_ids=tap)   # normed output (+ taps)
+            hn, caps = res if tap is not None else (res, None)
+            fused = mx.concatenate(caps, axis=-1) if tap is not None else None
+            head = lm._logits_from_norm
         elif self.is_vlm:
             lm = self.model.language_model
             sink = [] if tap is not None else None
@@ -510,10 +564,14 @@ class Target:
         """Clear per-generation spec state (hybrid capture). Loops call this at start so
         a long-lived served Target never carries state across generations. Pending
         deferred-commit rows (the loops flush at their exit; this is the backstop) are folded
-        into their own cache first."""
+        into their own cache first. An Inkling transaction left open (a verify whose round was
+        abandoned before its rollback) is aborted: the caches return to their pre-verify state."""
         self.flush_pending()
         self._stash = None       # ([per-layer gated_delta args], [per-layer conv input])
         self._spec_width = 0
+        txn, self._txn = getattr(self, "_txn", None), None
+        if txn is not None and txn.active:
+            txn.abort()
 
     def _flush_if_pending_for(self, cache) -> None:
         """A forward outside verify() on a cache with pending rows reads the stored state
@@ -650,6 +708,8 @@ class Target:
                 return self.plain(x, cache), None
             return self.run(x, cache, tap)
 
+        if self._inkling:
+            return self._verify_inkling(ids, cache, tap, fwd)
         if not self.is_hybrid:
             return fwd(ids)
         self._stash = None
@@ -687,7 +747,20 @@ class Target:
         its own rows: one state read + write per round instead of the re-run's second pair.
         Every other reader of the stored state flushes first (:meth:`flush_pending`: plain
         steps, run()/plain(), reset_spec(), the loops' exit). ``MLX_DSPARK_EAGER_COMMIT=1``
-        folds right here instead (the A/B)."""
+        folds right here instead (the A/B).
+
+        Inkling 2 commits its verify's transaction at the kept prefix (anchor + accepted):
+        mlx-vlm's caches pick each conv state from the per-prefix history the forward recorded
+        and replay / re-pick the rotating-KV updates; plain KV caches trim."""
+        if self._inkling:
+            txn, self._txn = self._txn, None
+            if txn is None:
+                if n_rejected > 0:
+                    raise RuntimeError("rollback() with rejected tokens but no open Inkling "
+                                       "verify transaction")
+                return                   # a width-1 step: committed in full by its forward
+            txn.commit(self._spec_width - n_rejected)
+            return
         if not self.is_hybrid:
             if n_rejected > 0:
                 for c in cache:
@@ -834,6 +907,65 @@ class Target:
             c[0] = mx.contiguous(padded[:, -n_keep:, :])
             c[1] = new_state
             li += 1
+
+    def _verify_inkling(self, ids: mx.array, cache, tap, fwd):
+        """Inkling 2 verify: the model's own forward inside mlx-vlm's speculative-cache
+        transaction (``speculative_verify=True`` opens it, records what rollback needs, and
+        pipelines the 48-visit graph with an ``async_eval`` every 4 visits). A width-1 step is
+        committed in full by its forward — no transaction, and the loops call no rollback."""
+        if self._txn is not None:        # a previous verify was never rolled back
+            self.reset_spec()
+        width = int(ids.shape[1])
+        if width == 1:
+            return fwd(ids)
+        out = self.model.language_model(inputs=ids, cache=cache, capture_layer_ids=tap,
+                                        speculative_verify=True)
+        self._txn = out.gdn_states
+        self._spec_width = width
+        fused = None if tap is None else mx.concatenate(out.hidden_states, axis=-1)
+        return out.logits, fused
+
+    _BENCH_TEXT = (
+        "def fibonacci(n):\n    \"\"\"Return the n-th Fibonacci number.\"\"\"\n    a, b = 0, 1\n"
+        "    for _ in range(n):\n        a, b = b, a + b\n    return a\n\nThe train leaves at "
+        "3:40 pm and travels 210 km at 84 km/h, so the trip takes two and a half hours and it "
+        "arrives at 6:10 pm. Ice floats because its open hexagonal lattice is less dense than "
+        "liquid water.")
+
+    def _bench_rows(self, width: int) -> mx.array:
+        """``[1, width]`` consecutive tokens of a fixed natural paragraph (code + prose), the
+        verify rows a content-sensitive verify is timed on (see :meth:`bench_verify`)."""
+        ids = getattr(self, "_bench_ids", None)
+        if ids is None:
+            try:
+                ids = list(self.tokenizer.encode(self._BENCH_TEXT))
+            except Exception:  # noqa: BLE001 — no usable tokenizer: distinct ids still vary routing
+                ids = []
+            ids = ids if len(ids) >= 16 else [1000 + 37 * i for i in range(64)]
+            self._bench_ids = ids
+        return mx.array([[ids[i % len(ids)] for i in range(width)]])
+
+    def bench_verify(self, ids: mx.array, cache, tap: list[int]) -> mx.array:
+        """One verify-shaped forward for a calibration timing loop, then undo it so every
+        iteration sees the same cache. Prices what production runs: Inkling 2 times the
+        transactional verify and aborts it; every other family times ``run()`` and trims (the
+        historical harness, unchanged)."""
+        if self._inkling:
+            # Rows of NATURAL text, not the harness's repeated token: Inkling's verify MoE loads
+            # each expert once per run of draft rows routed to it, so its cost depends on how
+            # many experts the rows share. One token repeated routes every row to the same 8
+            # experts and priced a 4-row verify at 58 ms vs 63 on real text — enough to derive
+            # cap 5 (1.19x) over cap 3 (1.34x). Consecutive real tokens share experts the way
+            # drafts do (62% distinct at 4 rows).
+            logits, _ = self.verify(self._bench_rows(int(ids.shape[1])), cache, tap)
+            mx.eval(logits)
+            self.reset_spec()            # abort: exact pre-verify state
+            return logits
+        logits, _ = self.run(ids, cache, tap)
+        for c in cache:
+            if c is not None and hasattr(c, "trim"):
+                c.trim(int(ids.shape[1]))
+        return logits
 
     def _rollback_shortconv(self, cache, keep: int) -> None:
         """Rebuild each LFM2 short-conv cache at the accept point (``keep`` = anchor + accepted

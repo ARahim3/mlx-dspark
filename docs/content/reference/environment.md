@@ -27,6 +27,15 @@ description: The environment variables the engine reads, and where it keeps thin
 `MLX_DSPARK_EAGER_COMMIT=1`
 : Rebuild a hybrid target's recurrence state at every accept instead of folding the accepted rows into the next verify (the default since the deferred commit). Same tokens, a little slower. For comparison runs only.
 
+`MLX_DSPARK_INKLING_GROUPED_MOE=0`
+: Inkling 2 only: verify draft rows with mlx-vlm's stock expert path instead of mlx-dspark's grouped kernel, which loads each expert once for every draft row routed to it. Slower at every draft length. For comparison runs only.
+
+`MLX_DSPARK_INKLING_FAST_HEAD=0`
+: Inkling 2 only: compute the fp32 logits through mlx-vlm's stock path, which keeps a 1.85 GB fp32 copy of the output head, instead of mlx-dspark's kernel that reads the bf16 head directly. Slower and uses more memory. For comparison runs only.
+
+`MLX_DSPARK_INKLING_DRAFT_HEAD_BITS`
+: Inkling 2 only: bits of the drafter's own copy of the output head, which its draft logits go through (default 8; 0 uses the model's bf16 head). Drafting only — the model still checks every token. 8 bits leaves acceptance unchanged and makes each draft round about 1.7 ms cheaper; 4 bits is faster still but starts to cost acceptance.
+
 `MLX_DSPARK_STREAM_KEEPALIVE_S`
 : Seconds between keep-alive frames on quiet streams (default 15). Lower it for aggressive proxies.
 

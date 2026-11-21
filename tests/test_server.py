@@ -41,6 +41,7 @@ class _FakeEngine:
     max_tokens_cap = 32768
     cap_controller = None
     is_muse = False           # mirrors Engine.is_muse (muse_glimmer channel parsing off)
+    is_inkling = False        # mirrors Engine.is_inkling (Inkling 2 sub-messages off)
     # Borrow the real Engine's reasoning-effort logic (pure over self.tokenizer) so the
     # server's map_reasoning_effort wiring is exercised against the real behavior.
     supports_reasoning_effort = S.Engine.supports_reasoning_effort

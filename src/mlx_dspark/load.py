@@ -282,6 +282,25 @@ REGISTRY = [
     {"id": "minicpm5-2b", "target": "mlx-community/MiniCPM5-2B-bf16",
      "dspark": "openbmb/MiniCPM5-2B-DSpark",
      "ram": "~6 GB", "speedup": "~3.2× (4.2× math)"},
+    # Thinking Machines Inkling-2-Mini — the first LOOPED MoE target and the first whose DSpark head
+    # ships INSIDE the target repo (`mtp.safetensors` + config.json `mtp_config`; `bundled_head`
+    # resolves the drafter to the target itself, so any copy that kept the head drafts from it and
+    # nothing else is fetched). model_type inkling2_loop: 24 layers, the middle 12 run three times
+    # (48 visits, one KV/rotating-KV + conv-state CacheList each), 8 of 128 experts per token
+    # (NVFP4 layers 0-19, MXFP8 20-23), bf16 attention, fp32 logits. Loads through mlx-vlm's inkling2
+    # model, which no mlx-vlm RELEASE ships yet (merged after 0.8.0; load_target names the fix). The
+    # head (inkling.py): per-layer context fusion, 8-row bidirectional block with a pure anchor slot,
+    # the rnn_hidden Markov head folded through the target's head — draft blocks identical to the
+    # reference head (51/51). Verify runs inside mlx-vlm's own speculative-cache transaction; the MoE
+    # at verify widths and the fp32 head run mlx-dspark kernels (inkling_kernels.py). Measured
+    # 2026-11-21 (M4 Pro, mlx 0.32.4, Automatic power mode, `benchmark --trials 3`, zero flags): **cap
+    # 3 = 1.39x** (1.04x chat / 1.44x code / 1.69x math, accept 2.52, baseline 24.8 tok/s); lookup off
+    # (MoE: a free draft still pulls fresh experts per row). Lossless (token forcing at cap 3: 1.04%
+    # near-tie rate vs plain greedy's own 1.17%, no large-margin event). Decode is bound by encoding ~13k graph
+    # primitives per step, not by bandwidth: see NOTES "Inkling-2-Mini ported".
+    {"id": "inkling-2-mini", "target": "thinkingmachines/Inkling-2-Mini",
+     "dspark": "thinkingmachines/Inkling-2-Mini", "bundled_head": True, "lookup_drafts": False,
+     "ram": "~22 GB", "speedup": "~1.4× (1.7× math)"},
 ]
 
 # legacy `--family` / load_pair("qwen3") values -> a concrete target repo (deprecated).
@@ -349,6 +368,18 @@ def resolve_drafter_window(explicit: int | None, target: str | None) -> int | No
     return drafter_window_default(target)
 
 
+def _registry_drafter(entry: dict, mode: str, target: str) -> str:
+    """The drafter a registry row resolves for ``target``. A row stamped ``bundled_head`` ships
+    its DSpark head INSIDE the target repo (Inkling 2: ``mtp.safetensors``), so the target itself
+    is the drafter — whichever copy of the model was passed (the official repo, a re-upload that
+    kept the head) — and no second repo is ever fetched for the head. The row's ``dspark`` value
+    still names the canonical repo for listings and docs; a copy without the head gets the
+    loader's error naming it."""
+    if mode == "dspark" and entry.get("bundled_head"):
+        return target
+    return entry[mode]
+
+
 def resolve(model: str | None = None, *, mode: str = "dspark", drafter: str | None = None,
             family: str | None = None, target: str | None = None) -> tuple[str, str | None]:
     """Resolve ``(target_repo, drafter_repo)`` from a ``--model`` target and ``--mode``.
@@ -371,7 +402,7 @@ def resolve(model: str | None = None, *, mode: str = "dspark", drafter: str | No
         return tgt, drafter
     entry = _registry_entry(tgt)
     if entry is not None and entry.get(mode):
-        return tgt, entry[mode]
+        return tgt, _registry_drafter(entry, mode, tgt)
     raise ValueError(
         f"no built-in {mode} drafter is registered for target {tgt!r} — pass --drafter <repo>, "
         f"use a known target (see `mlx-dspark models`), or use `--mode auto` / `--mode lookup` "
@@ -401,11 +432,11 @@ def resolve_mode(model: str | None = None, *, mode: str = "auto", drafter: str |
     if entry is not None:
         best = entry.get("mode")
         if best in ("dspark", "dflash") and entry.get(best):
-            return best, tgt, entry[best]
+            return best, tgt, _registry_drafter(entry, best, tgt)
         if entry.get("dspark"):
-            return "dspark", tgt, entry["dspark"]
+            return "dspark", tgt, _registry_drafter(entry, "dspark", tgt)
         if entry.get("dflash"):
-            return "dflash", tgt, entry["dflash"]
+            return "dflash", tgt, _registry_drafter(entry, "dflash", tgt)
     return "lookup", tgt, None
 
 
@@ -450,6 +481,8 @@ def drafter_lineage(repo_or_path: str) -> str:
     cfg = _drafter_config(repo_or_path)
     if not cfg:
         return "dspark"
+    if str(cfg.get("model_type", "")).startswith("inkling2"):
+        return "dspark"              # the bundled Inkling 2 head (inkling.py): a Markov head
     dfc = cfg.get("dflash_config") or {}
     if cfg.get("markov_rank") or dfc.get("markov_rank") or dfc.get("projector_type"):
         return "dspark"
@@ -622,9 +655,17 @@ def load_drafter(
     cached bf16 checkpoint first (mlx-lm has no modelopt loader), exactly as the GGUF Bonsai
     drafters are converted on first use.
     """
+    from .inkling import has_bundled_head, load_inkling2_drafter
     from .nvfp4_convert import ensure_converted as _ensure_nvfp4
 
-    path = _ensure_nvfp4(_resolve(repo_or_path))
+    path = _resolve(repo_or_path)
+    if has_bundled_head(path):
+        # Inkling 2 ships its head inside the target repo (mtp.safetensors). Checked FIRST: the
+        # target's config also declares modelopt NVFP4, which would send the whole 20 GB
+        # checkpoint through the NVFP4-drafter converter below.
+        return load_inkling2_drafter(path, quantize=quantize, bits=bits,
+                                     group_size=group_size, strict=strict)
+    path = _ensure_nvfp4(path)
     config = DSparkConfig.from_json(os.path.join(path, "config.json"))
 
     weights: dict[str, mx.array] = {}
@@ -1102,6 +1143,11 @@ def load_target(repo_or_path: str = DEFAULT_TARGET, *, require_tap: bool = False
         _register_nanbeige()
 
     refuse_remote_code(path, repo_or_path)
+    if str(cfg.get("model_type", "")).startswith("inkling2"):
+        from .inkling import MLX_VLM_HINT, mlx_vlm_supports_inkling2
+
+        if not mlx_vlm_supports_inkling2():
+            raise ValueError(f"{repo_or_path}: {MLX_VLM_HINT}")
     if _route_target(cfg) == "mlx_lm":
         from mlx_lm import load as lm_load
 

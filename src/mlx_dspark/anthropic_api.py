@@ -193,6 +193,124 @@ class MuseChannelParser:
             # <|eom|> in idle: ignore
 
 
+_INK_MODEL = "<|message_model|>"
+_INK_END = "<|end_message|>"
+_INK_KIND = re.compile(r"<\|content_([a-z_]+)\|>")
+_INK_HOLD = max(len(_INK_MODEL), len(_INK_END), len("<|content_invoke_tool_json|>")) - 1
+
+
+class InklingChannelParser:
+    """Incrementally splits Thinking Machines Inkling 2's raw output into
+    ``('reasoning' | 'answer', text)`` chunks — the same interface as :class:`MuseChannelParser`.
+
+    Inkling answers in sub-messages ``<|message_model|>[name]<|content_KIND|>body<|end_message|>``
+    (the chat template adds no generation prompt, so the model opens every sub-message itself):
+    ``thinking`` bodies are reasoning, ``text`` bodies the answer, and an ``invoke_tool_json`` body
+    — ``{"name": …, "args": {…}}`` — is a tool call, re-emitted on the answer channel as a Hermes
+    ``<tool_call>{"name", "arguments"}</tool_call>`` so :func:`~mlx_dspark.tools.parse_tool_calls`
+    and the streaming tool gate handle it like any other model's. Bodies are streamed with the
+    last :data:`_INK_HOLD` characters held back (a marker split across two rounds is still seen);
+    a tool body is held whole until its ``<|end_message|>``. Text outside any sub-message is kept
+    as answer unless it is only whitespace."""
+
+    def __init__(self):
+        self.buf = ""
+        self.state = "idle"       # 'idle' | 'header' | 'content' | 'tool'
+        self.channel: str | None = None
+        self.name = ""            # header text before <|content_…|> (a tool call's name)
+
+    @staticmethod
+    def _hermes(body: str, name: str) -> str:
+        try:
+            obj = json.loads(body)
+        except json.JSONDecodeError:
+            obj = None
+        if isinstance(obj, dict):
+            call = {"name": obj.get("name") or name,
+                    "arguments": obj.get("args", obj.get("arguments", {}))}
+            return "<tool_call>" + json.dumps(call, ensure_ascii=False) + "</tool_call>"
+        return "<tool_call>" + body + "</tool_call>"
+
+    def feed(self, piece: str, final: bool = False) -> list[tuple[str, str]]:
+        self.buf += piece
+        out: list[tuple[str, str]] = []
+        while True:
+            if self.state == "content":
+                j = self.buf.find(_INK_END)
+                k = self.buf.find(_INK_MODEL)           # a new sub-message without an end
+                if k != -1 and (j == -1 or k < j):
+                    j, end = k, 0
+                else:
+                    end = len(_INK_END)
+                if j == -1:
+                    hold = 0 if final else _INK_HOLD
+                    upto = max(0, len(self.buf) - hold)
+                    if upto:
+                        out.append((self.channel, self.buf[:upto]))
+                        self.buf = self.buf[upto:]
+                    return out
+                if j:
+                    out.append((self.channel, self.buf[:j]))
+                self.buf = self.buf[j + end:]
+                self.state, self.channel = "idle", None
+                continue
+
+            if self.state == "tool":
+                j = self.buf.find(_INK_END)
+                if j == -1:
+                    if final:
+                        out.append(("answer", self._hermes(self.buf, self.name)))
+                        self.buf, self.state = "", "idle"
+                    return out
+                out.append(("answer", self._hermes(self.buf[:j], self.name)))
+                self.buf = self.buf[j + len(_INK_END):]
+                self.state = "idle"
+                continue
+
+            if self.state == "header":
+                m = _INK_KIND.search(self.buf)
+                if m is None:
+                    if final:
+                        self.buf = ""
+                    return out
+                self.name = self.buf[:m.start()].strip()
+                kind = m.group(1)
+                self.buf = self.buf[m.end():]
+                if kind.startswith("invoke_tool"):
+                    self.state = "tool"
+                else:
+                    self.channel = "reasoning" if kind == "thinking" else "answer"
+                    self.state = "content"
+                continue
+
+            # idle: between sub-messages
+            j = self.buf.find(_INK_MODEL)
+            if j == -1:
+                if final:
+                    stray, self.buf = self.buf, ""
+                    if stray.strip():
+                        out.append(("answer", stray))
+                    return out
+                # hold anything that could still grow into <|message_model|>
+                keep = next((i for i in range(len(self.buf))
+                             if _INK_MODEL.startswith(self.buf[i:])), len(self.buf))
+                stray, self.buf = self.buf[:keep], self.buf[keep:]
+                if stray.strip():
+                    out.append(("answer", stray))
+                return out
+            if self.buf[:j].strip():
+                out.append(("answer", self.buf[:j]))
+            self.buf = self.buf[j + len(_INK_MODEL):]
+            self.state, self.name = "header", ""
+
+
+def _split_inkling(text: str) -> tuple[str, str]:
+    chunks = InklingChannelParser().feed(text, final=True)
+    reasoning = "".join(t for k, t in chunks if k == "reasoning")
+    answer = "".join(t for k, t in chunks if k == "answer")
+    return reasoning.strip(), answer.strip()
+
+
 def _split_muse(text: str) -> tuple[str, str]:
     chunks = MuseChannelParser().feed(text, final=True)
     reasoning = "".join(t for k, t in chunks if k == "reasoning")
@@ -214,6 +332,8 @@ def split_thinking(text: str, *, in_thinking: bool = False) -> tuple[str, str]:
     callers pass it since the Nanbeige intake exposed the truncated case (2026-08-31)."""
     if _MUSE_MSG in text:            # muse Onyx-ATEM channels (the marker is muse-only)
         return _split_muse(text)
+    if _INK_MODEL in text:           # Inkling 2 sub-messages (the marker is Inkling-only)
+        return _split_inkling(text)
     s = text.lstrip()
     for open_, close in _THINK_PAIRS:
         if s.startswith(open_):
@@ -602,7 +722,7 @@ class MessageStream:
 
     def __init__(self, *, model: str, input_tokens: int, msg_id: str | None = None,
                  thinking: bool = True, in_thinking: str | None = None,
-                 schemas: dict | None = None, muse: bool = False):
+                 schemas: dict | None = None, muse: bool = False, inkling: bool = False):
         self.model = model
         self.input_tokens = input_tokens
         self.id = msg_id or _msg_id()
@@ -613,8 +733,10 @@ class MessageStream:
         # muse_glimmer routes its recipient-tagged channels through a dedicated parser (the
         # open/close-pair machinery below doesn't model its `<|eom|>` handoffs); everything else
         # uses the pair state machine. The flag comes from the server (it knows the model), so a
-        # non-muse stream never touches muse code and stays byte-identical.
-        self._muse = MuseChannelParser() if muse else None
+        # non-muse stream never touches muse code and stays byte-identical. Inkling 2's
+        # sub-message channels take the same route through their own parser.
+        self._muse = (MuseChannelParser() if muse else InklingChannelParser() if inkling
+                      else None)
         # "thinking" when the chat template prefilled the opener (see prompt_opens_thinking);
         # `close` is the marker that ends the reasoning block, which differs per model family
         self.phase = "thinking" if in_thinking else "pending"

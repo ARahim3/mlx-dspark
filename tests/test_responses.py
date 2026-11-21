@@ -287,6 +287,7 @@ class _FakeEngine:
     cap_controller = None
     context_window = None
     is_muse = False
+    is_inkling = False        # mirrors Engine.is_inkling (Inkling 2 sub-messages off)
 
     def __init__(self, response_text="Hello world"):
         self.tokenizer = _FakeTok()
