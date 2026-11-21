@@ -283,9 +283,58 @@ def test_head_f32_matches_fp32_and_is_row_invariant():
     assert bool(mx.array_equal(got, alone).item())
 
 
+# ---------------------------------------------------------------- the mlx-vlm gate
+_INKLING_CFG = "mlx_vlm.models.inkling2.config"
+
+
+@pytest.mark.parametrize("has_loop", [False, True])
+def test_mlx_vlm_gate_asks_for_the_looped_model_not_the_module(monkeypatch, has_loop):
+    """mlx-vlm 0.8.0 ships models/inkling2 without the looped model: presence is not support."""
+    import sys
+    import types
+
+    from mlx_dspark.inkling import mlx_vlm_supports_inkling2
+
+    fake = types.ModuleType(_INKLING_CFG)
+    if has_loop:
+        fake.LoopConfig = object
+    monkeypatch.setitem(sys.modules, _INKLING_CFG, fake)
+    assert mlx_vlm_supports_inkling2("inkling2") is True
+    assert mlx_vlm_supports_inkling2("inkling2_loop") is has_loop
+    assert mlx_vlm_supports_inkling2() is has_loop
+
+
+def test_mlx_vlm_gate_without_the_module(monkeypatch):
+    import sys
+
+    from mlx_dspark.inkling import mlx_vlm_supports_inkling2
+
+    monkeypatch.setitem(sys.modules, _INKLING_CFG, None)       # import raises ImportError
+    assert mlx_vlm_supports_inkling2("inkling2") is False
+    assert mlx_vlm_supports_inkling2("inkling2_loop") is False
+
+
+def test_load_target_names_the_fix_on_an_mlx_vlm_without_the_looped_model(tmp_path, monkeypatch):
+    import json
+    import sys
+    import types
+
+    from mlx_dspark.inkling import MLX_VLM_HINT
+    from mlx_dspark.load import load_target
+
+    monkeypatch.setitem(sys.modules, _INKLING_CFG, types.ModuleType(_INKLING_CFG))
+    (tmp_path / "config.json").write_text(json.dumps({"model_type": "inkling2_loop"}))
+    with pytest.raises(ValueError) as err:
+        load_target(str(tmp_path))
+    assert MLX_VLM_HINT in str(err.value) and "git+https" in str(err.value)
+
+
 # ---------------------------------------------------------------- the Target (mlx-vlm inkling2)
 def _tiny_inkling():
-    pytest.importorskip("mlx_vlm.models.inkling2")
+    from mlx_dspark.inkling import mlx_vlm_supports_inkling2
+
+    if not mlx_vlm_supports_inkling2("inkling2_loop"):
+        pytest.skip("this mlx-vlm has no looped Inkling 2 model (0.8.0 ships the plain one only)")
     from mlx_vlm.models.inkling2 import Model, ModelConfig
     from mlx_vlm.models.inkling2.config import TextConfig, VisionConfig
 

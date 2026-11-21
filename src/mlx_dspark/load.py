@@ -1146,7 +1146,7 @@ def load_target(repo_or_path: str = DEFAULT_TARGET, *, require_tap: bool = False
     if str(cfg.get("model_type", "")).startswith("inkling2"):
         from .inkling import MLX_VLM_HINT, mlx_vlm_supports_inkling2
 
-        if not mlx_vlm_supports_inkling2():
+        if not mlx_vlm_supports_inkling2(cfg["model_type"]):
             raise ValueError(f"{repo_or_path}: {MLX_VLM_HINT}")
     if _route_target(cfg) == "mlx_lm":
         from mlx_lm import load as lm_load

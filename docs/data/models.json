@@ -928,7 +928,7 @@
       "tools": null,
       "thinking": true,
       "summary": "1.69× on math, 1.44× on code: Thinking Machines ships the DSpark head inside the model repo, so there is nothing extra to download.",
-      "caveat": "Needs an mlx-vlm with the inkling2 model, which no release ships yet (merged after 0.8.0): install mlx-vlm from git until one does.",
+      "caveat": "Needs an mlx-vlm with the looped inkling2 model, which no release ships yet (0.8.0 has the plain one only): install mlx-vlm from git until one does.",
       "variants": [
         {
           "registry": "inkling-2-mini",

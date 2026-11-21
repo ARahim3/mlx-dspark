@@ -49,8 +49,9 @@ HEAD_FILE = "mtp.safetensors"
 # Bits of the drafter-only copy of the target's head that the base logits use (0 = the target's
 # own bf16 head). See Inkling2DSparkDrafter.bind_target.
 DRAFT_HEAD_BITS = int(os.environ.get("MLX_DSPARK_INKLING_DRAFT_HEAD_BITS", "8") or 0)
-MLX_VLM_HINT = ("Inkling 2 needs an mlx-vlm with the `inkling2` model (merged 2026-11-20, after "
-                "the 0.8.0 release): upgrade mlx-vlm, or until a release ships it: "
+MLX_VLM_HINT = ("this Inkling 2 model needs a newer mlx-vlm: 0.8.0 ships the plain `inkling2` model "
+                "only, the looped one (Inkling-2-Mini, `inkling2_loop`) merged 2026-11-20, after it. "
+                "Upgrade mlx-vlm, or until a release ships it: "
                 "uv pip install 'mlx-vlm @ git+https://github.com/Blaizzy/mlx-vlm'")
 
 
@@ -73,13 +74,19 @@ def has_bundled_head(path: str) -> bool:
             and os.path.isfile(os.path.join(path, HEAD_FILE)))
 
 
-def mlx_vlm_supports_inkling2() -> bool:
-    from importlib.util import find_spec
+def mlx_vlm_supports_inkling2(model_type: str = "inkling2_loop") -> bool:
+    """Whether the installed mlx-vlm can build this Inkling 2 ``model_type``.
+
+    The module's presence does not answer for the looped model: mlx-vlm 0.8.0 ships
+    ``models/inkling2`` for the plain one only, and ``inkling2_loop`` (Inkling-2-Mini) arrived
+    with ``LoopConfig`` after that release."""
+    from importlib import import_module
 
     try:
-        return find_spec("mlx_vlm.models.inkling2") is not None
-    except (ImportError, ValueError):
+        config = import_module("mlx_vlm.models.inkling2.config")
+    except ImportError:
         return False
+    return "loop" not in str(model_type) or hasattr(config, "LoopConfig")
 
 
 def draft_config(cfg: dict) -> DSparkConfig:

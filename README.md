@@ -1333,8 +1333,8 @@ are bundled.
     24 layers whose middle 12 run three times per token, 8 of 128 experts, the experts in NVFP4 /
     MXFP8 as released (there is no other quant to pick; mlx-dspark runs the official checkpoint
     as-is). Its DSpark head ships **inside the model repo** (`mtp.safetensors`), so the drafter
-    resolves to the target itself. **Needs mlx-vlm from git** until a release ships the `inkling2`
-    model (it merged after 0.8.0). Measured 2026-11-21 on mlx 0.32.4 in Automatic (not High)
+    resolves to the target itself. **Needs mlx-vlm from git** until a release ships the looped
+    `inkling2` model (0.8.0 has the plain one only). Measured 2026-11-21 on mlx 0.32.4 in Automatic (not High)
     power mode, lookup drafts off (this pair's shipped default, like every MoE row). Verify uses
     mlx-dspark's own expert kernel, which loads each expert once for every draft row routed to it
     (verify at 4 rows 85.6 → 63.3 ms with the output-head kernel), so the derived cap is 3 rather
