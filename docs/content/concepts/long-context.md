@@ -25,7 +25,7 @@ Decode speed, prompt reading excluded, with agent-style content (source code plu
 </tbody>
 </table></div>
 
-Speedups at depth are lower than at chat length for a structural reason: attention over a long KV cache is extra verify work that a plain decoding step pays only once, and plain decoding itself slows with depth too (Qwen3.8-27B 4-bit: about 15 tok/s at 2k, 12.9 at 32k).
+Speedups at depth are lower than at chat length for a structural reason: attention over a long KV cache is extra verify work that a plain decoding step pays only once, and plain decoding itself slows with depth too (Qwen3.8-27B 4-bit: about 15 tok/s at 2k, 12.9 at 32k). Memory at 32k for the 4-bit Qwen3.8-27B + DFlash 2 pair: 25.3 GB peak during the prompt's prefill (16.5 GB of weights, the rest transients and the growing cache), about 19–20 GB while decoding; a server with prefix caching on holds one more copy of the context state.
 
 **You don't need to pick the cap.** With no `--max-draft`, calibration also measures how verify cost grows with depth, and the derived cap shrinks the verify width when a narrower one pays. `--max-draft auto` adapts per round. Under 4k tokens of context neither changes anything.
 

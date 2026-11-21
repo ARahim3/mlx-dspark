@@ -811,7 +811,10 @@ same depth, acceptance in parentheses:
 
 Speedups at depth are lower than at chat depth for a structural reason: attention over a long KV
 cache is extra verify work that a single decode step pays only once, and the baseline itself slows
-with depth (Qwen3.8-27B-4bit: ~15 tok/s at 2k, 12.9 at 32k).
+with depth (Qwen3.8-27B-4bit: ~15 tok/s at 2k, 12.9 at 32k). Memory at 32k for the 4-bit
+Qwen3.8-27B + DFlash 2 pair: **25.3 GB peak** during the prompt's prefill (16.5 GB of weights, the
+rest transients and the growing cache), ~19–20 GB while decoding; a serving process with prefix
+caching on keeps one more copy of the context state.
 
 [^lc1108]: Re-measured 2026-11-08 with the tree verify on (v0.20.4), same harness and content; the
     other rows are the 2026-09-27 chain measurements. DSpine (Tencent) holds the same acceptance at
