@@ -298,3 +298,62 @@ def test_selftest_passes_then_turns_off_a_body_that_no_longer_matches(monkeypatc
     assert all(F._on(m) for m, kind in F._fused_modules(lm) if kind != "layer")
     F.set_enabled(lm, True)                                    # a rejected kind stays off
     assert not any(F._on(m) for m, kind in F._fused_modules(lm) if kind == "layer")
+
+
+def _quantize_experts(lm, mode="nvfp4"):
+    """The released checkpoint's expert format on the tiny model (mlx-vlm's own quantized layer)."""
+    gsz, bits = (16, 4) if mode == "nvfp4" else (32, 8)
+    for layer in lm.model.layers:
+        sw = layer.mlp.switch_mlp
+        for name in ("gate_proj", "up_proj", "down_proj"):
+            lin = getattr(sw, name)
+            lin.weight = lin.weight.astype(mx.float32)
+            setattr(sw, name, lin.to_quantized(group_size=gsz, bits=bits, mode=mode))
+    mx.eval(lm.parameters())
+
+
+@pytest.mark.parametrize("mode", ["nvfp4", "mxfp8"])
+def test_installed_moe_kind_decodes_bit_identically_and_is_row_exact(mode):
+    from mlx_dspark import inkling_kernels as K
+
+    lm = _tiny_bf16_inkling()
+    _quantize_experts(lm, mode)
+    assert F.install(lm, enabled=False)["moe"] == 6
+    K.set_expert_views(lm)
+
+    def decode(kinds):
+        F.set_enabled(lm, False)
+        cache = lm.make_cache()
+        mx.eval(lm(inputs=mx.array([[3, 7, 11, 2, 9, 30, 41, 5, 8, 13, 21, 34]]), cache=cache).logits)
+        if kinds:
+            F.set_enabled(lm, True, kinds)
+        outs = []
+        for t in (4, 17, 23, 6):
+            outs.append(lm(inputs=mx.array([[t]]), cache=cache).logits)
+            mx.eval(outs[-1])
+        states = F._state_arrays([part for c in cache for part in c.caches])
+        mx.eval(states)
+        F.set_enabled(lm, False)
+        return outs, states
+
+    ref, ref_states = decode(None)
+    for kinds in (("moe",), (*F.EXACT_KINDS, *F.ROW_EXACT_KINDS)):
+        got, got_states = decode(kinds)
+        assert all(bool(mx.array_equal(a, b)) for a, b in zip(got, ref)), kinds
+        assert all(bool(mx.array_equal(a, b)) for a, b in zip(got_states, ref_states)), kinds
+    # a verify-width call: every row is the stock module's single-row (decode) result
+    moe = lm.model.layers[2].mlp
+    stock = type(moe).__mro__[1].__call__
+    rows = [(mx.random.normal((1, 1, 128), key=mx.random.key(i)) * 2).astype(mx.bfloat16)
+            for i in (1, 2, 2, 2, 3)]
+    F.set_enabled(lm, True, ("moe",))
+    got = moe(mx.concatenate(rows, axis=1))
+    ref_rows = mx.concatenate([stock(moe, r) for r in rows], axis=1)
+    assert bool(mx.array_equal(got, ref_rows))
+    # more rows than the fused path takes: the stock module
+    wide = (mx.random.normal((1, K.MOE_MAX_ROWS + 1, 128)) * 2).astype(mx.bfloat16)
+    assert bool(mx.array_equal(moe(wide), stock(moe, wide)))
+    assert F.selftest(lm)["moe"] is True and "moe" in F.enabled_kinds(lm)
+    F.disable(lm, ("moe",))
+    F.set_enabled(lm, True)                                    # a disabled kind stays off
+    assert "moe" not in F.enabled_kinds(lm) and "attn" in F.enabled_kinds(lm)

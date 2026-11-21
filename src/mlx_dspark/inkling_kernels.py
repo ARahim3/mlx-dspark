@@ -1,22 +1,30 @@
-"""Metal kernels for Inkling 2's verify and logits (Thinking Machines Inkling-2-Mini).
+"""Metal kernels for Inkling 2's routed experts and logits (Thinking Machines Inkling-2-Mini).
 
-``grouped_qmv`` — a batch-1 verify's routed-expert projections with each expert's quant groups
-dequantized ONCE for every draft row routed to it. A verify of ``w`` rows routes ``8·w`` (row,
-expert) pairs; MLX's ``gather_qmm`` runs one matrix-vector product per pair below its matrix-kernel
-threshold (>= 4 rows per expert on average, i.e. >= 512 rows here). Consecutive real tokens share
-experts heavily (Inkling-2-Mini: 79% / 62% / 47% distinct at w = 2 / 4 / 8), so the routes are sorted
-by expert and each run of equal experts is computed together in MLX's own small-batch layout
-(``fp_qmv_wide_impl``). Row-invariant: a route's result does not depend on its run.
+``run_qmv`` — the routed-expert projections of a decode step or a short verify: MLX's own
+single-row quantized matvec (``fp_qmv_impl`` / ``fp_qmv_fast_impl``), route by route, with each
+expert's packed weights read and decoded ONCE for every route sent to it. A verify of ``w`` rows
+routes ``8·w`` (row, expert) pairs and consecutive real tokens share experts heavily
+(Inkling-2-Mini: 75% / 67% / 46% distinct at w = 2 / 4 / 8), so the routes are sorted by expert
+and the first route of each run computes the whole run. Bit-identical to ``mx.gather_qmm`` per
+route (same lanes, same K blocks, the same fp32 running sum), so a verify row's expert outputs
+ARE the same token's decode outputs.
+
+``fused_moe`` — an Inkling 2 ``SparseMoE`` call of 1–16 rows around it: the routing scores as
+single-row products (the stock matmul rounds a verify's scores differently from decode's); top-k,
+the route weights and the expert sort in one launch (``fused_route``), the route combine in
+another (``combine_routes``). 8 launches per layer visit against the stock 16 (one row) or ~22 (a
+verify), and every row bit-identical to the stock module's decode call for that token. Installed
+and self-tested by ``inkling_fused`` (kind ``moe``).
 
 ``head_f32`` — fp32 logits from the bf16 output head without the stock 1.85 GB fp32 copy of it.
 
 Plus an exact per-instance install: the expert layers' constant global scale factors computed once
-instead of per call (``install_cached_global_scales``). See NOTES "Inkling-2-Mini ported" for the
-measurements and the exact-but-slower kernel variants that lost (archived in
-``drafts/inkling/inkling_kernels_with_exact_dedup.py``).
+instead of per call (``install_cached_global_scales``). See NOTES "Inkling expert path" for the
+cost model (a first route of an expert is memory-bound, a repeat is decode-bound) and the kernel
+variants that lost (archived in ``drafts/inkling/``).
 
-The fp4/fp8 types are adapted from MLX (``mlx/backend/metal/kernels/fp_quantized.h``, MIT,
-© 2023 Apple Inc.) via mlx-vlm's ``masked_quantized.py`` (MIT).
+The fp4/fp8 types and the qmv tile are adapted from MLX
+(``mlx/backend/metal/kernels/fp_quantized.h``, MIT, © 2023 Apple Inc.).
 """
 
 from __future__ import annotations
@@ -80,16 +88,110 @@ struct Dequantize {
     }
   }
 };
+
+// One tile of MLX's single-row qmv (2 simdgroups x 4 output rows; a lane owns VPT values of
+// every BLOCK-wide slice of K) for V routes that share an expert. Each row's packed values are
+// read and decoded once per slice and reused for the V routes; per route the arithmetic is
+// fp_qmv_impl's (FAST: fp_qmv_fast_impl's) operation for operation. The products are exact in
+// fp32 (a bf16 input times a 2- or 4-bit-mantissa weight), so only two things can round: the
+// per-slice sum, kept in MLX's order, and `scale * accum`, which MLX multiplies and THEN adds
+// (qdot returns the product) — written as two statements so it cannot contract to an fma.
+// (`rs` / `rd`: the V routes' input and output rows; `inv_scale_enc`: the expert's global scale —
+// read by the caller, whose index arrays may live in either address space.)
+template <typename T, int BITS, int GS, bool FAST, bool HAS_GS, int OUT_N, int V>
+inline void run_tile(
+    const device T* x, const device uint32_t* w, const device uint8_t* s, device T* out,
+    const thread int* rs, const thread int* rd, const float inv_scale_enc,
+    const int K, const int expert, const int out_row, const uint lane) {
+  constexpr int PACKS = FAST ? 2 : 1;
+  constexpr int VPT = (32 / BITS) * PACKS;      // values per lane per slice
+  constexpr int BLOCK = VPT * 32;               // slice width
+  constexpr int SSTEP = GS / VPT;               // lanes sharing one group scale
+  constexpr int LANE_BYTES = VPT * BITS / 8;
+  const int kw = K * BITS / 8;                  // packed bytes per weight row
+  const int kg = K / GS;                        // scales per weight row
+  const device uint8_t* ws = (const device uint8_t*)w
+      + size_t(expert) * OUT_N * kw + size_t(out_row) * kw + lane * LANE_BYTES;
+  const device uint8_t* sc = s + size_t(expert) * OUT_N * kg + size_t(out_row) * kg + lane / SSTEP;
+  const device T* xp[V];
+  float result[V][4];
+  #pragma unroll
+  for (int v = 0; v < V; v++) {
+    xp[v] = x + size_t(rs[v]) * K + lane * VPT;
+    #pragma unroll
+    for (int r = 0; r < 4; r++) result[v][r] = 0.0f;
+  }
+  for (int k = 0; k < K; k += BLOCK) {
+    if (K - k - int(lane) * VPT <= 0) break;    // the tail slice of a K that is not a multiple
+    float xt[V][VPT];
+    #pragma unroll
+    for (int v = 0; v < V; v++) {
+      #pragma unroll
+      for (int i = 0; i < VPT; i++) xt[v][i] = static_cast<float>(xp[v][k + i]);
+    }
+    #pragma unroll
+    for (int r = 0; r < 4; r++) {
+      const float sv = dequantize_scale<float, GS>(sc[r * kg]);
+      const device uint8_t* wl = ws + r * kw;
+      float d[VPT];
+      if constexpr (BITS == 4) {
+        const device uint16_t* wq = (const device uint16_t*)wl;
+        #pragma unroll
+        for (int i = 0; i < VPT / 4; i++) {
+          const uint q = wq[i];
+          d[4 * i] = Dequantize<4>{}(uint8_t(q));
+          d[4 * i + 1] = Dequantize<4>{}(uint8_t(q >> 4));
+          d[4 * i + 2] = Dequantize<4>{}(uint8_t(q >> 8));
+          d[4 * i + 3] = Dequantize<4>{}(uint8_t(q >> 12));
+        }
+      } else {
+        #pragma unroll
+        for (int i = 0; i < VPT; i++) d[i] = Dequantize<8>{}(wl[i]);
+      }
+      #pragma unroll
+      for (int v = 0; v < V; v++) {
+        float accum = 0;
+        if constexpr (BITS == 4) {
+          #pragma unroll
+          for (int i = 0; i < VPT / 4; i++) {
+            accum += (xt[v][4 * i] * d[4 * i] + xt[v][4 * i + 1] * d[4 * i + 1]
+                      + xt[v][4 * i + 2] * d[4 * i + 2] + xt[v][4 * i + 3] * d[4 * i + 3]);
+          }
+        } else {
+          #pragma unroll
+          for (int i = 0; i < VPT; i++) accum += xt[v][i] * d[i];
+        }
+        const float p = sv * accum;
+        result[v][r] = result[v][r] + p;
+      }
+    }
+    ws += BLOCK * BITS / 8;
+    sc += BLOCK / GS;
+  }
+  #pragma unroll
+  for (int v = 0; v < V; v++) {
+    device T* y = out + size_t(rd[v]) * OUT_N + out_row;
+    #pragma unroll
+    for (int r = 0; r < 4; r++) {
+      const float acc = simd_sum(result[v][r]);
+      if (lane == 0) {
+        if constexpr (HAS_GS) {
+          y[r] = static_cast<T>(acc * inv_scale_enc);
+        } else {
+          y[r] = static_cast<T>(acc);
+        }
+      }
+    }
+  }
+}
 """
 
-# Row-invariant grouped "wide" qmv (MLX's fp_qmv_wide_impl layout, adapted to expert runs).
-# Each thread owns one output row whose K reduction is split over KL lanes, lane j taking quant
-# groups j, j+KL, ...; a quant group is dequantized once into float4 registers and dot()'d against
-# every route of the run (streamed V at a time); the KL partials combine by a fixed shuffle
-# ladder; the per-expert global scale and the cast come last. A route's arithmetic never depends
-# on which other routes share its expert, so a verify row is bit-identical to the same token's
-# decode row when decode runs this kernel too (one route per run).
-_SOURCE_WIDE = r"""
+# Grid z = one slot per route, the routes sorted by expert. The first slot of a run of equal
+# experts (its leader) computes the whole run, up to RUN_V routes per pass over the weights (a
+# longer run takes another pass, from cache); the other slots of the run exit at once. Each run
+# length has its own straight-line tile: a tile sized for more routes than it serves costs up
+# to 45% (measured), so nothing is padded.
+_SOURCE_RUN = r"""
   const uint first = threadgroup_position_in_grid.z;
   const uint lane = thread_index_in_simdgroup;
   const uint sg = simdgroup_index_in_threadgroup;
@@ -98,122 +200,133 @@ _SOURCE_WIDE = r"""
   if (first > 0 && int(eids[first - 1]) == expert) return;      // not its run's leader
   int end = int(first) + 1;
   while (end < R && int(eids[end]) == expert) ++end;
-
   const int K = x_shape[x_ndim - 1];
-  constexpr int ROWS_SG = 32 / KL;           // output rows per simdgroup
-  constexpr int NF4 = GS / 4;                // float4 lanes per quant group
-  const short k_lane = lane % KL;
-  const short sg_row = lane / KL;
-  const int out_row = int(threadgroup_position_in_grid.y) * (ROWS_SG * NSG) + ROWS_SG * int(sg) + sg_row;
-  const int kw = K * BITS / 8;
-  const int kg = K / GS;
-  const int wr = min(out_row, OUT_N - 1);     // a tile past N reads a valid row, never writes
-  const device uint8_t* wrow = (const device uint8_t*)w + size_t(expert) * OUT_N * kw + size_t(wr) * kw;
-  const device uint8_t* srow = s + size_t(expert) * OUT_N * kg + size_t(wr) * kg;
+  const int out_row = int(threadgroup_position_in_grid.y) * 8 + int(sg) * 4;
   float inv_scale_enc = 1.0f;
   if (HAS_GS) {
     inv_scale_enc = g[expert] / (F8E4M3_MAX * F4E2M1_MAX);
   }
-
-  for (int begin = int(first); begin < end; begin += V) {
-    const int nv = min(V, end - begin);
-    const device T* xv[V];
+  int begin = int(first);
+  while (begin < end) {
+    const int nv = end - begin;
+    thread int rs[4];
+    thread int rd[4];
     #pragma unroll
-    for (int v = 0; v < V; v++) {
-      xv[v] = x + size_t(src[begin + min(v, nv - 1)]) * K;
+    for (int v = 0; v < 4; v++) {
+      const int r = min(begin + v, end - 1);
+      rs[v] = int(src[r]);
+      rd[v] = int(dst[r]);
     }
-    float result[V];
-    #pragma unroll
-    for (int v = 0; v < V; v++) result[v] = 0.0f;
-
-    for (int gi = k_lane; gi < kg; gi += KL) {
-      const int k0 = gi * GS;
-      float sc = dequantize_scale<float, GS>(srow[gi]);
-      const device uint8_t* wg = wrow + k0 * BITS / 8;
-      float4 w4[NF4];
-      if (BITS == 4) {
-        const device uint16_t* wq = (const device uint16_t*)wg;
-        #pragma unroll
-        for (int i = 0; i < NF4; i++) {
-          w4[i] = float4(Dequantize<4>{}(wq[i]), Dequantize<4>{}(wq[i] >> 4),
-                         Dequantize<4>{}(wq[i] >> 8), Dequantize<4>{}(wq[i] >> 12));
-        }
-      } else {
-        #pragma unroll
-        for (int i = 0; i < NF4; i++) {
-          w4[i] = float4(Dequantize<8>{}(wg[4 * i]), Dequantize<8>{}(wg[4 * i + 1]),
-                         Dequantize<8>{}(wg[4 * i + 2]), Dequantize<8>{}(wg[4 * i + 3]));
-        }
-      }
-      #pragma unroll
-      for (int v = 0; v < V; v++) {
-        if (v < nv) {
-          const device vec<T, 4>* x4 = (const device vec<T, 4>*)(xv[v] + k0);
-          float acc = 0;
-          #pragma unroll
-          for (int j = 0; j < NF4; j++) {
-            acc += dot(w4[j], float4(x4[j]));
-          }
-          result[v] += sc * acc;
-        }
-      }
-    }
-    #pragma unroll
-    for (int v = 0; v < V; v++) {
-      if (KL >= 32) result[v] += simd_shuffle_down(result[v], 16);
-      if (KL >= 16) result[v] += simd_shuffle_down(result[v], 8);
-      if (KL >= 8) result[v] += simd_shuffle_down(result[v], 4);
-      if (KL >= 4) result[v] += simd_shuffle_down(result[v], 2);
-      if (KL >= 2) result[v] += simd_shuffle_down(result[v], 1);
-    }
-    if (k_lane == 0 && out_row < OUT_N) {
-      for (int v = 0; v < nv; v++) {
-        out[size_t(dst[begin + v]) * OUT_N + out_row] = static_cast<T>(result[v] * inv_scale_enc);
-      }
+    if (nv >= 4) {
+      run_tile<T, BITS, GS, FAST, HAS_GS, OUT_N, 4>(x, w, s, out, rs, rd, inv_scale_enc, K, expert, out_row, lane);
+      begin += 4;
+    } else if (nv == 3) {
+      run_tile<T, BITS, GS, FAST, HAS_GS, OUT_N, 3>(x, w, s, out, rs, rd, inv_scale_enc, K, expert, out_row, lane);
+      begin += 3;
+    } else if (nv == 2) {
+      run_tile<T, BITS, GS, FAST, HAS_GS, OUT_N, 2>(x, w, s, out, rs, rd, inv_scale_enc, K, expert, out_row, lane);
+      begin += 2;
+    } else {
+      run_tile<T, BITS, GS, FAST, HAS_GS, OUT_N, 1>(x, w, s, out, rs, rd, inv_scale_enc, K, expert, out_row, lane);
+      begin += 1;
     }
   }
 """
 
-V_MAX = 8   # routes computed per pass over an expert's weights (a longer run takes a 2nd pass)
-# Tuned on an M4 Pro, Inkling-2-Mini, 48 chained MoE visits of real hidden states (ms, stock →
-# grouped): w=2 24.0 → 21.7, w=4 43.3 → 32.8, w=8 77.1 → 51.7; KL 4 beat 8 / 16, NSG 4 ≈ 2.
-# At w=1 the stock qmv wins (12.1 vs 15.4), so a single row keeps the stock path.
-WIDE_KL = 4     # lanes per output row's K reduction
-WIDE_NSG = 2    # simdgroups per threadgroup
+# M4 Pro, one projection launch (K 2304 x N 1152, 1.49 MB per expert), us: a route whose expert is
+# new costs ~6.6 (memory-bound), a repeat through a per-route kernel ~4.4 (decode-bound) and here
+# ~0 up to 4 routes a run — 16 pairs 164 -> 117, 8 quads 160 -> 79, 32 distinct 219 -> 209.
 
 
 @lru_cache(maxsize=1)
-def _wide_kernel():
+def _run_kernel():
     return mx.fast.metal_kernel(
-        name="mlx_dspark_inkling_grouped_wide_qmv",
+        name="mlx_dspark_inkling_run_qmv",
         input_names=["x", "w", "s", "g", "eids", "src", "dst"],
         output_names=["out"],
         header=_HEADER,
-        source=_SOURCE_WIDE,
+        source=_SOURCE_RUN,
         compile_options={"math_mode": "safe"},
     )
 
 
-def grouped_qmv(x: mx.array, linear, eids: mx.array, src: mx.array, dst: mx.array,
-                kl: int = WIDE_KL, nsg: int = WIDE_NSG, v: int = V_MAX) -> mx.array:
-    """Row-invariant grouped projection: ``out[dst[r]] = x[src[r]] @ W[eids[r]]ᵀ`` for every
-    route ``r`` (``eids`` sorted ascending), each expert's quant groups dequantized once per run
-    of equal ``eids`` and reused for every route in it. ``x``: ``[rows, K]``; returns
-    ``[len(eids), N]`` in ``x.dtype``. MLX's wide-qmv arithmetic: within rounding of the stock
-    qmv, and every route's result independent of its run."""
+@lru_cache(maxsize=1)
+def _no_factor() -> mx.array:
+    z = mx.zeros((8,), mx.float32)
+    mx.eval(z)
+    return z
+
+
+_VIEW = "_mlx_dspark_views"
+
+
+def _bound(linear):
+    """The arrays the kernel binds for a layer's packed weights and scales: 8-element views of
+    them when :func:`set_expert_views` installed some, else the tensors themselves."""
+    return linear.__dict__.get(_VIEW) or (linear.weight, linear.scales)
+
+
+def set_expert_views(language_model, enabled: bool = True) -> int:
+    """Bind every routed-expert tensor to the kernels as an 8-element VIEW of itself (the same
+    Metal buffer at offset 0; the kernel indexes the whole tensor from it, as it does anyway).
+
+    Why: MLX commits the command buffer once the arrays bound in it exceed 40 M ELEMENTS
+    (``MLX_MAX_MB_PER_BUFFER``; ``mlx/backend/metal/device.cpp``), and one stacked expert tensor
+    is 42.5 M (NVFP4) or 85 M (MXFP8) — so every expert launch ended its buffer: 144 commits a
+    token, ~1.4 ms of a 31 ms decode step. A view is charged its own 8 elements. Nothing
+    process-wide changes (the env knob would also apply to every other model in the server), and
+    the weights are persistent, so the limit's purpose — bounding the temporaries one buffer
+    holds — is untouched. The views share the tensors' buffers and live on the layer, so they die
+    with it. ``enabled=False`` removes them (the A/B). Returns how many projections have one.
+
+    Relies on a basic slice being a view of the same buffer; ``inkling_fused.selftest`` compares
+    the kernel's output with ``mx.gather_qmm`` bit for bit AFTER this ran, so if that ever stops
+    holding the expert kernels stay off."""
+    n = 0
+    for layer in language_model.model.layers:
+        sw = getattr(getattr(layer, "mlp", None), "switch_mlp", None)
+        for name in ("gate_proj", "up_proj", "down_proj"):
+            lin = getattr(sw, name, None) if sw is not None else None
+            if lin is None or layer_spec(lin) is None:
+                continue
+            if not enabled:
+                lin.__dict__.pop(_VIEW, None)
+                continue
+            if _VIEW not in lin.__dict__:
+                # (8, not fewer: a kernel input under 8 elements is passed as a constant)
+                views = (lin.weight.reshape(-1)[:8], lin.scales.reshape(-1)[:8])
+                mx.eval(views)
+                lin.__dict__[_VIEW] = views
+            n += 1
+    return n
+
+
+def fast_variant(bits: int, k: int) -> bool:
+    """Whether MLX runs its fast single-row qmv for this input width (two packs per lane: K a
+    multiple of 512 at 4 bits, 256 at 8), else the general one. The two reduce in different
+    orders; ``inkling_fused.selftest`` checks the choice against ``mx.gather_qmm`` at load."""
+    return k % ((32 // bits) * 2 * 32) == 0
+
+
+def run_qmv(x: mx.array, linear, eids: mx.array, src: mx.array, dst: mx.array) -> mx.array:
+    """``out[dst[r]] = x[src[r]] @ W[eids[r]]ᵀ`` for every route ``r``, bit-identical to
+    ``mx.gather_qmm``'s single-row product per route. Routes with equal ``eids`` next to each
+    other share one read of that expert (sort by expert to get it; any order is correct).
+    ``x``: ``[rows, K]``; ``eids`` / ``src`` / ``dst``: int32 ``[R]``; returns ``[R, N]`` in
+    ``x.dtype``."""
     bits, gsz, _ = layer_spec(linear)
     n = int(linear.weight.shape[-2])
+    k = int(linear.scales.shape[-1]) * gsz
     factor = global_factor(linear)
     has_gs = factor is not None
-    g = factor if has_gs else mx.zeros((1,), mx.float32)
     r = int(eids.shape[0])
-    rows_tg = (32 // kl) * nsg
-    return _wide_kernel()(
-        inputs=[x, linear.weight, linear.scales, g, eids, src, dst],
-        template=[("T", x.dtype), ("BITS", bits), ("GS", gsz), ("HAS_GS", has_gs),
-                  ("OUT_N", n), ("V", v), ("KL", kl), ("NSG", nsg)],
-        grid=(32, (-(-n // rows_tg)) * nsg, r),
-        threadgroup=(32, nsg, 1),
+    w, sc = _bound(linear)
+    return _run_kernel()(
+        inputs=[x, w, sc, factor if has_gs else _no_factor(), eids, src, dst],
+        template=[("T", x.dtype), ("BITS", bits), ("GS", gsz), ("FAST", fast_variant(bits, k)),
+                  ("HAS_GS", has_gs), ("OUT_N", n)],
+        grid=(32, (n // 8) * 2, r),
+        threadgroup=(32, 2, 1),
         output_shapes=[(r, n)],
         output_dtypes=[x.dtype],
     )[0]
@@ -252,75 +365,220 @@ def layer_spec(linear) -> tuple | None:
     return bits, gsz, mode
 
 
-# ---- the verify MoE ---------------------------------------------------------------------------
-# Rows from which (and up to which) a SparseMoE call takes the grouped path: a verify (2..16
-# rows). One row is a decode step — the stock qmv is faster there; longer calls are prefill
-# chunks, where mlx-vlm's sorted gather already batches experts.
-GROUPED_MOE_MIN_ROWS = 2
-GROUPED_MOE_MAX_ROWS = 16
+# ---- routing: top-k, route weights and the expert sort in one launch -------------------------------
+# mlx-vlm's _route after its score matmul, plus the argsort the run kernel wants:
+#   score = sigmoid(logit)                       MLX's Sigmoid: 1 / (1 + exp(|x|)), mirrored
+#   top-k of -(score + bias)                     MLX's sort is a stable merge sort, NaN last
+#   weight = score / (sum(scores) + 1e-20) * route_scale     the sum in rank order, as the stock
+#   routes sorted by expert (ties by route)      row reduce adds them
+# One threadgroup: a thread per (row, expert). Every step keeps the stock op's rounding points.
+def _route_source(experts: int, top_k: int, rows: int, route_scale: float) -> str:
+    return f"""
+    constexpr int E = {experts};
+    constexpr int TOPK = {top_k};
+    constexpr int NR = {rows};
+    constexpr int R = NR * TOPK;
+    const uint t = thread_position_in_threadgroup.x;
+    const uint row = t / E;
+    const uint e = t % E;
+    threadgroup float tg_key[NR * E];
+    threadgroup float tg_score[R];
+    threadgroup int tg_expert[R];
+    const float logit = logits[t];
+    const float y = 1 / (1 + metal::precise::exp(metal::abs(logit)));
+    const float score = (logit < 0) ? y : 1 - y;
+    const float biased = score + bias[e];
+    const float key = -biased;
+    tg_key[t] = key;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const bool kn = metal::isnan(key);
+    int rank = 0;
+    for (int j = 0; j < E; ++j) {{
+        const float other = tg_key[row * E + j];
+        const bool on = metal::isnan(other);
+        const bool before = (kn | on) ? ((!on) & kn) : (other < key);
+        const bool after = (kn | on) ? ((!kn) & on) : (key < other);
+        rank += (before || (!after && uint(j) < e)) ? 1 : 0;
+    }}
+    if (rank < TOPK) {{
+        tg_expert[row * TOPK + rank] = int(e);
+        tg_score[row * TOPK + rank] = score;
+    }}
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (t < uint(R)) {{
+        const uint rrow = t / TOPK;
+        float total = 0;
+        for (int j = 0; j < TOPK; ++j) total = tg_score[rrow * TOPK + j] + total;
+        const float denom = total + 1e-20f;
+        const float share = tg_score[t] / denom;
+        wts[t] = share * {route_scale!r}f;
+        const int mine = tg_expert[t];
+        int pos = 0;
+        for (int r = 0; r < R; ++r) {{
+            const int other = tg_expert[r];
+            pos += (other < mine || (other == mine && uint(r) < t)) ? 1 : 0;
+        }}
+        eids[pos] = mine;
+        src[pos] = int(rrow);
+        order[pos] = int(t);
+    }}
+"""
 
 
-def grouped_moe(moe, x: mx.array) -> mx.array:
-    """An Inkling 2 ``SparseMoE`` forward for a short multi-row call: the reference routing and
-    route combine (mlx-vlm's own compiled ``_route`` / ``_combine_routes``), with the three expert
-    projections through :func:`grouped_qmv` over the expert-sorted routes."""
-    import sys
+@lru_cache(maxsize=32)
+def _route_kernel(experts: int, top_k: int, rows: int, route_scale: float):
+    return mx.fast.metal_kernel(
+        name=f"mlx_dspark_inkling_route_{experts}_{top_k}_{rows}",
+        input_names=["logits", "bias"],
+        output_names=["eids", "src", "order", "wts"],
+        compile_options={"math_mode": "safe"},
+        source=_route_source(experts, top_k, rows, route_scale),
+    )
 
-    lang = sys.modules[type(moe).__mro__[1].__module__]
-    indices, weights = lang._route(x, moe.gate_weight, moe.e_score_correction_bias, moe.top_k,
-                                   moe.route_scale)
+
+ROUTE_MAX_THREADS = 1024      # one threadgroup holds every (row, expert) of a call
+
+
+def fused_route(logits: mx.array, bias: mx.array, top_k: int, route_scale: float):
+    """``(eids, src, order, weights)`` from the routing logits ``[rows, E]`` (fp32) and the
+    score bias ``[E]`` (fp32): the routes sorted by expert (``eids``), the row each reads
+    (``src``), its place in mlx-vlm's ``[row, k]`` route order (``order``), and the route weights
+    in that order (``[rows * top_k]``, fp32). The selection and weights are bit-identical to
+    mlx-vlm's ``_route``."""
+    rows, experts = int(logits.shape[0]), int(logits.shape[1])
+    r = rows * top_k
+    return _route_kernel(experts, top_k, rows, float(route_scale))(
+        inputs=[logits, bias],
+        grid=(rows * experts, 1, 1),
+        threadgroup=(rows * experts, 1, 1),
+        output_shapes=[(r,), (r,), (r,), (r,)],
+        output_dtypes=[mx.int32, mx.int32, mx.int32, mx.float32],
+    )
+
+
+# ---- the route combine ------------------------------------------------------------------------------
+# mlx-vlm's _combine_routes: (out.astype(fp32) * weight) summed over a row's routes in order, cast
+# back (stock: a multiply, a column reduce, a cast).
+_SOURCE_COMBINE = r"""
+    const uint i = thread_position_in_grid.x;
+    const int H = d_shape[1];
+    const uint row = i / H;
+    const int h = int(i % H);
+    if (row * TOPK >= uint(d_shape[0])) return;
+    float acc = 0;
+    for (int j = 0; j < TOPK; ++j) {
+        const size_t r = size_t(row) * TOPK + j;
+        const float p = static_cast<float>(d[r * H + h]) * wts[r];
+        acc = p + acc;
+    }
+    out[i] = static_cast<T>(acc);
+"""
+
+
+@lru_cache(maxsize=1)
+def _combine_kernel():
+    return mx.fast.metal_kernel(
+        name="mlx_dspark_inkling_combine_routes",
+        input_names=["d", "wts"],
+        output_names=["out"],
+        compile_options={"math_mode": "safe"},
+        source=_SOURCE_COMBINE,
+    )
+
+
+def combine_routes(down: mx.array, weights: mx.array, top_k: int) -> mx.array:
+    """``[rows, H]`` from the route outputs ``[rows * top_k, H]`` (mlx-vlm's route order) and
+    their weights ``[rows * top_k]``; bit-identical to mlx-vlm's ``_combine_routes``."""
+    r, hidden = int(down.shape[0]), int(down.shape[1])
+    rows = r // top_k
+    return _combine_kernel()(
+        inputs=[down, weights],
+        template=[("T", down.dtype), ("TOPK", top_k)],
+        grid=(rows * hidden, 1, 1),
+        threadgroup=(256, 1, 1),
+        output_shapes=[(rows, hidden)],
+        output_dtypes=[down.dtype],
+    )[0]
+
+
+# ---- the MoE ----------------------------------------------------------------------------------------
+# Rows a fused call accepts: a decode step, a verify, a prefill's short tail. Longer calls are
+# prefill chunks, where mlx-vlm's sorted gather already batches experts.
+MOE_MAX_ROWS = 16
+_GATE_F32 = "_mlx_dspark_gate_f32"
+
+
+def moe_spec(moe) -> bool:
+    """Whether :func:`fused_moe` can serve this ``SparseMoE`` (checked once, at install)."""
+    sw = getattr(moe, "switch_mlp", None)
+    projs = [getattr(sw, p, None) for p in ("gate_proj", "up_proj", "down_proj")]
+    if sw is None or any(q is None or layer_spec(q) is None for q in projs):
+        return False
+    gate, bias = getattr(moe, "gate_weight", None), getattr(moe, "e_score_correction_bias", None)
+    return (gate is not None and bias is not None and gate.ndim == 2
+            and bias.dtype == mx.float32 and bias.shape == (gate.shape[0],)
+            and isinstance(getattr(moe, "top_k", None), int)
+            and 0 < moe.top_k <= gate.shape[0] <= ROUTE_MAX_THREADS)
+
+
+def _gate_f32(moe) -> mx.array:
+    """The routing matrix in fp32, cast once (stock casts its 128 x H bf16 rows every call)."""
+    cached = moe.get(_GATE_F32)
+    if cached is None:
+        cached = moe.gate_weight.astype(mx.float32)
+        mx.eval(cached)
+        moe[_GATE_F32] = cached
+    return cached
+
+
+def fused_moe(moe, x: mx.array) -> mx.array:
+    """An Inkling 2 ``SparseMoE`` forward for one batch row of 1..``MOE_MAX_ROWS`` positions,
+    bit-identical ROW BY ROW to the stock module's single-row (decode) call: the routing scores
+    as one single-row product per position, :func:`fused_route`, three :func:`run_qmv`, the stock
+    activation, :func:`combine_routes`.
+
+    The stock module is not row-invariant itself: at 2+ rows MLX computes the fp32 score matmul
+    with its matrix kernel, whose sums round differently from the single-row kernel's (78% of a
+    verify's routing logits differ in the last bit from the same tokens' decode logits). Writing
+    the product as matrix @ a batch of columns keeps every row on the single-row kernel, in one
+    launch — so a verify row routes, and weighs its routes, exactly as its decode step does."""
     b, n, h = x.shape
     k = moe.top_k
+    sw = moe.switch_mlp
+    gate = _gate_f32(moe)
+    experts = int(gate.shape[0])
+    logits = (gate @ x.astype(mx.float32).reshape(n, h, 1)).reshape(n, experts)
+    if n * experts <= ROUTE_MAX_THREADS:
+        eids, src, order, weights = fused_route(logits, moe.e_score_correction_bias, k,
+                                                moe.route_scale)
+    else:                 # more rows than one threadgroup holds: the same routing in stock ops
+        eids, src, order, weights = _route_ops(logits, moe.e_score_correction_bias, k,
+                                               moe.route_scale)
+    ident = _arange(n * k)
+    xs = x.reshape(n, h)
+    up = run_qmv(xs, sw.up_proj, eids, src, ident)
+    gate_out = run_qmv(xs, sw.gate_proj, eids, src, ident)
+    down = run_qmv(sw.activation(up, gate_out), sw.down_proj, eids, ident, order)
+    return combine_routes(down, weights, k).reshape(b, n, h)
+
+
+def _route_ops(logits: mx.array, bias: mx.array, top_k: int, route_scale: float):
+    """:func:`fused_route` in MLX ops (mlx-vlm's ``_route`` after its score matmul, then the
+    expert sort), for calls wider than the kernel's one threadgroup."""
+    scores = mx.sigmoid(logits)
+    indices = mx.argpartition(-(scores + bias), top_k - 1, axis=-1)[..., :top_k]
+    weights = mx.take_along_axis(scores, indices, axis=-1)
+    weights = weights / (weights.sum(axis=-1, keepdims=True) + 1e-20) * route_scale
     flat = indices.reshape(-1).astype(mx.int32)
     order = mx.argsort(flat).astype(mx.int32)
-    eids = flat[order]
-    src = order // k
-    ident = mx.arange(n * k, dtype=mx.int32)
-    xs = x.reshape(n, h)
-    sw = moe.switch_mlp
-    up = grouped_qmv(xs, sw.up_proj, eids, src, ident)
-    gate = grouped_qmv(xs, sw.gate_proj, eids, src, ident)
-    down = grouped_qmv(sw.activation(up, gate), sw.down_proj, eids, ident, order)
-    return lang._combine_routes(down.reshape(b, n, k, h), weights)
+    return flat[order], order // top_k, order, weights.reshape(-1)
 
 
-_GROUPED_CLASSES: dict[type, type] = {}
-
-
-def _grouped_class(base: type) -> type:
-    cls = _GROUPED_CLASSES.get(base)
-    if cls is None:
-        def __call__(self, x):
-            if (self._mlx_dspark_grouped and x.ndim == 3 and x.shape[0] == 1
-                    and GROUPED_MOE_MIN_ROWS <= x.shape[1] <= GROUPED_MOE_MAX_ROWS
-                    and getattr(self, "sharding_group", None) is None):
-                return grouped_moe(self, x)
-            return base.__call__(self, x)
-
-        cls = type(f"Grouped{base.__name__}", (base,), {"__call__": __call__})
-        _GROUPED_CLASSES[base] = cls
-    return cls
-
-
-def install_grouped_moe(language_model, enabled: bool = True) -> int:
-    """Give every routed-expert layer of an Inkling 2 language model the grouped verify path
-    (a per-INSTANCE class swap: nothing global is patched, and other models are untouched).
-    ``enabled=False`` keeps the swap but routes every call to the stock forward (the A/B).
-    Returns the number of layers that took it."""
-    n = 0
-    for layer in language_model.model.layers:
-        moe = getattr(layer, "mlp", None)
-        sw = getattr(moe, "switch_mlp", None)
-        projs = [getattr(sw, p, None) for p in ("gate_proj", "up_proj", "down_proj")]
-        if sw is None or any(q is None or layer_spec(q) is None for q in projs):
-            continue
-        base = type(moe)
-        if base.__name__.startswith("Grouped"):
-            base = base.__mro__[1]
-        moe.__class__ = _grouped_class(base)
-        moe._mlx_dspark_grouped = bool(enabled)
-        n += 1
-    return n
+@lru_cache(maxsize=32)
+def _arange(n: int) -> mx.array:
+    a = mx.arange(n, dtype=mx.int32)
+    mx.eval(a)
+    return a
 
 
 # ---- the output head ----------------------------------------------------------------------------

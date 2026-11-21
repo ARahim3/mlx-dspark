@@ -8,8 +8,8 @@ Target's inkling branch, the server's sub-message parser).
   the engine window applying to the global layer only;
 - the loader: the head lives in the target repo and is routed BEFORE the NVFP4-drafter converter
   (the target's config declares modelopt NVFP4);
-- the kernels (Metal only): grouped_qmv row invariance + closeness to mx.gather_qmm, head_f32
-  vs an fp32 reference;
+- the kernels (Metal only): run_qmv / fused_route / combine_routes / fused_moe bit for bit
+  against the stock ops, the expert views, head_f32 vs an fp32 reference;
 - the Target (needs an mlx-vlm with the inkling2 model): a transactional verify + rollback equals
   plain forwards of the kept tokens, including past the sliding-window wrap.
 """
@@ -248,24 +248,187 @@ def _quant_switch(e, n, k, mode, seed=1):
     return m, call
 
 
+def _per_route(call, x, eids, src, **kw):
+    """The stock arithmetic: one single-row gather_qmm product per route."""
+    return call(x[src][:, None, None, :], eids[:, None].astype(mx.uint32), **kw).reshape(
+        eids.shape[0], -1)
+
+
 @metal
-@pytest.mark.parametrize("mode,k", [("nvfp4", 512), ("nvfp4", 384), ("mxfp8", 512)])
-def test_grouped_qmv_row_invariant_and_close(mode, k):
-    from mlx_dspark.inkling_kernels import grouped_qmv
+@pytest.mark.parametrize("mode,k", [("nvfp4", 512), ("nvfp4", 384), ("mxfp8", 512),
+                                    ("mxfp8", 384)])       # MLX's fast and general qmv, each
+def test_run_qmv_is_bit_identical_to_gather_qmm_for_every_run_length(mode, k):
+    from mlx_dspark.inkling_kernels import fast_variant, run_qmv
 
     m, call = _quant_switch(6, 64, k, mode)
+    assert fast_variant(m.bits, k) == (k == 512)
     x = mx.random.normal((5, k)).astype(mx.bfloat16)
-    experts = mx.array([3, 1, 3, 0, 3, 1, 5, 3, 0, 1], mx.int32)   # runs of 1..4 equal experts
-    src = mx.array([0, 1, 2, 3, 4, 0, 1, 2, 3, 4], mx.int32)
+    # runs of 1, 2, 3, 4 and 6 equal experts (6 = a pass of four and a pass of two)
+    experts = mx.array([5, 0, 0, 1, 1, 1, 2, 2, 2, 2, 4, 4, 4, 4, 4, 4], mx.int32)
+    src = mx.array([i % 5 for i in range(16)], mx.int32)
+    ident = mx.arange(16, dtype=mx.int32)
+    ref = _per_route(call, x, experts, src)
     order = mx.argsort(experts).astype(mx.int32)
-    eids, srcs = experts[order], src[order]
-    ident = mx.arange(10, dtype=mx.int32)
-    got = grouped_qmv(x, m, eids, srcs, ident)
-    alone = mx.concatenate([grouped_qmv(x, m, eids[i:i + 1], srcs[i:i + 1],
-                                        mx.array([0], mx.int32)) for i in range(10)])
-    assert bool(mx.array_equal(got, alone).item())                 # a run never changes a row
-    ref = call(x[srcs][:, None, None, :], eids[:, None]).reshape(10, -1)
-    assert mx.allclose(got.astype(mx.float32), ref.astype(mx.float32), atol=2e-2, rtol=2e-2)
+    got = run_qmv(x, m, experts[order], src[order], order)      # sorted, written back in place
+    assert got.dtype == mx.bfloat16 and bool(mx.array_equal(got, ref).item())
+    # any route order is correct: unsorted, every route is its own run
+    shuffled = mx.array([3, 12, 0, 9, 6, 15, 1, 10, 4, 13, 7, 2, 11, 5, 14, 8], mx.int32)
+    assert bool(mx.array_equal(run_qmv(x, m, experts[shuffled], src[shuffled], shuffled), ref))
+    assert bool(mx.array_equal(run_qmv(x, m, experts, src, ident), ref))
+
+
+@metal
+def test_run_qmv_applies_the_per_expert_global_scale_like_gather_qmm():
+    from mlx_dspark.inkling_kernels import run_qmv
+
+    if "global_scale" not in (mx.gather_qmm.__doc__ or ""):
+        pytest.skip("this mlx has no gather_qmm(global_scale=)")
+    m, _ = _quant_switch(6, 64, 384, "nvfp4")
+    factor = mx.array([2688.0 * v for v in (0.5, 0.013, 1.7, 0.2, 0.09, 3.1)], mx.float32)
+    m._mlx_dspark_factor = factor                 # what install_cached_global_scales leaves
+    x = mx.random.normal((3, 384)).astype(mx.bfloat16)
+    eids = mx.array([0, 0, 2, 3, 3, 3, 5], mx.int32)
+    src = mx.array([0, 1, 2, 0, 1, 2, 1], mx.int32)
+    ref = mx.gather_qmm(x[src][:, None, None, :], m.weight, m.scales,
+                        rhs_indices=eids[:, None].astype(mx.uint32), transpose=True,
+                        group_size=16, bits=4, mode="nvfp4", global_scale=factor).reshape(7, -1)
+    assert bool(mx.array_equal(run_qmv(x, m, eids, src, mx.arange(7, dtype=mx.int32)), ref))
+
+
+def _route_reference(logits, bias, top_k, route_scale):
+    """mlx-vlm's ``_route`` after its score matmul, in MLX ops."""
+    scores = mx.sigmoid(logits)
+    indices = mx.argpartition(-(scores + bias), top_k - 1, axis=-1)[..., :top_k]
+    weights = mx.take_along_axis(scores, indices, axis=-1)
+    return indices, weights / (weights.sum(axis=-1, keepdims=True) + 1e-20) * route_scale
+
+
+@metal
+@pytest.mark.parametrize("rows", [1, 3, 8])
+def test_fused_route_selects_weighs_and_sorts_like_the_stock_ops(rows):
+    from mlx_dspark.inkling_kernels import fused_route
+
+    experts, k = 128, 8
+    logits = mx.random.normal((rows, experts), key=mx.random.key(rows)) * 3
+    bias = mx.random.normal((experts,), key=mx.random.key(99)) * 0.1
+    indices, weights = _route_reference(logits, bias, k, 8.0)
+    eids, src, order, wts = fused_route(logits, bias, k, 8.0)
+    assert bool(mx.array_equal(wts, weights.reshape(-1)))                  # bit for bit
+    flat = indices.reshape(-1).astype(mx.int32)
+    assert bool(mx.array_equal(flat[order], eids))                         # same selection ...
+    assert bool(mx.array_equal(src, order // k))
+    assert sorted(order.tolist()) == list(range(rows * k))                 # ... every route once
+    assert eids.tolist() == sorted(eids.tolist())                          # sorted by expert
+
+
+@metal
+def test_fused_route_breaks_ties_like_the_stock_stable_sort():
+    from mlx_dspark.inkling_kernels import fused_route
+
+    experts, k = 128, 8
+    logits = mx.zeros((2, experts))                                        # every score 0.5
+    bias = mx.zeros((experts,))
+    bias[100] = 0.5
+    bias[7] = 0.5
+    bias[50] = 0.25
+    indices, weights = _route_reference(logits, bias, k, 8.0)
+    assert indices[0].tolist() == [7, 100, 50, 0, 1, 2, 3, 4]              # the stock order
+    eids, _, order, wts = fused_route(logits, bias, k, 8.0)
+    picked = mx.zeros((2 * k,), mx.int32)
+    picked[order] = eids
+    assert picked.tolist() == indices.reshape(-1).tolist()
+    assert bool(mx.array_equal(wts, weights.reshape(-1)))
+
+
+@metal
+def test_combine_routes_is_bit_identical_to_the_stock_ops():
+    from mlx_dspark.inkling_kernels import combine_routes
+
+    rows, k, hidden = 3, 8, 256
+    down = (mx.random.normal((rows * k, hidden)) * 3).astype(mx.bfloat16)
+    weights = mx.random.uniform(shape=(rows * k,)) * 2
+    ref = ((down.reshape(rows, k, hidden).astype(mx.float32)
+            * weights.reshape(rows, k)[..., None]).sum(axis=-2)).astype(mx.bfloat16)
+    got = combine_routes(down, weights, k)
+    assert got.shape == (rows, hidden) and bool(mx.array_equal(got, ref))
+
+
+def _fake_moe(mode="nvfp4", experts=16, hidden=256, inner=64, top_k=4):
+    """A SparseMoE-shaped module (what fused_moe reads) and its stock forward in MLX ops."""
+    up, call_up = _quant_switch(experts, inner, hidden, mode, seed=1)
+    gate, call_gate = _quant_switch(experts, inner, hidden, mode, seed=2)
+    down, call_down = _quant_switch(experts, hidden, inner, mode, seed=3)
+    moe, sw = nn.Module(), nn.Module()
+    sw.up_proj, sw.gate_proj, sw.down_proj = up, gate, down
+
+    def activation(u, g):                      # mlx-vlm's softcapped SwiGLU
+        dtype = g.dtype
+        g, u = g.astype(mx.float32), u.astype(mx.float32)
+        return (mx.tanh(g / 4.0) * 4.0 * mx.sigmoid(g) * mx.tanh(u / 25.0) * 25.0).astype(dtype)
+
+    sw.activation = activation
+    moe.switch_mlp = sw
+    moe.gate_weight = mx.random.normal((experts, hidden), key=mx.random.key(7)).astype(mx.bfloat16)
+    moe.e_score_correction_bias = mx.random.normal((experts,), key=mx.random.key(8)) * 0.1
+    moe.top_k, moe.route_scale = top_k, 8.0
+
+    def stock_row(x):                          # x [1, 1, hidden]: the decode call
+        logits = x.astype(mx.float32) @ moe.gate_weight.astype(mx.float32).T
+        indices, weights = _route_reference(logits, moe.e_score_correction_bias, top_k, 8.0)
+        xe = mx.expand_dims(x, (-2, -3))
+        act = activation(call_up(xe, indices), call_gate(xe, indices))
+        out = call_down(act, indices).squeeze(-2)
+        return (out.astype(mx.float32) * weights[..., None]).sum(axis=-2).astype(out.dtype)
+
+    return moe, stock_row
+
+
+@metal
+@pytest.mark.parametrize("mode", ["nvfp4", "mxfp8"])
+def test_fused_moe_rows_are_bit_identical_to_single_row_stock_calls(mode):
+    from mlx_dspark.inkling_kernels import fused_moe, moe_spec
+
+    moe, stock_row = _fake_moe(mode)
+    assert moe_spec(moe)
+    a, b, c = (mx.random.normal((1, 1, 256), key=mx.random.key(i)).astype(mx.bfloat16)
+               for i in (11, 12, 13))
+    # repeated rows route alike: runs of 1..5 routes per expert in one call
+    for rows in ([c], [a, b, b, b, c], [a, a, a, a, a, b, b]):
+        ref = mx.concatenate([stock_row(r) for r in rows], axis=1)
+        got = fused_moe(moe, mx.concatenate(rows, axis=1))
+        assert got.shape == ref.shape and got.dtype == mx.bfloat16
+        assert bool(mx.array_equal(got, ref)), len(rows)
+
+
+@metal
+def test_fused_moe_routes_in_ops_past_one_threadgroup(monkeypatch):
+    from mlx_dspark import inkling_kernels as K
+
+    moe, stock_row = _fake_moe()
+    rows = [mx.random.normal((1, 1, 256), key=mx.random.key(i)).astype(mx.bfloat16) for i in range(5)]
+    monkeypatch.setattr(K, "ROUTE_MAX_THREADS", 16)            # 5 rows x 16 experts no longer fit
+    ref = mx.concatenate([stock_row(r) for r in rows], axis=1)
+    assert bool(mx.array_equal(K.fused_moe(moe, mx.concatenate(rows, axis=1)), ref))
+
+
+@metal
+def test_expert_views_bind_the_same_weights_and_come_off_again():
+    from types import SimpleNamespace
+
+    from mlx_dspark import inkling_kernels as K
+
+    moe, _ = _fake_moe()
+    lm = SimpleNamespace(model=SimpleNamespace(layers=[SimpleNamespace(mlp=moe)]))
+    x = mx.random.normal((1, 3, 256), key=mx.random.key(5)).astype(mx.bfloat16)
+    ref = K.fused_moe(moe, x)
+    mx.eval(ref)
+    assert K.set_expert_views(lm) == 3
+    up = moe.switch_mlp.up_proj
+    w, s = K._bound(up)
+    assert w.size == 8 and s.size == 8 and w.dtype == up.weight.dtype
+    assert "_mlx_dspark_views" not in up.parameters()           # not a parameter of the model
+    assert bool(mx.array_equal(K.fused_moe(moe, x), ref))
+    assert K.set_expert_views(lm, False) == 0 and K._bound(up)[0] is up.weight
 
 
 @metal

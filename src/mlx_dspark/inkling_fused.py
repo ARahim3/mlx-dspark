@@ -22,6 +22,12 @@ the stock arithmetic's rounding POINTS: the squared sums reduce in the order of 
 ``rms_single_row`` (``mlx/backend/metal/kernels/rms_norm.metal``, MIT, © 2024 Apple Inc.), the
 controller's rank-64 code is accumulated in fp32 and rounded to bf16 exactly where MLX's bf16
 matmul rounds it. What differs is the summation order of fp32 dot products — the fp-tie class.
+
+``moe`` — the routed experts (``inkling_kernels.fused_moe``): top-k, route weights and the expert
+sort in one launch, MLX's own single-row quantized matvec per route with each expert's weights
+read once per run of routes, the combine in one launch. For 1–16 positions, each row bit-identical
+to the stock module's single-row call (the stock multi-row call rounds its routing scores
+differently from its own single-row call; this one does not).
 """
 
 from __future__ import annotations
@@ -716,6 +722,25 @@ def _gated(out, gate):
     return (out.astype(mx.float32) * mx.sigmoid(gate.astype(mx.float32))).astype(out.dtype)
 
 
+@lru_cache(maxsize=16)
+def _zero_row(batch: int, heads: int, head_dim: int, dtype) -> mx.array:
+    """The attention sink's key / value row (stock fills one per call)."""
+    z = mx.zeros((batch, heads, 1, head_dim), dtype)
+    mx.eval(z)
+    return z
+
+
+def _temporal_parts(kv, v: mx.array) -> list[mx.array]:
+    """The pieces mlx-vlm's ``RotatingKVCache._temporal_order`` returns or concatenates, so the
+    caller can add the sink row in the same copy. The self-test runs a wrapped ring against the
+    stock forward (``ring_run``)."""
+    if kv._idx == v.shape[2]:
+        return [v]
+    if kv._idx < kv.offset:
+        return [v[..., : kv.keep, :], v[..., kv._idx:, :], v[..., kv.keep: kv._idx, :]]
+    return [v[..., : kv._idx, :]]
+
+
 # ---- the attention body -------------------------------------------------------------------------
 # mlx-vlm's Attention.__call__ (models/inkling2/language.py, Apache-2.0) for one batch row: the
 # projections, the KV cache update, the relative-position mask and the attention itself are the
@@ -766,16 +791,19 @@ def _attn_call(base):
                 r = (r.astype(mx.float32) * tau[..., None, None]).astype(x.dtype)
         q, k, v = (a.transpose(0, 2, 1, 3) for a in (q, k, v))
         k, v = kv.update_and_fetch(k, v)
-        if isinstance(kv, lang.RotatingKVCache):
-            k, v = kv._temporal_order(k), kv._temporal_order(v)
-        size = k.shape[2]
+        # [keys in temporal order ‖ the sink's zero row] as ONE concatenate (stock: the ring's
+        # reorder, a zeros fill, then another copy of the whole K and V for the sink row)
+        rotating = isinstance(kv, lang.RotatingKVCache)
+        k_parts = _temporal_parts(kv, k) if rotating else [k]
+        v_parts = _temporal_parts(kv, v) if rotating else [v]
+        size = sum(part.shape[2] for part in k_parts)
         mask = lang.banded_additive_mask(r, self.rel_proj.astype(x.dtype), size - length, size,
                                          self.sliding, self.rel_extent, left_padding=None,
-                                         shape_ref=k)
+                                         shape_ref=k if k.shape[2] == size else k_parts[0])
         sinks = self.sink_proj(x).transpose(0, 2, 1)[..., None]
         mask = mx.concatenate([mask, sinks], axis=-1)
-        k = mx.concatenate([k, mx.zeros((b, self.n_kv, 1, self.head_dim), k.dtype)], axis=2)
-        v = mx.concatenate([v, mx.zeros((b, self.n_kv, 1, self.head_dim), v.dtype)], axis=2)
+        k = mx.concatenate([*k_parts, _zero_row(b, self.n_kv, self.head_dim, k.dtype)], axis=2)
+        v = mx.concatenate([*v_parts, _zero_row(b, self.n_kv, self.head_dim, v.dtype)], axis=2)
         out = mx.fast.scaled_dot_product_attention(q, k, v, scale=self.head_dim**-0.5, mask=mask)
         out = out.transpose(0, 2, 1, 3).reshape(b, length, -1)
         return self.o_proj(_gated(out, self.gate_proj(x)))
@@ -829,6 +857,21 @@ def _layer_call(base):
     return __call__
 
 
+# ---- the routed experts --------------------------------------------------------------------------
+def _moe_call(base):
+    from . import inkling_kernels as K
+
+    def __call__(self, x):
+        if not (_on(self) and x.ndim == 3 and x.shape[0] == 1
+                and 1 <= x.shape[1] <= K.MOE_MAX_ROWS and x.dtype == mx.bfloat16
+                and not self.training and getattr(self, "sharding_group", None) is None
+                and _gpu()):
+            return base.__call__(self, x)
+        return K.fused_moe(self, x)
+
+    return __call__
+
+
 # ---- install --------------------------------------------------------------------------------------
 _CLASSES: dict[tuple[type, str], type] = {}
 
@@ -846,6 +889,8 @@ def _swap(module, make_call, tag: str) -> None:
 
 
 def _fused_modules(language_model):
+    from .inkling_kernels import moe_spec
+
     model = language_model.model
     final = getattr(model, "final_input", None)
     if final is not None and getattr(final, "normalize_values", False):
@@ -853,6 +898,8 @@ def _fused_modules(language_model):
     for layer in model.layers:
         if hasattr(layer, "attn_sconv") and hasattr(layer, "mlp_sconv"):
             yield layer, "layer"
+        if getattr(layer, "mlp", None) is not None and moe_spec(layer.mlp):
+            yield layer.mlp, "moe"
         if getattr(layer, "self_attn", None) is not None and hasattr(layer.self_attn, "q_scale"):
             yield layer.self_attn, "attn"
         for name in ("attention_input", "mlp_input"):
@@ -872,12 +919,14 @@ def _fused_modules(language_model):
 
 
 _MAKERS = {"sconv": _sconv_call, "res": _res_call, "ctrl": _ctrl_call, "layer": _layer_call,
-           "attn": _attn_call}
+           "attn": _attn_call, "moe": _moe_call}
 
 
 _OFF = "_mlx_dspark_fused_off"      # kinds the self-test switched off for this model
 EXACT_KINDS = ("sconv", "layer", "attn")       # bit-identical to the stock forward
+ROW_EXACT_KINDS = ("moe",)                     # each row bit-identical to the stock DECODE call
 ROUNDING_KINDS = ("res", "ctrl")               # fp32 dot products summed in another order
+ALL_KINDS = EXACT_KINDS + ROW_EXACT_KINDS + ROUNDING_KINDS
 
 
 def install(language_model, enabled: bool = True) -> dict[str, int]:
@@ -894,11 +943,51 @@ def install(language_model, enabled: bool = True) -> dict[str, int]:
 def set_enabled(language_model, enabled: bool, kinds=None) -> None:
     """Route every installed piece to the fused path (``True``) or the stock forward (the A/B).
     ``kinds`` limits the switch to some pieces (``"sconv"``, ``"res"``, ``"ctrl"``, ``"layer"``,
-    ``"attn"``). A kind the self-test rejected stays off."""
+    ``"attn"``, ``"moe"``). A kind the self-test rejected (or :func:`disable` named) stays off."""
     off = language_model.__dict__.get(_OFF, ())
     for module, kind in _fused_modules(language_model):
         if kinds is None or kind in kinds:
             module.__dict__[_FLAG] = bool(enabled) and kind not in off
+
+
+def disable(language_model, kinds) -> None:
+    """Keep ``kinds`` on the stock path from now on (an A/B switch; survives ``set_enabled``)."""
+    off = set(language_model.__dict__.get(_OFF, ())) | set(kinds)
+    language_model.__dict__[_OFF] = tuple(sorted(off))
+    set_enabled(language_model, False, kinds)
+
+
+def enabled_kinds(language_model) -> tuple[str, ...]:
+    """The kinds currently routed to their fused path (sorted)."""
+    return tuple(sorted({kind for module, kind in _fused_modules(language_model) if _on(module)}))
+
+
+def _moe_selftest(language_model, rand) -> bool:
+    """The fused MoE against the stock module ROW BY ROW (what a decode step computes for each
+    token), on one layer per expert format, with rows repeated so that runs of 1, 2, 3, 4 and
+    more routes per expert all occur — each run length is its own kernel path. The first call
+    is the widest verify (8 rows): the router's largest threadgroup, so a GPU that cannot launch
+    it fails here, at load."""
+    from .inkling_kernels import fused_moe, moe_spec
+
+    seen = set()
+    for layer in language_model.model.layers:
+        moe = getattr(layer, "mlp", None)
+        if moe is None or not moe_spec(moe):
+            continue
+        fmt = tuple((p.mode, p.bits, tuple(p.weight.shape[1:]))
+                    for p in (moe.switch_mlp.up_proj, moe.switch_mlp.down_proj))
+        if fmt in seen:
+            continue
+        seen.add(fmt)
+        stock = type(moe).__mro__[1].__call__
+        hidden = int(moe.gate_weight.shape[1])
+        a, b, c = (rand((1, 1, hidden), mx.bfloat16) for _ in range(3))
+        for rows in ([a, a, a, a, a, b, b, c], [a, b, b, b, c], [c]):
+            ref = mx.concatenate([stock(moe, row) for row in rows], axis=1)
+            if not bool(mx.array_equal(fused_moe(moe, mx.concatenate(rows, axis=1)), ref)):
+                return False
+    return bool(seen)
 
 
 def _rel_l2(got: mx.array, ref: mx.array) -> float:
@@ -921,21 +1010,22 @@ def selftest(language_model, rows: int = 2, seed: int = 0) -> dict[str, bool]:
     switch off any kind that does not hold: the layer and attention bodies are copies of
     mlx-vlm's, so an upstream change must turn them off, not change the model. ``sconv`` /
     ``layer`` / ``attn`` must match bit for bit (outputs and the cache states they leave);
-    ``res`` / ``ctrl`` within rounding. A kernel that does not build on this GPU (threadgroup
-    limits) fails its kind the same way. Leaves the model with every passing kind on.
-    Returns ``{kind: passed}``."""
+    ``moe`` must match a single-row layer call bit for bit and, at more rows, the stock module's
+    single-row call row by row (:func:`_moe_selftest`); ``res`` / ``ctrl`` within rounding. A
+    kernel that does not build on this GPU (threadgroup limits) fails its kind the same way.
+    Leaves the model with every passing kind on. Returns ``{kind: passed}``."""
     lm = language_model
     model = lm.model
     layers = model.layers
     visits = list(model.layer_indices)
     hidden = int(model.embed_norm.weight.shape[0])
     key = mx.random.key(seed)
-    keys = iter(mx.random.split(key, 64))
+    keys = iter(mx.random.split(key, 128))
 
     def rand(shape, dtype=mx.float32):
         return mx.random.normal(shape, key=next(keys)).astype(dtype)
 
-    def layer_run(index, on_kinds, messages=None):
+    def layer_run(index, on_kinds, messages=None, rows=rows):
         x = rand((1, rows, hidden), mx.bfloat16)
         blocks = [rand((1, rows, hidden), mx.bfloat16)] if layers[index].attention_input is not None else []
         outs = []
@@ -952,20 +1042,59 @@ def selftest(language_model, rows: int = 2, seed: int = 0) -> dict[str, bool]:
         return (bool(mx.array_equal(a, b)) and len(sa) == len(sb)
                 and all(bool(mx.array_equal(u, v)) for u, v in zip(sa, sb)))
 
+    def ring_run(index, steps=6, window=3):
+        """A sliding layer on a ``window``-key ring for ``steps`` single-row calls — it fills,
+        wraps and is read back in temporal order (the attention body reorders the ring and adds
+        the sink row in one copy; a load-time probe on a fresh 1024-key ring never wraps)."""
+        kv = lm.make_cache()[visits.index(index)][0]
+        if not hasattr(kv, "max_size") or not hasattr(kv, "_temporal_order"):
+            return True
+        xs = [rand((1, 1, hidden), mx.bfloat16) for _ in range(steps)]
+        blocks = [rand((1, 1, hidden), mx.bfloat16)] if layers[index].attention_input is not None else []
+        runs = []
+        for on in (False, True):
+            set_enabled(lm, False)
+            if on:
+                set_enabled(lm, True, ("attn",))
+            cache = lm.make_cache()[visits.index(index)]
+            cache.caches = (type(kv)(max_size=window, keep=0), *cache.caches[1:])
+            outs = [layers[index](x, list(blocks), cache, None) for x in xs]
+            st = _state_arrays(cache)
+            mx.eval(outs, st)
+            runs.append((outs, st))
+        (a, sa), (b, sb) = runs
+        return (all(bool(mx.array_equal(u, v)) for u, v in zip(a, b)) and len(sa) == len(sb)
+                and all(bool(mx.array_equal(u, v)) for u, v in zip(sa, sb)))
+
     sliding = next((i for i, layer in enumerate(layers) if layer.is_sliding and i > 0), None)
     globl = next((i for i, layer in enumerate(layers) if not layer.is_sliding), None)
     core = next((i for i, layer in enumerate(layers) if getattr(layer, "controllers", None)), None)
     probes = [i for i in (sliding, globl) if i is not None]
     result: dict[str, bool] = {}
     lm.__dict__[_OFF] = ()
+    installed = {kind for _, kind in _fused_modules(lm)}
     for kind in EXACT_KINDS:
+        if kind not in installed:
+            continue
         try:
             ok = all(layer_run(i, (kind,)) for i in probes)
             if ok and core is not None:
                 ok = layer_run(core, (kind,), rand((1, rows, 4, hidden)))
+            if ok and kind == "attn" and sliding is not None:
+                ok = ring_run(sliding)
         except Exception:  # noqa: BLE001 — a kernel this GPU cannot launch: keep the stock path
             ok = False
         result[kind] = ok
+    if "moe" in installed:
+        # a decode step through the whole layer (bit for bit, states included), then the
+        # multi-row call against single-row stock calls
+        try:
+            ok = all(layer_run(i, ("moe",), rows=1) for i in probes)
+            set_enabled(lm, False)
+            ok = ok and _moe_selftest(lm, rand)
+        except Exception:  # noqa: BLE001
+            ok = False
+        result["moe"] = ok
     try:
         res = layers[probes[0]].mlp_input if probes else None
         ok = res is not None

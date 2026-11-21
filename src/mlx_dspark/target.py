@@ -117,20 +117,21 @@ class Target:
             # dense relative-position masks per global layer: 512-row prefill chunks are faster
             # and ~3x leaner than the default 2048 (generate._target_chunk)
             self.prefill_chunk = 512
-            # Verify-width MoE: each expert's weights dequantized once per run of draft rows
-            # routed to it (inkling_kernels.grouped_moe; decode rows keep the stock qmv).
-            # Per-instance, Inkling only; MLX_DSPARK_INKLING_GROUPED_MOE=0 is the A/B.
             from .inkling_kernels import (
                 install_cached_global_scales,
                 install_fast_head,
-                install_grouped_moe,
+                set_expert_views,
             )
 
             # constant per-expert scale factors computed once instead of per call (exact;
             # ~400 fewer graph primitives per decode step)
             install_cached_global_scales(model.language_model)
-            install_grouped_moe(model.language_model, enabled=os.environ.get(
-                "MLX_DSPARK_INKLING_GROUPED_MOE", "1").lower() not in ("0", "false"))
+            # the expert kernels bind 8-element views of the stacked expert tensors, so MLX does
+            # not end the command buffer after every expert launch (144 commits a token).
+            # MLX_DSPARK_INKLING_EXPERT_VIEWS=0 is the A/B; the self-test below runs with them.
+            if (os.environ.get("MLX_DSPARK_INKLING_EXPERT_VIEWS", "1").lower()
+                    not in ("0", "false")):
+                set_expert_views(model.language_model)
             # fp32 logits from the bf16 head without the stock 1.85 GB fp32 copy: half the
             # head traffic every step, and row-invariant (verify logits == decode logits).
             # MLX_DSPARK_INKLING_FAST_HEAD=0 is the A/B.
@@ -138,22 +139,30 @@ class Target:
                 install_fast_head(model.language_model)
             # Decode- and verify-width calls launch ~7,000 small GPU kernels per forward on the
             # stock path; inkling_fused folds the runs between the big matmuls into single
-            # launches (each piece self-tested against this mlx-vlm's stock forward at load, and
-            # left on the stock path if it does not hold). MLX_DSPARK_INKLING_FUSED=0 is the A/B.
+            # launches, and runs the routed experts through one read of each expert per run of
+            # routes (a verify's rows share experts). Each piece is self-tested against this
+            # mlx-vlm's stock forward at load and left on the stock path if it does not hold.
+            # MLX_DSPARK_INKLING_FUSED=0 is the A/B; MLX_DSPARK_INKLING_GROUPED_MOE=0 switches
+            # off the expert kernels alone.
             self.inkling_fused: dict[str, bool] = {}
             if (os.environ.get("MLX_DSPARK_INKLING_FUSED", "1").lower() not in ("0", "false")
                     and mx.metal.is_available() and mx.default_device() == mx.gpu):
-                from .inkling_fused import install as install_fused
-                from .inkling_fused import selftest as fused_selftest
+                from . import inkling_fused
 
-                install_fused(model.language_model, enabled=False)
-                self.inkling_fused = fused_selftest(model.language_model)
-                if any(self.inkling_fused.values()):
-                    self.calibration_tag = "|ikf"
+                inkling_fused.install(model.language_model, enabled=False)
+                self.inkling_fused = inkling_fused.selftest(model.language_model)
                 off = sorted(k for k, ok in self.inkling_fused.items() if not ok)
                 if off:
                     print(f"[inkling] fused forward: {', '.join(off)} failed the self-test "
                           "against this mlx-vlm and stay on the stock path", file=sys.stderr)
+                if os.environ.get("MLX_DSPARK_INKLING_GROUPED_MOE", "1").lower() in ("0", "false"):
+                    inkling_fused.disable(model.language_model, ("moe",))
+                    self.inkling_fused["moe"] = False
+                # a curve is priced by the forward that measured it: tag the fused set
+                on = inkling_fused.enabled_kinds(model.language_model)
+                if on:
+                    missing = sorted(set(inkling_fused.ALL_KINDS) - set(on))
+                    self.calibration_tag = "|ikf2" + ("-" + "-".join(missing) if missing else "")
         self._txn = None          # the open transaction of the last multi-row Inkling verify
         # nanbeige (Nanbeige4.2): a looped-depth transformer — num_hidden_layers dense
         # blocks applied num_loops times with shared weights, per-loop KV caches, and the
