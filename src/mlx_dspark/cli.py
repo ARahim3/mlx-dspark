@@ -102,6 +102,14 @@ def cmd_generate(argv: list[str]) -> None:
     ap.add_argument("--kv-bits", type=int, default=0, choices=[0, 4, 8],
                     help="quantize the target KV cache (4/8 bits; 0 = off). Cuts the KV "
                          "bandwidth bill on long contexts; mlx-lm text targets only")
+    ap.add_argument("--target-bits", type=int, default=0, choices=[0, 8],
+                    help="Inkling 2 only: quantize at load what its checkpoint keeps in bf16 and "
+                         "reads every token (the attention projections and the output head) to "
+                         "8-bit; the experts stay as released. Plain decoding ~26%% faster, "
+                         "speculative ~7%%. NOT the released weights: about 1.6%% of next-token "
+                         "choices differ, all near-ties (the released model differs from itself "
+                         "on about 1%% between a decode step and a verify pass). 0 = as released "
+                         "(default); ignored for other targets")
     ap.add_argument("--lookup-drafts", action=argparse.BooleanOptionalAction, default=None,
                     help="hybrid n-gram drafting inside dspark mode. Unset = the pair's "
                          "measured default (ON for most targets — free extra speedup on "
@@ -192,7 +200,8 @@ def cmd_generate(argv: list[str]) -> None:
     print(f"loading {args.mode}: target={target_repo}"
           + (f", drafter={drafter_repo}" if drafter_repo else ""))
     target, tok = load_target(target_repo, require_tap=args.mode in ("dspark", "dflash"),
-                              kv_bits=args.kv_bits or None)
+                              kv_bits=args.kv_bits or None,
+                              target_bits=args.target_bits or None)
     drafter = None
     if args.mode == "dspark":
         drafter, _ = load_drafter(drafter_repo, quantize=args.drafter_bits > 0,
@@ -407,6 +416,14 @@ def cmd_serve(argv: list[str]) -> None:
                     help="quantize the target KV cache (4/8 bits; 0 = off). Cuts the KV "
                          "bandwidth bill on long contexts; mlx-lm text targets only "
                          "(disables --max-batch)")
+    ap.add_argument("--target-bits", type=int, default=0, choices=[0, 8],
+                    help="Inkling 2 only: quantize at load what its checkpoint keeps in bf16 and "
+                         "reads every token (the attention projections and the output head) to "
+                         "8-bit; the experts stay as released. Plain decoding ~26%% faster, "
+                         "speculative ~7%%. NOT the released weights: about 1.6%% of next-token "
+                         "choices differ, all near-ties (the released model differs from itself "
+                         "on about 1%% between a decode step and a verify pass). 0 = as released "
+                         "(default); ignored for other targets")
     ap.add_argument("--max-batch", type=int, default=1,
                     help="micro-batch up to N concurrently-queued requests through one batched "
                          "target forward (dense mlx-lm target + dspark/baseline; ~1.5-2.5x "
@@ -562,6 +579,7 @@ def cmd_serve(argv: list[str]) -> None:
         "memory_guard": args.memory_guard,       # shed caches when macOS reports memory pressure
         "batch_widths": (sorted({2, args.max_batch}) if args.max_batch > 1 else None),
         "kv_bits": args.kv_bits or None,
+        "target_bits": args.target_bits or None,
         "context_window": args.context_window,
     }
     if args.no_model:
@@ -787,6 +805,10 @@ def cmd_benchmark(argv: list[str]) -> None:
     ap.add_argument("--drafter-window", type=int, default=None, metavar="N",
                     help="DSpark drafter context window (see `mlx-dspark generate --help`); 0 = "
                          "whole context, unset = the pair default.")
+    ap.add_argument("--target-bits", type=int, default=0, choices=[0, 8],
+                    help="Inkling 2 only: 8 = its bf16 attention projections and output head "
+                         "quantized at load (see `mlx-dspark generate --help`). Prints in the "
+                         "header.")
     ap.add_argument("--trust-remote-code", action="store_true",
                     help="allow a checkpoint to ship Python the loader imports (config.json "
                          "model_file / auto_map). Refused by default: a crafted model repo "
@@ -839,12 +861,16 @@ def cmd_benchmark(argv: list[str]) -> None:
           f"sdpa split (long-ctx verify): {sdpa_note}\n"
           f"multi-row attention kernel: {mra_note}\n"
           f"prefill CPU co-prefill: {cpu_note}\n"
-          f"loading + warming up…")
+          + (f"target bits: {args.target_bits} (bf16 attention + output head quantized at load; "
+             f"not the released weights)\n" if args.target_bits else "")
+          + "loading + warming up…")
     target, tok = load_target(
-        target_repo, require_tap=any(m in ("dspark", "dflash") for m in modes))
+        target_repo, require_tap=any(m in ("dspark", "dflash") for m in modes),
+        target_bits=args.target_bits or None)
     greedy_generate(target, tok, "Tell me about the sea.", max_new_tokens=100)
 
-    results = {"device": dev, "mlx": mx.__version__, "target": target_repo, "runs": []}
+    results = {"device": dev, "mlx": mx.__version__, "target": target_repo,
+               "target_bits": int(getattr(target, "target_bits", 0) or 0), "runs": []}
 
     def run(label, fn):
         """Per-prompt medians over --trials, plus the across-prompt mean. The per-prompt

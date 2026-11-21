@@ -625,6 +625,7 @@ class Engine:
         wired_limit: bool = False,
         batch_widths: list[int] | None = None,   # e.g. [2, max_batch]: calibrate (B,cap) grid
         kv_bits: int | None = None,              # quantize the target KV cache (4/8)
+        target_bits: int | None = None,          # Inkling 2: its bf16 parts at 8-bit (opt-in)
         context_window: int | None = None,       # override the target's own limit
         wide_gemm_min: int | None = None,        # prefill wide-GEMM: None=calibrate, 0=off, N=forced
         cpu_split: float | None = None,          # prefill CPU co-prefill: None=calibrate, 0=off, f=forced
@@ -669,7 +670,7 @@ class Engine:
 
         def _load_models():
             tgt, tok = load_target(target_repo, require_tap=mode in ("dspark", "dflash"),
-                                   kv_bits=kv_bits)
+                                   kv_bits=kv_bits, target_bits=target_bits)
             draft = None
             if mode == "dspark":
                 draft, _ = load_drafter(drafter_repo, quantize=drafter_bits > 0,
@@ -1956,6 +1957,7 @@ class EngineHolder:
              drafter_window: int | None = None,
              cpu_split: float | None = None,
              kv_bits: int | None = None,
+             target_bits: int | None = None,
              warmup: bool | None = None,
              memory_guard: bool | None = None,
              enable_thinking: bool | None = None,
@@ -2029,6 +2031,8 @@ class EngineHolder:
                     kwargs["cpu_split"] = cpu_split       # 0 -> off, float -> forced fraction
                 if kv_bits is not None:
                     kwargs["kv_bits"] = kv_bits or None    # 0 -> full precision
+                if target_bits is not None:
+                    kwargs["target_bits"] = target_bits or None   # 0 -> as released
                 if warmup is not None:
                     kwargs["warmup"] = warmup
                 if memory_guard is not None:
@@ -2315,6 +2319,10 @@ def make_handler(engine: Engine, api_key: str | None):
                     # "kv_bits" override (< 0.13.1) also lacks this key (issue #17).
                     "kv_bits": int(getattr(getattr(engine, "target", None),
                                            "kv_bits", 0) or 0),
+                    # Inkling 2's bf16 attention + output head quantized at load: 0 = the
+                    # released weights, 8 = the opt-in. 0 for every target it does not apply to.
+                    "target_bits": int(getattr(getattr(engine, "target", None),
+                                               "target_bits", 0) or 0),
                     # {code, level, message, action} rows a client shows as a banner: live
                     # macOS memory pressure + the engine's load-time notes (the context-
                     # window RAM estimate used to reach only stderr). Empty when all is well.
@@ -2510,6 +2518,14 @@ def make_handler(engine: Engine, api_key: str | None):
                                         or kv_bits not in (0, 4, 8)):
                 return self._send_error(400, "'kv_bits' must be 0 (full precision), 4, or 8 "
                                              "(omit it to keep the server's setting)")
+            # Inkling 2 only: its bf16 attention projections + output head quantized to 8-bit
+            # at load (not the released weights). 0 = explicitly as released; omit = keep the
+            # server's setting. Ignored, with /health reporting 0, for any other target.
+            target_bits = req.get("target_bits")
+            if target_bits is not None and (isinstance(target_bits, bool)
+                                            or target_bits not in (0, 8)):
+                return self._send_error(400, "'target_bits' must be 0 (the released weights) or "
+                                             "8 (omit it to keep the server's setting)")
             # Whether this load runs the warmup pass (a throwaway generation to warm the
             # kernels so the first real request is fast). Omit = the server's default (on).
             warmup = req.get("warmup")
@@ -2544,7 +2560,7 @@ def make_handler(engine: Engine, api_key: str | None):
                                      small_m=small_m, sdpa_split=sdpa_split,
                                      multirow_attn=multirow_attn,
                                      drafter_window=drafter_window, cpu_split=cpu_split,
-                                     kv_bits=kv_bits,
+                                     kv_bits=kv_bits, target_bits=target_bits,
                                      warmup=warmup, memory_guard=memory_guard,
                                      enable_thinking=enable_thinking,
                                      reasoning_effort=effort.lower() if effort else None)

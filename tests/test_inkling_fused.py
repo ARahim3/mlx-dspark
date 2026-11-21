@@ -357,3 +357,40 @@ def test_installed_moe_kind_decodes_bit_identically_and_is_row_exact(mode):
     F.disable(lm, ("moe",))
     F.set_enabled(lm, True)                                    # a disabled kind stays off
     assert "moe" not in F.enabled_kinds(lm) and "attn" in F.enabled_kinds(lm)
+
+
+def test_dense_bits_quantizes_the_five_projections_and_the_logits_head():
+    from mlx_dspark import inkling_kernels as K
+
+    lm = _tiny_bf16_inkling()
+    ids = mx.array([[3, 7, 11, 2, 9, 30, 41, 5, 8, 13]])
+    ref = lm(inputs=ids, cache=lm.make_cache()).logits
+    mx.eval(ref)
+    with pytest.raises(ValueError, match="4-bit"):
+        K.install_dense_bits(lm, 4)                       # measured, fails the gate: not offered
+    assert K.dense_bits(lm) == 0
+    assert K.install_dense_bits(lm, 8) == 6 * len(K.DENSE_PROJECTIONS) + 1
+    assert K.dense_bits(lm) == 8 and K.install_dense_bits(lm, 8) == 0        # idempotent
+    for layer in lm.model.layers:
+        attn = layer.self_attn
+        assert all(type(getattr(attn, name)).__name__ == "QuantizedLinear"
+                   and getattr(attn, name).bits == 8 for name in K.DENSE_PROJECTIONS)
+        assert type(attn.r_proj).__name__ == "Linear"     # position / sink projections stay
+    assert type(lm.lm_head).__name__ == "Linear"          # the raw head stays: drafters bind it
+    assert not K.install_fast_head(lm)                    # the logits already have their head
+    got = lm(inputs=ids, cache=lm.make_cache()).logits
+    assert got.dtype == mx.float32 and got.shape == ref.shape    # fp32 logits, as released
+    assert 0 < _rel(got, ref) < 0.35                      # 8-bit weights; random ones amplify
+
+
+def test_fused_exact_kinds_stay_bit_identical_on_the_8bit_model(monkeypatch):
+    from mlx_dspark import inkling_kernels as K
+
+    lm = _tiny_bf16_inkling()
+    K.install_dense_bits(lm, 8)
+    F.install(lm, enabled=False)
+    ref, ref_states = _walk(lm, None)
+    got, got_states = _walk(lm, F.EXACT_KINDS)
+    assert all(bool(mx.array_equal(a, b)) for a, b in zip(got, ref))
+    assert all(bool(mx.array_equal(a, b)) for a, b in zip(got_states, ref_states))
+    assert F.selftest(lm) == dict.fromkeys((*F.EXACT_KINDS, *F.ROUNDING_KINDS), True)

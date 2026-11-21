@@ -1100,14 +1100,21 @@ def refuse_remote_code(path: str, repo_or_path: str) -> None:
 
 
 def load_target(repo_or_path: str = DEFAULT_TARGET, *, require_tap: bool = False,
-                kv_bits: int | None = None, kv_group_size: int = 64):
+                kv_bits: int | None = None, kv_group_size: int = 64,
+                target_bits: int | None = None):
     """Return (Target, tokenizer). Routes text models to mlx-lm and multimodal/unified
     models (Gemma-4) to mlx-vlm (see :func:`_route_target`), then wraps in a family-aware
     Target (hidden-state tap). ``require_tap=True`` (any drafter mode) additionally probes
     that the manual mlx-lm tap reproduces the model's own forward — a family the generic
     loop can't replicate fails loudly here instead of silently drafting from a wrong
-    stream. Baseline/lookup modes skip the probe (they never tap)."""
+    stream. Baseline/lookup modes skip the probe (they never tap).
+
+    ``target_bits=8`` (Inkling 2 only, opt-in): quantize at load what the checkpoint keeps in
+    bf16 — the attention projections and the output head (``inkling_kernels.install_dense_bits``;
+    faster, and not the released weights). Ignored with a note for any other target, so a
+    server started with it can still swap models."""
     import json
+    import sys
 
     path = _resolve(repo_or_path)
     cfg: dict = {}
@@ -1146,6 +1153,11 @@ def load_target(repo_or_path: str = DEFAULT_TARGET, *, require_tap: bool = False
         _register_nanbeige()
 
     refuse_remote_code(path, repo_or_path)
+    if target_bits and not supports_target_bits(cfg):
+        print(f"[mlx-dspark] target bits {target_bits} ignored for {repo_or_path}: the option "
+              "applies to Inkling 2 targets (their checkpoint keeps the attention and output "
+              "head in bf16). Loading it as published.", file=sys.stderr)
+        target_bits = None
     if str(cfg.get("model_type", "")).startswith("inkling2"):
         from .inkling import MLX_VLM_HINT, mlx_vlm_supports_inkling2
 
@@ -1180,20 +1192,27 @@ def load_target(repo_or_path: str = DEFAULT_TARGET, *, require_tap: bool = False
                 f"https://github.com/ARahim3/mlx-dspark/issues{hint}"
             ) from e
         tokenizer = getattr(processor, "tokenizer", processor)
-    target = Target(model, tokenizer, kv_bits=kv_bits, kv_group_size=kv_group_size)
+    target = Target(model, tokenizer, kv_bits=kv_bits, kv_group_size=kv_group_size,
+                    target_bits=target_bits)
     if require_tap:
         target.verify_tap()
     return target, tokenizer
 
 
-def load_pair(model: str = "gemma4", *, drafter: str | None = None):
+def supports_target_bits(cfg: dict) -> bool:
+    """Whether ``target_bits`` (the bf16 parts quantized at load) applies to this target config."""
+    return str(cfg.get("model_type", "")).startswith("inkling2")
+
+
+def load_pair(model: str = "gemma4", *, drafter: str | None = None,
+              target_bits: int | None = None):
     """Convenience: load (target, tokenizer, DSpark drafter, cfg).
 
     ``model`` is a target HF repo or local path (e.g. ``"mlx-community/Qwen3-8B-8bit"``); the
     matched drafter auto-resolves from the registry, or pass ``drafter=``. A legacy family alias
-    (``"qwen3"`` / ``"gemma4"``) is still accepted."""
+    (``"qwen3"`` / ``"gemma4"``) is still accepted. ``target_bits``: see :func:`load_target`."""
     target_repo, drafter_repo = resolve(model, mode="dspark", drafter=drafter)
-    target, tok = load_target(target_repo, require_tap=True)
+    target, tok = load_target(target_repo, require_tap=True, target_bits=target_bits)
     drafter_m, cfg = load_drafter(drafter_repo)
     drafter_m.ctx_window = drafter_window_default(target_repo)   # see DRAFTER_WINDOW_DEFAULT
     return target, tok, drafter_m, cfg

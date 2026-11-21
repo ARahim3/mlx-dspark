@@ -561,6 +561,11 @@ def test_hybrid_kv_bits_builds_mixed_cache_and_rollback_matches_committed():
     assert bool(mx.allclose(v2[0], ref[-3:], atol=1e-4, rtol=1e-4).item())
 
 
+def test_target_bits_refused_on_a_target_that_is_not_inkling():
+    with pytest.raises(ValueError, match="Inkling 2"):
+        Target(_tiny_hybrid(), tokenizer=None, target_bits=8)
+
+
 def test_hybrid_kv_bits_mamba2_refused_with_reason():
     """The Mamba-2 (nemotron_h) mixed-cache path is unvalidated — refuse it by name."""
     import pytest

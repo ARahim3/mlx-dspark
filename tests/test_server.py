@@ -1171,6 +1171,28 @@ def test_health_reports_kv_bits(server):
     assert _get(base, "/health")["kv_bits"] == 8
 
 
+def test_health_reports_target_bits(server):
+    """0 unless the loaded target runs Inkling 2's bf16 parts at 8-bit (--target-bits 8)."""
+    eng, base = server
+    assert _get(base, "/health")["target_bits"] == 0
+
+    class _T:
+        kv_bits = 0
+        target_bits = 8
+
+    eng.target = _T()
+    assert _get(base, "/health")["target_bits"] == 8
+
+
+def test_admin_load_rejects_bad_target_bits(holder_server):
+    _holder, base = holder_server
+    for bad in (4, 16, "8", True):
+        with pytest.raises(urllib.error.HTTPError) as e:
+            _post(base, "/admin/load", {"model": "repo", "target_bits": bad})
+        assert e.value.code == 400, bad
+        assert "target_bits" in json.loads(e.value.read())["error"]["message"]
+
+
 def test_health_reports_multirow_and_drafter_window(server):
     eng, base = server
     h = _get(base, "/health")

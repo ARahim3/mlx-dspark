@@ -554,6 +554,42 @@ def test_target_inkling_verify_rollback_equals_plain_forwards():
     assert t._txn is None
 
 
+def test_target_inkling_target_bits_quantizes_tags_the_curve_and_still_rolls_back():
+    from mlx_dspark.target import Target
+
+    t = Target(_tiny_inkling(), tokenizer=None, target_bits=8)
+    assert t.target_bits == 8 and t.calibration_tag.endswith("|tb8")
+    attn = t.model.language_model.model.layers[0].self_attn
+    assert type(attn.q_proj).__name__ == "QuantizedLinear" and attn.q_proj.bits == 8
+    assert Target(_tiny_inkling(), tokenizer=None).target_bits == 0
+    with pytest.raises(ValueError, match="4-bit"):
+        Target(_tiny_inkling(), tokenizer=None, target_bits=4)
+    tap = [1, 3, 5, 8]
+    prompt = mx.array([[1, 5, 9, 2, 7, 3, 11, 4, 6, 8, 10, 12]])
+
+    def fresh():
+        c = t.make_cache()
+        t.prefill(prompt, c, tap)
+        return c
+
+    a = fresh()
+    t.verify(mx.array([[13, 14, 15, 16]]), a, tap)
+    t.rollback(a, n_rejected=2, accepted=[14])
+    got = t.plain(mx.array([[17]]), a)
+    b = fresh()
+    t.plain(mx.array([[13, 14]]), b)
+    want = t.plain(mx.array([[17]]), b)
+    assert got.dtype == mx.float32 and mx.allclose(got, want, atol=1e-3, rtol=1e-3)
+
+
+def test_target_bits_applies_to_inkling_configs_only():
+    from mlx_dspark.load import supports_target_bits
+
+    assert supports_target_bits({"model_type": "inkling2_loop"})
+    assert supports_target_bits({"model_type": "inkling2"})
+    assert not supports_target_bits({"model_type": "qwen3"}) and not supports_target_bits({})
+
+
 def test_target_inkling_reset_spec_aborts_an_open_verify():
     from mlx_dspark.target import Target
 

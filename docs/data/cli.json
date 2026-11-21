@@ -154,6 +154,18 @@
    },
    {
     "flags": [
+     "--target-bits"
+    ],
+    "metavar": "TARGET_BITS",
+    "choices": [
+     0,
+     8
+    ],
+    "default": 0,
+    "help": "Inkling 2 only: quantize at load what its checkpoint keeps in bf16 and reads every token (the attention projections and the output head) to 8-bit; the experts stay as released. Plain decoding ~26%% faster, speculative ~7%%. NOT the released weights: about 1.6%% of next-token choices differ, all near-ties (the released model differs from itself on about 1%% between a decode step and a verify pass). 0 = as released (default); ignored for other targets"
+   },
+   {
+    "flags": [
      "--max-batch"
     ],
     "metavar": "MAX_BATCH",
@@ -597,6 +609,18 @@
    },
    {
     "flags": [
+     "--target-bits"
+    ],
+    "metavar": "TARGET_BITS",
+    "choices": [
+     0,
+     8
+    ],
+    "default": 0,
+    "help": "Inkling 2 only: quantize at load what its checkpoint keeps in bf16 and reads every token (the attention projections and the output head) to 8-bit; the experts stay as released. Plain decoding ~26%% faster, speculative ~7%%. NOT the released weights: about 1.6%% of next-token choices differ, all near-ties (the released model differs from itself on about 1%% between a decode step and a verify pass). 0 = as released (default); ignored for other targets"
+   },
+   {
+    "flags": [
      "--lookup-drafts",
      "--no-lookup-drafts"
     ],
@@ -834,6 +858,18 @@
     "choices": null,
     "default": null,
     "help": "DSpark drafter context window (see `mlx-dspark generate --help`); 0 = whole context, unset = the pair default."
+   },
+   {
+    "flags": [
+     "--target-bits"
+    ],
+    "metavar": "TARGET_BITS",
+    "choices": [
+     0,
+     8
+    ],
+    "default": 0,
+    "help": "Inkling 2 only: 8 = its bf16 attention projections and output head quantized at load (see `mlx-dspark generate --help`). Prints in the header."
    },
    {
     "flags": [

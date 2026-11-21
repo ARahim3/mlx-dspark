@@ -77,6 +77,7 @@ class Target:
     # class defaults, so a Target built without __init__ (tests' Target.__new__ doubles) is a
     # plain non-Inkling target with no open verify transaction
     _inkling = False
+    target_bits = 0           # Inkling 2's bf16 parts quantized at load (0 = as released)
     # appended to the calibration cache key: a target whose own forward has variants with
     # different verify curves names the live one here (Inkling 2's fused forward: "|ikf")
     calibration_tag = ""
@@ -84,7 +85,7 @@ class Target:
     prefill_chunk: int | None = None   # None = generate.PREFILL_CHUNK (see _target_chunk)
 
     def __init__(self, model, tokenizer, *, kv_bits: int | None = None,
-                 kv_group_size: int = 64):
+                 kv_group_size: int = 64, target_bits: int | None = None):
         self.model = model
         self.tokenizer = tokenizer
         # mlx-vlm targets (gemma4) vs mlx-lm; mlx-lm also ships text-only modules for some
@@ -119,9 +120,18 @@ class Target:
             self.prefill_chunk = 512
             from .inkling_kernels import (
                 install_cached_global_scales,
+                install_dense_bits,
                 install_fast_head,
                 set_expert_views,
             )
+
+            # --target-bits 8 (opt-in): the attention projections and the output head, which
+            # the checkpoint keeps in bf16, quantized at load — before everything below, so
+            # the fused pieces are self-tested on the modules that will run. Not the released
+            # weights (inkling_kernels.install_dense_bits has the measurements).
+            if target_bits:
+                install_dense_bits(model.language_model, int(target_bits))
+                self.target_bits = int(target_bits)
 
             # constant per-expert scale factors computed once instead of per call (exact;
             # ~400 fewer graph primitives per decode step)
@@ -163,6 +173,12 @@ class Target:
                 if on:
                     missing = sorted(set(inkling_fused.ALL_KINDS) - set(on))
                     self.calibration_tag = "|ikf2" + ("-" + "-".join(missing) if missing else "")
+            if self.target_bits:
+                self.calibration_tag += f"|tb{self.target_bits}"
+        elif target_bits:
+            raise ValueError("target_bits applies to Inkling 2 targets only (their checkpoint "
+                             "keeps the attention and output head in bf16); for another model "
+                             "load a quantized repo")
         self._txn = None          # the open transaction of the last multi-row Inkling verify
         # nanbeige (Nanbeige4.2): a looped-depth transformer — num_hidden_layers dense
         # blocks applied num_loops times with shared weights, per-loop KV caches, and the

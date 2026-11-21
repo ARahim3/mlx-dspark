@@ -18,6 +18,10 @@ and self-tested by ``inkling_fused`` (kind ``moe``).
 
 ``head_f32`` — fp32 logits from the bf16 output head without the stock 1.85 GB fp32 copy of it.
 
+``install_dense_bits`` — opt-in (``--target-bits 8``): the attention projections and the output
+head, which the released checkpoint keeps in bf16 and which are two thirds of the bytes a token
+reads, quantized to 8-bit at load. NOT the released weights; see its docstring for what was measured.
+
 Plus an exact per-instance install: the expert layers' constant global scale factors computed once
 instead of per call (``install_cached_global_scales``). See NOTES "Inkling expert path" for the
 cost model (a first route of an expert is memory-bound, a repeat is decode-bound) and the kernel
@@ -29,9 +33,11 @@ The fp4/fp8 types and the qmv tile are adapted from MLX
 
 from __future__ import annotations
 
+import types
 from functools import lru_cache
 
 import mlx.core as mx
+import mlx.nn as nn
 
 _HEADER = r"""
 constant constexpr float F8E4M3_MAX = 448.0f;
@@ -676,6 +682,8 @@ def install_fast_head(language_model) -> bool:
 
     lm = language_model
     head = getattr(lm, "lm_head", None)
+    if lm.__dict__.get(_DENSE_HEAD) is not None:       # the logits go through the 8-bit head
+        return False
     if (head is None or type(head).__name__ != "Linear" or "bias" in head
             or head.weight.dtype != mx.bfloat16 or head.weight.shape[1] % 256
             or not mx.metal.is_available()):
@@ -698,6 +706,84 @@ def install_fast_head(language_model) -> bool:
 
     lm._logits_from_norm = types.MethodType(_logits_from_norm, lm)
     return True
+
+
+# ---- the bf16 parts at 8-bit (opt-in) -----------------------------------------------------------
+# The released checkpoint quantizes only the experts. Per token (Inkling-2-Mini) the rest is the
+# five large attention projections of every layer visit, 2.49 GB in bf16, and the output head,
+# 0.93 GB, against 1.84 GB of experts — two thirds of the traffic of a decode step.
+DENSE_PROJECTIONS = ("q_proj", "k_proj", "v_proj", "gate_proj", "o_proj")
+DENSE_BITS = (8,)          # 4 was measured and is not offered (see install_dense_bits)
+_DENSE = "_mlx_dspark_dense_bits"
+_DENSE_HEAD = "_mlx_dspark_dense_head"
+
+
+def install_dense_bits(language_model, bits: int = 8, group_size: int = 64) -> int:
+    """Quantize IN PLACE (affine, like any ``-8bit`` MLX model) each layer's five large attention
+    projections and give the logits an 8-bit copy of the output head. The experts, the small
+    position / sink projections, the embeddings and the drafter are untouched, and ``lm_head``
+    itself stays (drafters bind the raw head). Returns how many matrices were quantized.
+
+    These are NOT the released weights. Measured on Inkling-2-Mini (M4 Pro, mlx 0.32.4, paired in
+    one process; NOTES "Inkling ... quantized in memory"): plain decode 1.26x, a 4-row verify
+    48.6 -> 45.4 ms (a quantized product costs per row; the bf16 one is flat), prompt processing
+    and DSpark acceptance unchanged. Step by step on the same tokens (4,620 positions) the next
+    token differs from the released model's in 1.6%, at released margins of 0.10 median / 0.74
+    max (the released model disagrees with itself in 0.8% between a decode step and a verify
+    pass). The 8-bit model's own greedy output, judged by the released weights, has 1.56%
+    near-tie mismatches against the released model's own 1.06% (4,608 positions): inside the
+    token-forcing gate's 0.5-point tolerance, at its edge — close, measurably not identical. 4-bit
+    fails that gate (3.65%, 8 large-margin events), so only 8 is accepted.
+
+    The head copy keeps fp32 scales and takes an fp32 input, so the logits stay fp32 as the
+    checkpoint's ``fwd_output_dtype`` requires."""
+    if bits not in DENSE_BITS:
+        raise ValueError(f"target bits must be one of {DENSE_BITS} (got {bits}): 4-bit attention "
+                         "measurably changes this model's output")
+    lm = language_model
+    if lm.__dict__.get(_DENSE):
+        if lm.__dict__[_DENSE] != bits:
+            raise ValueError("this model's dense weights are already quantized to "
+                             f"{lm.__dict__[_DENSE]} bits")
+        return 0
+    n = 0
+    for layer in lm.model.layers:
+        attn = getattr(layer, "self_attn", None)
+        for name in DENSE_PROJECTIONS:
+            lin = getattr(attn, name, None) if attn is not None else None
+            if type(lin) is not nn.Linear or lin.weight.shape[1] % group_size:
+                continue
+            q = nn.QuantizedLinear.from_linear(lin, group_size=group_size, bits=bits)
+            mx.eval(q.parameters())
+            setattr(attn, name, q)
+            n += 1
+    head = getattr(lm, "lm_head", None)
+    if (type(head) is nn.Linear and "bias" not in head
+            and head.weight.shape[1] % group_size == 0):
+        qh = nn.QuantizedLinear.from_linear(head, group_size=group_size, bits=bits)
+        qh.scales = qh.scales.astype(mx.float32)
+        qh.biases = qh.biases.astype(mx.float32)
+        mx.eval(qh.parameters())
+        lm.__dict__[_DENSE_HEAD] = qh           # the model's own lm_head stays as released
+
+        def _logits_from_norm(self, h):
+            dtype = self.model.embed_norm.weight.dtype
+            logits = self.__dict__[_DENSE_HEAD](h.astype(dtype).astype(mx.float32))
+            cap = self.config.final_logit_softcapping
+            if cap:
+                logits = mx.tanh(logits / cap) * cap
+            return logits[..., : self.config.unpadded_vocab_size]
+
+        lm._logits_from_norm = types.MethodType(_logits_from_norm, lm)
+        n += 1
+    lm.__dict__[_DENSE] = bits
+    mx.clear_cache()                            # hand the replaced bf16 matrices back
+    return n
+
+
+def dense_bits(language_model) -> int:
+    """The bits :func:`install_dense_bits` left this model's dense weights at (0 = as released)."""
+    return int(language_model.__dict__.get(_DENSE, 0))
 
 
 # ---- constant per-expert scale factors ------------------------------------------------------------

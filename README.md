@@ -1346,6 +1346,12 @@ are bundled.
     every MoE row). The derived cap is 3; cap 2 is within 3% (42.2 tok/s, chat 1.05×). Lossless
     by token forcing against the stock forward (0.98% near-tie disagreements vs stock greedy's
     own 1.37%, none large).
+    **Optional `--target-bits 8`** quantizes at load what the checkpoint keeps in bf16 (the
+    attention projections and the output head: two thirds of the bytes a token reads): plain
+    decoding 33.7 → **42.7 tok/s**, with the drafter **47.8 tok/s** (1.93× stock mlx-vlm). Those
+    are no longer the released weights — about 1.6% of next-token choices differ, all near-ties,
+    where the released model differs from itself in about 1% — so it is off by default, and on
+    chat-like content plain decoding is the faster mode with it.
 [^nemotron]: **Nemotron-3.5-Lightning-30B-A3B** — the first **Mamba-2 + MoE hybrid** target
     (`nemotron_h`, NVIDIA's official DSpark head), the project's first non-attention recurrence,
     with an exact Mamba-2 spec rollback. Lookup drafts off everywhere (a net loss on it, as on

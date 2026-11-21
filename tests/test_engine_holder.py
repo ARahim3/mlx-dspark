@@ -338,3 +338,29 @@ class TestKvBitsOverride:
         captured.clear()
         h.swap(model="repo")
         assert captured["kv_bits"] == 8              # omitted -> server's startup setting
+
+    def test_swap_target_bits_override_and_zero_means_released_weights(self, monkeypatch):
+        """`target_bits` rides /admin/load like kv_bits: 8 quantizes Inkling 2's bf16 parts at
+        load, explicit 0 means the released weights, omitted keeps the startup setting."""
+
+        import mlx_dspark.server as server
+
+        h = server.EngineHolder(FakeEngine("old"), load_kwargs={"target_bits": 8})
+        captured = {}
+
+        def capture(**kw):
+            captured.update(kw)
+            return FakeEngine("new")
+
+        monkeypatch.setattr(server.Engine, "load", staticmethod(capture))
+        monkeypatch.setattr(server, "maybe_batch_engine", lambda e, b: e)
+
+        h.swap(model="repo", target_bits=0)
+        assert captured["target_bits"] is None
+        captured.clear()
+        h.swap(model="repo")
+        assert captured["target_bits"] == 8
+        captured.clear()
+        h2 = server.EngineHolder(FakeEngine("old"), load_kwargs={})
+        h2.swap(model="repo", target_bits=8)
+        assert captured["target_bits"] == 8
