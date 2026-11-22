@@ -44,11 +44,13 @@ final class RaceModel: ObservableObject {
     private var task: Task<Void, Never>?
     private var replayTask: Task<Void, Never>?
 
-    /// The default matchup: plain baseline on the LEFT, the drafter at cap 4 beside it —
-    /// baseline-vs-best is the comparison people understand at a glance; extra arms are a
+    /// The default matchup: the reference on the LEFT, the drafter at cap 4 beside it —
+    /// reference-vs-best is the comparison people understand at a glance; extra arms are a
     /// chip-tap away. (The old default ran three arms, which read as clutter in a demo.)
+    /// The reference is the STOCK runtime where the engine can race it (what a user of plain
+    /// mlx-lm / mlx-vlm gets from this model), else the engine's own plain decode.
     func defaultArms(available: [String]) -> [RaceArm] {
-        var arms: [RaceArm] = [RaceArm(mode: "baseline")]
+        var arms: [RaceArm] = [RaceArm(mode: available.contains("stock") ? "stock" : "baseline")]
         if let drafterMode = available.first(where: { $0 == "dspark" || $0 == "dflash" }) {
             arms.append(RaceArm(mode: drafterMode, cap: 4))
         } else if available.contains("lookup") {

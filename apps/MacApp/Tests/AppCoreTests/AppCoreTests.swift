@@ -179,6 +179,17 @@ struct HealthInfoTests {
         let health = try JSONDecoder().decode(HealthInfo.self, from: Data(json.utf8))
         #expect(health.drafter == nil)
         #expect(health.contextWindow == nil)
+        #expect(health.raceStock == nil)      // an engine without the stock race arm
+    }
+
+    /// The Lab's stock lane: the engine names the runtime the arm stands for, or sends null
+    /// when the loaded target has none.
+    @Test func decodesTheStockRaceRuntime() throws {
+        let json = #"{"status":"ok","model":"Inkling-2-Mini","mode":"dspark","race_stock":"mlx-vlm 0.8.0"}"#
+        let health = try JSONDecoder().decode(HealthInfo.self, from: Data(json.utf8))
+        #expect(health.raceStock == "mlx-vlm 0.8.0")
+        let none = #"{"status":"ok","model":"X","mode":"dspark","race_stock":null}"#
+        #expect(try JSONDecoder().decode(HealthInfo.self, from: Data(none.utf8)).raceStock == nil)
     }
 }
 

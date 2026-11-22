@@ -36,6 +36,11 @@ public struct HealthInfo: Decodable, Sendable, Equatable {
     /// the Lab's cap+conf bundle chip. An engine without it would silently drop the field
     /// and the lane label would lie, so the chip only shows when this is true.
     public let raceArmConfidence: Bool?
+    /// The stock runtime a `stock` race arm stands for — e.g. `"mlx-vlm 0.8.0"` — or nil when
+    /// the loaded target has no such arm (and on engines that predate it). The arm runs the
+    /// model on that library's own forward with every mlx-dspark kernel off: what a user of
+    /// the stock runtime gets, beside what the engine gives. The Lab offers it only when set.
+    public let raceStock: String?
     /// While `status == "loading"`: which stage the load is in — `"loading"` (fetching /
     /// loading weights) or `"warming_up"` (a short throwaway generation after the weights are
     /// resident, so the first real request is warm). Lets the loading screen say "Warming up…"
@@ -73,6 +78,7 @@ public struct HealthInfo: Decodable, Sendable, Equatable {
         case supportsReasoningEffort = "supports_reasoning_effort"
         case confidenceThreshold = "confidence_threshold"
         case raceArmConfidence = "race_arm_confidence"
+        case raceStock = "race_stock"
         case lookupDrafts = "lookup_drafts"
         case kvBits = "kv_bits"
     }

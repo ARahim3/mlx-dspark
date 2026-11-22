@@ -1028,11 +1028,16 @@ final class AppModel: ObservableObject {
 
     /// Which strategies can be raced with the currently loaded pair. `baseline` and `lookup`
     /// need only the target; a drafter mode needs the drafter this engine was loaded with, so
-    /// dspark and dflash are never both on offer.
+    /// dspark and dflash are never both on offer. `stock` — the model on the stock runtime's
+    /// own forward, no mlx-dspark kernel — is there when the engine reports one
+    /// (`/health.race_stock`).
     var availableRaceArms: [String] {
-        guard let mode = health?.mode else { return ["baseline", "lookup"] }
-        return mode == "dspark" || mode == "dflash"
-            ? [mode, "baseline", "lookup"] : ["baseline", "lookup"]
+        var arms = ["baseline", "lookup"]
+        if let mode = health?.mode, mode == "dspark" || mode == "dflash" {
+            arms.insert(mode, at: 0)
+        }
+        if health?.raceStock != nil { arms.append("stock") }
+        return arms
     }
 
     /// Which modes the Decoding picker can APPLY — a different question from

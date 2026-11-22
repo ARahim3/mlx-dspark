@@ -38,10 +38,12 @@ struct RaceTab: View {
         }
         // A hot swap can change what's raceable (a drafterless target has no dspark arm);
         // stale arms would 400 the next run.
-        .onChange(of: model.availableRaceArms) { _, available in
+        .onChange(of: model.availableRaceArms) { before, available in
             let valid = Set(available)
+            // ... and a model with a stock arm changes the default matchup (stock on the left)
+            let stockChanged = before.contains("stock") != available.contains("stock")
             if race.phase != .running,
-               race.selectedArms.contains(where: { !valid.contains($0.mode) }) {
+               stockChanged || race.selectedArms.contains(where: { !valid.contains($0.mode) }) {
                 race.selectedArms = race.defaultArms(available: available)
             }
         }
@@ -65,11 +67,14 @@ struct RaceControls: View {
         model.availableRaceArms.first(where: { $0 == "dspark" || $0 == "dflash" })
     }
 
-    /// Everything this pair could race: baseline first (the reference belongs on the left),
-    /// then the drafter at preset + user-typed caps and its cap-auto (the adaptive cap the
-    /// engine derives from this machine's measured curves), then lookup.
+    /// Everything this pair could race: the references first (they belong on the left) — the
+    /// stock runtime where the engine can race it, then the engine's own plain decode — then
+    /// the drafter at preset + user-typed caps and its cap-auto (the adaptive cap the engine
+    /// derives from this machine's measured curves), then lookup.
     private var candidateArms: [RaceArm] {
-        var arms: [RaceArm] = [RaceArm(mode: "baseline")]
+        var arms: [RaceArm] = []
+        if model.availableRaceArms.contains("stock") { arms.append(RaceArm(mode: "stock")) }
+        arms.append(RaceArm(mode: "baseline"))
         if let drafterMode {
             let presets = [2, 3, 4, 6]
             arms.append(contentsOf: presets.map { RaceArm(mode: drafterMode, cap: $0) })
@@ -126,7 +131,7 @@ struct RaceControls: View {
                 // Toggle chips: pick the matchup. The server takes 2–4 arms; order is fixed
                 // to the candidate order so baseline always lands in the left lane.
                 ForEach(candidateArms) { arm in
-                    ArmChip(arm: arm,
+                    ArmChip(label: chipLabel(arm),
                             isOn: race.selectedArms.contains(arm),
                             disabled: race.phase == .running
                                 || (!race.selectedArms.contains(arm) && race.selectedArms.count >= 4))
@@ -193,6 +198,13 @@ struct RaceControls: View {
         if !race.selectedArms.contains(arm), race.selectedArms.count < 4 { toggle(arm) }
     }
 
+    /// The stock arm's chip names the runtime it stands for ("stock mlx-vlm 0.8.0"), as its
+    /// lane will once the engine starts it.
+    private func chipLabel(_ arm: RaceArm) -> String {
+        guard arm.mode == "stock", let runtime = model.health?.raceStock else { return arm.label }
+        return "stock \(runtime)"
+    }
+
     private func toggle(_ arm: RaceArm) {
         if let index = race.selectedArms.firstIndex(of: arm) {
             race.selectedArms.remove(at: index)
@@ -207,7 +219,7 @@ struct RaceControls: View {
 }
 
 private struct ArmChip: View {
-    let arm: RaceArm
+    let label: String
     let isOn: Bool
     let disabled: Bool
     let action: () -> Void
@@ -217,7 +229,7 @@ private struct ArmChip: View {
             HStack(spacing: 4) {
                 Image(systemName: isOn ? "checkmark.circle.fill" : "circle")
                     .imageScale(.small)
-                Text(arm.label)
+                Text(label)
             }
             .font(.caption.weight(.medium))
             .padding(.horizontal, 8).padding(.vertical, 4)
