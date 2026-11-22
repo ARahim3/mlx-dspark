@@ -48,7 +48,7 @@ Agents
 : One-click setup for Claude Code, Codex, OpenCode, pi and any OpenAI-compatible app: the exact config for each, and a round-trip test.
 
 Lab
-: **Race** runs several decoders on the same prompt and checks the lossless claim token by token. **Live** streams per-round acceptance. **Curves** shows this Mac's measured cost curves. **This Mac** shows your measured memory bandwidth, the plain-decoding ceiling for the loaded model, how far above it speculation runs, and macOS memory pressure and swap.
+: **Race** runs several decoders on the same prompt and checks the lossless claim token by token. Where the engine can run it, a **stock** lane shows the same model on plain mlx-lm or mlx-vlm, next to mlx-dspark's own plain decoding and its drafter. A model's reasoning sits in a folded card above its answer. **Replay** plays the finished race back on a clean stage made for screen recording: the model, your Mac, the prompt, the speedup and the lanes. **Live** streams per-round acceptance. **Curves** shows this Mac's measured cost curves. **This Mac** shows your measured memory bandwidth, the plain-decoding ceiling for the loaded model, how far above it speculation runs, and macOS memory pressure and swap.
 
 Settings
 : Decoding controls, a fixed engine port, serving on your local network with an API key, and your model folders.

@@ -64,14 +64,44 @@ struct RaceTab: View {
 /// verdict in a line, and the lanes at the full height of the window. Nothing to operate —
 /// the two controls it has fade out while the replay plays.
 struct RaceStage: View {
+    @EnvironmentObject private var model: AppModel
     @ObservedObject var race: RaceModel
+
+    /// "Inkling-2-Mini" — the loaded model, by its short name.
+    private var modelName: String? {
+        (model.health?.model ?? model.model).components(separatedBy: "/").last
+    }
+
+    /// "Apple M4 Pro · 48 GB" — the Mac the numbers were measured on.
+    private var device: String? {
+        guard let chip = model.machine?.chip.name, !chip.isEmpty else { return nil }
+        guard let bytes = model.machine?.memory.totalBytes, bytes > 0 else { return chip }
+        return "\(chip) · \(Int((Double(bytes) / 1_073_741_824).rounded())) GB"
+    }
+
+    /// The reference lane in a few words ("stock mlx-vlm", not its commit).
+    private func short(_ label: String) -> String {
+        label.hasPrefix("stock ") ? label.split(separator: " ").prefix(2).joined(separator: " ")
+                                  : label
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
-            HStack(alignment: .top, spacing: 12) {
-                Text(race.prompt)
-                    .font(.callout).foregroundStyle(.secondary)
-                    .lineLimit(2)
+            // Who is racing, and on what: a recording should say so by itself.
+            HStack(alignment: .center, spacing: 10) {
+                Text(AppIdentity.displayName)
+                    .font(.system(.title3, design: .rounded).weight(.bold))
+                    .foregroundStyle(.tint)
+                    .padding(.horizontal, 10).padding(.vertical, 4)
+                    .background(.tint.opacity(0.14), in: Capsule())
+                if let modelName {
+                    Text(modelName).font(.title3.weight(.semibold)).lineLimit(1)
+                }
+                if let device {
+                    Label(device, systemImage: "laptopcomputer")
+                        .font(.callout).foregroundStyle(.secondary)
+                        .lineLimit(1)
+                }
                 Spacer(minLength: 12)
                 HStack(spacing: 12) {
                     Button { race.replay() } label: {
@@ -90,12 +120,23 @@ struct RaceStage: View {
                 .animation(.easeOut(duration: 0.25), value: race.isReplaying)
             }
 
+            // The prompt both lanes answer.
+            HStack(alignment: .top, spacing: 8) {
+                Image(systemName: "text.bubble").foregroundStyle(.tertiary)
+                Text(race.prompt)
+                    .font(.callout)
+                    .lineLimit(2)
+                Spacer(minLength: 0)
+            }
+            .padding(.horizontal, 12).padding(.vertical, 8)
+            .background(.quaternary.opacity(0.25), in: RoundedRectangle(cornerRadius: 8))
+
             HStack(alignment: .firstTextBaseline, spacing: 10) {
                 if let (fast, slow) = race.speedup, slow.tokensPerSec > 0 {
                     Text(String(format: "%.2f×", fast.tokensPerSec / slow.tokensPerSec))
                         .font(.system(size: 40, weight: .semibold, design: .rounded))
                         .foregroundStyle(.tint)
-                    Text("\(fast.label) vs \(slow.label)")
+                    Text("faster than \(short(slow.label))")
                         .font(.title3).foregroundStyle(.secondary)
                         .lineLimit(1).minimumScaleFactor(0.7)
                 }
@@ -448,6 +489,9 @@ struct RaceLaneColumn: View {
         return mine >= (race.lanes.compactMap { $0.result?.tokensPerSec }.max() ?? 0)
     }
 
+    /// An mlx-dspark arm (its plain decode, a drafter, lookup) — not the stock runtime's.
+    private var isOurs: Bool { (lane?.result?.mode ?? "") != "stock" }
+
     private var lane: RaceModel.Lane? {
         race.lanes.indices.contains(laneIndex) ? race.lanes[laneIndex] : nil
     }
@@ -466,8 +510,14 @@ struct RaceLaneColumn: View {
         if let lane {
             VStack(alignment: .leading, spacing: 6) {
                 HStack(alignment: .firstTextBaseline, spacing: 6) {
+                    if staged, isOurs {
+                        Text(AppIdentity.displayName)
+                            .font(.headline.weight(.bold)).foregroundStyle(.tint)
+                    }
                     Text(lane.label)
                         .font(staged ? .headline : .caption.weight(.semibold))
+                        .foregroundStyle(staged && !isOurs ? AnyShapeStyle(.secondary)
+                                                           : AnyShapeStyle(.primary))
                         .lineLimit(1).truncationMode(.middle)
                     if lane.isRunning { ProgressView().controlSize(.small) }
                     Spacer()
@@ -505,6 +555,9 @@ struct RaceLaneColumn: View {
                     .frame(height: staged ? nil : 340)
                     .frame(maxHeight: staged ? .infinity : nil)
                     .background(.quaternary.opacity(0.25), in: RoundedRectangle(cornerRadius: 8))
+                    .overlay(RoundedRectangle(cornerRadius: 8)
+                        .strokeBorder(.tint.opacity(staged && isOurs && isFastest ? 0.55 : 0),
+                                      lineWidth: 1.5))
                     // Follow the stream like a chat window: every appended token keeps the
                     // tail in view. Replay resets the text, which naturally scrolls back up.
                     .onChange(of: displayText) { _, _ in
