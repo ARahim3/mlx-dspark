@@ -673,6 +673,113 @@ def head_f32(h: mx.array, weight: mx.array) -> mx.array:
     )[0]
 
 
+# The same layout for the 8-bit head of --target-bits 8 (affine, group 64, fp32 scales): MLX's
+# quantized matmul with an fp32 input is at the memory floor for one or two rows and then pays
+# per row (Inkling-2-Mini, M4 Pro: 2.3 ms at 1-2 rows, 4.0 at 4, 8.1 at 8, against 3.9 flat for
+# the bf16 head), which is most of why a verify row costs more on the 8-bit target than on the
+# released weights. This reads each packed row once for every input row, like head_f32:
+#   out[r, v] = sum_g scale[v, g] * sum_{k in g} q[v, k] * h[r, k]  +  bias[v, g] * sum_{k in g} h[r, k]
+# with every (r, v) reduced the same way whatever R is.
+_SOURCE_HEAD_Q8 = r"""
+  const uint lane = thread_index_in_simdgroup;
+  const uint sg = simdgroup_index_in_threadgroup;
+  const int K = h_shape[1];
+  const int V = scales_shape[0];
+  const int NG = K / GS;
+  const int row0 = int(threadgroup_position_in_grid.y) * (4 * NSG) + int(sg) * 4;
+  if (row0 >= V) return;
+  float acc[R][4];
+  #pragma unroll
+  for (int r = 0; r < R; r++) {
+    for (int i = 0; i < 4; i++) acc[r][i] = 0.0f;
+  }
+  const device uint8_t* wp[4];
+  size_t gp[4];
+  #pragma unroll
+  for (int i = 0; i < 4; i++) {
+    const size_t row = size_t(min(row0 + i, V - 1));
+    wp[i] = (const device uint8_t*)w + row * K + lane * 8;
+    gp[i] = row * NG;
+  }
+  for (int k = 0; k < K; k += 256) {
+    const int g = (k + int(lane) * 8) / GS;
+    float wv[4][8];
+    float sc[4];
+    float bi[4];
+    #pragma unroll
+    for (int i = 0; i < 4; i++) {
+      #pragma unroll
+      for (int j = 0; j < 8; j++) wv[i][j] = float(wp[i][k + j]);
+      sc[i] = scales[gp[i] + g];
+      bi[i] = biases[gp[i] + g];
+    }
+    #pragma unroll
+    for (int r = 0; r < R; r++) {
+      const device bfloat16_t* hp = h + size_t(r) * K + k + lane * 8;
+      float xv[8];
+      float xs = 0.0f;
+      #pragma unroll
+      for (int j = 0; j < 8; j++) {
+        xv[j] = float(hp[j]);
+        xs += xv[j];
+      }
+      #pragma unroll
+      for (int i = 0; i < 4; i++) {
+        float s = 0.0f;
+        #pragma unroll
+        for (int j = 0; j < 8; j++) s = fma(wv[i][j], xv[j], s);
+        acc[r][i] += sc[i] * s + bi[i] * xs;
+      }
+    }
+  }
+  #pragma unroll
+  for (int r = 0; r < R; r++) {
+    #pragma unroll
+    for (int i = 0; i < 4; i++) {
+      float t = simd_sum(acc[r][i]);
+      if (lane == 0 && row0 + i < V) out[size_t(r) * V + row0 + i] = t;
+    }
+  }
+"""
+
+HEAD_Q8_MAX_ROWS = 8
+
+
+@lru_cache(maxsize=1)
+def _head_q8_kernel():
+    return mx.fast.metal_kernel(
+        name="mlx_dspark_inkling_head_q8_f32",
+        input_names=["h", "w", "scales", "biases"],
+        output_names=["out"],
+        source=_SOURCE_HEAD_Q8,
+        compile_options={"math_mode": "safe"},
+    )
+
+
+def head_q8_ok(qlinear) -> bool:
+    """Whether :func:`head_q8_f32` can serve this quantized head (8-bit affine, fp32 scales)."""
+    return (isinstance(qlinear, nn.QuantizedLinear) and qlinear.bits == 8
+            and getattr(qlinear, "mode", "affine") == "affine" and "bias" not in qlinear
+            and qlinear.scales.dtype == mx.float32 and qlinear.biases.dtype == mx.float32
+            and (qlinear.scales.shape[1] * qlinear.group_size) % 256 == 0
+            and 256 % qlinear.group_size == 0 and mx.metal.is_available())
+
+
+def head_q8_f32(h: mx.array, qlinear) -> mx.array:
+    """``h [R, H] (bf16) @ dequantized(qlinear)ᵀ`` as fp32 ``[R, V]``, ``R <= 8``, every row
+    reduced identically whatever ``R`` is."""
+    r = int(h.shape[0])
+    v = int(qlinear.scales.shape[0])
+    return _head_q8_kernel()(
+        inputs=[h, qlinear.weight, qlinear.scales, qlinear.biases],
+        template=[("R", r), ("NSG", HEAD_NSG), ("GS", int(qlinear.group_size))],
+        grid=(32, (-(-v // (4 * HEAD_NSG))) * HEAD_NSG, 1),
+        threadgroup=(32, HEAD_NSG, 1),
+        output_shapes=[(r, v)],
+        output_dtypes=[mx.float32],
+    )[0]
+
+
 def install_fast_head(language_model) -> bool:
     """Route an Inkling 2 language model's fp32 logits (``_logits_from_norm``) through
     :func:`head_f32` for calls of <= 16 rows (decode, verify, a prefill's last row); longer calls
@@ -708,6 +815,129 @@ def install_fast_head(language_model) -> bool:
     return True
 
 
+# ---- the draft head's Markov bias + argmax ---------------------------------------------------------
+# One greedy step of Inkling 2's ``rnn_hidden`` Markov head ends in
+#   token = argmax_v( base[v] + fold_b[v] + sum_r latent[r] * fold[v, r] )        v < unpadded vocab
+# where ``fold = lm_head . hidden_out`` is a rank-256 correction to the block's base logits. The
+# reference materializes it: a [256, V] bf16 matrix streamed per step (103 MB on Inkling-2-Mini),
+# a [V] bias, an add, a softcap, an argmax. Here the fold is stored per VOCAB row ([V, 256],
+# affine-quantized: the same bytes a row at a time) and one launch scans it, keeping only each
+# threadgroup's best candidate: nothing V-sized is written, and the softcap is skipped — it is
+# monotonic, so it cannot change which token is largest. Drafting only: the target verifies
+# every drafted token, so a different rounding here can change acceptance, never output.
+_SOURCE_FOLD = r"""
+  // threadgroup: NSG simdgroups, each scanning RPS vocab rows four at a time; a lane owns 8 of
+  // the 256 latent values (GS / 8 lanes share a quantization group)
+  const uint lane = thread_index_in_simdgroup;
+  const uint sg = simdgroup_index_in_threadgroup;
+  const uint tg = threadgroup_position_in_grid.y;
+  threadgroup float tg_val[NSG];
+  threadgroup int tg_idx[NSG];
+  float l[8];
+  float lsum = 0;
+  #pragma unroll
+  for (int j = 0; j < 8; j++) {
+    l[j] = float(latent[lane * 8 + j]);
+    lsum += l[j];
+  }
+  const int g = int(lane) / (GS / 8);
+  float best = -3.0e38f;
+  int best_i = 0;
+  const int row_begin = (int(tg) * NSG + int(sg)) * RPS;
+  for (int r = 0; r < RPS; r += 4) {
+    float t[4];
+    #pragma unroll
+    for (int i = 0; i < 4; i++) {
+      const int v = min(row_begin + r + i, V_ALL - 1);
+      float acc = 0;
+      if constexpr (BITS == 8) {
+        const device uint8_t* wp = (const device uint8_t*)w + size_t(v) * 256 + lane * 8;
+        #pragma unroll
+        for (int j = 0; j < 8; j++) acc += float(wp[j]) * l[j];
+      } else {
+        const uint q = ((const device uint32_t*)w)[size_t(v) * 32 + lane];
+        #pragma unroll
+        for (int j = 0; j < 8; j++) acc += float((q >> (4 * j)) & 15u) * l[j];
+      }
+      const size_t gi = size_t(v) * (256 / GS) + g;
+      t[i] = simd_sum(float(scales[gi]) * acc + float(biases[gi]) * lsum);
+    }
+    #pragma unroll
+    for (int i = 0; i < 4; i++) {
+      const int v = row_begin + r + i;
+      if (v < V_OUT) {
+        const float c = t[i] + float(fold_b[v]) + float(base[v]);
+        if (c > best) {
+          best = c;
+          best_i = v;
+        }
+      }
+    }
+  }
+  if (lane == 0) {
+    tg_val[sg] = best;
+    tg_idx[sg] = best_i;
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (sg == 0 && lane == 0) {
+    float b = tg_val[0];
+    int bi = tg_idx[0];
+    for (int k = 1; k < NSG; k++) {
+      if (tg_val[k] > b) {
+        b = tg_val[k];
+        bi = tg_idx[k];
+      }
+    }
+    vals[tg] = b;
+    idxs[tg] = bi;
+  }
+"""
+
+FOLD_RANK = 256            # the kernel's lane layout: 32 lanes x 8 latent values
+FOLD_NSG = 4
+FOLD_RPS = 64              # vocab rows per simdgroup -> 256 per threadgroup
+
+
+@lru_cache(maxsize=1)
+def _fold_kernel():
+    return mx.fast.metal_kernel(
+        name="mlx_dspark_inkling_fold_argmax",
+        input_names=["latent", "w", "scales", "biases", "fold_b", "base"],
+        output_names=["vals", "idxs"],
+        source=_SOURCE_FOLD,
+        compile_options={"math_mode": "safe"},
+    )
+
+
+def quantize_fold(fold_t: mx.array, bits: int, group_size: int = 64):
+    """``(w, scales, biases)``: the Markov fold ``[rank, V]`` stored per vocab row ``[V, rank]``
+    and affine-quantized along the rank (what :func:`fold_argmax` scans)."""
+    rows = mx.contiguous(fold_t.T)
+    w, scales, biases = mx.quantize(rows, group_size=group_size, bits=bits)
+    mx.eval(w, scales, biases)
+    return w, scales, biases
+
+
+def fold_argmax(latent: mx.array, fold, fold_b: mx.array, base: mx.array, bits: int,
+                vocab_out: int, group_size: int = 64) -> mx.array:
+    """``argmax_v(base[v] + fold_b[v] + latent . fold[v])`` over ``v < vocab_out`` as an int32
+    ``[1]`` (the lowest index among equal maxima, like ``mx.argmax``). ``latent``: ``[256]``;
+    ``fold``: :func:`quantize_fold`'s triple; ``fold_b`` / ``base``: ``[V]``."""
+    w, scales, biases = fold
+    v_all = int(w.shape[0])
+    n_tg = -(-v_all // (FOLD_NSG * FOLD_RPS))
+    vals, idxs = _fold_kernel()(
+        inputs=[latent, w, scales, biases, fold_b, base],
+        template=[("BITS", bits), ("GS", group_size), ("NSG", FOLD_NSG), ("RPS", FOLD_RPS),
+                  ("V_ALL", v_all), ("V_OUT", int(vocab_out))],
+        grid=(32, n_tg * FOLD_NSG, 1),
+        threadgroup=(32, FOLD_NSG, 1),
+        output_shapes=[(n_tg,), (n_tg,)],
+        output_dtypes=[mx.float32, mx.int32],
+    )
+    return idxs[mx.argmax(vals)].reshape(1)
+
+
 # ---- the bf16 parts at 8-bit (opt-in) -----------------------------------------------------------
 # The released checkpoint quantizes only the experts. Per token (Inkling-2-Mini) the rest is the
 # five large attention projections of every layer visit, 2.49 GB in bf16, and the output head,
@@ -716,9 +946,11 @@ DENSE_PROJECTIONS = ("q_proj", "k_proj", "v_proj", "gate_proj", "o_proj")
 DENSE_BITS = (8,)          # 4 was measured and is not offered (see install_dense_bits)
 _DENSE = "_mlx_dspark_dense_bits"
 _DENSE_HEAD = "_mlx_dspark_dense_head"
+_DENSE_HEAD_KERNEL = "_mlx_dspark_dense_head_kernel"     # head_q8_f32 serves short calls (A/B flag)
 
 
-def install_dense_bits(language_model, bits: int = 8, group_size: int = 64) -> int:
+def install_dense_bits(language_model, bits: int = 8, group_size: int = 64,
+                       fast_head: bool = True) -> int:
     """Quantize IN PLACE (affine, like any ``-8bit`` MLX model) each layer's five large attention
     projections and give the logits an 8-bit copy of the output head. The experts, the small
     position / sink projections, the embeddings and the drafter are untouched, and ``lm_head``
@@ -735,8 +967,11 @@ def install_dense_bits(language_model, bits: int = 8, group_size: int = 64) -> i
     token-forcing gate's 0.5-point tolerance, at its edge — close, measurably not identical. 4-bit
     fails that gate (3.65%, 8 large-margin events), so only 8 is accepted.
 
-    The head copy keeps fp32 scales and takes an fp32 input, so the logits stay fp32 as the
-    checkpoint's ``fwd_output_dtype`` requires."""
+    The head copy keeps fp32 scales and accumulates in fp32, so the logits stay fp32 as the
+    checkpoint's ``fwd_output_dtype`` requires. Calls of up to ``HEAD_Q8_MAX_ROWS`` rows (decode,
+    verify) go through :func:`head_q8_f32` (``fast_head=False``: MLX's quantized matmul, the
+    A/B): flat at the memory floor for 1-4 rows where the stock product pays per row from the
+    third, bit-identical to it at one row, and every verify row equal to its decode row."""
     if bits not in DENSE_BITS:
         raise ValueError(f"target bits must be one of {DENSE_BITS} (got {bits}): 4-bit attention "
                          "measurably changes this model's output")
@@ -765,10 +1000,21 @@ def install_dense_bits(language_model, bits: int = 8, group_size: int = 64) -> i
         qh.biases = qh.biases.astype(mx.float32)
         mx.eval(qh.parameters())
         lm.__dict__[_DENSE_HEAD] = qh           # the model's own lm_head stays as released
+        lm.__dict__[_DENSE_HEAD_KERNEL] = bool(fast_head) and head_q8_ok(qh)
 
         def _logits_from_norm(self, h):
             dtype = self.model.embed_norm.weight.dtype
-            logits = self.__dict__[_DENSE_HEAD](h.astype(dtype).astype(mx.float32))
+            qh = self.__dict__[_DENSE_HEAD]
+            rows = 1
+            for d in h.shape[:-1]:
+                rows *= int(d)
+            if (self.__dict__.get(_DENSE_HEAD_KERNEL) and rows <= HEAD_Q8_MAX_ROWS
+                    and dtype == mx.bfloat16
+                    and not self.training and mx.default_device() == mx.gpu):
+                flat = h.astype(dtype).reshape(rows, h.shape[-1])
+                logits = head_q8_f32(flat, qh).reshape(*h.shape[:-1], -1)
+            else:
+                logits = qh(h.astype(dtype).astype(mx.float32))
             cap = self.config.final_logit_softcapping
             if cap:
                 logits = mx.tanh(logits / cap) * cap
@@ -784,6 +1030,11 @@ def install_dense_bits(language_model, bits: int = 8, group_size: int = 64) -> i
 def dense_bits(language_model) -> int:
     """The bits :func:`install_dense_bits` left this model's dense weights at (0 = as released)."""
     return int(language_model.__dict__.get(_DENSE, 0))
+
+
+def dense_head(language_model):
+    """The quantized copy of the output head :func:`install_dense_bits` built, or None."""
+    return language_model.__dict__.get(_DENSE_HEAD)
 
 
 # ---- constant per-expert scale factors ------------------------------------------------------------

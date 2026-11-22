@@ -446,6 +446,98 @@ def test_head_f32_matches_fp32_and_is_row_invariant():
     assert bool(mx.array_equal(got, alone).item())
 
 
+@metal
+def test_head_q8_f32_matches_the_quantized_matmul_and_is_row_invariant():
+    from mlx_dspark.inkling_kernels import head_q8_f32, head_q8_ok
+
+    mx.random.seed(4)
+    lin = nn.Linear(512, 300, bias=False)                           # V not a multiple of 8
+    lin.weight = (mx.random.normal((300, 512)) * 0.05).astype(mx.bfloat16)
+    q = nn.QuantizedLinear.from_linear(lin, group_size=64, bits=8)
+    assert not head_q8_ok(q)                                        # bf16 scales: MLX's own path
+    q.scales, q.biases = q.scales.astype(mx.float32), q.biases.astype(mx.float32)
+    assert head_q8_ok(q)
+    h = mx.random.normal((5, 512)).astype(mx.bfloat16)
+    got = head_q8_f32(h, q)
+    ref = q(h.astype(mx.float32))
+    assert got.dtype == mx.float32 and got.shape == (5, 300)
+    assert mx.allclose(got, ref, atol=1e-4, rtol=1e-4)
+    alone = mx.concatenate([head_q8_f32(h[i:i + 1], q) for i in range(5)])
+    assert bool(mx.array_equal(got, alone).item())
+
+
+@metal
+@pytest.mark.parametrize("bits", [8, 4])
+def test_fold_argmax_is_the_argmax_of_the_dequantized_markov_logits(bits):
+    from mlx_dspark.inkling_kernels import FOLD_RANK, fold_argmax, quantize_fold
+
+    mx.random.seed(5)
+    vocab, vocab_out = 1000, 900                                     # not a threadgroup multiple
+    fold_t = (mx.random.normal((FOLD_RANK, vocab)) * 0.1).astype(mx.bfloat16)
+    fold = quantize_fold(fold_t, bits)
+    rows = mx.dequantize(*fold, group_size=64, bits=bits).astype(mx.float32)      # [V, rank]
+    fold_b = (mx.random.normal((vocab,)) * 0.1).astype(mx.bfloat16)
+    for trial in range(6):
+        latent = mx.tanh(mx.random.normal((FOLD_RANK,))).astype(mx.bfloat16)
+        base = mx.random.normal((vocab,)).astype(mx.bfloat16 if trial % 2 else mx.float32)
+        ref = (rows @ latent.astype(mx.float32) + fold_b.astype(mx.float32)
+               + base.astype(mx.float32))
+        got = fold_argmax(latent, fold, fold_b, base, bits, vocab_out)
+        assert got.shape == (1,) and got.dtype == mx.int32
+        assert got.item() == mx.argmax(ref[:vocab_out]).item()
+    # the padded ids are never picked, and equal maxima go to the lowest id
+    base = mx.zeros((vocab,), mx.float32)
+    base[vocab_out + 5] = 1e4
+    base[700] = 1e3
+    base[300] = 1e3
+    zero = mx.zeros((FOLD_RANK,), mx.bfloat16)
+    flat = mx.zeros((vocab,), mx.bfloat16)
+    assert fold_argmax(zero, fold, flat, base, bits, vocab_out).item() == 300
+
+
+@metal
+def test_drafter_greedy_block_through_the_fold_kernel_matches_the_reference_path(monkeypatch):
+    # rank 256 is the kernel's layout: the same drafter with the fold kept in bf16 (the
+    # reference: full-vocab bias, softcap, argmax) drafts the same block from the same context
+    from mlx.utils import tree_map
+
+    from mlx_dspark import inkling as I
+
+    def bound(fold_bits):
+        monkeypatch.setattr(I, "FOLD_BITS", fold_bits)
+        mx.random.seed(7)
+        d = Inkling2DSparkDrafter(draft_config(_target_config(markov_rank=256)))
+        d.update(tree_map(lambda p: mx.random.normal(p.shape) * 0.2, d.parameters()))
+        d.bind_embed(nn.Embedding(96, 64))
+        d.bind_lm_head(nn.Linear(64, 96, bias=False))
+        ctx = d.make_ctx_cache()
+        d.update_context(mx.random.normal((1, 10, 4 * 64)), ctx_offset=0, ctx_caches=ctx)
+        return d, ctx
+
+    mx.random.seed(7)
+    ref, ref_ctx = bound(0)
+    want = _draft(ref, ref_ctx, 5, 10).tolist()
+    assert ref.markov_head._fold_q is None and ref.markov_head._fold_t is not None
+    from mlx_dspark import inkling as I2
+
+    assert I2.FOLD_BITS == 0                            # (the reference arm above set it)
+    got_d, got_ctx = bound(8)
+    got = _draft(got_d, got_ctx, 5, 10).tolist()
+    assert got_d.markov_head._fold_q is not None and got_d.markov_head._fold_t is None
+    assert len(got) == 7 and max(got) < 90
+    # random tiny weights leave real margins: 8-bit rounding of the fold does not move them
+    assert got == want
+    low_d, low_ctx = bound(4)                           # the default
+    low = _draft(low_d, low_ctx, 5, 10).tolist()
+    assert low_d.markov_head._fold_bits == 4 and len(low) == 7 and max(low) < 90
+    # the sampling path reads the same (quantized) fold as a full-vocabulary bias
+    toks, probs = got_d.sample_block_probs(
+        got_d.compute_logits(got_d.head_slice(got_d.backbone(
+            got_d.embed(mx.array([[5] + [0] * 7])), 10, got_ctx), 3))[0], 5, temperature=0.7)
+    assert toks.shape == (3,) and probs.shape == (3, 90)
+    assert mx.allclose(probs.sum(axis=-1), mx.ones((3,)), atol=1e-3)
+
+
 # ---------------------------------------------------------------- the mlx-vlm gate
 _INKLING_CFG = "mlx_vlm.models.inkling2.config"
 
@@ -624,7 +716,7 @@ def test_bench_rows_are_natural_text_not_one_repeated_token():
     assert len(set(t2._bench_rows(8)[0].tolist())) == 8
 
 
-def test_bind_target_builds_an_8bit_drafter_only_head(monkeypatch):
+def test_bind_target_builds_a_quantized_drafter_only_head(monkeypatch):
     # base logits go through a quantized COPY of the target's head (drafting-only); the Markov
     # fold keeps the exact head; rebuilt only when the head changes; 0 bits = the bf16 head
     from types import SimpleNamespace
@@ -635,7 +727,7 @@ def test_bind_target_builds_an_8bit_drafter_only_head(monkeypatch):
     head = nn.Linear(64, 96, bias=False)
     tgt = SimpleNamespace(model=SimpleNamespace(language_model=SimpleNamespace(lm_head=head)))
     d.bind_target(tgt)
-    assert isinstance(d._base_head, nn.QuantizedLinear) and d._base_head.bits == 8
+    assert isinstance(d._base_head, nn.QuantizedLinear) and d._base_head.bits == 6
     first = d._base_head
     d.bind_target(tgt)
     assert d._base_head is first                                  # same head: no rebuild
@@ -645,3 +737,52 @@ def test_bind_target_builds_an_8bit_drafter_only_head(monkeypatch):
     monkeypatch.setattr(I, "DRAFT_HEAD_BITS", 0)
     d.bind_target(tgt)
     assert d._base_head is None
+
+
+@metal
+def test_bind_target_drafts_from_the_8bit_head_a_target_bits_target_already_holds():
+    # --target-bits 8 keeps an 8-bit copy of the head for the target's logits: the drafter's
+    # base logits read that one (fp32, through the same kernel) instead of building its own
+    from types import SimpleNamespace
+
+    from mlx_dspark.inkling_kernels import _DENSE_HEAD
+
+    d = _bound_drafter()
+    head = nn.Linear(64, 96, bias=False)
+    head.weight = (mx.random.normal((96, 64)) * 0.2).astype(mx.bfloat16)
+    shared = nn.QuantizedLinear.from_linear(head, group_size=64, bits=8)
+    shared.scales, shared.biases = shared.scales.astype(mx.float32), shared.biases.astype(mx.float32)
+    lm = SimpleNamespace(lm_head=head)
+    tgt = SimpleNamespace(model=SimpleNamespace(language_model=lm))
+    d.bind_target(tgt)
+    own = d._base_head
+    assert isinstance(own, nn.QuantizedLinear)
+    lm.__dict__[_DENSE_HEAD] = shared                 # 64 % 256: not the kernel's layout
+    d.bind_target(tgt)
+    assert d._base_head is own
+    # a head the kernel serves (hidden a multiple of 256)
+    wide = Inkling2DSparkDrafter(draft_config(_target_config(hidden_size=256, head_dim=64)
+                                              | {"text_config": {"hidden_size": 256, "vocab_size": 96,
+                                                                 "unpadded_vocab_size": 90,
+                                                                 "final_logit_softcapping": 30.0}}))
+    from mlx.utils import tree_map
+
+    wide.update(tree_map(lambda p: mx.random.normal(p.shape) * 0.2, wide.parameters()))
+    big = nn.Linear(256, 96, bias=False)
+    big.weight = (mx.random.normal((96, 256)) * 0.2).astype(mx.bfloat16)
+    qbig = nn.QuantizedLinear.from_linear(big, group_size=64, bits=8)
+    qbig.scales, qbig.biases = qbig.scales.astype(mx.float32), qbig.biases.astype(mx.float32)
+    lm2 = SimpleNamespace(lm_head=big)
+    lm2.__dict__[_DENSE_HEAD] = qbig
+    wide.bind_embed(nn.Embedding(96, 256))
+    wide.bind_lm_head(big)
+    wide.bind_target(SimpleNamespace(model=SimpleNamespace(language_model=lm2)))
+    assert callable(wide._base_head) and not isinstance(wide._base_head, nn.Module)
+    assert wide._base_src is qbig
+    hidden = mx.random.normal((1, 3, 256)).astype(mx.bfloat16)
+    got = wide.compute_logits(hidden)
+    assert got.shape == (1, 3, 96) and got.dtype == mx.float32
+    assert mx.allclose(got, qbig(hidden.astype(mx.float32)), atol=1e-3, rtol=1e-3)
+    ctx = wide.make_ctx_cache()
+    wide.update_context(mx.random.normal((1, 6, 4 * 256)), ctx_offset=0, ctx_caches=ctx)
+    assert _draft(wide, ctx, 3, 6).shape == (7,)

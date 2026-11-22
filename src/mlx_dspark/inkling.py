@@ -42,13 +42,19 @@ import mlx.nn as nn
 from .config import DSparkConfig
 from .model import CtxCache
 
+_FOLD_RANK = 256            # inkling_kernels.FOLD_RANK: the fold kernel's lane layout
+
 # config.json model_type of the targets whose repo carries this head (Inkling-2-Mini is the
 # looped variant; Inkling-2-Small is the plain one — same head contract).
 TARGET_MODEL_TYPES = ("inkling2", "inkling2_loop")
 HEAD_FILE = "mtp.safetensors"
 # Bits of the drafter-only copy of the target's head that the base logits use (0 = the target's
 # own bf16 head). See Inkling2DSparkDrafter.bind_target.
-DRAFT_HEAD_BITS = int(os.environ.get("MLX_DSPARK_INKLING_DRAFT_HEAD_BITS", "8") or 0)
+DRAFT_HEAD_BITS = int(os.environ.get("MLX_DSPARK_INKLING_DRAFT_HEAD_BITS", "6") or 0)
+# Bits of the Markov fold (lm_head . hidden_out), stored per vocab row and scanned by one kernel
+# per draft step (0 = the reference's bf16 [rank, V] matrix and full-vocab bias). See
+# _RnnMarkovHead.fold.
+FOLD_BITS = int(os.environ.get("MLX_DSPARK_INKLING_FOLD_BITS", "4") or 0)
 MLX_VLM_HINT = ("this Inkling 2 model needs a newer mlx-vlm: 0.8.0 ships the plain `inkling2` model "
                 "only, the looped one (Inkling-2-Mini, `inkling2_loop`) merged 2026-11-20, after it. "
                 "Upgrade mlx-vlm, or until a release ships it: "
@@ -236,7 +242,9 @@ class _RnnMarkovHead(nn.Module):
         # derived, never parameters (leading underscore keeps them out of mlx's filter):
         self._w_rec = None      # rnn_proj.weight[:, :2r] in fp32
         self._w_ctx = None      # rnn_proj.weight[:, 2r:] in fp32
-        self._fold_t = None     # (lm_head · hidden_out)ᵀ  [rank, V]
+        self._fold_t = None     # (lm_head · hidden_out)ᵀ  [rank, V]   (FOLD_BITS == 0)
+        self._fold_q = None     # the same per vocab row [V, rank], quantized (w, scales, biases)
+        self._fold_bits = 0
         self._fold_b = None     # lm_head · hidden_out.bias  [V]
 
     def prepare(self) -> None:
@@ -250,23 +258,61 @@ class _RnnMarkovHead(nn.Module):
         ``[..., H]`` -> raw logits ``[..., V]``; applying it to ``hidden_out``'s columns gives
         ``(lm_head · hidden_out)ᵀ`` directly."""
         w = self.hidden_out.weight                  # [H, r]
-        self._fold_t = project(mx.contiguous(w.T)[None])[0]                 # [r, V]
+        fold_t = project(mx.contiguous(w.T)[None])[0]                       # [r, V]
         self._fold_b = project(self.hidden_out.bias[None, None])[0, 0]      # [V]
-        mx.eval(self._fold_t, self._fold_b)
+        mx.eval(fold_t, self._fold_b)
+        self._fold_t = self._fold_q = None
+        self._fold_bits = 0
+        if (FOLD_BITS in (4, 8) and fold_t.shape[0] == _FOLD_RANK and mx.metal.is_available()
+                and mx.default_device() == mx.gpu):
+            # Stored per vocab row and quantized: a draft step then reads 29 MB (4-bit; 55 at
+            # 8) instead of streaming the 103 MB bf16 matrix, in one launch that keeps only
+            # the argmax (inkling_kernels.fold_argmax). A rank-256 correction to drafting
+            # logits — the target verifies every token. Teacher-forced on ~1,000 paired
+            # anchors: acceptance 2.272 at 8 bits, 2.274 at 4 (cap 3); 2.530 / 2.543 (cap 7).
+            from .inkling_kernels import quantize_fold
+
+            self._fold_q = quantize_fold(fold_t, FOLD_BITS)
+            self._fold_bits = FOLD_BITS
+        else:
+            self._fold_t = fold_t
 
     def context(self, hidden: mx.array, f_rnn: mx.array) -> mx.array:
         inputs = mx.concatenate([hidden, mx.broadcast_to(f_rnn, hidden.shape)], axis=-1)
         return inputs.astype(mx.float32) @ self._w_ctx.T + self.rnn_proj.bias.astype(mx.float32)
 
-    def step(self, state: mx.array, prev: mx.array, ctx_row: mx.array):
+    def advance(self, state: mx.array, prev: mx.array, ctx_row: mx.array):
+        """One recurrence step: ``(next state, latent)`` — the latent is what the fold turns
+        into the vocabulary bias."""
         inputs = mx.concatenate([state, self.markov_w1(prev)], axis=-1)
         raw = (inputs.astype(mx.float32) @ self._w_rec.T + ctx_row).astype(state.dtype)
         gate, cand, out = mx.split(raw, 3, axis=-1)
         gate = mx.sigmoid(gate.astype(mx.float32)).astype(state.dtype)
         cand = mx.tanh(cand.astype(mx.float32)).astype(state.dtype)
         state = gate * state + (1 - gate) * cand
-        latent = mx.tanh(out.astype(mx.float32)).astype(state.dtype)
-        return state, mx.addmm(self._fold_b, latent, self._fold_t)
+        return state, mx.tanh(out.astype(mx.float32)).astype(state.dtype)
+
+    def bias(self, latent: mx.array) -> mx.array:
+        """The full-vocabulary Markov bias ``[B, V]`` of a latent (the sampling path)."""
+        if self._fold_q is not None:
+            w, scales, biases = self._fold_q
+            return self._fold_b + mx.quantized_matmul(latent, w, scales, biases, transpose=True,
+                                                      group_size=64, bits=self._fold_bits)
+        return mx.addmm(self._fold_b, latent, self._fold_t)
+
+    def step(self, state: mx.array, prev: mx.array, ctx_row: mx.array):
+        state, latent = self.advance(state, prev, ctx_row)
+        return state, self.bias(latent)
+
+    def greedy(self, latent: mx.array, base_row: mx.array, vocab_out: int):
+        """``argmax(base_row + bias(latent))`` over the first ``vocab_out`` ids as one launch,
+        or None when the fold is not in the kernel's form."""
+        if self._fold_q is None or latent.shape[0] != 1:
+            return None
+        from .inkling_kernels import fold_argmax
+
+        return fold_argmax(latent.reshape(-1), self._fold_q, self._fold_b, base_row,
+                           self._fold_bits, vocab_out)
 
 
 class Inkling2DSparkDrafter(nn.Module):
@@ -307,15 +353,33 @@ class Inkling2DSparkDrafter(nn.Module):
 
     def bind_target(self, target) -> None:
         """Build the drafter-only quantized copy of the target's output head that the BASE logits
-        go through (``DRAFT_HEAD_BITS``; the Markov fold keeps the exact bf16 head). Drafting-only:
-        the target verifies every token. Measured on Inkling-2-Mini (teacher-forced, 4-bit head):
-        8-bit leaves cap-3 acceptance unchanged on chat / code / math (2.04 / 2.76 / 3.35) and
-        cuts the 3-row base-logit matmul 3.80 -> 2.11 ms; 4-bit (1.48 ms) starts to cost
-        acceptance (cap 7: 4.47 -> 4.35 on math). Rebuilt only when the head changes."""
-        head = getattr(getattr(getattr(target, "model", None), "language_model", None),
-                       "lm_head", None)
+        go through (``DRAFT_HEAD_BITS``; the Markov fold is built from the exact bf16 head).
+        Drafting-only: the target verifies every token. Measured on Inkling-2-Mini,
+        teacher-forced: 8-bit leaves acceptance unchanged against the bf16 head and cuts the
+        3-row base-logit matmul 3.80 -> 2.11 ms; 6-bit (the default; 1.7 ms, 116 MB less) leaves
+        it unchanged too — 2.280 vs 2.272 over 1,046 paired anchors at cap 3, 2.521 vs 2.530
+        over 929 at cap 7, and no slower at one or two rows; 5-bit is no faster; 4-bit (1.48
+        ms) starts to cost acceptance (cap 7: 4.47 -> 4.35 on math). Rebuilt only when the head
+        changes."""
+        lm = getattr(getattr(target, "model", None), "language_model", None)
+        head = getattr(lm, "lm_head", None)
         if not DRAFT_HEAD_BITS or type(head) is not nn.Linear or "bias" in head:
             self._base_head = self._base_src = None
+            return
+        # A target loaded with --target-bits 8 already holds an 8-bit copy of this head for its
+        # own logits: draft from that one (fp32 logits through the same kernel, flat to 4 rows)
+        # instead of keeping a second copy (0.35 GB at 6 bits; ~0.4 ms a round dearer).
+        from .inkling_kernels import HEAD_Q8_MAX_ROWS, dense_head, head_q8_f32, head_q8_ok
+
+        shared = dense_head(lm) if lm is not None else None
+        if (shared is not None and head_q8_ok(shared)
+                and self.block_size <= HEAD_Q8_MAX_ROWS and mx.default_device() == mx.gpu):
+            if self._base_src is not shared:
+                def base(hidden, qh=shared):
+                    b, rows, width = hidden.shape
+                    return head_q8_f32(hidden.reshape(b * rows, width), qh).reshape(b, rows, -1)
+
+                self._base_head, self._base_src = base, shared
             return
         if self._base_src is head.weight:
             return
@@ -442,10 +506,14 @@ class Inkling2DSparkDrafter(nn.Module):
         prev = (first_prev_token.reshape(-1) if isinstance(first_prev_token, mx.array)
                 else mx.array([int(first_prev_token)]))
         tokens = []
+        head = self.markov_head
         for i in range(k):
-            state, bias = self.markov_head.step(state, prev, ctx[:, i])
-            logits = self._capped(base_logits[i][None] + bias, dtype)
-            prev = mx.argmax(logits, axis=-1)
+            state, latent = head.advance(state, prev, ctx[:, i])
+            nxt = head.greedy(latent, base_logits[i], self.unpadded)
+            if nxt is None:
+                logits = self._capped(base_logits[i][None] + head.bias(latent), dtype)
+                nxt = mx.argmax(logits, axis=-1)
+            prev = nxt
             tokens.append(prev)
         return mx.concatenate(tokens)
 
