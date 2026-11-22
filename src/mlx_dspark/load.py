@@ -298,7 +298,9 @@ REGISTRY = [
     # Automatic power mode, `benchmark --trials 3`, zero flags), baseline = the fused forward:
     # **cap 2 = 1.18x** (0.99x chat / 1.22x code / 1.34x math, accept 2.14, baseline 29.7 tok/s);
     # over the stock forward the same head is 1.40x at cap 3 (33.5 tok/s vs 35.1 here). Lookup off
-    # (MoE: a free draft still pulls fresh experts per row). Lossless (token forcing against the
+    # (MoE: a free draft still pulls fresh experts per row; re-measured 2026-11-22 with the fused
+    # pieces taking 33 rows: x1.90 on a verbatim rewrite, x0.91 on a reordering edit, x0.95-1.07 on
+    # chat / code / math — content-dependent, so it stays off). Lossless (token forcing against the
     # STOCK forward: 0.91% near-tie rate vs stock greedy's own 1.37%, no excess large-margin
     # event). See NOTES "Inkling-2-Mini ported", "Inkling fused forward".
     {"id": "inkling-2-mini", "target": "thinkingmachines/Inkling-2-Mini",

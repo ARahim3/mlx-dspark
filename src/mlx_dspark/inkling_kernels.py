@@ -508,8 +508,9 @@ def combine_routes(down: mx.array, weights: mx.array, top_k: int) -> mx.array:
 
 
 # ---- the MoE ----------------------------------------------------------------------------------------
-# Rows a fused call accepts: a decode step, a verify, a prefill's short tail. Longer calls are
-# prefill chunks, where mlx-vlm's sorted gather already batches experts.
+# Rows a fused call accepts whatever the forward's own limit: a decode step, a verify, a prefill's
+# short tail (``inkling_fused`` raises it to its own limit for a lookup round's wider verify).
+# Longer calls are prefill chunks, where mlx-vlm's sorted gather already batches experts.
 MOE_MAX_ROWS = 16
 _GATE_F32 = "_mlx_dspark_gate_f32"
 
@@ -643,8 +644,32 @@ _SOURCE_HEAD = r"""
   }
 """
 
-HEAD_MAX_ROWS = 16
+HEAD_MAX_ROWS = 16        # rows one launch carries (an fp32 accumulator per row and vocab lane)
+HEAD_WIDE_ROWS = 33       # rows a call may have (a lookup round's verify: 32 copied tokens and
+#                           the anchor): past HEAD_MAX_ROWS they go in launches of
+HEAD_CHUNK_ROWS = 12      # rows, every row reduced as in a one-row call. M4 Pro, ms by rows per
+#                           launch, bf16 head: 3.7 flat to 8, 3.9 at 12, 4.8 at 16; 33 rows cost
+#                           11.9 in launches of 12, 13.5 in 16s, 18.8 in 8s (the 8-bit head: 12.8 /
+#                           14.3 / 19.1, and 4.6 / 6.1 for one launch of 12 / 16)
 HEAD_NSG = 2
+_FAST_HEAD = "_mlx_dspark_fast_head"      # per language model: False routes back to the stock head
+
+
+def set_fast_head(language_model, enabled: bool) -> None:
+    """Route the fp32 logits through :func:`head_f32` (installed by :func:`install_fast_head`)
+    or back to the stock promotion: the A/B, and what a stock judge wants."""
+    language_model.__dict__[_FAST_HEAD] = bool(enabled)
+
+
+def head_rows(kernel, h: mx.array, weight, single: int = HEAD_MAX_ROWS,
+              per_launch: int = HEAD_CHUNK_ROWS) -> mx.array:
+    """``kernel(h, weight)`` for any number of rows: one launch up to ``single`` rows, launches
+    of ``per_launch`` past that."""
+    rows = int(h.shape[0])
+    if rows <= single:
+        return kernel(h, weight)
+    return mx.concatenate([kernel(h[a: a + per_launch], weight)
+                           for a in range(0, rows, per_launch)], axis=0)
 
 
 @lru_cache(maxsize=1)
@@ -782,7 +807,8 @@ def head_q8_f32(h: mx.array, qlinear) -> mx.array:
 
 def install_fast_head(language_model) -> bool:
     """Route an Inkling 2 language model's fp32 logits (``_logits_from_norm``) through
-    :func:`head_f32` for calls of <= 16 rows (decode, verify, a prefill's last row); longer calls
+    :func:`head_f32` for calls of <= ``HEAD_WIDE_ROWS`` rows (decode, verify, a prefill's last row;
+    ``HEAD_MAX_ROWS`` a launch); longer calls
     keep the stock path. Per instance; never builds the stock path's fp32 head copy for short
     calls. Returns whether it was installed."""
     import types
@@ -802,10 +828,11 @@ def install_fast_head(language_model) -> bool:
         rows = 1
         for d in h.shape[:-1]:
             rows *= int(d)
-        if rows > HEAD_MAX_ROWS or self.training or dtype != mx.bfloat16:
+        if (rows > HEAD_WIDE_ROWS or self.training or dtype != mx.bfloat16
+                or not self.__dict__.get(_FAST_HEAD, True)):
             return stock(self, h)
         flat = h.astype(dtype).reshape(rows, h.shape[-1])
-        logits = head_f32(flat, self.lm_head.weight).reshape(*h.shape[:-1], -1)
+        logits = head_rows(head_f32, flat, self.lm_head.weight).reshape(*h.shape[:-1], -1)
         cap = self.config.final_logit_softcapping
         if cap:
             logits = mx.tanh(logits / cap) * cap
@@ -1008,11 +1035,11 @@ def install_dense_bits(language_model, bits: int = 8, group_size: int = 64,
             rows = 1
             for d in h.shape[:-1]:
                 rows *= int(d)
-            if (self.__dict__.get(_DENSE_HEAD_KERNEL) and rows <= HEAD_Q8_MAX_ROWS
+            if (self.__dict__.get(_DENSE_HEAD_KERNEL) and rows <= HEAD_WIDE_ROWS
                     and dtype == mx.bfloat16
                     and not self.training and mx.default_device() == mx.gpu):
                 flat = h.astype(dtype).reshape(rows, h.shape[-1])
-                logits = head_q8_f32(flat, qh).reshape(*h.shape[:-1], -1)
+                logits = head_rows(head_q8_f32, flat, qh).reshape(*h.shape[:-1], -1)
             else:
                 logits = qh(h.astype(dtype).astype(mx.float32))
             cap = self.config.final_logit_softcapping

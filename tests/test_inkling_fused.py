@@ -169,6 +169,104 @@ def test_controller_within_rounding_row_invariant_and_reads_row_views():
     assert bool(mx.array_equal(got, alone))
 
 
+# ---------------------------------------------------------------- the packed verify attention
+def _packed_case(nh, nkv, hd, drel, extent, sliding, rows, keys, seed=0):
+    import types
+
+    attn = types.SimpleNamespace(rel_extent=extent, sliding=sliding, n_heads=nh, n_kv=nkv,
+                                 head_dim=hd, rel_proj=mx.zeros((drel, extent)))
+    s = seed * 10
+    return attn, {
+        "q": _bf16(1, rows, nh, hd, scale=0.6, seed=s + 1),
+        "k": _bf16(1, nkv, keys, hd, scale=0.6, seed=s + 2),
+        "v": _bf16(1, nkv, keys, hd, seed=s + 3),
+        "r": _bf16(1, rows, nh, drel, scale=0.5, seed=s + 4),
+        "rel_t": _bf16(extent, drel, scale=0.3, seed=s + 5),
+        "sinks": _bf16(1, rows, nh, seed=s + 6),
+        "gate": _bf16(1, rows, nh * hd, seed=s + 7),
+    }
+
+
+def _attention_fp32(attn, q, k, v, r, rel_t, sinks, gate):
+    """mlx-vlm's attention after the cache update, with nothing rounded inside: the additive
+    mask with the sink's column (bf16, as the stream's), fp32 scores, softmax and values, the
+    output rounded to bf16, then the gate."""
+    _, rows, nh, hd = q.shape
+    g, keys = nh // k.shape[1], k.shape[2]
+    zero = mx.zeros((1, k.shape[1], 1, hd), k.dtype)
+    mask = F.fused_mask(r, rel_t, sinks, keys, attn.sliding, attn.rel_extent)
+    kf = mx.repeat(mx.concatenate([k, zero], axis=2), g, axis=1).astype(mx.float32)
+    vf = mx.repeat(mx.concatenate([v, zero], axis=2), g, axis=1).astype(mx.float32)
+    scores = (q.transpose(0, 2, 1, 3).astype(mx.float32) @ kf.swapaxes(-1, -2)) * hd ** -0.5
+    out = mx.softmax(scores + mask.astype(mx.float32), axis=-1) @ vf
+    return F._gated(out.astype(mx.bfloat16).transpose(0, 2, 1, 3).reshape(1, rows, -1), gate)
+
+
+@pytest.mark.parametrize("nh,nkv,hd,drel,extent", [
+    (24, 8, 128, 16, 1024),            # Inkling-2-Mini
+    (4, 4, 32, 4, 8),                  # the tiny test model: no GQA
+    (8, 2, 64, 8, 40),                 # GQA 4, another head and code width
+])
+@pytest.mark.parametrize("windowed", [False, True])
+def test_packed_attention_is_the_fp32_attention_within_rounding(nh, nkv, hd, drel, extent,
+                                                                windowed):
+    sliding = extent if windowed else 0
+    # one tile, a partial tile, several key blocks, past the extent / at the window cap; one row
+    # to more rows than a simdgroup holds for the head group
+    for rows, keys in ((3, 16), (1, 5), (4, 37), (8, 300), (5, extent + 9), (2, extent + 1)):
+        if sliding:
+            keys = min(keys, sliding - 1 + rows)     # all a sliding call can see
+        attn, t = _packed_case(nh, nkv, hd, drel, extent, sliding, rows, keys, seed=rows + keys)
+        assert F._packed_ok(attn, rows)
+        got = F.packed_attention(attn, **t)
+        ref = _attention_fp32(attn, **t)
+        assert got.shape == ref.shape == (1, rows, nh * hd) and got.dtype == mx.bfloat16
+        assert _rel(got, ref) < F.PACKED_TOL, (rows, keys)       # measured: 1e-6 to 1e-4
+
+
+def test_packed_attention_reads_views_and_never_looks_ahead():
+    rows, keys = 4, 1040
+    attn, t = _packed_case(24, 8, 128, 16, 1024, 0, rows, keys)
+    ref = F.packed_attention(attn, **t)
+    # K and V as views into a larger buffer (the in-place caches hand out exactly that)
+    def pad(a):
+        return mx.concatenate([_bf16(1, 8, 7, 128, seed=90), a, _bf16(1, 8, 300, 128, seed=91)],
+                              axis=2)[..., 7: 7 + keys, :]
+
+    viewed = F.packed_attention(attn, **{**t, "k": pad(t["k"]), "v": pad(t["v"])})
+    assert bool(mx.array_equal(viewed, ref))
+    # another token in the LAST row — its query, code, sink, gate and its own key / value —
+    # leaves every earlier row's output the same bits
+    other = dict(t)
+    for name in ("q", "r", "sinks", "gate"):
+        other[name] = mx.concatenate([t[name][:, :-1], t[name][:, -1:] * 1.7 + 0.3], axis=1)
+    for name in ("k", "v"):
+        other[name] = mx.concatenate([t[name][:, :, :-1], t[name][:, :, -1:] * -2.0], axis=2)
+    moved = F.packed_attention(attn, **other)
+    assert bool(mx.array_equal(moved[:, :-1], ref[:, :-1]))
+    assert not bool(mx.array_equal(moved[:, -1], ref[:, -1]))
+    # and a sliding layer's rows each drop the keys that left their own window
+    attn, t = _packed_case(24, 8, 128, 16, 1024, 1024, rows, 1023 + rows, seed=3)
+    ref = F.packed_attention(attn, **t)
+    old = {**t, "k": mx.concatenate([t["k"][:, :, :1] * 5.0, t["k"][:, :, 1:]], axis=2),
+           "v": mx.concatenate([t["v"][:, :, :1] * 5.0, t["v"][:, :, 1:]], axis=2)}
+    moved = F.packed_attention(attn, **old)          # the oldest key: row 0 alone still sees it
+    assert bool(mx.array_equal(moved[:, 1:], ref[:, 1:]))
+    assert not bool(mx.array_equal(moved[:, 0], ref[:, 0]))
+
+
+def test_packed_attention_refuses_shapes_it_was_not_written_for():
+    ok = _packed_case(24, 8, 128, 16, 1024, 0, 4, 64)[0]
+    assert F._packed_ok(ok, 8)
+    for change in ({"head_dim": 100}, {"n_kv": 5}, {"rel_proj": mx.zeros((6, 1024))},
+                   {"head_dim": 512}):
+        attn = _packed_case(24, 8, 128, 16, 1024, 0, 4, 64)[0]
+        for name, value in change.items():
+            setattr(attn, name, value)
+        assert not F._packed_ok(attn, 8), change
+    assert not F._packed_ok(ok, 100)                 # more rows than one threadgroup holds
+
+
 # ---------------------------------------------------------------- installed, against mlx-vlm
 def _tiny_bf16_inkling():
     from mlx_dspark.inkling import mlx_vlm_supports_inkling2
@@ -313,6 +411,150 @@ def test_one_launch_mask_is_bit_identical_and_the_walk_matches_with_it():
         assert all(bool(mx.array_equal(a, b)) for a, b in zip(got_states, ref_states)), on
 
 
+def test_packed_verify_attention_runs_at_verify_widths_only_and_stays_close(monkeypatch):
+    from mlx_dspark import inkling_cache as C
+
+    lm = _tiny_bf16_inkling()
+    F.install(lm, enabled=False)
+    def converted():
+        return C.convert(lm.make_cache())
+
+    ref, _ = _walk(lm, F.EXACT_KINDS, converted)
+    calls = []
+    stock = F.packed_attention
+    monkeypatch.setattr(F, "packed_attention",
+                        lambda attn, q, *a: calls.append(q.shape[1]) or stock(attn, q, *a))
+    monkeypatch.setattr(F, "PACKED_MIN_ROWS", 3)
+    F.set_packed(lm, True, min_keys=1)
+    assert F.packed_attn(lm)
+    got, _ = _walk(lm, F.EXACT_KINDS, converted)
+    assert calls == [4] * 8                          # the 4-row verify's 8 visits; no decode step
+    # decode steps before the verify are untouched; everything after it is within rounding
+    assert all(bool(mx.array_equal(a, b)) for a, b in zip(got[:3], ref[:3]))
+    assert max(_rel(a, b) for a, b in zip(got, ref)) < 0.05
+    # under its key threshold, on the stock caches or switched off: the stock call, bit for bit
+    for setup, cache in ((lambda: F.set_packed(lm, True), converted),
+                         (lambda: F.set_packed(lm, True, min_keys=1), None),
+                         (lambda: F.set_packed(lm, False), converted)):
+        setup()
+        calls.clear()
+        got, _ = _walk(lm, F.EXACT_KINDS, cache)
+        assert calls == [] and all(bool(mx.array_equal(a, b)) for a, b in zip(got, ref))
+    assert not F.packed_attn(lm)
+
+
+def test_selftest_turns_the_packed_attention_off_when_it_drifts_or_looks_ahead(monkeypatch):
+    lm = _tiny_bf16_inkling()
+    F.install(lm, enabled=False)
+    assert F.selftest(lm)[F.PACKED_KIND] is True and F.packed_attn(lm)
+    stock = F.packed_attention
+    # outside rounding
+    monkeypatch.setattr(F, "packed_attention", lambda *a: stock(*a) * 1.01)
+    result = F.selftest(lm)
+    assert result[F.PACKED_KIND] is False and not F.packed_attn(lm)
+    assert result["attn"] and result[F.KV_KIND] and result["model"]      # nothing else is touched
+    assert all(F._on(m) for m, _ in F._fused_modules(lm))
+    # inside any tolerance, but the first row reads the last one
+    def leaky(attn, q, k, v, r, rel_t, sinks, gate):
+        out = stock(attn, q, k, v, r, rel_t, sinks, gate)
+        return mx.concatenate([out[:, :1] + out[:, -1:] * 1e-3, out[:, 1:]], axis=1)
+
+    monkeypatch.setattr(F, "packed_attention", leaky)
+    assert F.selftest(lm)[F.PACKED_KIND] is False
+    # without the in-place caches there is nothing for it to read
+    monkeypatch.setattr(F, "packed_attention", stock)
+    assert F.selftest(lm)[F.PACKED_KIND] is True
+    from mlx_dspark import inkling_cache as C
+
+    monkeypatch.setattr(C.classes()[1], "sink_views", lambda self: (None, None))
+    result = F.selftest(lm)
+    assert result[F.KV_KIND] is False and result[F.PACKED_KIND] is False and not F.packed_attn(lm)
+
+
+def _walk_wide(lm, on_kinds, width, make_cache=None):
+    """Prefill (stock), a decode step, a ``width``-row verify committed at 5 rows, a decode step:
+    the logits and taps of every forward after the prefill and the final cache states."""
+    F.set_enabled(lm, False)
+    cache = (make_cache or lm.make_cache)()
+    mx.eval(lm(inputs=mx.array([[3, 7, 11, 2, 9, 30, 41, 5, 8, 13, 21, 34]]), cache=cache).logits)
+    if on_kinds:
+        F.set_enabled(lm, True, on_kinds)
+    outs = [lm(inputs=mx.array([[4]]), cache=cache).logits]
+    mx.eval(outs)
+    out = lm(inputs=mx.array([[(6 + 5 * i) % 60 for i in range(width)]]), cache=cache,
+             capture_layer_ids=[1, 5, 8], speculative_verify=True)
+    outs.extend([out.logits, *out.hidden_states])
+    mx.eval(outs)
+    out.gdn_states.commit(5)
+    outs.append(lm(inputs=mx.array([[33]]), cache=cache).logits)
+    states = F._state_arrays([part for c in cache for part in c.caches])
+    mx.eval(outs, states)
+    F.set_enabled(lm, False)
+    return outs, states
+
+
+@pytest.mark.parametrize("width", [9, 16, 33])
+def test_calls_wider_than_a_drafter_round_stay_bit_identical(monkeypatch, width):
+    """A lookup round verifies up to 32 copied tokens: past 8 rows MLX's attention leaves its
+    vector kernels, so the exact pieces are checked against the stock forward there too."""
+    from mlx_dspark import inkling_cache as C
+
+    assert width <= F.MAX_ROWS
+    lm = _tiny_bf16_inkling()
+    F.install(lm, enabled=False)
+    ref, ref_states = _walk_wide(lm, None, width)
+    hits = _count_fused_calls(monkeypatch)
+    # until the wider calls are cleared, a verify past VECTOR_ROWS is the stock forward
+    assert F.rows_limit(lm) == F.VECTOR_ROWS
+    got, _ = _walk_wide(lm, (*F.EXACT_KINDS, "model"), width)
+    assert all(bool(mx.array_equal(a, b)) for a, b in zip(got, ref))
+    narrow = dict(hits)
+    F.set_rows(lm, F.MAX_ROWS)
+    for kinds in (("sconv",), ("layer",), ("attn",), (*F.EXACT_KINDS, "model")):
+        got, got_states = _walk_wide(lm, kinds, width)
+        assert all(bool(mx.array_equal(a, b)) for a, b in zip(got, ref)), kinds
+        assert all(bool(mx.array_equal(a, b)) for a, b in zip(got_states, ref_states)), kinds
+    assert hits["fused_head_prep"] > narrow["fused_head_prep"] + 8      # the wide verify too
+    # ... and on the in-place caches (views into the general attention path, rolled back by trim)
+    got, _ = _walk_wide(lm, (*F.EXACT_KINDS, "model"), width, lambda: C.convert(lm.make_cache()))
+    assert all(bool(mx.array_equal(a, b)) for a, b in zip(got, ref))
+    # the packed attention takes a wide call up to PACKED_MAX_ROWS rows (past that MLX's matmul
+    # attention is the faster one, and the stock call bit for bit)
+    calls = []
+    stock = F.packed_attention
+    monkeypatch.setattr(F, "packed_attention",
+                        lambda attn, q, *a: calls.append(q.shape[1]) or stock(attn, q, *a))
+    F.set_packed(lm, True, min_keys=1)
+    got, _ = _walk_wide(lm, F.EXACT_KINDS, width, lambda: C.convert(lm.make_cache()))
+    if width <= F.PACKED_MAX_ROWS:
+        assert calls == [width] * 8
+        assert max(_rel(a, b) for a, b in zip(got, ref)) < 0.05
+    else:
+        assert calls == [] and all(bool(mx.array_equal(a, b)) for a, b in zip(got, ref))
+    F.set_rows(lm, F.VECTOR_ROWS)
+    calls.clear()
+    _walk_wide(lm, F.EXACT_KINDS, width, lambda: C.convert(lm.make_cache()))
+    assert calls == []
+
+
+def test_selftest_keeps_wide_calls_on_the_stock_path_when_they_do_not_match(monkeypatch):
+    lm = _tiny_bf16_inkling()
+    F.install(lm, enabled=False)
+    assert F.selftest(lm)[F.WIDE_KIND] is True and F.rows_limit(lm) == F.MAX_ROWS
+    # a piece that drifts only at the wide width (as a kernel picked by row count would)
+    stock = F.fused_norm_cast
+
+    def drifting(norm, x):
+        out = stock(norm, x)
+        return out * 2 if x.shape[1] > F.VECTOR_ROWS else out
+
+    monkeypatch.setattr(F, "fused_norm_cast", drifting)
+    result = F.selftest(lm)
+    assert result[F.WIDE_KIND] is False and F.rows_limit(lm) == F.VECTOR_ROWS
+    assert all(result[k] for k in (*F.EXACT_KINDS, F.KV_KIND, F.PACKED_KIND, "model"))
+    assert all(F._on(m) for m, _ in F._fused_modules(lm))        # narrow calls keep every piece
+
+
 def test_layer_visit_loop_is_bit_identical_and_reads_messages_once_per_pass(monkeypatch):
     lm = _tiny_bf16_inkling()
     F.install(lm, enabled=False)
@@ -354,7 +596,9 @@ def test_selftest_passes_then_turns_off_a_body_that_no_longer_matches(monkeypatc
     lm = _tiny_bf16_inkling()
     F.install(lm, enabled=False)
     assert F.selftest(lm) == dict.fromkeys(
-        (*F.EXACT_KINDS, F.KV_KIND, F.MASK_KIND, *F.ROUNDING_KINDS, *F.LOOP_KINDS), True)
+        (*F.EXACT_KINDS, F.KV_KIND, F.MASK_KIND, F.PACKED_KIND, *F.ROUNDING_KINDS,
+         *F.LOOP_KINDS, F.WIDE_KIND), True)
+    assert F.rows_limit(lm) == F.MAX_ROWS
     assert all(F._on(m) for m, _ in F._fused_modules(lm))
     # the cleared in-place caches are what make_cache hands out
     from mlx_dspark import inkling_cache as C
@@ -448,7 +692,16 @@ def test_installed_moe_kind_decodes_bit_identically_and_is_row_exact(mode):
     # more rows than the fused path takes: the stock module
     wide = (mx.random.normal((1, K.MOE_MAX_ROWS + 1, 128)) * 2).astype(mx.bfloat16)
     assert bool(mx.array_equal(moe(wide), stock(moe, wide)))
-    assert F.selftest(lm)["moe"] is True and "moe" in F.enabled_kinds(lm)
+    result = F.selftest(lm)
+    assert result["moe"] is True and "moe" in F.enabled_kinds(lm)
+    # cleared for a lookup round's width: the fused experts take it, each row still the stock
+    # module's single-row result (more rows than one routing threadgroup, runs past one tile)
+    assert result[F.WIDE_KIND] is True and F.rows_limit(lm) == F.MAX_ROWS
+    rows = [(mx.random.normal((1, 1, 128), key=mx.random.key(i % 5)) * 2).astype(mx.bfloat16)
+            for i in range(F.MAX_ROWS)]
+    F.set_enabled(lm, True, ("moe",))
+    got = moe(mx.concatenate(rows, axis=1))
+    assert bool(mx.array_equal(got, mx.concatenate([stock(moe, r) for r in rows], axis=1)))
     F.disable(lm, ("moe",))
     F.set_enabled(lm, True)                                    # a disabled kind stays off
     assert "moe" not in F.enabled_kinds(lm) and "attn" in F.enabled_kinds(lm)
@@ -489,4 +742,6 @@ def test_fused_exact_kinds_stay_bit_identical_on_the_8bit_model(monkeypatch):
     assert all(bool(mx.array_equal(a, b)) for a, b in zip(got, ref))
     assert all(bool(mx.array_equal(a, b)) for a, b in zip(got_states, ref_states))
     assert F.selftest(lm) == dict.fromkeys(
-        (*F.EXACT_KINDS, F.KV_KIND, F.MASK_KIND, *F.ROUNDING_KINDS, *F.LOOP_KINDS), True)
+        (*F.EXACT_KINDS, F.KV_KIND, F.MASK_KIND, F.PACKED_KIND, *F.ROUNDING_KINDS,
+         *F.LOOP_KINDS, F.WIDE_KIND), True)
+    assert F.rows_limit(lm) == F.MAX_ROWS

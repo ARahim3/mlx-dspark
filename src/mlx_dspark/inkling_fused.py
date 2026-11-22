@@ -4,7 +4,8 @@ One decode step of the stock mlx-vlm forward launches ~7,000 GPU kernels for 48 
 of them a few thousand elements wide: about half of a step's time is the launches, not the weights
 (NOTES "Inkling fused forward"). Each piece here replaces a run of small stock operations with one
 Metal kernel, for calls of one batch row and at most ``MAX_ROWS`` positions (a decode step or a
-speculative verify); anything else — prefill chunks, the CPU, training — takes the stock path.
+speculative verify — up to a lookup round's 32 copied tokens and their anchor); anything else —
+prefill chunks, the CPU, training — takes the stock path.
 
 Installed per INSTANCE (a class swap on the model's own modules, like ``inkling_kernels``): nothing
 global is patched and other models are untouched. ``set_enabled(lm, False)`` routes every call back
@@ -25,9 +26,13 @@ matmul rounds it. What differs is the summation order of fp32 dot products — t
 
 ``moe`` — the routed experts (``inkling_kernels.fused_moe``): top-k, route weights and the expert
 sort in one launch, MLX's own single-row quantized matvec per route with each expert's weights
-read once per run of routes, the combine in one launch. For 1–16 positions, each row bit-identical
-to the stock module's single-row call (the stock multi-row call rounds its routing scores
-differently from its own single-row call; this one does not).
+read once per run of routes, the combine in one launch. At any width a fused call has, each row
+is bit-identical to the stock module's single-row call (the stock multi-row call rounds its
+routing scores differently from its own single-row call; this one does not).
+
+Calls of up to ``VECTOR_ROWS`` positions are a drafter round (MLX's attention still runs its
+vector kernels there); up to ``MAX_ROWS`` they are a lookup round's long copy draft, taken once
+the self-test has matched every exact piece to the stock forward at that width (``set_rows``).
 """
 
 from __future__ import annotations
@@ -39,8 +44,12 @@ import mlx.core as mx
 
 from .inkling_cache import is_sink_cache
 
-MAX_ROWS = 8          # positions per call a fused piece accepts (the widest verify: cap 7 + anchor)
+MAX_ROWS = 33         # positions per call a fused piece accepts: the widest verify, a lookup
+#                       round's 32 copied tokens + the anchor (a drafter round is cap 7 + anchor)
+VECTOR_ROWS = 8       # where MLX's SDPA still runs its vector kernels: the widest drafter round,
+#                       and the limit until the self-test clears the wider calls (set_rows)
 _FLAG = "_mlx_dspark_fused"
+_ROWS = "_mlx_dspark_rows"      # per fused module: the positions per call it accepts
 
 
 def _gpu() -> bool:
@@ -49,6 +58,10 @@ def _gpu() -> bool:
 
 def _on(module) -> bool:
     return bool(module.__dict__.get(_FLAG, False))
+
+
+def _rows(module) -> int:
+    return module.__dict__.get(_ROWS, VECTOR_ROWS)
 
 
 # ---- short convolution + next state -------------------------------------------------------------
@@ -126,7 +139,7 @@ def fused_short_convolution(state: mx.array, weight: mx.array, x: mx.array, widt
 
 def _sconv_ok(conv, x, cache, mask) -> bool:
     return (cache is not None and mask is None and not conv.training and conv.kernel_size == 4
-            and x.ndim == 3 and x.shape[0] == 1 and x.shape[1] <= MAX_ROWS
+            and x.ndim == 3 and x.shape[0] == 1 and x.shape[1] <= _rows(conv)
             and x.dtype == mx.bfloat16 and x.shape[-1] % 128 == 0 and _gpu())
 
 
@@ -293,7 +306,7 @@ def fused_attention_residual(states: list[mx.array], query: mx.array) -> mx.arra
 def _res_call(base):
     def __call__(self, blocks, partial):
         if not (_on(self) and partial.ndim == 3 and partial.shape[0] == 1
-                and partial.shape[1] <= MAX_ROWS and len(blocks) < 8 and not self.training
+                and partial.shape[1] <= _rows(self) and len(blocks) < 8 and not self.training
                 and _row_group(partial.shape[-1]) is not None and _gpu()
                 and all(s.shape == partial.shape and s.dtype in (mx.bfloat16, mx.float32)
                         for s in (*blocks, partial))):
@@ -464,7 +477,7 @@ def fused_controller(x: mx.array, message: mx.array, down: mx.array, forget: mx.
 
 def _ctrl_call(base):
     def __call__(self, x, message):
-        if not (_on(self) and x.ndim == 3 and x.shape[0] == 1 and x.shape[1] <= MAX_ROWS
+        if not (_on(self) and x.ndim == 3 and x.shape[0] == 1 and x.shape[1] <= _rows(self)
                 and message.shape == x.shape and x.dtype == mx.float32
                 and message.dtype == mx.float32 and not self.training
                 and self.down_weight.dtype == mx.bfloat16
@@ -851,6 +864,356 @@ def set_mask(language_model, enabled: bool) -> None:
             attn.__dict__[_MASK] = bool(enabled)
 
 
+# ---- attention at verify widths: K and V read once per KV head -------------------------------------
+# At L query rows MLX's vector SDPA gives every (query head, row) its own pass over the keys: with
+# G query heads per KV head that is G * L reads of the same K and V, plus a mask array of
+# [heads, L, S] built first. Here all G * L rows of a KV head share one pass: the rows sit on
+# 8 x 8 simdgroup matrices (8 rows a simdgroup), the keys arrive 16 at a time straight from the
+# cache's view, the relative-position bias is computed where the mask would have been read, and
+# the sink's logit and the output gate are folded into the second pass. Two launches (a partial
+# softmax per block of keys, then the combine) for the stock path's mask launch, SDPA and gate.
+#
+# NOT bit-identical to the stock call: the same products (scores from bf16 q and k, exact in
+# fp32; the bias rounded to the stream's dtype as the mask array is; fp32 weights times the
+# values) reduced over the keys in another grouping, and the softmax's running maximum taken per
+# tile. The fp-tie class of ``res`` / ``ctrl``. Used for calls of PACKED_MIN_ROWS to
+# PACKED_MAX_ROWS rows over PACKED_MIN_KEYS+ keys (where it wins); a decode step, and everything
+# else, keeps the stock, bit-identical call.
+# Derived from MLX's own two-pass sdpa_vector (mlx/backend/metal/kernels/sdpa_vector.h, MIT,
+# © 2024 Apple Inc.).
+# Where it wins (M4 Pro, paired in the verify loop): nothing or a small loss under 1,024 keys,
+# +3% of a 3-row verify and +4-5% of a 4-row one from there on, a tie at 2 rows. 1,024 keys with
+# the sink is also where MLX's SDPA switches to its two-pass kernel, whose per-block partial
+# outputs are rounded to the stream's dtype: from there the stock call is ~3e-3 (relative) from
+# the fp32 arithmetic and this kernel ~1e-6; under it the two agree to ~1e-6.
+# At 9-12 rows it still leads MLX's attention there (the matmul path: -3 ms of a verify at 2,600
+# tokens); from ~16 rows MLX's GEMMs are the faster way to do this arithmetic (+5 to +10 ms for
+# this kernel at 16-33 rows, and x0.5-0.8 at a prefill chunk's 512), so it stops at 12.
+PACKED_MIN_ROWS = 3
+PACKED_MAX_ROWS = 12
+PACKED_MIN_KEYS = 1024                  # keys counting the sink's
+_PACKED = "_mlx_dspark_packed_attn"     # per attention module: the key count it starts at (0 = off)
+_PACKED_TILE = 16                       # keys per step: two 8 x 8 score matrices
+_PACKED_BLOCKS = 16                     # key blocks per KV head (threadgroups working one head)
+
+
+def _packed_p1_source(nh: int, nkv: int, hd: int, drel: int, scale: float, rel_extent: int,
+                      sliding: int) -> str:
+    g = nh // nkv
+    bias = " + ".join(f"dot(rv{i}, as_type<float4>(uint4(*(const device packed_ushort4*)"
+                      f"(p + {4 * i})) << 16))" for i in range(drel // 4))
+    rload = "\n".join(
+        f"    const float4 rv{i} = as_type<float4>(uint4(*(const device packed_ushort4*)"
+        f"(rp + {4 * i})) << 16);" for i in range(drel // 4))
+    return f"""
+    constexpr int DH = {hd};
+    constexpr int DT = DH / 8;
+    constexpr int DREL = {drel};
+    constexpr int NH = {nh};
+    constexpr int G = {g};
+    constexpr int SLIDING = {sliding};
+    constexpr int REL_EXTENT = {rel_extent};
+    const int hk = int(threadgroup_position_in_grid.x);
+    const int blk = int(threadgroup_position_in_grid.z);
+    const uint sg = simdgroup_index_in_threadgroup;
+    const uint lane = thread_index_in_simdgroup;
+    const int NB = meta[0];
+    const int TOTAL_S = meta[1];
+    const int chunk = meta[2];
+    const int k0 = blk * chunk;
+    const int k1 = min(TOTAL_S, k0 + chunk);
+    // this thread's two elements of an 8 x 8 simdgroup matrix: row fm, columns fn and fn + 1
+    const short qid = lane / 4;
+    const short fm = (qid & 4) + ((lane / 2) % 4);
+    const short fn = (qid & 2) * 2 + (lane % 2) * 2;
+    // a matrix row is one (query head of this KV head, query row); spare rows repeat the last
+    const int row = int(sg) * 8 + fm;
+    const int valid_row = min(row, G * QL - 1);
+    const int qi = valid_row % QL;
+    const int hq = hk * G + valid_row / QL;
+    const int q_abs = (TOTAL_S - QL) + qi;
+
+    const device bfloat16_t* qrow = q + (size_t(qi) * NH + hq) * DH;
+    simdgroup_matrix<bfloat16_t, 8, 8> Qf[DT];
+    #pragma unroll
+    for (int dt = 0; dt < DT; ++dt) {{
+        Qf[dt].thread_elements()[0] = qrow[dt * 8 + fn];
+        Qf[dt].thread_elements()[1] = qrow[dt * 8 + fn + 1];
+    }}
+    simdgroup_matrix<float, 8, 8> Of[DT];
+    #pragma unroll
+    for (int dt = 0; dt < DT; ++dt) Of[dt] = simdgroup_matrix<float, 8, 8>(0.0f);
+
+    // the row's relative-position code (bf16 read as raw bits: a bf16 is the top half of its fp32)
+    const device uint16_t* rp = (const device uint16_t*)r + (size_t(qi) * NH + hq) * DREL;
+{rload}
+    const device uint16_t* relp = (const device uint16_t*)rel_t;
+
+    const int64_t kss = k_buf_strides[2], vss = v_buf_strides[2];
+    const device bfloat16_t* kb = k_buf + int64_t(hk) * k_buf_strides[1];
+    const device bfloat16_t* vb = v_buf + int64_t(hk) * v_buf_strides[1];
+    threadgroup bfloat16_t kstage[16 * DH];
+    threadgroup bfloat16_t vstage[16 * DH];
+
+    float m = -1e30f, l = 0.0f;
+    for (int kt = k0; kt < k1; kt += 16) {{
+        const bool full = k1 - kt >= 16;
+        simdgroup_matrix<float, 8, 8> S0 = simdgroup_matrix<float, 8, 8>(0.0f);
+        simdgroup_matrix<float, 8, 8> S1 = simdgroup_matrix<float, 8, 8>(0.0f);
+        if (full) {{
+            const device bfloat16_t* kp = kb + int64_t(kt) * kss;
+            for (int dt = 0; dt < DT; ++dt) {{
+                simdgroup_matrix<bfloat16_t, 8, 8> K0, K1;
+                simdgroup_load(K0, kp + dt * 8, kss, ulong2(0, 0), true);
+                simdgroup_load(K1, kp + 8 * kss + dt * 8, kss, ulong2(0, 0), true);
+                simdgroup_multiply_accumulate(S0, Qf[dt], K0, S0);
+                simdgroup_multiply_accumulate(S1, Qf[dt], K1, S1);
+            }}
+        }} else {{
+            // the block's last keys: staged in threadgroup memory, zero padded to a tile
+            const uint tid = thread_position_in_threadgroup.x;
+            const uint nthr = threads_per_threadgroup.x;
+            for (uint idx = tid; idx < 16 * (DH / 4); idx += nthr) {{
+                const int j = int(idx) / (DH / 4);
+                const int d4 = (int(idx) % (DH / 4)) * 4;
+                if (kt + j < k1) {{
+                    *(threadgroup packed_ushort4*)(kstage + j * DH + d4) = *(const device packed_ushort4*)
+                        ((const device uint16_t*)(kb + int64_t(kt + j) * kss) + d4);
+                    *(threadgroup packed_ushort4*)(vstage + j * DH + d4) = *(const device packed_ushort4*)
+                        ((const device uint16_t*)(vb + int64_t(kt + j) * vss) + d4);
+                }} else {{
+                    *(threadgroup packed_ushort4*)(kstage + j * DH + d4) = packed_ushort4(0);
+                    *(threadgroup packed_ushort4*)(vstage + j * DH + d4) = packed_ushort4(0);
+                }}
+            }}
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            for (int dt = 0; dt < DT; ++dt) {{
+                simdgroup_matrix<bfloat16_t, 8, 8> K0, K1;
+                simdgroup_load(K0, kstage + dt * 8, DH, ulong2(0, 0), true);
+                simdgroup_load(K1, kstage + 8 * DH + dt * 8, DH, ulong2(0, 0), true);
+                simdgroup_multiply_accumulate(S0, Qf[dt], K0, S0);
+                simdgroup_multiply_accumulate(S1, Qf[dt], K1, S1);
+            }}
+        }}
+
+        // this thread's four scores: mask, scale, bias — then the row's running softmax
+        float s[4] = {{S0.thread_elements()[0], S0.thread_elements()[1],
+                      S1.thread_elements()[0], S1.thread_elements()[1]}};
+        float top = -INFINITY;
+        #pragma unroll
+        for (int j = 0; j < 4; ++j) {{
+            const int key = kt + (j >> 1) * 8 + fn + (j & 1);
+            const int dist = q_abs - key;                       // backward distance
+            if (key >= k1 || dist < 0 || (SLIDING > 0 && dist >= SLIDING)) {{
+                s[j] = -INFINITY;                               // padding, causal, window cap
+            }} else {{
+                float bias = 0.0f;
+                if (dist < REL_EXTENT) {{
+                    const device uint16_t* p = relp + size_t(dist) * DREL;
+                    bias = float(bfloat16_t({bias}));
+                }}
+                s[j] = s[j] * {scale!r}f + bias;
+            }}
+            top = max(top, s[j]);
+        }}
+        top = max(top, simd_shuffle_xor(top, 1));               // the row's four lanes
+        top = max(top, simd_shuffle_xor(top, 8));
+        const float mn = max(m, top);
+        const float f = metal::fast::exp(m - mn);
+        float ps = 0.0f;
+        #pragma unroll
+        for (int j = 0; j < 4; ++j) {{
+            s[j] = metal::fast::exp(s[j] - mn);
+            ps += s[j];
+        }}
+        ps += simd_shuffle_xor(ps, 1);
+        ps += simd_shuffle_xor(ps, 8);
+        l = l * f + ps;
+        m = mn;
+        // fp32 weights times the values, as the stock kernel multiplies them: each thread
+        // widens its own two elements of a value tile on load
+        simdgroup_matrix<float, 8, 8> P0, P1;
+        P0.thread_elements()[0] = s[0];
+        P0.thread_elements()[1] = s[1];
+        P1.thread_elements()[0] = s[2];
+        P1.thread_elements()[1] = s[3];
+        const device bfloat16_t* vp = vb + int64_t(kt + fm) * vss + fn;
+        const threadgroup bfloat16_t* vs = vstage + int(fm) * DH + fn;
+        for (int dt = 0; dt < DT; ++dt) {{
+            Of[dt].thread_elements()[0] *= f;
+            Of[dt].thread_elements()[1] *= f;
+            simdgroup_matrix<float, 8, 8> V0, V1;
+            if (full) {{
+                V0.thread_elements()[0] = float(vp[dt * 8]);
+                V0.thread_elements()[1] = float(vp[dt * 8 + 1]);
+                V1.thread_elements()[0] = float(vp[8 * vss + dt * 8]);
+                V1.thread_elements()[1] = float(vp[8 * vss + dt * 8 + 1]);
+            }} else {{
+                V0.thread_elements()[0] = float(vs[dt * 8]);
+                V0.thread_elements()[1] = float(vs[dt * 8 + 1]);
+                V1.thread_elements()[0] = float(vs[8 * DH + dt * 8]);
+                V1.thread_elements()[1] = float(vs[8 * DH + dt * 8 + 1]);
+            }}
+            simdgroup_multiply_accumulate(Of[dt], P0, V0, Of[dt]);
+            simdgroup_multiply_accumulate(Of[dt], P1, V1, Of[dt]);
+        }}
+        if (!full) threadgroup_barrier(mem_flags::mem_threadgroup);
+    }}
+
+    const int64_t pbase = (int64_t(hk) * NB + blk) * RP;
+    device float* op = opart + (pbase + int(sg) * 8) * DH;
+    for (int dt = 0; dt < DT; ++dt) simdgroup_store(Of[dt], op + dt * 8, DH);
+    if (fn == 0) {{
+        mpart[pbase + row] = m;
+        lpart[pbase + row] = l;
+    }}
+"""
+
+
+def _packed_p2_source(nh: int, nkv: int, hd: int) -> str:
+    return f"""
+    constexpr int DH = {hd};
+    constexpr int NH = {nh};
+    constexpr int G = {nh // nkv};
+    const int d = int(thread_position_in_grid.x);
+    const int r = int(thread_position_in_grid.y);
+    const int hk = int(thread_position_in_grid.z);
+    const int NB = meta[0];
+    const int qi = r % QL;
+    const int hq = hk * G + r / QL;
+    const device float* mp = mpart + int64_t(hk) * NB * RP + r;
+    const device float* lp = lpart + int64_t(hk) * NB * RP + r;
+    const device float* op = opart + (int64_t(hk) * NB * RP + r) * DH + d;
+    // the sink: a key of zeros whose logit is the row's own — it only adds to the denominator
+    const float sk = float(sinks[size_t(qi) * NH + hq]);
+    float M = sk;
+    for (int j = 0; j < NB; ++j) M = max(M, mp[j * RP]);
+    float den = metal::fast::exp(sk - M);
+    float num = 0.0f;
+    for (int j = 0; j < NB; ++j) {{
+        const float w = metal::fast::exp(mp[j * RP] - M);
+        den += w * lp[j * RP];
+        num += w * op[int64_t(j) * RP * DH];
+    }}
+    // the attention's output in the stream's dtype, then the gate (mlx-vlm: out * sigmoid(gate))
+    const float a = float(bfloat16_t(num / den));
+    const size_t at = (size_t(qi) * NH + hq) * DH + d;
+    const float gv = float(gate[at]);
+    const float y = 1.0f / (1.0f + metal::precise::exp(metal::abs(gv)));
+    out[at] = bfloat16_t(a * ((gv < 0.0f) ? y : 1.0f - y));
+"""
+
+
+@lru_cache(maxsize=16)
+def _packed_kernels(nh: int, nkv: int, hd: int, drel: int, scale: float, rel_extent: int,
+                    sliding: int):
+    p1 = mx.fast.metal_kernel(
+        name=f"mlx_dspark_inkling_packed_attn_p1_{nh}_{nkv}_{hd}_{drel}_{rel_extent}_{sliding}",
+        input_names=["q", "k_buf", "v_buf", "r", "rel_t", "meta"],
+        output_names=["opart", "mpart", "lpart"],
+        ensure_row_contiguous=False,
+        source=_packed_p1_source(nh, nkv, hd, drel, scale, rel_extent, sliding),
+    )
+    p2 = mx.fast.metal_kernel(
+        name=f"mlx_dspark_inkling_packed_attn_p2_{nh}_{nkv}_{hd}",
+        input_names=["opart", "mpart", "lpart", "sinks", "gate", "meta"],
+        output_names=["out"],
+        source=_packed_p2_source(nh, nkv, hd),
+    )
+    return p1, p2
+
+
+@lru_cache(maxsize=8192)
+def _packed_meta(size: int) -> tuple[mx.array, int]:
+    """``([blocks, keys, keys per block], blocks)`` for a call over ``size`` keys."""
+    blocks = _PACKED_BLOCKS // 2 if size <= 256 else _PACKED_BLOCKS
+    per_block = math.ceil(size / blocks)
+    chunk = max(_PACKED_TILE, math.ceil(per_block / _PACKED_TILE) * _PACKED_TILE)   # whole tiles
+    nb = math.ceil(size / chunk)
+    meta = mx.array([nb, size, chunk], mx.int32)
+    mx.eval(meta)
+    return meta, nb
+
+
+def _packed_ok(attn, length: int) -> bool:
+    """Whether the packed kernel was written for this attention's shape: whole 8-wide tiles of
+    the head dimension (and two staged 16-key tiles of it inside a threadgroup's 32 KB), the
+    relative code in float4s, and the rows of a KV head (``length`` per query head) in one
+    threadgroup."""
+    d_rel = int(attn.rel_proj.shape[0])
+    return (attn.n_heads % attn.n_kv == 0 and attn.head_dim % 8 == 0 and attn.head_dim <= 256
+            and d_rel % 4 == 0 and length >= 1
+            and math.ceil(attn.n_heads // attn.n_kv * length / 8) * 32 <= 1024)
+
+
+def packed_attention(attn, q: mx.array, k: mx.array, v: mx.array, r: mx.array, rel_t: mx.array,
+                     sinks: mx.array, gate: mx.array) -> mx.array:
+    """The gated attention output ``[1, L, heads * head_dim]`` (what mlx-vlm hands to ``o_proj``)
+    for ``q [1, L, heads, head_dim]``, the cache's ``k`` / ``v [1, kv_heads, S, head_dim]`` in
+    temporal order WITHOUT the sink row (views are read where they lie), ``r [1, L, heads,
+    d_rel]``, ``rel_t [extent, d_rel]``, ``sinks [1, L, heads]`` and the gate projection
+    ``[1, L, heads * head_dim]`` — all bf16."""
+    _, length, nh, hd = q.shape
+    nkv, size = int(k.shape[1]), int(k.shape[2])
+    rows = (nh // nkv) * length
+    nsg = math.ceil(rows / 8)
+    rp = nsg * 8
+    p1, p2 = _packed_kernels(nh, nkv, hd, int(r.shape[-1]), float(hd) ** -0.5,
+                             int(attn.rel_extent), int(attn.sliding or 0))
+    meta, nb = _packed_meta(size)
+    template = [("QL", length), ("RP", rp)]
+    opart, mpart, lpart = p1(
+        inputs=[q, k, v, r, rel_t, meta],
+        template=template,
+        grid=(nkv * 32 * nsg, 1, nb),
+        threadgroup=(32 * nsg, 1, 1),
+        output_shapes=[(nkv, nb, rp, hd), (nkv, nb, rp), (nkv, nb, rp)],
+        output_dtypes=[mx.float32] * 3,
+    )
+    return p2(
+        inputs=[opart, mpart, lpart, sinks, gate, meta],
+        template=template,
+        grid=(hd, rows, nkv),
+        threadgroup=(hd, 1, 1),
+        output_shapes=[(1, length, nh * hd)],
+        output_dtypes=[mx.bfloat16],
+    )[0]
+
+
+def _packed_reference(attn, q, k, v, r, rel_t, sinks, gate) -> mx.array:
+    """What :func:`packed_attention` computes, in plain fp32 MLX ops with nothing rounded
+    inside: the additive mask with the sink's column (in the stream's dtype, as stock builds
+    it), fp32 scores, softmax and values, the output rounded once, then the gate. The
+    self-test's yardstick — the stock call itself rounds more (bf16 partials in MLX's two-pass
+    kernel from 1,024 keys, a bf16 matmul where no vector kernel covers the head width)."""
+    _, rows, nh, hd = q.shape
+    g = nh // k.shape[1]
+    zero = _zero_row(1, int(k.shape[1]), hd, k.dtype)
+    mask = fused_mask(r, rel_t, sinks, int(k.shape[2]), attn.sliding, attn.rel_extent)
+    kf = mx.repeat(mx.concatenate([k, zero], axis=2), g, axis=1).astype(mx.float32)
+    vf = mx.repeat(mx.concatenate([v, zero], axis=2), g, axis=1).astype(mx.float32)
+    scores = (q.transpose(0, 2, 1, 3).astype(mx.float32) @ kf.swapaxes(-1, -2)) * hd ** -0.5
+    out = mx.softmax(scores + mask.astype(mx.float32), axis=-1) @ vf
+    return _gated(out.astype(q.dtype).transpose(0, 2, 1, 3).reshape(1, rows, -1), gate)
+
+
+def set_packed(language_model, enabled: bool, min_keys: int | None = None) -> None:
+    """Switch the packed verify attention on or off for every attention module it was written
+    for (the A/B; the self-test decides at load). ``min_keys``: the key count, sink included,
+    it starts at (default ``PACKED_MIN_KEYS``)."""
+    start = int(PACKED_MIN_KEYS if min_keys is None else min_keys) if enabled else 0
+    for layer in language_model.model.layers:
+        attn = getattr(layer, "self_attn", None)
+        if attn is not None and hasattr(attn, "rel_proj"):
+            attn.__dict__[_PACKED] = start if _packed_ok(attn, PACKED_MAX_ROWS) else 0
+
+
+def packed_attn(language_model) -> bool:
+    """Whether the packed verify attention is on for this model."""
+    return any(layer.self_attn.__dict__.get(_PACKED) for layer in language_model.model.layers
+               if getattr(layer, "self_attn", None) is not None)
+
+
 # ---- the attention body -------------------------------------------------------------------------
 # mlx-vlm's Attention.__call__ (models/inkling2/language.py, Apache-2.0) for one batch row: the
 # projections, the KV cache update, the relative-position mask and the attention itself are the
@@ -864,7 +1227,7 @@ def _attn_call(base):
         cfg = self.config
         kv, conv = cache if cache is not None else (None, None)
         if not (_on(self) and kv is not None and conv is not None and conv_mask is None
-                and x.ndim == 3 and x.shape[0] == 1 and x.shape[1] <= MAX_ROWS
+                and x.ndim == 3 and x.shape[0] == 1 and x.shape[1] <= _rows(self)
                 and x.dtype == mx.bfloat16 and not self.training
                 and self.sharding_group is None and cfg.use_value_norm_no_gamma
                 and self.head_dim % 32 == 0 and cfg.d_rel <= 32 and _gpu()
@@ -899,9 +1262,17 @@ def _attn_call(base):
                     mx.maximum(positions / cfg.log_scaling_n_floor, 1))
                 q = (q.astype(mx.float32) * tau[..., None, None]).astype(x.dtype)
                 r = (r.astype(mx.float32) * tau[..., None, None]).astype(x.dtype)
-        q, k, v = (a.transpose(0, 2, 1, 3) for a in (q, k, v))
-        k, v = kv.update_and_fetch(k, v)
+        k, v = kv.update_and_fetch(k.transpose(0, 2, 1, 3), v.transpose(0, 2, 1, 3))
         sinks = self.sink_proj(x)
+        packed_from = self.__dict__.get(_PACKED)
+        if (packed_from and PACKED_MIN_ROWS <= length <= PACKED_MAX_ROWS
+                and k.shape[2] + 1 >= packed_from and is_sink_cache(kv)
+                and sinks.dtype == r.dtype == k.dtype == v.dtype == mx.bfloat16):
+            # a verify over a long window: all rows of a KV head share one read of K and V
+            # (NOT bit-identical to the stock call below — see packed_attention)
+            return self.o_proj(packed_attention(
+                self, q, k, v, r, _rel_transposed(self, r.dtype), sinks, self.gate_proj(x)))
+        q = q.transpose(0, 2, 1, 3)
         if is_sink_cache(kv):
             # inkling_cache: the rows are in temporal order and the sink's zero row sits in the
             # buffer behind them, so K and V are VIEWS — the same keys in the same order into
@@ -996,7 +1367,7 @@ def _model_call(base):
         ref = inputs if input_embeddings is None else input_embeddings
         visits = len(self.layer_indices)
         ok = (_on(self) and bool(cache) and len(cache) == visits and not self.training
-              and ref.shape[0] == 1 and ref.shape[1] <= MAX_ROWS and _gpu())
+              and ref.shape[0] == 1 and ref.shape[1] <= _rows(self) and _gpu())
         if ok and capture_layer_ids is not None:
             ok = (len(capture_layer_ids) == len(set(capture_layer_ids))
                   and all(type(i) is int and 0 <= i <= visits for i in capture_layer_ids))
@@ -1052,7 +1423,7 @@ def _moe_call(base):
 
     def __call__(self, x):
         if not (_on(self) and x.ndim == 3 and x.shape[0] == 1
-                and 1 <= x.shape[1] <= K.MOE_MAX_ROWS and x.dtype == mx.bfloat16
+                and 1 <= x.shape[1] <= max(K.MOE_MAX_ROWS, _rows(self)) and x.dtype == mx.bfloat16
                 and not self.training and getattr(self, "sharding_group", None) is None
                 and _gpu()):
             return base.__call__(self, x)
@@ -1123,7 +1494,29 @@ ALL_KINDS = EXACT_KINDS + LOOP_KINDS + ROW_EXACT_KINDS + ROUNDING_KINDS
 # attention's mask and sink column come from one launch (both bit-identical, both self-tested)
 KV_KIND = "kv"
 MASK_KIND = "mask"
+# ... whether the pieces also hold for calls wider than a drafter round (up to MAX_ROWS: a lookup
+# round's long copy draft), each against the stock forward at that width
+WIDE_KIND = "wide"
+# ... and whether a verify over a long window takes the packed attention (within rounding of the
+# stock call; needs the in-place caches)
+PACKED_KIND = "vattn"
+PACKED_TOL = 2e-3          # vs the fp32 arithmetic (measured: 1e-7 to 3e-4)
+PACKED_TOL_STOCK = 2e-2    # vs the stock module, which rounds more inside (measured: up to 4e-3)
 _KV = "_mlx_dspark_kv_caches"
+
+
+def set_rows(language_model, rows: int) -> None:
+    """The positions per call the fused pieces accept: ``VECTOR_ROWS`` (a drafter round) or
+    ``MAX_ROWS`` (a lookup round too; the self-test decides at load, this is the A/B)."""
+    rows = max(1, min(int(rows), MAX_ROWS))
+    for module, _ in _fused_modules(language_model):
+        module.__dict__[_ROWS] = rows
+    language_model.__dict__[_ROWS] = rows
+
+
+def rows_limit(language_model) -> int:
+    """The widest call the fused pieces take on this model."""
+    return language_model.__dict__.get(_ROWS, VECTOR_ROWS)
 
 
 def kv_caches(language_model) -> bool:
@@ -1176,7 +1569,7 @@ def enabled_kinds(language_model) -> tuple[str, ...]:
     return tuple(sorted({kind for module, kind in _fused_modules(language_model) if _on(module)}))
 
 
-def _moe_selftest(language_model, rand) -> bool:
+def _moe_selftest(language_model, rand, wide: bool = False) -> bool:
     """The fused MoE against the stock module ROW BY ROW (what a decode step computes for each
     token), on one layer per expert format, with rows repeated so that runs of 1, 2, 3, 4 and
     more routes per expert all occur — each run length is its own kernel path. The first call
@@ -1197,7 +1590,10 @@ def _moe_selftest(language_model, rand) -> bool:
         stock = type(moe).__mro__[1].__call__
         hidden = int(moe.gate_weight.shape[1])
         a, b, c = (rand((1, 1, hidden), mx.bfloat16) for _ in range(3))
-        for rows in ([a, a, a, a, a, b, b, c], [a, b, b, b, c], [c]):
+        plans = [[a, a, a, a, a, b, b, c], [a, b, b, b, c], [c]]
+        if wide:        # a lookup round: more rows than one routing threadgroup, runs past a tile
+            plans = [[a] * 6 + [b] * 9 + [c] * (MAX_ROWS - 15)]
+        for rows in plans:
             ref = mx.concatenate([stock(moe, row) for row in rows], axis=1)
             if not bool(mx.array_equal(fused_moe(moe, mx.concatenate(rows, axis=1)), ref)):
                 return False
@@ -1230,7 +1626,11 @@ def selftest(language_model, rows: int = 2, seed: int = 0) -> dict[str, bool]:
     ``kv`` and ``mask`` are not module kinds: ``kv`` says whether the in-place KV caches
     (``inkling_cache``) reproduce the stock caches bit for bit here, and :func:`make_cache` hands
     them out only then; ``mask`` whether the one-launch mask + sink column equals mlx-vlm's
-    kernel and concatenate (:func:`set_mask`).
+    kernel and concatenate (:func:`set_mask`); ``vattn`` whether the packed verify attention
+    (:func:`packed_attention`) stays within rounding of the stock call and leaks nothing from a
+    later row into an earlier one (:func:`set_packed`); ``wide`` whether all of it also holds
+    for calls of up to ``MAX_ROWS`` positions — a lookup round — which then take the fused
+    pieces too (:func:`set_rows`; otherwise they stop at ``VECTOR_ROWS``, a drafter round).
     Leaves the model with every passing kind on. Returns ``{kind: passed}``."""
     lm = language_model
     model = lm.model
@@ -1284,7 +1684,7 @@ def selftest(language_model, rows: int = 2, seed: int = 0) -> dict[str, bool]:
         return (all(bool(mx.array_equal(u, v)) for u, v in zip(a, b)) and len(sa) == len(sb)
                 and all(bool(mx.array_equal(u, v)) for u, v in zip(sa, sb)))
 
-    def kv_run(index, window=5):
+    def kv_run(index, window=5, plan=None):
         """The in-place caches (``inkling_cache``) against the stock ones on one layer, through
         the calls a generation makes: decode steps, a prefill-sized chunk, and verifies inside
         mlx-vlm's speculative transaction committed in part, in full and at one row — on a
@@ -1296,8 +1696,8 @@ def selftest(language_model, rows: int = 2, seed: int = 0) -> dict[str, bool]:
         from .inkling_cache import convert
 
         # (rows, rows kept): kept None = an ordinary call, else a verify committed there
-        plan = [(1, None), (1, None), (4, 2), (1, None), (3, 3), (4, 1), (1, None), (6, None),
-                (2, 1), (1, None), (5, 4), (3, 1), (1, None), (1, None)]
+        plan = plan or [(1, None), (1, None), (4, 2), (1, None), (3, 3), (4, 1), (1, None),
+                        (6, None), (2, 1), (1, None), (5, 4), (3, 1), (1, None), (1, None)]
         xs = [rand((1, n, hidden), mx.bfloat16) for n, _ in plan]
         blocks = [rand((1, 1, hidden), mx.bfloat16)] if layers[index].attention_input is not None else []
 
@@ -1332,9 +1732,10 @@ def selftest(language_model, rows: int = 2, seed: int = 0) -> dict[str, bool]:
                    for arm in ((True, True), (True, False))
                    for a, b in zip(run(*arm), ref))
 
-    def model_run():
+    def model_run(rows=rows, first=True):
         taps = [1, len(visits)]
-        ids = [mx.array([[3]]), mx.array([[5, 7][:rows] + [11] * max(0, rows - 2)])]
+        ids = ([mx.array([[3]])] if first else []) + [
+            mx.array([[5, 7][:rows] + [11 + i for i in range(max(0, rows - 2))]])]
         runs = []
         for on in (False, True):
             set_enabled(lm, True)
@@ -1379,12 +1780,105 @@ def selftest(language_model, rows: int = 2, seed: int = 0) -> dict[str, bool]:
                     return False
         return True
 
+    def packed_run(index):
+        """The packed verify attention on this layer's shape and weights, the widest verify past
+        the sliding cap / the relative-position extent (several key blocks, a partial tile, the
+        window cap) and a short window:
+        the kernel against the same arithmetic in fp32 ops, closely (the stock call rounds more
+        inside, so it cannot be the yardstick for the numerics); the attention module with the
+        kernel against the stock module on the in-place caches, loosely — an upstream change
+        of the attention is far outside it; and causality, which no tolerance covers: with
+        another token in the LAST row, every earlier row's output must be the same bits."""
+        from .inkling_cache import convert
+
+        attn = layers[index].self_attn
+        if not _packed_ok(attn, PACKED_MAX_ROWS):
+            return False
+        edge = attn.sliding or attn.rel_extent
+        d_rel = int(attn.rel_proj.shape[0])
+        rel_t = _rel_transposed(attn, mx.bfloat16)
+        for n, keys in ((PACKED_MAX_ROWS, edge + 6), (VECTOR_ROWS, edge + 6), (PACKED_MIN_ROWS, 12)):
+            size = min(keys, attn.sliding - 1) + n if attn.sliding else keys + n
+            args = (rand((1, n, attn.n_heads, attn.head_dim), mx.bfloat16),
+                    rand((1, attn.n_kv, size, attn.head_dim), mx.bfloat16),
+                    rand((1, attn.n_kv, size, attn.head_dim), mx.bfloat16),
+                    rand((1, n, attn.n_heads, d_rel), mx.bfloat16), rel_t,
+                    rand((1, n, attn.n_heads), mx.bfloat16),
+                    rand((1, n, attn.n_heads * attn.head_dim), mx.bfloat16))
+            if not _rel_l2(packed_attention(attn, *args),
+                           _packed_reference(attn, *args)) < PACKED_TOL:
+                return False
+
+        def run(prefix, x, start):
+            entry = lm.make_cache()[visits.index(index)]
+            convert([entry])
+            if not is_sink_cache(entry.caches[0]):
+                raise RuntimeError("no in-place cache for this layer's KV cache")
+            attn.__dict__[_PACKED] = 0
+            attn(prefix, cache=entry)            # more rows than a verify: the stock body
+            attn.__dict__[_PACKED] = start
+            out = attn(x, cache=entry)
+            mx.eval(out)
+            return out
+
+        set_enabled(lm, False)
+        set_enabled(lm, True, ("attn",))
+        held = attn.__dict__.get(_ROWS)
+        attn.__dict__[_ROWS] = MAX_ROWS
+        try:
+            # a drafter round over a long window; the widest call it takes over a short one
+            for n, keys in ((VECTOR_ROWS, edge + 6), (PACKED_MAX_ROWS, MAX_ROWS + 4)):
+                prefix = rand((1, keys, hidden), mx.bfloat16)
+                x = rand((1, n, hidden), mx.bfloat16)
+                ref, got = run(prefix, x, 0), run(prefix, x, 1)
+                if got.shape != ref.shape or not _rel_l2(got, ref) < PACKED_TOL_STOCK:
+                    return False
+                other = mx.concatenate([x[:, :-1], rand((1, 1, hidden), mx.bfloat16)], axis=1)
+                if not bool(mx.array_equal(run(prefix, other, 1)[:, :-1], got[:, :-1])):
+                    return False
+            return True
+        finally:
+            attn.__dict__[_PACKED] = 0
+            attn.__dict__[_ROWS] = held if held is not None else VECTOR_ROWS
+
+    def wide_run():
+        """Calls wider than a drafter round (a lookup round: up to ``MAX_ROWS`` positions), where
+        MLX's attention leaves its vector kernels and its matrix products may pick other
+        kernels: every exact piece against the stock forward at that width (states included),
+        the in-place caches through a wide verify committed in part and in full, the experts
+        row by row, and the layer-visit loop around them."""
+        set_rows(lm, MAX_ROWS)
+        # the exact kinds that passed, together (a mismatch switches the wide calls off whichever
+        # piece it is, so there is nothing to tell apart here)
+        exact = tuple(kind for kind in EXACT_KINDS if result.get(kind))
+        if exact:
+            if not all(layer_run(i, exact, rows=MAX_ROWS) for i in probes):
+                return False
+            if core is not None and not layer_run(core, exact, rand((1, MAX_ROWS, 4, hidden)),
+                                                  rows=MAX_ROWS):
+                return False
+        if result.get(KV_KIND) and not all(
+                kv_run(i, plan=[(1, None), (MAX_ROWS, 9), (1, None), (MAX_ROWS - 1, MAX_ROWS - 1),
+                                (1, None)]) for i in probes):
+            return False
+        if result.get("moe"):
+            set_enabled(lm, False)
+            if not _moe_selftest(lm, rand, wide=True):
+                return False
+        if result.get("model"):
+            set_enabled(lm, True)
+            if not model_run(rows=MAX_ROWS, first=False):
+                return False
+        return True
+
     sliding = next((i for i, layer in enumerate(layers) if layer.is_sliding and i > 0), None)
     globl = next((i for i, layer in enumerate(layers) if not layer.is_sliding), None)
     core = next((i for i, layer in enumerate(layers) if getattr(layer, "controllers", None)), None)
     probes = [i for i in (sliding, globl) if i is not None]
     result: dict[str, bool] = {}
     lm.__dict__[_OFF] = ()
+    set_packed(lm, False)               # the exact checks compare the stock attention call
+    set_rows(lm, VECTOR_ROWS)
     installed = {kind for _, kind in _fused_modules(lm)}
     if "attn" in installed:
         # first, so the attention and cache checks below run on the mask they will ship with
@@ -1412,6 +1906,12 @@ def selftest(language_model, rows: int = 2, seed: int = 0) -> dict[str, bool]:
         except Exception:  # noqa: BLE001 — another mlx-vlm cache layout: keep the stock caches
             ok = False
         result[KV_KIND] = ok
+        # the packed verify attention reads the in-place caches' views: only with them
+        try:
+            ok = ok and result.get("attn", False) and all(packed_run(i) for i in probes)
+        except Exception:  # noqa: BLE001 — the kernel does not build here: keep the stock call
+            ok = False
+        result[PACKED_KIND] = ok
     if "moe" in installed:
         # a decode step through the whole layer (bit for bit, states included), then the
         # multi-row call against single-row stock calls
@@ -1446,7 +1946,7 @@ def selftest(language_model, rows: int = 2, seed: int = 0) -> dict[str, bool]:
         ok = False
     result["ctrl"] = ok
     lm.__dict__[_OFF] = tuple(kind for kind, passed in result.items()
-                              if not passed and kind not in (KV_KIND, MASK_KIND))
+                              if not passed and kind not in (KV_KIND, MASK_KIND, PACKED_KIND))
     lm.__dict__[_KV] = bool(result.get(KV_KIND))
     if "model" in installed:
         # the loop last, around the pieces that passed: whole forwards (a decode step, then a
@@ -1458,5 +1958,13 @@ def selftest(language_model, rows: int = 2, seed: int = 0) -> dict[str, bool]:
         result["model"] = ok
         if not ok:
             lm.__dict__[_OFF] += ("model",)
+    # last: the wider calls, with every verdict above in force
+    try:
+        ok = bool(probes) and wide_run()
+    except Exception:  # noqa: BLE001 — a kernel this GPU cannot launch at that width
+        ok = False
+    result[WIDE_KIND] = ok
+    set_rows(lm, MAX_ROWS if ok else VECTOR_ROWS)
+    set_packed(lm, bool(result.get(PACKED_KIND)))
     set_enabled(lm, True)
     return result

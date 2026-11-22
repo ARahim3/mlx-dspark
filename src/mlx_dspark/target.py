@@ -191,14 +191,29 @@ class Target:
                 if os.environ.get("MLX_DSPARK_INKLING_MASK", "1").lower() in ("0", "false"):
                     inkling_fused.set_mask(model.language_model, False)
                     self.inkling_fused[inkling_fused.MASK_KIND] = False
+                # A verify of 3 to 12 rows over 1,024+ keys reads K and V once per KV head instead
+                # of once per query head and row (inkling_fused.packed_attention). Within
+                # rounding of the stock call, not bit-identical: validated by the token-forcing
+                # gate at depth. MLX_DSPARK_INKLING_VERIFY_ATTN=0 is the A/B.
+                if (os.environ.get("MLX_DSPARK_INKLING_VERIFY_ATTN", "1").lower()
+                        in ("0", "false") or not self.inkling_fused.get(inkling_fused.KV_KIND)):
+                    inkling_fused.set_packed(model.language_model, False)
+                    self.inkling_fused[inkling_fused.PACKED_KIND] = False
+                # Calls wider than a drafter round (9 to 33 positions: a lookup round's copy
+                # draft) take the fused pieces too once the self-test matched them to the stock
+                # forward at that width; MLX_DSPARK_INKLING_WIDE_ROWS=0 keeps them at 8 (the A/B).
+                if os.environ.get("MLX_DSPARK_INKLING_WIDE_ROWS", "1").lower() in ("0", "false"):
+                    inkling_fused.set_rows(model.language_model, inkling_fused.VECTOR_ROWS)
+                    self.inkling_fused[inkling_fused.WIDE_KIND] = False
                 # a curve is priced by the forward that measured it: tag the fused set
                 on = inkling_fused.enabled_kinds(model.language_model)
                 if on:
                     missing = sorted(set(inkling_fused.ALL_KINDS) - set(on))
-                    for name in (inkling_fused.KV_KIND, inkling_fused.MASK_KIND):
+                    for name in (inkling_fused.KV_KIND, inkling_fused.MASK_KIND,
+                                 inkling_fused.PACKED_KIND, inkling_fused.WIDE_KIND):
                         if not self.inkling_fused.get(name):
                             missing.append(name)
-                    self.calibration_tag = "|ikf3" + ("-" + "-".join(missing) if missing else "")
+                    self.calibration_tag = "|ikf5" + ("-" + "-".join(missing) if missing else "")
             if self.target_bits:
                 self.calibration_tag += f"|tb{self.target_bits}"
         elif target_bits:

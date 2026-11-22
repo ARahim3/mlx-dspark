@@ -446,6 +446,70 @@ def test_head_f32_matches_fp32_and_is_row_invariant():
     assert bool(mx.array_equal(got, alone).item())
 
 
+def test_fast_head_serves_wide_calls_and_switches_off(monkeypatch):
+    """The installed head takes calls of up to HEAD_WIDE_ROWS rows and defers to the stock
+    promotion past that, or when switched off (the A/B; what a stock judge runs)."""
+    import types
+
+    from mlx_dspark import inkling_kernels as K
+
+    if not mx.metal.is_available():
+        pytest.skip("custom Metal kernels")
+    calls = []
+    monkeypatch.setattr(K, "head_f32", lambda h, w: calls.append(h.shape[0]) or (
+        h.astype(mx.float32) @ w.astype(mx.float32).T))
+
+    class LM:
+        training = False
+
+        def __init__(self):
+            self.lm_head = nn.Linear(256, 40, bias=False)
+            self.lm_head.weight = self.lm_head.weight.astype(mx.bfloat16)
+            self.model = types.SimpleNamespace(embed_norm=types.SimpleNamespace(
+                weight=mx.zeros((256,), mx.bfloat16)))
+            self.config = types.SimpleNamespace(final_logit_softcapping=None,
+                                                unpadded_vocab_size=36)
+
+        def _logits_from_norm(self, h):
+            calls.append("stock")
+            return (h.astype(mx.float32) @ self.lm_head.weight.astype(mx.float32).T)[..., :36]
+
+    lm = LM()
+    assert K.install_fast_head(lm)
+    for rows, want in ((1, [1]), (K.HEAD_MAX_ROWS, [K.HEAD_MAX_ROWS]), (17, [12, 5]),
+                       (K.HEAD_WIDE_ROWS, [12, 12, 9]), (K.HEAD_WIDE_ROWS + 1, ["stock"])):
+        calls.clear()
+        out = lm._logits_from_norm(mx.zeros((1, rows, 256), mx.bfloat16))
+        assert out.shape == (1, rows, 36) and calls == want, rows
+    K.set_fast_head(lm, False)
+    calls.clear()
+    lm._logits_from_norm(mx.zeros((1, 4, 256), mx.bfloat16))
+    assert calls == ["stock"]
+
+
+@metal
+def test_wide_head_calls_go_in_launches_and_stay_row_invariant():
+    """A lookup round's verify is wider than one head launch carries: the rows go in launches of
+    HEAD_CHUNK_ROWS, each row still its one-row result."""
+    from mlx_dspark.inkling_kernels import head_f32, head_q8_f32, head_rows
+
+    mx.random.seed(5)
+    w = (mx.random.normal((300, 512)) * 0.05).astype(mx.bfloat16)
+    h = mx.random.normal((33, 512)).astype(mx.bfloat16)
+    got = head_rows(head_f32, h, w)
+    assert got.shape == (33, 300) and got.dtype == mx.float32
+    assert bool(mx.array_equal(got, mx.concatenate([head_f32(h[i:i + 1], w) for i in range(33)])))
+    assert bool(mx.array_equal(head_rows(head_f32, h[:16], w), head_f32(h[:16], w)))
+    lin = nn.Linear(512, 300, bias=False)
+    lin.weight = w
+    q = nn.QuantizedLinear.from_linear(lin, group_size=64, bits=8)
+    q.scales, q.biases = q.scales.astype(mx.float32), q.biases.astype(mx.float32)
+    got = head_rows(head_q8_f32, h, q)
+    alone = mx.concatenate([head_q8_f32(h[i:i + 1], q) for i in range(33)])
+    assert got.shape == (33, 300) and bool(mx.array_equal(got, alone))
+    assert bool(mx.array_equal(head_rows(head_q8_f32, h[:16], q), alone[:16]))      # one launch
+
+
 @metal
 def test_head_q8_f32_matches_the_quantized_matmul_and_is_row_invariant():
     from mlx_dspark.inkling_kernels import head_q8_f32, head_q8_ok
