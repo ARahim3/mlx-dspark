@@ -21,7 +21,7 @@ Every route also answers without the `/v1` prefix (`/chat/completions`, `/messag
 
 Generation routes answer `503` while no model is loaded (`--no-model`, or during a swap). A prompt longer than the context window is refused with *"prompt is too long"*, the wording agent clients recognize and compact on. Unknown request fields are ignored, never rejected.
 
-Accepted request parameters: `temperature`, `top_p`, `top_k`, `max_tokens`, `stop` / `stop_sequences`, `seed`, `presence_penalty`, `frequency_penalty`, `logprobs`, `top_logprobs`, `tools`, `enable_thinking`, `thinking`, `reasoning_effort`. Unset sampling values fall back to `--default-temperature` / `--default-top-p` / `--default-top-k`, then to the model's own `generation_config`. `max_tokens` defaults to `--default-max-tokens` (2048) and is capped at `--max-tokens-cap` (32768).
+Accepted request parameters: `temperature`, `top_p`, `top_k`, `max_tokens`, `stop` / `stop_sequences`, `seed`, `presence_penalty`, `frequency_penalty`, `logprobs`, `top_logprobs`, `tools`, `enable_thinking`, `thinking`, `reasoning_effort` (`none` turns thinking off; `minimal`, `low`, `medium`, `high` and `xhigh` map to the nearest level the model's template has; the Responses API's `reasoning.effort` is read the same way). Unset sampling values fall back to `--default-temperature` / `--default-top-p` / `--default-top-k`, then to the model's own `generation_config`. `max_tokens` defaults to `--default-max-tokens` (2048) and is capped at `--max-tokens-cap` (32768).
 
 ### The `x_mlx_dspark` block
 

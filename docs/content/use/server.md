@@ -103,7 +103,7 @@ The model name in a request is the last part of the repo id (`Qwen3-8B-8bit` for
 - **Sampling:** `temperature`, `top_p`, `top_k`, `seed`, `max_tokens`, `stop`. Speculative sampling stays lossless: the output is an exact sample from the model at that temperature.
 - **Penalties and logprobs:** `presence_penalty`, `frequency_penalty`, `logprobs`, `top_logprobs`.
 - **Tools:** OpenAI `tools` / `tool_calls`, Anthropic `tool_use` / `tool_result`, and the Responses API's flat tool shape. Each is translated into whatever the loaded model's chat template expects, including multi-turn tool history. Six native tool-call syntaxes are parsed back: Hermes JSON (Qwen3), Gemma-4's, the XML `<function=…>` form (Ornith and others), Muse's ATEM calls, LFM2's Python-style call list, and MiniCPM5's `<function name="…">`.
-- **Thinking:** `enable_thinking` (per request), Anthropic's `thinking: {"type": "disabled"}`, and `reasoning_effort` where the template supports it.
+- **Thinking:** `enable_thinking` (per request), Anthropic's `thinking: {"type": "disabled"}`, and `reasoning_effort` where the template supports it (`low`, `medium`, `high`, `xhigh`, mapped to the nearest level the model has; `minimal` likewise, and `none` turns thinking off). The Responses API's `reasoning.effort` is read the same way. On a model whose template has effort levels but no on/off switch (Inkling 2), turning thinking off selects its lowest level, `none`.
 
 When no temperature is sent, the model's own `generation_config` defaults apply. Many community conversions ship none, in which case omitted means greedy; set `--default-temperature` to change that.
 

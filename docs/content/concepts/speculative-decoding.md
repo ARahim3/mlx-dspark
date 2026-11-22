@@ -77,6 +77,8 @@ Inside DSpark mode, lookup also runs as a **hybrid**. When the current text matc
 
 A free draft still has to be verified, and on a mixture of experts every extra verified row pulls in a fresh set of experts. So lookup drafts are **off by default** for the pairs where that measured as a net loss (every MoE, and the 4-bit 27B hybrids). `--lookup-drafts` / `--no-lookup-drafts` overrides the default either way.
 
+Inkling-2-Mini is the MoE where turning them on can pay: its verify passes run mlx-dspark's own forward up to 33 rows, so a verbatim rewrite (fixing typos in a document) runs at 141 tok/s with `--lookup-drafts`, against 74 for the drafter alone and 36 plain. They stay off by default there because the drafter already predicts copied text well, and an edit that reorders or inserts lines loses 5–9% with them on.
+
 ## DSpark or DFlash?
 
 It depends on the model and on the MLX version, because the answer comes from two curves: how many tokens a drafter gets accepted, and how fast verification cost grows with width on your chip. The objective isn't acceptance, it's **acceptance per unit of verify width**:

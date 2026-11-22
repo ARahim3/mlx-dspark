@@ -45,6 +45,12 @@ description: The environment variables the engine reads, and where it keeps thin
 `MLX_DSPARK_INKLING_MASK=0`
 : Inkling 2 only: build the attention's relative-position mask with mlx-vlm's stock kernel and a concatenate for the sink's column, instead of mlx-dspark's single kernel that writes both. Same values bit for bit; slower, and more so the longer the conversation. For comparison runs only.
 
+`MLX_DSPARK_INKLING_VERIFY_ATTN=0`
+: Inkling 2 only: run every verify pass's attention through MLX's own attention kernel instead of mlx-dspark's, which reads the cached keys and values once per key/value head for all the rows of the pass (MLX's reads them once per row and query head). mlx-dspark's is used for verify passes of 3 to 12 rows once a layer sees 1,024 keys, which is where it is faster; a decode step always uses MLX's. The two agree within floating-point rounding, not bit for bit. Slower on long conversations. For comparison runs only.
+
+`MLX_DSPARK_INKLING_WIDE_ROWS=0`
+: Inkling 2 only: keep mlx-dspark's fused forward to verify passes of at most 8 rows (a drafter round), so a wider one — a lookup round checking up to 32 copied tokens at once — runs mlx-vlm's stock code as before. Slower for lookup drafts (`--lookup-drafts`); nothing else changes. For comparison runs only.
+
 `MLX_DSPARK_INKLING_FOLD_BITS`
 : Inkling 2 only: bits of the drafter's Markov correction matrix, which one GPU kernel scans per drafted token (default 4; 8 is the other choice, and 0 keeps the reference's bf16 matrix with its full-vocabulary bias, softcap and argmax). Drafting only — the model still checks every token. Acceptance is the same at 4, 8 and bf16; each draft round is about 1 ms cheaper than the reference path.
 

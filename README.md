@@ -234,7 +234,8 @@ memory pressure, context-window RAM notes), `GET /metrics`, and `GET /machine` (
 bandwidth, the loaded model's bytes per token, the plain-decode ceiling and a verdict). It supports
 `temperature`, `top_p`, `top_k`, `max_tokens`, `stop`, `seed`, `presence_penalty` / `frequency_penalty`,
 `logprobs` / `top_logprobs`, **tool calling** (`tools` / `tool_calls`), a per-request thinking toggle
-(`enable_thinking`), and per-request `reasoning_effort` on models whose template supports it (Qwen3.8-class;
+(`enable_thinking`), and per-request `reasoning_effort` on models whose template supports it (Qwen3.8-class and
+Inkling 2; `none` turns thinking off, any other level maps to the nearest one the model has;
 `GET /health` reports `supports_reasoning_effort`). Each response carries an `x_mlx_dspark` block — accept length, decode and
 end-to-end tok/s, time to first token, prompt tokens served from the prefix cache, and the decode rate as a multiple of this
 Mac's single-stream roofline — so the spec-decode gain is visible and "why was this turn fast/slow" has an answer. **Continuous batching** (`--max-batch N`) serves concurrent requests in one
@@ -1336,7 +1337,9 @@ are bundled.
     expert's weights once for all the rows routed to it; and its attention reads the cached keys
     and values in place where the stock code copies them at every layer (and again to roll a
     verify pass back — those copies alone are 7% of a decode step at a 2,600-token prompt and
-    12% at 8,000). Plain decoding is 39% faster and a verify pass far cheaper (the same drafter
+    12% at 8,000), and on long prompts a verify pass reads them once per key/value head instead
+    of once per row and query head (5% of a 4-row verify pass at 2,600 tokens, 8% at 16,000).
+    Plain decoding is 39% faster and a verify pass far cheaper (the same drafter
     on the stock forward reaches 28.9 tok/s). **The baseline column in this row is mlx-dspark's
     own faster plain decode**, which is why the ratio there reads 1.37×. It is the first **looped mixture-of-experts** target: 24 layers
     whose middle 12 run three times per token, 8 of 128 experts, the experts in NVFP4 / MXFP8 as
@@ -1345,7 +1348,10 @@ are bundled.
     to the target itself, and reads its own 8-bit copy of the output head. **Needs mlx-vlm from
     git** until a release ships the looped `inkling2` model (0.8.0 has the plain one only).
     Measured 2026-11-22 on mlx 0.32.4, lookup drafts off (this pair's shipped default, like
-    every MoE row). The derived cap is 3; cap 2 is within 2% (46.8 tok/s, chat 1.15×). Lossless
+    every MoE row; on a verbatim rewrite `--lookup-drafts` is worth turning on — a pass that
+    checks 32 copied tokens costs 175 ms on mlx-dspark's forward, and fixing typos in a document
+    runs at 141 tok/s against 74 for the drafter alone — but an edit that reorders or inserts
+    loses 5–9% with them). The derived cap is 3; cap 2 is within 2% (46.8 tok/s, chat 1.15×). Lossless
     by token forcing against the stock forward (0.98% near-tie disagreements vs stock greedy's
     own 1.37%, none large).
     **Optional `--target-bits 8`** quantizes at load what the checkpoint keeps in bf16 (the
