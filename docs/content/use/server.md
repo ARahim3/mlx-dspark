@@ -36,7 +36,7 @@ The speedup is transparent. Clients don't need to know speculation is happening,
 : Cap the prompt length below the model's own maximum, mainly to keep the KV cache inside your RAM. Over-long requests get the "prompt is too long" error that agent clients compact on.
 
 `--max-batch N`
-: Serve up to N concurrent requests in one batched forward pass, for several agents or users at once. See [Batching](/concepts/batching/).
+: Serve up to N concurrent requests in one batched forward pass, for several agents or users at once (up to 8 on Inkling-2-Mini, where a request that is alone keeps its drafter). See [Batching](/concepts/batching/).
 
 `--host 0.0.0.0 --api-key KEY`
 : Listen on your network. With a key, every route except `/health` requires it.

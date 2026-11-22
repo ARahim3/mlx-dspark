@@ -36,6 +36,7 @@ Every response carries this non-standard block. Clients ignore it; it's how you 
 | `decode_tokens_per_sec` | Generation only. |
 | `target_forwards` | Passes through the model. |
 | `lookup_rounds` | Rounds whose draft came free from lookup (when any). |
+| `batched_tokens` | Of this request's tokens, how many were decoded in a pass shared with other requests (`--max-batch`; when any). The request's own rate drops there while the server's total rises. |
 | `prompt_tokens`, `cached_tokens`, `completion_tokens`, `context_tokens` | Token accounting; `cached_tokens` is what the prefix cache served. |
 | `prefill_seconds`, `decode_seconds`, `ttft_seconds` | Where the time went. |
 | `prefill_tokens_per_sec` | Prompt-reading speed (when at least 16 new tokens were read). |
@@ -49,7 +50,7 @@ The OpenAI endpoints also fill the standard `usage.prompt_tokens_details.cached_
 | Route | Returns |
 |---|---|
 | `GET /health` | Always open, even with `--api-key` and mid-swap. `status` is `ok`, `loading` or `no_model`. When ready: model, mode, target and drafter, `max_draft`, `lookup_drafts`, `tree` (`setting` and the resolved `nodes`: null = chains, 0 = the chain's width), `confidence_threshold`, `context_window`, `kv_bits`, `target_bits`, the kernel and prefill switches (`small_m`, `multirow_attn`, `sdpa_split`, `cpu_split`, `drafter_window`), `warmup`, `memory_guard`, `max_output_tokens`, `supports_reasoning_effort`, `thinking_default`, `reasoning_effort`, and a `warnings` list (memory pressure, context-window RAM). While loading: `phase` (`loading` or `warming_up`) and `download` progress. |
-| `GET /metrics` | Aggregate counters, allocator memory, macOS memory pressure and swap, the last roofline verdict, memory-guard state. |
+| `GET /metrics` | Aggregate counters, allocator memory, macOS memory pressure and swap, the last roofline verdict, memory-guard state. With `--max-batch`, a `batching` block: requests served batched and serially, the largest batch seen, and on Inkling-2-Mini the shared passes run and the rows they carried (`batched_steps`, `batched_step_rows`). |
 | `GET /machine` | Chip, measured memory bandwidth, the loaded model's bytes per token and single-stream ceiling, and a verdict. Answers without a model too. |
 | `GET /calibration` | This Mac's measured cost curves for the loaded pair. |
 | `GET /events` | Server-sent events: one event per speculation round (drafted, accepted, committed, cap, timing) and prefill progress events. |

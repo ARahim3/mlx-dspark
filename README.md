@@ -968,6 +968,36 @@ different length per row needs a masked batched re-run that does not exist yet. 
 target batches its baseline and takes the serial path for dspark; nothing silently degrades.
 Gemma-4 (mlx-vlm, rotating cache) still falls back to serialized entirely.
 
+### Inkling-2-Mini: the drafter for one request, a shared pass for several
+
+`--max-batch N` (up to 8) on Inkling-2-Mini batches on mlx-dspark's own forward for that model,
+and lets the two ways of getting more out of a weight read take turns. **A request that is alone
+runs exactly as without the flag** — the drafter, at the same speed (within 1%, measured). **Two
+or more decode together**, one token each per pass, sampled or greedy. A request running alone
+under the drafter hands over at its next round when another arrives and gets the drafter back
+when it is alone again, so an arrival never waits for the request ahead of it: a short request
+landing in the middle of a long one saw its first token after 0.44 s instead of 8–11 s.
+
+Each request keeps its own cache — prompts of different lengths need no padding, the prefix
+cache serves every request as usual — and a long prompt arriving mid-session is read a chunk at
+a time, sharing the time evenly with the requests already streaming.
+
+Total tok/s, 8 varied prompts, 96 tokens each, M4 Pro, mlx 0.32.4 (paired in one process):
+
+| requests at once | total tok/s | each request | vs one, plain (36.5) | vs one, with the drafter (48.6) |
+|---|---|---|---|---|
+| 2 | 58.8 | 29.4 | 1.61× | 1.21× |
+| 4 | 86.7 | 21.7 | 2.37× | 1.78× |
+| 8 | **124.6** | 15.6 | **3.41×** | **2.57×** |
+
+With 2,600-token prompts: 55.7 / 82.5 / 115.8 tok/s at 2 / 4 / 8 (the drafter alone: 55.2 on
+that content, so two requests is where batching draws level with it). A mixture of experts, and
+it still batches well: two thirds of the bytes Inkling reads per token are its dense attention
+and output head, which every row shares. Requests with penalties, logprobs or a seed keep the
+one-at-a-time path. Batched output passes the same token-forcing check as speculative output
+(1.04% near-tie disagreements at 2 and 4 requests against 0.91% for one request at a time, none
+large).
+
 ## Prefix caching
 
 The server keeps the target KV cache (and, for DSpark, the drafter context) from the previous turn and
