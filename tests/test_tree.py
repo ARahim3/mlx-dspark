@@ -484,7 +484,18 @@ def test_multirow_tree_kernel_matches_masked_attention(shape):
     scale = q.shape[-1] ** -0.5
     ref = _ORIG_SDPA(q.astype(mx.float32), k.astype(mx.float32), v.astype(mx.float32),
                      scale=scale, mask=mask)
-    out = multirow_sdpa(q, k, v, scale=scale, causal=False, tree_anc=bits)
+    try:
+        out = multirow_sdpa(q, k, v, scale=scale, causal=False, tree_anc=bits)
+        mx.eval(out)
+    except ValueError as e:
+        # A geometry this GPU won't launch: GitHub's virtualized M1 caps the compiled kernel at
+        # 384 threads per threadgroup, and the 16-row tree at 24/4/256 needs 768. Production
+        # never launches it there — the kernel takes a tree only inside the window
+        # measure_window found launchable (test_multirow_attn covers that), and tree_ready()
+        # falls back to chains on any failure.
+        if "threads per threadgroup" not in str(e):
+            raise
+        pytest.skip(f"launch geometry unavailable on this GPU: {e}")
     mlx_err = float(mx.abs(_ORIG_SDPA(q, k, v, scale=scale, mask=mask).astype(mx.float32)
                            - ref).max())
     assert float(mx.abs(out.astype(mx.float32) - ref).max()) <= max(2 * mlx_err, 1e-2)
