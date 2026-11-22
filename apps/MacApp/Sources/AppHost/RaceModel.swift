@@ -18,6 +18,8 @@ final class RaceModel: ObservableObject {
         let index: Int
         var label: String
         var text: String = ""
+        /// The model's reasoning, which the engine streams apart from the answer.
+        var reasoning: String = ""
         var tokens: [RaceToken] = []
         var result: RaceResult?
         var isRunning = false
@@ -33,6 +35,7 @@ final class RaceModel: ObservableObject {
     @Published var isReplaying = false
     /// Text shown during replay, keyed by lane index.
     @Published var replayText: [Int: String] = [:]
+    @Published var replayReasoning: [Int: String] = [:]
 
     @Published var prompt: String = RacePrompt.presets[0].text
     @Published var maxTokens: Int = 200
@@ -84,6 +87,7 @@ final class RaceModel: ObservableObject {
                     case .token(let token):
                         guard token.index < self.lanes.count else { break }
                         self.lanes[token.index].text += token.text
+                        self.lanes[token.index].reasoning += token.reasoning
                         self.lanes[token.index].tokens.append(token)
                     case .armFinished(let result):
                         guard result.index < self.lanes.count else { break }
@@ -109,6 +113,7 @@ final class RaceModel: ObservableObject {
         replayTask?.cancel()
         isReplaying = true
         replayText = Dictionary(uniqueKeysWithValues: lanes.map { ($0.index, "") })
+        replayReasoning = replayText
 
         replayTask = Task { [weak self] in
             guard let self else { return }
@@ -132,6 +137,7 @@ final class RaceModel: ObservableObject {
                 }
                 if Task.isCancelled { break }
                 self.replayText[entry.lane, default: ""] += entry.token.text
+                self.replayReasoning[entry.lane, default: ""] += entry.token.reasoning
             }
             self.isReplaying = false
         }

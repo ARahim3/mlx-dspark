@@ -354,6 +354,11 @@ struct RaceLaneColumn: View {
         return race.isReplaying ? (race.replayText[laneIndex] ?? "") : lane.text
     }
 
+    private var displayReasoning: String {
+        guard let lane else { return "" }
+        return race.isReplaying ? (race.replayReasoning[laneIndex] ?? "") : lane.reasoning
+    }
+
     var body: some View {
         if let lane {
             VStack(alignment: .leading, spacing: 6) {
@@ -369,9 +374,18 @@ struct RaceLaneColumn: View {
                 }
                 ScrollViewReader { proxy in
                     ScrollView {
-                        MarkdownText(text: displayText)
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                            .padding(10)
+                        VStack(alignment: .leading, spacing: 8) {
+                            // The reasoning in the chat's own card: open while the model is
+                            // still thinking, folded away once its answer starts.
+                            if !displayReasoning.isEmpty {
+                                ThinkingCard(reasoning: displayReasoning,
+                                             thinking: displayText.isEmpty
+                                                 && (lane.isRunning || race.isReplaying))
+                            }
+                            MarkdownText(text: displayText)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                        }
+                        .padding(10)
                         Color.clear.frame(height: 1).id("lane-end")
                     }
                     .frame(height: 340)
@@ -379,6 +393,9 @@ struct RaceLaneColumn: View {
                     // Follow the stream like a chat window: every appended token keeps the
                     // tail in view. Replay resets the text, which naturally scrolls back up.
                     .onChange(of: displayText) { _, _ in
+                        proxy.scrollTo("lane-end", anchor: .bottom)
+                    }
+                    .onChange(of: displayReasoning) { _, _ in
                         proxy.scrollTo("lane-end", anchor: .bottom)
                     }
                 }

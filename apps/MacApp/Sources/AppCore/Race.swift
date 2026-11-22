@@ -141,10 +141,20 @@ public struct RaceVerdict: Decodable, Sendable {
 /// Keeping `tMs` is what makes an honest replay possible: the arms must run sequentially (MLX
 /// is thread-affine, so two decoders cannot share the process), but their timings are real, so
 /// the UI can replay them side by side afterwards at true relative speed.
+/// One streamed piece of an arm's output: answer text, or (engines that split it out) the
+/// model's reasoning — never both, and never the model's own channel markers.
 public struct RaceToken: Sendable {
     public let index: Int
     public let text: String
+    public let reasoning: String
     public let tMs: Double
+
+    public init(index: Int, text: String, reasoning: String = "", tMs: Double) {
+        self.index = index
+        self.text = text
+        self.reasoning = reasoning
+        self.tMs = tMs
+    }
 }
 
 public enum RaceEvent: Sendable {
@@ -226,10 +236,16 @@ extension APIClient {
                                 continuation.yield(.armStarted(index: a.index, label: a.label))
                             }
                         case "token":
-                            struct Tok: Decodable { let index: Int; let text: String; let t_ms: Double }
+                            struct Tok: Decodable {
+                                let index: Int
+                                let text: String
+                                let reasoning: String?      // absent on older engines
+                                let t_ms: Double
+                            }
                             if let t = try? decoder.decode(Tok.self, from: data) {
-                                continuation.yield(.token(RaceToken(index: t.index,
-                                                                    text: t.text, tMs: t.t_ms)))
+                                continuation.yield(.token(RaceToken(
+                                    index: t.index, text: t.text,
+                                    reasoning: t.reasoning ?? "", tMs: t.t_ms)))
                             }
                         case "arm_done":
                             if let r = try? decoder.decode(RaceResult.self, from: data) {
