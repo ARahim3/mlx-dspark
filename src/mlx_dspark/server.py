@@ -1399,8 +1399,8 @@ class Engine:
         return arms
 
     def stock_runtime(self) -> str | None:
-        """What the ``stock`` race arm stands for — ``"mlx-vlm 0.8.0"``, ``"mlx-lm 0.32.2"`` —
-        or None where there is no such arm.
+        """What the ``stock`` race arm stands for — ``"mlx-lm 0.32.2"``, ``"mlx-vlm git 111ac66"``
+        (:func:`_runtime_label`) — or None where there is no such arm.
 
         The arm is plain greedy decoding with everything of ours switched off: the target's
         stock forward as the installed library runs it (``Target.stock_forward``) on MLX's
@@ -1409,8 +1409,6 @@ class Engine:
         give. Offered for mlx-lm targets and Inkling 2; not for the other mlx-vlm targets (not
         built), nor for Inkling 2 with ``--target-bits`` (the stock forward would then run the
         re-quantized weights, which is not what the stock library loads)."""
-        from importlib import metadata
-
         t = self.target
         if t is None:
             return None
@@ -1420,10 +1418,7 @@ class Engine:
             package = "mlx-vlm"
         else:
             package = "mlx-lm"
-        try:
-            return f"{package} {metadata.version(package)}"
-        except metadata.PackageNotFoundError:
-            return package
+        return _runtime_label(package)
 
     def race(self, prompt_ids: list[int], arms: list[dict], max_tokens: int, on_event) -> None:
         """Run the same prompt through several decode strategies and compare.
@@ -1447,7 +1442,7 @@ class Engine:
             conf = arm.get("confidence")
             label = mode if cap is None else f"{mode} cap {cap}"
             if mode == "stock":
-                label = f"stock {self.stock_runtime() or 'runtime'}"   # e.g. "stock mlx-vlm 0.8.0"
+                label = f"stock {self.stock_runtime() or 'runtime'}"   # e.g. "stock mlx-lm 0.32.2"
             if conf is not None:
                 label += f" conf {conf:g}"
             on_event("arm_start", {"index": index, "mode": mode, "cap": cap,
@@ -1714,6 +1709,24 @@ class Engine:
 
 
 _STOP = object()   # sentinel: unwedges the scheduler thread so the process can exit
+
+
+def _runtime_label(package: str) -> str:
+    """How to name an installed runtime to a person: ``"mlx-lm 0.32.2"`` for a release,
+    ``"mlx-vlm git 111ac66"`` for an install from git. A git checkout still reports the LAST
+    release's version — mlx-vlm main says 0.8.0, and the real 0.8.0 cannot load Inkling-2-Mini —
+    so the commit (PEP 610 ``direct_url.json``) names it instead of a version it is not."""
+    from importlib import metadata
+
+    try:
+        dist = metadata.distribution(package)
+    except metadata.PackageNotFoundError:
+        return package
+    commit = None
+    with contextlib.suppress(ValueError, OSError, AttributeError):
+        commit = (json.loads(dist.read_text("direct_url.json") or "{}").get("vcs_info")
+                  or {}).get("commit_id")
+    return f"{package} git {str(commit)[:7]}" if commit else f"{package} {dist.version}"
 
 
 class _Job:
@@ -2623,7 +2636,7 @@ def make_handler(engine: Engine, api_key: str | None):
                     # A client must gate its conf-bundle arm on this — an engine without
                     # it would silently DROP the field and the lane label would lie.
                     "race_arm_confidence": True,
-                    # the runtime a "stock" race arm stands for ("mlx-vlm 0.8.0"), or null
+                    # the runtime a "stock" race arm stands for ("mlx-lm 0.32.2"), or null
                     # when the loaded target has no such arm: a client offers the arm on it
                     "race_stock": getattr(engine, "stock_runtime", lambda: None)(),
                     # whether the small-M MMA verify kernel is live for this load (the
@@ -3004,9 +3017,35 @@ def make_handler(engine: Engine, api_key: str | None):
             if effort is not None:
                 start_payload["reasoning_effort"] = template_kwargs.get("reasoning_effort", "none")
             self._sse(start_payload, "start")
+            # Each arm's raw text goes through the loaded model's reasoning / answer splitter —
+            # the one every other streaming path uses (_channel_splitter) — so a lane gets the
+            # answer in `text` and the reasoning in `reasoning`, never the model's own markers
+            # (Inkling 2's `<|message_model|><|content_thinking|>…`, muse's channel headers,
+            # a `<think>` block). One token event per piece, in the order the model wrote them.
+            splitters: dict = {}
+            clocks: dict = {}
+
+            def pieces(index, chunks):
+                for kind, text in chunks:
+                    if not text:
+                        continue
+                    piece = {"index": index, "text": "", "t_ms": clocks.get(index, 0.0)}
+                    piece["text" if kind == "answer" else "reasoning"] = text
+                    self._sse(piece, "token")
+
+            def relay(name, payload):
+                index = payload.get("index") if isinstance(payload, dict) else None
+                if name == "arm_start":
+                    splitters[index] = self._channel_splitter(prompt_ids)
+                elif name == "token" and index in splitters:
+                    clocks[index] = payload.get("t_ms", 0.0)
+                    return pieces(index, splitters[index].feed(payload.get("text", "")))
+                elif name == "arm_done" and index in splitters:
+                    pieces(index, splitters.pop(index).feed("", final=True))   # what it held back
+                self._sse(payload, name)
+
             try:
-                engine.race(prompt_ids, arms, max_tokens,
-                            lambda name, payload: self._sse(payload, name))
+                engine.race(prompt_ids, arms, max_tokens, relay)
             except (BrokenPipeError, ConnectionResetError):
                 return
             except Exception as e:  # noqa: BLE001 — report inside the stream; headers are sent

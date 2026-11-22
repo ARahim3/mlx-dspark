@@ -471,6 +471,46 @@ def test_race_thinking_param_validated_and_echoed(server):
     assert "thinking" not in json.loads(start[5:])
 
 
+def test_race_lanes_get_answer_and_reasoning_not_the_models_markers(server):
+    """The race relays each arm's text through the model's reasoning / answer splitter, like
+    every other streaming path: an Inkling 2 lane showed `<|message_model|><|content_thinking|>…`
+    verbatim, rendered its reasoning as markdown, and lost the code fence that followed a tag."""
+    eng, base = server
+    eng.is_inkling = True
+    eng.race_arms_available = lambda: ["dspark", "baseline"]
+    raw = ["<|message_mod", "el|><|content_thinking|>Compute 1.5*3600", " = 5400.<|end_mess",
+           "age|><|message_model|><|content_text|>```python\nx = 1\n```", "<|end_message|>"]
+
+    def race(prompt_ids, arms, max_tokens, on_event):
+        for index in range(2):
+            on_event("arm_start", {"index": index, "label": f"arm {index}"})
+            for n, piece in enumerate(raw):
+                on_event("token", {"index": index, "text": piece, "t_ms": 10.0 * (n + 1)})
+            on_event("arm_done", {"index": index, "label": f"arm {index}", "tokens": 5})
+        on_event("verdict", {"identical": True})
+
+    eng.race = race
+    out = _post(base, "/admin/race", {"prompt": "hi", "arms": ["dspark", "baseline"]}, stream=True)
+    events, name = [], None
+    for line in out.splitlines():
+        if line.startswith("event: "):
+            name = line[7:]
+        elif line.startswith("data: "):
+            events.append((name, json.loads(line[6:])))
+    assert "<|" not in out                                  # no marker reaches a client
+    for index in range(2):
+        mine = [(n, d) for n, d in events if d.get("index") == index]
+        tokens = [d for n, d in mine if n == "token"]
+        assert "".join(d.get("reasoning", "") for d in tokens) == "Compute 1.5*3600 = 5400."
+        assert "".join(d["text"] for d in tokens) == "```python\nx = 1\n```"
+        assert all("text" in d and ("reasoning" in d) != bool(d["text"]) for d in tokens)
+        kinds = ["r" if "reasoning" in d else "a" for d in tokens]
+        assert kinds == sorted(kinds, reverse=True)         # reasoning first, then the answer
+        assert [n for n, _ in mine][-1] == "arm_done"       # the held-back tail comes before it
+        assert all(0 < d["t_ms"] <= 50.0 for d in tokens)
+    assert events[-1][0] in ("verdict", "done")
+
+
 # --- checkpoint-mode boundary probes (stable prompt boundary per chat template) ----------
 
 

@@ -60,6 +60,31 @@ def test_no_stock_arm_where_the_stock_library_would_not_run_this(monkeypatch):
     assert engine.stock_runtime() is None
 
 
+def test_a_git_install_is_named_by_its_commit_not_the_last_release(monkeypatch):
+    """mlx-vlm installed from git still says 0.8.0 — a release that cannot load Inkling-2-Mini."""
+    from importlib import metadata
+    from types import SimpleNamespace
+
+    files = {"direct_url.json": '{"url": "https://github.com/Blaizzy/mlx-vlm", "vcs_info": '
+                                '{"vcs": "git", "commit_id": "d998a6207b7dc613b52618646dbea13a4799f7ca"}}'}
+
+    def dist(name):
+        return SimpleNamespace(version="0.8.0", read_text=lambda f: files.get(f))
+
+    monkeypatch.setattr(metadata, "distribution", dist)
+    assert S._runtime_label("mlx-vlm") == "mlx-vlm git d998a62"
+    files.clear()                                             # a release from an index
+    assert S._runtime_label("mlx-vlm") == "mlx-vlm 0.8.0"
+    files["direct_url.json"] = '{"url": "file:///src/mlx-vlm", "dir_info": {"editable": true}}'
+    assert S._runtime_label("mlx-vlm") == "mlx-vlm 0.8.0"
+
+    def missing(name):
+        raise metadata.PackageNotFoundError(name)
+
+    monkeypatch.setattr(metadata, "distribution", missing)
+    assert S._runtime_label("mlx-vlm") == "mlx-vlm"
+
+
 @metal
 def test_inkling_stock_switches_everything_off_and_puts_it_back():
     from test_inkling_batch import PROMPTS, _target
