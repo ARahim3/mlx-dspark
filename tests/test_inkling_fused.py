@@ -269,6 +269,10 @@ def test_packed_attention_refuses_shapes_it_was_not_written_for():
 
 # ---------------------------------------------------------------- installed, against mlx-vlm
 def _tiny_bf16_inkling():
+    return _tiny_bf16_model().language_model
+
+
+def _tiny_bf16_model():
     from mlx_dspark.inkling import mlx_vlm_supports_inkling2
 
     if not mlx_vlm_supports_inkling2("inkling2_loop"):
@@ -303,7 +307,7 @@ def _tiny_bf16_inkling():
     lm.model.final_input.query = lm.model.final_input.query.astype(mx.float32)
     model.eval()                      # as a loaded checkpoint: the stock kernel paths need it too
     mx.eval(model.parameters())
-    return lm
+    return model
 
 
 def _count_fused_calls(monkeypatch):

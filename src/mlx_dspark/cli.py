@@ -425,9 +425,12 @@ def cmd_serve(argv: list[str]) -> None:
                          "on about 1%% between a decode step and a verify pass). 0 = as released "
                          "(default); ignored for other targets")
     ap.add_argument("--max-batch", type=int, default=1,
-                    help="micro-batch up to N concurrently-queued requests through one batched "
-                         "target forward (dense mlx-lm target + dspark/baseline; ~1.5-2.5x "
-                         "aggregate throughput at 2-4 concurrent). 1 = serialized (default)")
+                    help="serve up to N concurrent requests through one batched target "
+                         "forward (dense mlx-lm targets in dspark/baseline mode, hybrids in "
+                         "baseline mode: ~1.5-2.5x aggregate throughput at 2-4 concurrent; "
+                         "Inkling 2 in dspark/baseline mode, up to 8: a request that is alone "
+                         "keeps the drafter, overlapping requests decode together). "
+                         "1 = serialized (default)")
     ap.add_argument("--context-window", type=int, default=None,
                     help="cap the prompt length (default: the target's own trained limit). "
                          "An over-long request is refused with the message Claude Code "

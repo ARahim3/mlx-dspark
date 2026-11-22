@@ -111,6 +111,7 @@ class GenResult:
     decay_ratio: float | None = None   # late/early decode rate within this request (RoundLog)
     swap_delta_bytes: int | None = None  # macOS swap growth during this request
     cold: bool = False            # first request since load with warmup off (kernel compile)
+    batched_tokens: int = 0       # of num_tokens, decoded in a step shared with other requests
 
     @property
     def mean_accept_len(self) -> float:
@@ -1306,6 +1307,7 @@ def speculative_generate(
     prefill_marks=None,
     on_prefill_chunk=None,
     verbose: bool = False,
+    _streamer=None,
 ) -> GenResult:
     """Speculative decoding (batch=1).
 
@@ -1390,7 +1392,10 @@ def speculative_generate(
                and hasattr(drafter, "tree_lattice") and target_model.tree_ready())
     conv_k = target_model._tree_conv_k() if tree_on else 4
     tree_rounds = 0
-    st = _Streamer(tokenizer, eos_ids, on_text, stop)
+    # `_streamer`: a caller that runs one generation as several calls of this loop (a batched
+    # session handing a request over, inkling_batch.Session) passes the streamer it keeps
+    # across them, so the text, a stop string and the detokenizer's state carry over.
+    st = _streamer if _streamer is not None else _Streamer(tokenizer, eos_ids, on_text, stop)
     t0 = time.time()
 
     # --- prefill (only the suffix past any reused prefix; chunked, feeding the drafter

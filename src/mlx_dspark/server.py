@@ -35,6 +35,7 @@ import traceback
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from types import SimpleNamespace
 from urllib.parse import urlsplit
 
 from . import anthropic_api as A
@@ -734,10 +735,14 @@ class Engine:
             # and let a CapController pick the cap per round. Only meaningful with a drafter.
             ctrl = None
             if max_draft_tokens == "auto" and mode in ("dspark", "dflash"):
+                from .batch_engine import batch_spec_supported
                 from .calibrate import calibrate
 
+                # the (B, cap) grid prices batched SPECULATIVE rounds: only targets that run
+                # them (dense mlx-lm) measure it — Inkling 2 batches plain decoding instead
                 ctrl = calibrate(tgt, draft, mode=mode, target_repo=target_repo,
-                                 drafter_repo=drafter_repo, batch_widths=batch_widths)
+                                 drafter_repo=drafter_repo,
+                                 batch_widths=batch_widths if batch_spec_supported(tgt) else None)
             # prefill wide-GEMM path (dequantize once above a calibrated width) — process
             # -wide, measured once and cached like the cap
             from .calibrate import apply_wide_gemm
@@ -973,6 +978,72 @@ class Engine:
     def _generate_impl_inner(self, prompt_ids, max_tokens, temperature, top_p, top_k, stop,
                              seed, on_text, presence_penalty=0.0, frequency_penalty=0.0,
                              logprobs=None) -> GenResult:
+        run = self._begin_request(prompt_ids, on_text)
+        cache, ctx, reuse_len = run.cache, run.ctx, run.reuse_len
+        on_text, on_round = run.on_text, run.on_round
+        on_prefill, prefill_marks = run.on_prefill, run.prefill_marks
+        on_prefill_chunk, eff_cap = run.on_prefill_chunk, run.eff_cap
+        try:
+            if self.mode == "dspark":
+                res = speculative_generate(
+                    self.target, self.tokenizer, self.drafter, prompt_ids=prompt_ids,
+                    cache=cache, ctx_caches=ctx, reuse_len=reuse_len,
+                    max_new_tokens=max_tokens, max_draft_tokens=eff_cap,
+                    cap_controller=self.cap_controller, lookup_drafts=self.lookup_drafts,
+                    lookup_long_draft=self.lookup_long_draft,
+                    confidence_threshold=self.confidence_threshold,
+                    temperature=temperature, top_p=top_p, top_k=top_k,
+                    presence_penalty=presence_penalty, frequency_penalty=frequency_penalty,
+                    logprobs=logprobs, seed=seed, stop=stop, on_text=on_text,
+                    on_round=on_round, on_prefill=on_prefill, prefill_marks=prefill_marks,
+                    on_prefill_chunk=on_prefill_chunk, tree=self.tree_nodes,
+                )
+            elif self.mode == "dflash":
+                res = dflash_generate(
+                    self.target, self.tokenizer, self.drafter, prompt_ids=prompt_ids,
+                    cache=cache, ctx_caches=ctx, reuse_len=reuse_len,
+                    max_new_tokens=max_tokens, max_draft_tokens=eff_cap,
+                    cap_controller=self.cap_controller,
+                    temperature=temperature, top_p=top_p, top_k=top_k,
+                    seed=seed, stop=stop, on_text=on_text, on_round=on_round,
+                    on_prefill=on_prefill, prefill_marks=prefill_marks,
+                    on_prefill_chunk=on_prefill_chunk, tree=self.tree_nodes,
+                )
+            elif self.mode == "lookup":
+                res = lookup_generate(
+                    self.target, self.tokenizer, prompt_ids=prompt_ids,
+                    cache=cache, reuse_len=reuse_len,
+                    max_new_tokens=max_tokens, max_draft_tokens=self.max_draft_tokens or 6,
+                    long_draft_tokens=max(self.max_draft_tokens or 6, self.lookup_long_draft),
+                    temperature=temperature, top_p=top_p, top_k=top_k,
+                    seed=seed, stop=stop, on_text=on_text, on_round=on_round,
+                    on_prefill=on_prefill, prefill_marks=prefill_marks,
+                    on_prefill_chunk=on_prefill_chunk,
+                )
+            else:
+                res = greedy_generate(
+                    self.target, self.tokenizer, prompt_ids=prompt_ids,
+                    cache=cache, reuse_len=reuse_len,
+                    max_new_tokens=max_tokens, temperature=temperature, top_p=top_p,
+                    top_k=top_k, presence_penalty=presence_penalty,
+                    frequency_penalty=frequency_penalty, logprobs=logprobs, seed=seed,
+                    stop=stop, on_text=on_text, on_round=on_round,
+                    on_prefill=on_prefill, prefill_marks=prefill_marks,
+                    on_prefill_chunk=on_prefill_chunk,
+                )
+        except BaseException:                     # never leave a desynced cache behind
+            if self.prefix is not None:
+                self.prefix.reset()
+            raise
+        finally:
+            self._end_prefill_progress(run)       # clear clients' progress on every exit path
+        return self._finish_request(run, res)
+
+    def _begin_request(self, prompt_ids, on_text) -> SimpleNamespace:
+        """Everything a generation needs before its loop starts, as one record: the round
+        recorder, the prefix-cache plan (caches, reused length, where to snapshot), the
+        depth-adjusted cap and the prefill-progress hook. :meth:`_generate_impl_inner` runs a
+        loop on it; a batched session (:class:`BatchEngine`) keeps one per request."""
         recorder = RoundRecorder(self.rounds, uuid.uuid4().hex[:8], self.mode)
         on_round = self._with_slow_round_log(recorder, len(prompt_ids))
         # Per-request facts for spec_info: TTFT (first streamed text, engine-side — the
@@ -1030,13 +1101,7 @@ class Engine:
         # below ~4k ctx the refinement is a no-op by construction). A user-pinned cap
         # (no _depth_capper) is never touched; --max-draft auto prices depth inside the
         # controller instead (set_depth from the loops).
-        eff_cap = self.max_draft_tokens
-        if self._depth_capper is not None and self.mode in ("dspark", "dflash"):
-            from .calibrate import STATIC_PRIOR_P
-            default = (self.max_draft_tokens if self.max_draft_tokens is not None
-                       else self._depth_capper.max_cap)          # dflash: full block
-            eff_cap = self._depth_capper.depth_adjusted_cap(
-                len(prompt_ids), default, STATIC_PRIOR_P)
+        eff_cap = self._cap_at(len(prompt_ids))
         self._last_cap = eff_cap
         # Prefill progress (issue #29): one non-recorded `/events` event per evaluated
         # prefill chunk, so a client (the app's status bar) can show how far a long cold
@@ -1046,88 +1111,64 @@ class Engine:
         # length. The trailing done-event fires from `finally` so an error or cancel
         # mid-prefill clears a client's progress display too. A prompt that fits in one
         # chunk emits nothing.
-        _progress_seen = [False]
+        run = SimpleNamespace(
+            prompt_ids=prompt_ids, recorder=recorder, on_round=on_round, on_text=on_text,
+            ttft=ttft, swap_before=swap_before, cold=cold, cache=cache, ctx=ctx,
+            reuse_len=reuse_len, on_prefill=on_prefill, prefill_marks=prefill_marks,
+            eff_cap=eff_cap, progress_seen=False)
         _n_prompt = len(prompt_ids)
 
-        def on_prefill_chunk(pos, _req=recorder.request_id, _total=_n_prompt):
-            _progress_seen[0] = True
+        def on_prefill_chunk(pos, _req=recorder.request_id, _total=_n_prompt, _run=run):
+            _run.progress_seen = True
             self.rounds.publish({"type": "prefill", "req": _req, "mode": self.mode,
                                  "processed": int(pos), "total": _total})
-        try:
-            if self.mode == "dspark":
-                res = speculative_generate(
-                    self.target, self.tokenizer, self.drafter, prompt_ids=prompt_ids,
-                    cache=cache, ctx_caches=ctx, reuse_len=reuse_len,
-                    max_new_tokens=max_tokens, max_draft_tokens=eff_cap,
-                    cap_controller=self.cap_controller, lookup_drafts=self.lookup_drafts,
-                    lookup_long_draft=self.lookup_long_draft,
-                    confidence_threshold=self.confidence_threshold,
-                    temperature=temperature, top_p=top_p, top_k=top_k,
-                    presence_penalty=presence_penalty, frequency_penalty=frequency_penalty,
-                    logprobs=logprobs, seed=seed, stop=stop, on_text=on_text,
-                    on_round=on_round, on_prefill=on_prefill, prefill_marks=prefill_marks,
-                    on_prefill_chunk=on_prefill_chunk, tree=self.tree_nodes,
-                )
-            elif self.mode == "dflash":
-                res = dflash_generate(
-                    self.target, self.tokenizer, self.drafter, prompt_ids=prompt_ids,
-                    cache=cache, ctx_caches=ctx, reuse_len=reuse_len,
-                    max_new_tokens=max_tokens, max_draft_tokens=eff_cap,
-                    cap_controller=self.cap_controller,
-                    temperature=temperature, top_p=top_p, top_k=top_k,
-                    seed=seed, stop=stop, on_text=on_text, on_round=on_round,
-                    on_prefill=on_prefill, prefill_marks=prefill_marks,
-                    on_prefill_chunk=on_prefill_chunk, tree=self.tree_nodes,
-                )
-            elif self.mode == "lookup":
-                res = lookup_generate(
-                    self.target, self.tokenizer, prompt_ids=prompt_ids,
-                    cache=cache, reuse_len=reuse_len,
-                    max_new_tokens=max_tokens, max_draft_tokens=self.max_draft_tokens or 6,
-                    long_draft_tokens=max(self.max_draft_tokens or 6, self.lookup_long_draft),
-                    temperature=temperature, top_p=top_p, top_k=top_k,
-                    seed=seed, stop=stop, on_text=on_text, on_round=on_round,
-                    on_prefill=on_prefill, prefill_marks=prefill_marks,
-                    on_prefill_chunk=on_prefill_chunk,
-                )
-            else:
-                res = greedy_generate(
-                    self.target, self.tokenizer, prompt_ids=prompt_ids,
-                    cache=cache, reuse_len=reuse_len,
-                    max_new_tokens=max_tokens, temperature=temperature, top_p=top_p,
-                    top_k=top_k, presence_penalty=presence_penalty,
-                    frequency_penalty=frequency_penalty, logprobs=logprobs, seed=seed,
-                    stop=stop, on_text=on_text, on_round=on_round,
-                    on_prefill=on_prefill, prefill_marks=prefill_marks,
-                    on_prefill_chunk=on_prefill_chunk,
-                )
-        except BaseException:                     # never leave a desynced cache behind
-            if self.prefix is not None:
-                self.prefix.reset()
-            raise
-        finally:
-            if _progress_seen[0]:                 # clear clients' progress on every exit path
-                self.rounds.publish({"type": "prefill", "req": recorder.request_id,
-                                     "mode": self.mode, "processed": len(prompt_ids),
-                                     "total": len(prompt_ids), "done": True})
-        if self.prefix is not None and cache is not None and self.mode != "dflash":
+        run.on_prefill_chunk = on_prefill_chunk
+        return run
+
+    def _cap_at(self, context: int):
+        """The draft cap for a prompt of ``context`` tokens: the configured one, depth-adjusted
+        where it was derived (see the call site in :meth:`_begin_request`)."""
+        eff_cap = self.max_draft_tokens
+        if self._depth_capper is not None and self.mode in ("dspark", "dflash"):
+            from .calibrate import STATIC_PRIOR_P
+            default = (self.max_draft_tokens if self.max_draft_tokens is not None
+                       else self._depth_capper.max_cap)          # dflash: full block
+            eff_cap = self._depth_capper.depth_adjusted_cap(context, default, STATIC_PRIOR_P)
+        return eff_cap
+
+    def _end_prefill_progress(self, run) -> None:
+        if run.progress_seen:
+            n = len(run.prompt_ids)
+            self.rounds.publish({"type": "prefill", "req": run.recorder.request_id,
+                                 "mode": self.mode, "processed": n, "total": n, "done": True})
+            run.progress_seen = False
+
+    def _finish_request(self, run, res: GenResult, *, store: bool = True,
+                        timed: bool = True) -> GenResult:
+        """Book a finished generation: the prefix-cache slot, the counters, the per-request
+        stamps. A batched session passes ``store=False`` (its requests' caches are not the
+        loop's to hand back) and ``timed=False`` (requests overlap, so it books its own wall
+        time once instead of every request's)."""
+        prompt_ids = run.prompt_ids
+        if store and self.prefix is not None and run.cache is not None and self.mode != "dflash":
             # dflash slots come only from the boundary checkpoint during prefill: its
             # drafter ctx window can't serve trim-mode reuse, so a post-generation trim
             # slot would be a broken promise on a dense target (see _build_prefix_cache).
-            self.prefix.store(cache, ctx, prompt_ids, res.token_ids)
+            self.prefix.store(run.cache, run.ctx, prompt_ids, res.token_ids)
         self.stats["requests"] += 1
         self.stats["prompt_tokens"] += len(prompt_ids)
         self.stats["completion_tokens"] += res.num_tokens
-        self.stats["generation_seconds"] += res.seconds
-        self.stats["decode_seconds"] += res.decode_seconds
+        if timed:
+            self.stats["generation_seconds"] += res.seconds
+            self.stats["decode_seconds"] += res.decode_seconds
         self.stats["sum_accept_len"] += res.mean_accept_len * res.num_tokens
         # Stamp the per-request facts (all additive; the loops never see them).
         res.prompt_tokens = len(prompt_ids)
-        res.reused_tokens = int(reuse_len)
-        res.ttft_seconds = ttft[0] or res.prefill_seconds
-        res.decay_ratio = self.rounds.decay_ratio(recorder.request_id)
-        res.swap_delta_bytes = swap_usage()["used_bytes"] - swap_before
-        res.cold = cold
+        res.reused_tokens = int(run.reuse_len)
+        res.ttft_seconds = run.ttft[0] or res.prefill_seconds
+        res.decay_ratio = self.rounds.decay_ratio(run.recorder.request_id)
+        res.swap_delta_bytes = swap_usage()["used_bytes"] - run.swap_before
+        res.cold = run.cold
         self._last_context = len(prompt_ids) + res.num_tokens
         self.last_verdict = self._verdict_for(res)
         return res
@@ -1264,6 +1305,10 @@ class Engine:
             #                                          after any depth-aware refinement
         if res.lookup_rounds:
             info["lookup_rounds"] = res.lookup_rounds
+        if getattr(res, "batched_tokens", 0):
+            # tokens decoded in a step shared with other requests (--max-batch): why this
+            # request's own rate is under the single-stream one while the server's total is over
+            info["batched_tokens"] = int(res.batched_tokens)
         # Per-request timing tiles (all additive): where the wall clock went, how much of the
         # prompt the prefix cache served, and how the decode compares with this Mac's
         # single-stream roofline at this context depth.
@@ -1665,6 +1710,9 @@ class BatchEngine:
         self._q: _queue.Queue = _queue.Queue()
         self.batch_stats = {"batched_requests": 0, "batches": 0, "max_batch_seen": 0,
                             "serial_requests": 0}
+        # Inkling 2 batches plain decoding on its own forward (inkling_batch.Session): any
+        # sampling, prompts of any length, its prefix cache and — alone — its drafter.
+        self._inkling = bool(getattr(engine, "is_inkling", False))
         engine._executor.submit(self._scheduler)   # occupies the one MLX thread until close()
         # concurrent.futures' shutdown hook joins the executor thread at interpreter exit —
         # a forever-looping scheduler would wedge the process (Ctrl-C'd server, scripts,
@@ -1729,6 +1777,8 @@ class BatchEngine:
                         j.done.set()
 
     def _run(self, batch: list[_Job]):
+        if self._inkling:
+            return self._run_inkling(batch)
         # only requests with identical sampling can share a batch (one temp/top_p/top_k per run);
         # penalized requests take the serial path (the batched kernels don't apply penalties yet)
         groups: dict = {}
@@ -1828,6 +1878,123 @@ class BatchEngine:
         for j in deferred:
             self._run_serial(j)
 
+    # --- Inkling 2: a session of requests on the model's own forward ---
+    @staticmethod
+    def _inkling_batchable(job: _Job) -> bool:
+        """Penalties and logprobs need the sequential loop; a seeded request must be the only
+        one drawing from the generator to be reproducible."""
+        p = job.params
+        return (not p["presence_penalty"] and not p["frequency_penalty"]
+                and p["logprobs"] is None and p["seed"] is None)
+
+    def _run_inkling(self, jobs: list[_Job]):
+        """Run requests through an :class:`~mlx_dspark.inkling_batch.Session`: two or more
+        decode together, one token each per forward; a request that is alone runs the engine's
+        own single-stream loop (the drafter, in dspark mode) on the same caches and yields at a
+        round boundary when another arrives. Requests are admitted as they arrive, up to
+        ``max_batch``, and each is delivered the moment it finishes. A request the session
+        cannot take (penalties, logprobs, a seed) waits for it to drain, and stops further
+        admissions so it cannot starve."""
+        from .inkling_batch import Request, Session
+
+        eng = self.engine
+        waiting = [j for j in jobs if self._inkling_batchable(j)]
+        deferred = [j for j in jobs if not self._inkling_batchable(j)]
+        if not waiting:
+            for j in deferred:
+                self._run_serial(j)
+            return
+        session = Session(
+            eng.target, eng.tokenizer, eng.drafter if eng.mode == "dspark" else None,
+            capacity=self.max_batch, solo=self._inkling_solo,
+            waiting=lambda: not deferred and not self._q.empty())
+        live: dict[int, _Job] = {}
+        steps0 = self.batch_stats.get("batched_steps", 0)
+        rows0 = self.batch_stats.get("batched_step_rows", 0)
+        t0 = time.time()
+        eng._busy = True
+        try:
+            while session.n_active or waiting:
+                while not deferred and len(waiting) + session.n_active < self.max_batch:
+                    try:
+                        nj = self._q.get_nowait()
+                    except _queue.Empty:
+                        break
+                    if nj is _STOP:
+                        self._q.put(nj)          # the session drains; the scheduler exits after
+                        deferred.append(_STOP)
+                        break
+                    (waiting if self._inkling_batchable(nj) else deferred).append(nj)
+                while waiting and session.has_free_slot:
+                    job = waiting.pop(0)
+                    p = job.params
+                    run = SimpleNamespace(job=job, plan=None)
+                    req = Request(job.prompt_ids, max_new_tokens=p["max_tokens"],
+                                  temperature=p["temperature"], top_p=p["top_p"],
+                                  top_k=p["top_k"], stop=p["stop"], meta=run,
+                                  prepare=self._inkling_prepare)
+                    live[id(job)] = job
+                    session.admit(req)
+                done = session.tick()
+                # counters first: a client reading /metrics right after its response sees them
+                self.batch_stats["max_batch_seen"] = max(self.batch_stats["max_batch_seen"],
+                                                         session.peak)
+                self.batch_stats["batched_steps"] = steps0 + session.steps
+                self.batch_stats["batched_step_rows"] = rows0 + session.step_rows
+                for req, res in done:
+                    job = req.meta.job
+                    self.batch_stats["batched_requests" if req.shared else "serial_requests"] += 1
+                    eng._end_prefill_progress(req.meta.plan)
+                    job.result = eng._finish_request(req.meta.plan, res, store=False,
+                                                     timed=False)
+                    live.pop(id(job), None)
+                    job.done.set()
+        except BaseException as e:  # noqa: BLE001
+            if eng.prefix is not None:
+                eng.prefix.reset()
+            for j in [*waiting, *live.values()]:
+                if not j.done.is_set():
+                    j.error = e
+                    j.done.set()
+        finally:
+            eng._busy = False
+        self.batch_stats["batches"] += 1
+        wall = time.time() - t0               # the requests overlapped: book the wall once
+        eng.stats["generation_seconds"] += wall
+        eng.stats["decode_seconds"] += max(0.0, wall - session.prefill_seconds)
+        for j in deferred:
+            if j is not _STOP:
+                self._run_serial(j)
+
+    def _inkling_prepare(self, req) -> None:
+        """A request is about to read its prompt: take its prefix-cache plan now (the prefix
+        cache serves one prefill at a time, and the session reads prompts one after another)."""
+        eng = self.engine
+        plan = req.meta.plan = eng._begin_request(req.prompt_ids, req.meta.job.on_text)
+        req.on_text, req.on_round = plan.on_text, plan.on_round
+        req.cache, req.ctx, req.reuse_len = plan.cache, plan.ctx, plan.reuse_len
+        req.prefill_marks, req.on_prefill = plan.prefill_marks, plan.on_prefill
+        req.on_prefill_chunk = plan.on_prefill_chunk
+
+    def _inkling_solo(self, req, prompt_ids, reuse_len, max_new_tokens, fresh: bool):
+        """The single-stream speculative loop on ``req``'s caches, from where they stand, with
+        the session's streamer (so it can be asked to yield)."""
+        eng = self.engine
+        temperature, top_p, top_k = req.sampling
+        return speculative_generate(
+            eng.target, eng.tokenizer, eng.drafter, prompt_ids=prompt_ids,
+            cache=req.cache, ctx_caches=req.ctx, reuse_len=reuse_len,
+            max_new_tokens=max_new_tokens,
+            max_draft_tokens=req.meta.plan.eff_cap if fresh else eng._cap_at(len(prompt_ids)),
+            cap_controller=eng.cap_controller, lookup_drafts=eng.lookup_drafts,
+            lookup_long_draft=eng.lookup_long_draft,
+            confidence_threshold=eng.confidence_threshold,
+            temperature=temperature, top_p=top_p, top_k=top_k, on_round=req.on_round,
+            on_prefill=req.on_prefill if fresh else None,
+            prefill_marks=req.prefill_marks if fresh else None,
+            on_prefill_chunk=req.on_prefill_chunk if fresh else None,
+            tree=eng.tree_nodes, _streamer=req.streamer)
+
     def _run_serial(self, job: _Job):
         try:
             p = job.params
@@ -1888,6 +2055,15 @@ def maybe_batch_engine(engine: Engine, max_batch: int):
     from .batch_engine import batch_spec_supported, batchable
 
     if max_batch <= 1 or engine.mode not in ("dspark", "baseline"):
+        return engine
+    if getattr(engine, "is_inkling", False):
+        # Inkling 2 (an mlx-vlm target): batched plain decoding on its fused forward, the
+        # drafter for a request that is alone (inkling_batch) — when the pieces it stands on
+        # cleared their self-test at load.
+        from .inkling_batch import supported
+
+        if supported(engine.target.model.language_model):
+            return BatchEngine(engine, max_batch=max_batch)
         return engine
     ok = batch_spec_supported if engine.mode == "dspark" else batchable
     if not ok(engine.target):
@@ -3462,8 +3638,13 @@ def run_server(engine, *, host: str = "127.0.0.1", port: int = 8080,
             + ", ".join(f"{k}:{v:.2f}" for k, v in sorted(split["fracs"].items(),
                                                           key=lambda kv: int(kv[0])))
             + ")" if split else "off"))
-        if isinstance(engine, BatchEngine):
-            print(f"  batching: micro-batch up to {engine.max_batch} concurrent "
+        max_batch = getattr(engine, "max_batch", None)   # a BatchEngine, also behind a holder
+        if max_batch and getattr(engine, "is_inkling", False):
+            print(f"  batching: up to {max_batch} concurrent requests decode together "
+                  f"({engine.mode}; a lone request keeps the single-stream path; penalties / "
+                  "logprobs / a seed: serial)")
+        elif max_batch:
+            print(f"  batching: micro-batch up to {max_batch} concurrent "
                   f"({engine.mode}; serial fallback for temp>0 dspark / lone requests)")
         if engine.cap_controller is not None:
             print(f"  max-draft: auto (calibrated for this machine; starting cap "
