@@ -81,6 +81,11 @@ class Target:
     # appended to the calibration cache key: a target whose own forward has variants with
     # different verify curves names the live one here (Inkling 2's fused forward: "|ikf")
     calibration_tag = ""
+    # --max-draft auto: clock a parked (cap 0) step when its token reaches the host, not when
+    # it is scheduled (generate's parked sprint). On for Inkling 2, where the scheduling clock
+    # kept the controller parked through code (probe rounds read ~40% slow); every other
+    # target keeps the clock its parking behaviour was measured with until it is A/B'd there.
+    parked_sync_clock = False
     _txn = None
     prefill_chunk: int | None = None   # None = generate.PREFILL_CHUNK (see _target_chunk)
 
@@ -115,6 +120,7 @@ class Target:
             "inkling2")
         if self._inkling:
             self.family = "inkling2"
+            self.parked_sync_clock = True
             # dense relative-position masks per global layer: 512-row prefill chunks are faster
             # and ~3x leaner than the default 2048 (generate._target_chunk)
             self.prefill_chunk = 512
@@ -129,8 +135,10 @@ class Target:
             # the checkpoint keeps in bf16, quantized at load — before everything below, so
             # the fused pieces are self-tested on the modules that will run. Not the released
             # weights (inkling_kernels.install_dense_bits has the measurements).
+            fast_head = (os.environ.get("MLX_DSPARK_INKLING_FAST_HEAD", "1").lower()
+                         not in ("0", "false"))
             if target_bits:
-                install_dense_bits(model.language_model, int(target_bits))
+                install_dense_bits(model.language_model, int(target_bits), fast_head=fast_head)
                 self.target_bits = int(target_bits)
 
             # constant per-expert scale factors computed once instead of per call (exact;
@@ -144,8 +152,9 @@ class Target:
                 set_expert_views(model.language_model)
             # fp32 logits from the bf16 head without the stock 1.85 GB fp32 copy: half the
             # head traffic every step, and row-invariant (verify logits == decode logits).
-            # MLX_DSPARK_INKLING_FAST_HEAD=0 is the A/B.
-            if os.environ.get("MLX_DSPARK_INKLING_FAST_HEAD", "1").lower() not in ("0", "false"):
+            # MLX_DSPARK_INKLING_FAST_HEAD=0 is the A/B (it also switches the 8-bit head of
+            # --target-bits 8 back to MLX's quantized matmul).
+            if fast_head:
                 install_fast_head(model.language_model)
             # Decode- and verify-width calls launch ~7,000 small GPU kernels per forward on the
             # stock path; inkling_fused folds the runs between the big matmuls into single
@@ -168,11 +177,28 @@ class Target:
                 if os.environ.get("MLX_DSPARK_INKLING_GROUPED_MOE", "1").lower() in ("0", "false"):
                     inkling_fused.disable(model.language_model, ("moe",))
                     self.inkling_fused["moe"] = False
+                # The KV caches the attention reads in place (inkling_cache: rows in temporal
+                # order with the sink's zero row in the buffer, so no K / V copy per layer
+                # visit and a verify's rollback is a counter). make_cache() hands them out
+                # when the self-test matched them to the stock caches bit for bit.
+                # MLX_DSPARK_INKLING_KV_CACHE=0 is the A/B.
+                if os.environ.get("MLX_DSPARK_INKLING_KV_CACHE", "1").lower() in ("0", "false"):
+                    model.language_model.__dict__[inkling_fused._KV] = False
+                    self.inkling_fused[inkling_fused.KV_KIND] = False
+                # The attention's relative-position mask and the sink's logit column from one
+                # launch (stock: a kernel that idles 7 of 8 threads at one row, then a
+                # concatenate that copies the mask). MLX_DSPARK_INKLING_MASK=0 is the A/B.
+                if os.environ.get("MLX_DSPARK_INKLING_MASK", "1").lower() in ("0", "false"):
+                    inkling_fused.set_mask(model.language_model, False)
+                    self.inkling_fused[inkling_fused.MASK_KIND] = False
                 # a curve is priced by the forward that measured it: tag the fused set
                 on = inkling_fused.enabled_kinds(model.language_model)
                 if on:
                     missing = sorted(set(inkling_fused.ALL_KINDS) - set(on))
-                    self.calibration_tag = "|ikf2" + ("-" + "-".join(missing) if missing else "")
+                    for name in (inkling_fused.KV_KIND, inkling_fused.MASK_KIND):
+                        if not self.inkling_fused.get(name):
+                            missing.append(name)
+                    self.calibration_tag = "|ikf3" + ("-" + "-".join(missing) if missing else "")
             if self.target_bits:
                 self.calibration_tag += f"|tb{self.target_bits}"
         elif target_bits:
@@ -250,6 +276,10 @@ class Target:
 
     # -- cache --
     def make_cache(self):
+        if self._inkling:
+            from .inkling_fused import make_cache
+
+            return make_cache(self.model.language_model)     # in-place KV caches when cleared
         if self.is_vlm:
             return self.model.language_model.make_cache()
         from mlx_lm.models.cache import make_prompt_cache

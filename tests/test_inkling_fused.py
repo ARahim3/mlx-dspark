@@ -222,11 +222,11 @@ def _count_fused_calls(monkeypatch):
     return hits
 
 
-def _walk(lm, on_kinds):
+def _walk(lm, on_kinds, make_cache=None):
     """Prefill 12 tokens (stock), three decode steps, a 4-row verify committed at 2 rows, one
     more step — the logits of every forward after the prefill and the final cache states."""
     F.set_enabled(lm, False)
-    cache = lm.make_cache()
+    cache = (make_cache or lm.make_cache)()
     mx.eval(lm(inputs=mx.array([[3, 7, 11, 2, 9, 30, 41, 5, 8, 13, 21, 34]]), cache=cache).logits)
     if on_kinds:
         F.set_enabled(lm, True, on_kinds)
@@ -264,6 +264,76 @@ def test_installed_exact_kinds_are_bit_identical_to_mlx_vlm(monkeypatch):
         assert all(bool(mx.array_equal(a, b)) for a, b in zip(got_states, ref_states)), kinds
 
 
+def test_in_place_kv_caches_walk_bit_identically_to_the_stock_caches():
+    from mlx_dspark import inkling_cache as C
+
+    lm = _tiny_bf16_inkling()
+    F.install(lm, enabled=False)
+    ref, _ = _walk(lm, None)
+
+    def converted():
+        cache = C.convert(lm.make_cache())
+        assert all(C.is_sink_cache(entry.caches[0]) for entry in cache)
+        for entry in cache:
+            entry.caches[0].step = 2          # the 8-key window slides and is rebuilt in the walk
+        return cache
+
+    # with the fused attention (views with the sink row) and with the stock body (prefill's)
+    for kinds in (F.EXACT_KINDS, ("attn",), None):
+        got, _ = _walk(lm, kinds, converted)
+        assert all(bool(mx.array_equal(a, b)) for a, b in zip(got, ref)), kinds
+
+
+def test_one_launch_mask_is_bit_identical_and_the_walk_matches_with_it():
+    lm = _tiny_bf16_inkling()                    # (skips where mlx-vlm has no looped Inkling 2)
+    from mlx_vlm.models.inkling2 import language as L
+
+    F.install(lm, enabled=False)
+    for layer in (lm.model.layers[0], lm.model.layers[1]):           # sliding, global
+        attn = layer.self_attn
+        for rows, size in ((1, 1), (1, 6), (3, 3), (3, 9), (8, 15), (5, 40)):
+            if attn.sliding and size > attn.sliding - 1 + rows:
+                continue
+            r = _bf16(1, rows, attn.n_heads, 4, seed=rows * 100 + size)
+            sinks = _bf16(1, rows, attn.n_heads, seed=7 + size)
+            ref = mx.concatenate(
+                [L.banded_additive_mask(r, attn.rel_proj.astype(mx.bfloat16), size - rows, size,
+                                        attn.sliding, attn.rel_extent, left_padding=None,
+                                        shape_ref=mx.zeros((1, 1, size, 1), mx.bfloat16)),
+                 sinks.transpose(0, 2, 1)[..., None]], axis=-1)
+            got = F.fused_mask(r, F._rel_transposed(attn, mx.bfloat16), sinks, size, attn.sliding,
+                               attn.rel_extent)
+            assert got.shape == ref.shape and bool(mx.array_equal(got, ref)), (rows, size)
+    # in the forward: the same walk with the mask from one launch and from the stock pair
+    ref, ref_states = _walk(lm, None)
+    for on in (True, False):
+        F.set_mask(lm, on)
+        got, got_states = _walk(lm, F.EXACT_KINDS)
+        assert all(bool(mx.array_equal(a, b)) for a, b in zip(got, ref)), on
+        assert all(bool(mx.array_equal(a, b)) for a, b in zip(got_states, ref_states)), on
+
+
+def test_layer_visit_loop_is_bit_identical_and_reads_messages_once_per_pass(monkeypatch):
+    lm = _tiny_bf16_inkling()
+    F.install(lm, enabled=False)
+    ref, ref_states = _walk(lm, None)
+    scheduled = []
+    monkeypatch.setattr(F.mx, "async_eval", lambda *a: scheduled.append(a))
+    for kinds in (("model",), (*F.EXACT_KINDS, "model")):
+        scheduled.clear()
+        got, got_states = _walk(lm, kinds)
+        assert all(bool(mx.array_equal(a, b)) for a, b in zip(got, ref)), kinds
+        assert all(bool(mx.array_equal(a, b)) for a, b in zip(got_states, ref_states)), kinds
+        # 8 visits per forward, handed over every SCHEDULE_EVERY: decode steps too (stock hands
+        # over inside the speculative verify only)
+        assert len(scheduled) == 5 * (8 // F.SCHEDULE_EVERY)
+    # a prefill-sized call is the stock loop
+    scheduled.clear()
+    F.set_enabled(lm, True, ("model",))
+    lm(inputs=mx.array([list(range(2, 2 + F.MAX_ROWS + 4))]), cache=lm.make_cache())
+    assert scheduled == []
+
+
 def test_installed_rounding_kinds_stay_close_and_long_calls_take_the_stock_path():
     lm = _tiny_bf16_inkling()
     F.install(lm, enabled=False)
@@ -283,8 +353,13 @@ def test_installed_rounding_kinds_stay_close_and_long_calls_take_the_stock_path(
 def test_selftest_passes_then_turns_off_a_body_that_no_longer_matches(monkeypatch):
     lm = _tiny_bf16_inkling()
     F.install(lm, enabled=False)
-    assert F.selftest(lm) == dict.fromkeys((*F.EXACT_KINDS, *F.ROUNDING_KINDS), True)
+    assert F.selftest(lm) == dict.fromkeys(
+        (*F.EXACT_KINDS, F.KV_KIND, F.MASK_KIND, *F.ROUNDING_KINDS, *F.LOOP_KINDS), True)
     assert all(F._on(m) for m, _ in F._fused_modules(lm))
+    # the cleared in-place caches are what make_cache hands out
+    from mlx_dspark import inkling_cache as C
+
+    assert F.kv_caches(lm) and all(C.is_sink_cache(e.caches[0]) for e in F.make_cache(lm))
     # mlx-vlm changes its layer body: the copy must switch off, the other pieces stay on
     from mlx_vlm.models.inkling2 import language as L
 
@@ -298,6 +373,26 @@ def test_selftest_passes_then_turns_off_a_body_that_no_longer_matches(monkeypatc
     assert all(F._on(m) for m, kind in F._fused_modules(lm) if kind != "layer")
     F.set_enabled(lm, True)                                    # a rejected kind stays off
     assert not any(F._on(m) for m, kind in F._fused_modules(lm) if kind == "layer")
+
+
+def test_selftest_keeps_the_stock_caches_when_the_in_place_ones_do_not_match(monkeypatch):
+    from mlx_dspark import inkling_cache as C
+
+    lm = _tiny_bf16_inkling()
+    F.install(lm, enabled=False)
+    window_cls = C.classes()[1]
+    stock = window_cls.sink_views
+
+    def off_by_one(self):                       # a window that shows the attention one key less
+        k, v = stock(self)
+        return k[..., 1:, :], v[..., 1:, :]
+
+    monkeypatch.setattr(window_cls, "sink_views", off_by_one)
+    result = F.selftest(lm)
+    assert result[F.KV_KIND] is False and result["attn"] and result["model"]
+    assert not F.kv_caches(lm)
+    assert not any(C.is_sink_cache(e.caches[0]) for e in F.make_cache(lm))
+    assert all(F._on(m) for m, _ in F._fused_modules(lm))      # the module kinds are untouched
 
 
 def _quantize_experts(lm, mode="nvfp4"):
@@ -393,4 +488,5 @@ def test_fused_exact_kinds_stay_bit_identical_on_the_8bit_model(monkeypatch):
     got, got_states = _walk(lm, F.EXACT_KINDS)
     assert all(bool(mx.array_equal(a, b)) for a, b in zip(got, ref))
     assert all(bool(mx.array_equal(a, b)) for a, b in zip(got_states, ref_states))
-    assert F.selftest(lm) == dict.fromkeys((*F.EXACT_KINDS, *F.ROUNDING_KINDS), True)
+    assert F.selftest(lm) == dict.fromkeys(
+        (*F.EXACT_KINDS, F.KV_KIND, F.MASK_KIND, *F.ROUNDING_KINDS, *F.LOOP_KINDS), True)

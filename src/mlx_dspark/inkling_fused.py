@@ -37,6 +37,8 @@ from functools import lru_cache
 
 import mlx.core as mx
 
+from .inkling_cache import is_sink_cache
+
 MAX_ROWS = 8          # positions per call a fused piece accepts (the widest verify: cap 7 + anchor)
 _FLAG = "_mlx_dspark_fused"
 
@@ -741,6 +743,114 @@ def _temporal_parts(kv, v: mx.array) -> list[mx.array]:
     return [v[..., : kv._idx, :]]
 
 
+# ---- attention: the relative-position mask and the sink's column, one launch ----------------------
+# mlx-vlm builds the additive mask [1, H, L, S] with a kernel of 8 x 8 threadgroups over
+# (key, query row) — at one query row seven of every eight threads have nothing to do — that
+# reads its [d_rel, extent] projection down a column (2 KB between the 16 values of one key
+# distance), and then concatenates the sink's logit column: a second copy of the whole mask.
+# Here: one thread per output element, the projection transposed once per layer so a distance's
+# values sit together, and the sink's column written by the same launch. The value expression is
+# mlx-vlm's own (`_MASK_V2_SRC`, models/inkling/language.py, MIT): the same 16 products added in
+# the same order — bit-identical, which the self-test checks against the stock pair at load.
+_MASK_SOURCE = r"""
+    const int j = int(thread_position_in_grid.x);     // key; j == S is the sink's column
+    const int i = int(thread_position_in_grid.y);     // query row
+    const int h = int(thread_position_in_grid.z);     // head
+    const int S = dims[0];
+    const int LQ = rel_shape[1];
+    const int H = rel_shape[2];
+    const size_t at = (size_t(h) * LQ + i) * (S + 1) + j;
+    if (j == S) {
+        out[at] = sinks[size_t(i) * H + h];
+        return;
+    }
+    const int dist = (i + (S - LQ)) - j;              // backward distance
+    T val;
+    if (dist < 0) {
+        val = (T)(-1e30f);                            // causal
+    } else if (SLIDING > 0 && dist >= SLIDING) {
+        val = (T)(-1e30f);                            // sliding-window cap
+    } else if (dist < REL_EXTENT) {
+        float acc = 0.0f;
+        const size_t rbase = (size_t(i) * H + h) * D_REL;
+        const size_t pbase = size_t(dist) * D_REL;
+        for (uint d = 0; d < D_REL; ++d)
+            acc += (float)rel[rbase + d] * (float)proj[pbase + d];
+        val = (T)acc;
+    } else {
+        val = (T)0;                                   // in context, outside the band
+    }
+    out[at] = val;
+"""
+_MASK = "_mlx_dspark_mask"          # per attention module: the one-launch mask is on
+_REL_T = "_mlx_dspark_rel_t"        # per attention module: (rel_proj it was built from, its transpose)
+
+
+@lru_cache(maxsize=1)
+def _mask_kernel():
+    return mx.fast.metal_kernel(
+        name="mlx_dspark_inkling_mask_sink",
+        input_names=["rel", "proj", "sinks", "dims"],
+        output_names=["out"],
+        source=_MASK_SOURCE,
+    )
+
+
+@lru_cache(maxsize=4096)
+def _dims(size: int) -> mx.array:
+    d = mx.array([size], mx.int32)
+    mx.eval(d)
+    return d
+
+
+def _rel_transposed(attn, dtype) -> mx.array:
+    """``rel_proj`` as ``[extent, d_rel]`` in the stream's dtype, built once per layer."""
+    held = attn.__dict__.get(_REL_T)
+    if held is None or held[0] is not attn.rel_proj or held[1].dtype != dtype:
+        t = mx.contiguous(attn.rel_proj.astype(dtype).T)
+        mx.eval(t)
+        held = attn.__dict__[_REL_T] = (attn.rel_proj, t)
+    return held[1]
+
+
+def fused_mask(rel: mx.array, proj_t: mx.array, sinks: mx.array, size: int, sliding: int,
+               rel_extent: int) -> mx.array:
+    """mlx-vlm's ``banded_additive_mask`` for the last ``L`` of ``size`` keys with the sink's
+    logit as column ``size``: ``[1, H, L, size + 1]`` from ``rel [1, L, H, d_rel]``, ``proj_t
+    [extent, d_rel]`` and ``sinks [1, L, H]`` (all one dtype)."""
+    _, rows, heads, d_rel = rel.shape
+    return _mask_kernel()(
+        inputs=[rel, proj_t, sinks, _dims(int(size))],
+        template=[("T", rel.dtype), ("D_REL", int(d_rel)), ("REL_EXTENT", int(rel_extent)),
+                  ("SLIDING", int(sliding))],
+        grid=(size + 1, rows, heads),
+        threadgroup=(min(256, size + 1), 1, 1),
+        output_shapes=[(1, heads, rows, size + 1)],
+        output_dtypes=[rel.dtype],
+    )[0]
+
+
+def _attention_mask(attn, lang, r, sinks, size, length, shape_ref):
+    """The attention's additive mask with the sink's column: one launch when the self-test
+    cleared it for this model, the stock kernel + concatenate otherwise."""
+    if attn.__dict__.get(_MASK) and sinks.dtype == r.dtype and r.shape[0] == 1:
+        return fused_mask(r, _rel_transposed(attn, r.dtype), sinks, size, attn.sliding,
+                          attn.rel_extent)
+    mask = lang.banded_additive_mask(r, attn.rel_proj.astype(r.dtype), size - length, size,
+                                     attn.sliding, attn.rel_extent, left_padding=None,
+                                     shape_ref=shape_ref)
+    return mx.concatenate([mask, sinks.transpose(0, 2, 1)[..., None]], axis=-1)
+
+
+def set_mask(language_model, enabled: bool) -> None:
+    """Switch the one-launch mask on or off for every attention module (the A/B; the self-test
+    decides at load)."""
+    for layer in language_model.model.layers:
+        attn = getattr(layer, "self_attn", None)
+        if attn is not None and hasattr(attn, "rel_proj"):
+            attn.__dict__[_MASK] = bool(enabled)
+
+
 # ---- the attention body -------------------------------------------------------------------------
 # mlx-vlm's Attention.__call__ (models/inkling2/language.py, Apache-2.0) for one batch row: the
 # projections, the KV cache update, the relative-position mask and the attention itself are the
@@ -791,19 +901,25 @@ def _attn_call(base):
                 r = (r.astype(mx.float32) * tau[..., None, None]).astype(x.dtype)
         q, k, v = (a.transpose(0, 2, 1, 3) for a in (q, k, v))
         k, v = kv.update_and_fetch(k, v)
-        # [keys in temporal order ‖ the sink's zero row] as ONE concatenate (stock: the ring's
-        # reorder, a zeros fill, then another copy of the whole K and V for the sink row)
-        rotating = isinstance(kv, lang.RotatingKVCache)
-        k_parts = _temporal_parts(kv, k) if rotating else [k]
-        v_parts = _temporal_parts(kv, v) if rotating else [v]
-        size = sum(part.shape[2] for part in k_parts)
-        mask = lang.banded_additive_mask(r, self.rel_proj.astype(x.dtype), size - length, size,
-                                         self.sliding, self.rel_extent, left_padding=None,
-                                         shape_ref=k if k.shape[2] == size else k_parts[0])
-        sinks = self.sink_proj(x).transpose(0, 2, 1)[..., None]
-        mask = mx.concatenate([mask, sinks], axis=-1)
-        k = mx.concatenate([*k_parts, _zero_row(b, self.n_kv, self.head_dim, k.dtype)], axis=2)
-        v = mx.concatenate([*v_parts, _zero_row(b, self.n_kv, self.head_dim, v.dtype)], axis=2)
+        sinks = self.sink_proj(x)
+        if is_sink_cache(kv):
+            # inkling_cache: the rows are in temporal order and the sink's zero row sits in the
+            # buffer behind them, so K and V are VIEWS — the same keys in the same order into
+            # the same SDPA kernel, nothing copied
+            size = k.shape[2]
+            mask = _attention_mask(self, lang, r, sinks, size, length, k)
+            k, v = kv.sink_views()
+        else:
+            # [keys in temporal order ‖ the sink's zero row] as ONE concatenate (stock: the
+            # ring's reorder, a zeros fill, then another copy of the whole K and V)
+            rotating = isinstance(kv, lang.RotatingKVCache)
+            k_parts = _temporal_parts(kv, k) if rotating else [k]
+            v_parts = _temporal_parts(kv, v) if rotating else [v]
+            size = sum(part.shape[2] for part in k_parts)
+            mask = _attention_mask(self, lang, r, sinks, size, length,
+                                   k if k.shape[2] == size else k_parts[0])
+            k = mx.concatenate([*k_parts, _zero_row(b, self.n_kv, self.head_dim, k.dtype)], axis=2)
+            v = mx.concatenate([*v_parts, _zero_row(b, self.n_kv, self.head_dim, v.dtype)], axis=2)
         out = mx.fast.scaled_dot_product_attention(q, k, v, scale=self.head_dim**-0.5, mask=mask)
         out = out.transpose(0, 2, 1, 3).reshape(b, length, -1)
         return self.o_proj(_gated(out, self.gate_proj(x)))
@@ -857,6 +973,79 @@ def _layer_call(base):
     return __call__
 
 
+# ---- the layer-visit loop -------------------------------------------------------------------------
+# mlx-vlm's TextModel.__call__ (models/inkling2/language.py, Apache-2.0) for decode / verify
+# widths. Nothing numeric changes; two things about how the graph reaches the GPU do:
+#   * A loop pass's messages for ALL its layers come from one read. The bank a pass reads is
+#     fixed when the pass starts, so the stock loop's per-layer read (two matmuls and a softmax,
+#     24 times a token) is the same rows of one larger product — bit-identical on the kernels
+#     MLX picks here, which the self-test checks on every load.
+#   * The graph is handed to the GPU every few visits at decode width too. Stock does that only
+#     inside a speculative verify (every 4 visits); a single-row forward was encoded whole before
+#     the GPU saw any of it, which a pipelined decode loop hides and an unpipelined step (a
+#     verify of one row, a parked round's first step, calibration) pays in full.
+# Visits between hand-offs (stock's value inside a verify). Measured on an M4 Pro, decode width:
+# pipelined 29.6 ms/step with the stock loop, 28.4-28.5 at every 4 / 8 / 12 / 16 / 24; a step
+# built and evaluated alone 36.7 -> 30.4 / 30.7 / 31.6 / 32.1 / 33.5.
+SCHEDULE_EVERY = 4
+
+
+def _model_call(base):
+    def __call__(self, inputs, cache=None, input_embeddings=None, skip_final_norm=False,
+                 capture_layer_ids=None, speculative_verify=False):
+        ref = inputs if input_embeddings is None else input_embeddings
+        visits = len(self.layer_indices)
+        ok = (_on(self) and bool(cache) and len(cache) == visits and not self.training
+              and ref.shape[0] == 1 and ref.shape[1] <= MAX_ROWS and _gpu())
+        if ok and capture_layer_ids is not None:
+            ok = (len(capture_layer_ids) == len(set(capture_layer_ids))
+                  and all(type(i) is int and 0 <= i <= visits for i in capture_layer_ids))
+        if not ok:
+            return base.__call__(self, inputs, cache, input_embeddings, skip_final_norm,
+                                 capture_layer_ids, speculative_verify)
+        requested = set(capture_layer_ids or ())
+        captures = {}
+        x = self.embed(inputs) if input_embeddings is None else input_embeddings
+        blocks = []
+        loop = self.loop
+        pass_messages = None
+        per_layer = int(self.message_queries.shape[1]) if loop is not None else 0
+        every = SCHEDULE_EVERY
+        for visit, index in enumerate(self.layer_indices):
+            if loop is not None and index == loop.core_start:
+                if visit == index:
+                    prelude, prelude_blocks = x, blocks.copy()
+                else:
+                    # The first block appended in the core is the prelude partial.
+                    # Only completed core blocks and the last partial supply messages.
+                    states = mx.stack([*blocks[len(prelude_blocks) + 1:], x], axis=-2)
+                    bank = mx.fast.rms_norm(states.astype(mx.float32), None, 1e-6)
+                    x, blocks = prelude, prelude_blocks.copy()
+                    queries = self.message_queries
+                    scores = (queries.reshape(-1, queries.shape[-1]) @ bank.swapaxes(-1, -2)
+                              ) * x.shape[-1] ** -0.5
+                    pass_messages = mx.softmax(scores, axis=-1) @ bank
+            messages = None
+            if pass_messages is not None and index < loop.core_end:
+                at = (index - loop.core_start) * per_layer
+                messages = pass_messages[..., at: at + per_layer, :]
+            if visit in requested:
+                captures[visit] = x
+            x = self.layers[index](x, blocks, cache[visit], messages)
+            if every and (visit + 1) % every == 0:
+                mx.async_eval(x)
+        h = self.final_input(blocks, x)[..., 0, :]
+        normalized = self.norm(h).astype(x.dtype)
+        if visits in requested:
+            captures[visits] = normalized
+        result = h if skip_final_norm else normalized
+        if capture_layer_ids is not None:
+            return result, [captures[i] for i in capture_layer_ids]
+        return result
+
+    return __call__
+
+
 # ---- the routed experts --------------------------------------------------------------------------
 def _moe_call(base):
     from . import inkling_kernels as K
@@ -892,6 +1081,8 @@ def _fused_modules(language_model):
     from .inkling_kernels import moe_spec
 
     model = language_model.model
+    if hasattr(model, "layer_indices") and hasattr(model, "final_input"):
+        yield model, "model"
     final = getattr(model, "final_input", None)
     if final is not None and getattr(final, "normalize_values", False):
         yield final, "res"
@@ -919,14 +1110,36 @@ def _fused_modules(language_model):
 
 
 _MAKERS = {"sconv": _sconv_call, "res": _res_call, "ctrl": _ctrl_call, "layer": _layer_call,
-           "attn": _attn_call, "moe": _moe_call}
+           "attn": _attn_call, "moe": _moe_call, "model": _model_call}
 
 
 _OFF = "_mlx_dspark_fused_off"      # kinds the self-test switched off for this model
 EXACT_KINDS = ("sconv", "layer", "attn")       # bit-identical to the stock forward
+LOOP_KINDS = ("model",)                        # the layer-visit loop: bit-identical, whole forward
 ROW_EXACT_KINDS = ("moe",)                     # each row bit-identical to the stock DECODE call
 ROUNDING_KINDS = ("res", "ctrl")               # fp32 dot products summed in another order
-ALL_KINDS = EXACT_KINDS + ROW_EXACT_KINDS + ROUNDING_KINDS
+ALL_KINDS = EXACT_KINDS + LOOP_KINDS + ROW_EXACT_KINDS + ROUNDING_KINDS
+# Not module kinds: whether new caches are the in-place ones of inkling_cache, and whether the
+# attention's mask and sink column come from one launch (both bit-identical, both self-tested)
+KV_KIND = "kv"
+MASK_KIND = "mask"
+_KV = "_mlx_dspark_kv_caches"
+
+
+def kv_caches(language_model) -> bool:
+    """Whether the self-test cleared the in-place KV caches for this model."""
+    return bool(language_model.__dict__.get(_KV, False))
+
+
+def make_cache(language_model) -> list:
+    """The model's layer-visit caches, with the in-place KV caches where the self-test cleared
+    them (``inkling_cache``); the stock mlx-vlm caches otherwise."""
+    cache = language_model.make_cache()
+    if kv_caches(language_model):
+        from .inkling_cache import convert
+
+        convert(cache)
+    return cache
 
 
 def install(language_model, enabled: bool = True) -> dict[str, int]:
@@ -943,7 +1156,8 @@ def install(language_model, enabled: bool = True) -> dict[str, int]:
 def set_enabled(language_model, enabled: bool, kinds=None) -> None:
     """Route every installed piece to the fused path (``True``) or the stock forward (the A/B).
     ``kinds`` limits the switch to some pieces (``"sconv"``, ``"res"``, ``"ctrl"``, ``"layer"``,
-    ``"attn"``, ``"moe"``). A kind the self-test rejected (or :func:`disable` named) stays off."""
+    ``"attn"``, ``"moe"``, ``"model"``). A kind the self-test rejected (or :func:`disable`
+    named) stays off."""
     off = language_model.__dict__.get(_OFF, ())
     for module, kind in _fused_modules(language_model):
         if kinds is None or kind in kinds:
@@ -1013,6 +1227,10 @@ def selftest(language_model, rows: int = 2, seed: int = 0) -> dict[str, bool]:
     ``moe`` must match a single-row layer call bit for bit and, at more rows, the stock module's
     single-row call row by row (:func:`_moe_selftest`); ``res`` / ``ctrl`` within rounding. A
     kernel that does not build on this GPU (threadgroup limits) fails its kind the same way.
+    ``kv`` and ``mask`` are not module kinds: ``kv`` says whether the in-place KV caches
+    (``inkling_cache``) reproduce the stock caches bit for bit here, and :func:`make_cache` hands
+    them out only then; ``mask`` whether the one-launch mask + sink column equals mlx-vlm's
+    kernel and concatenate (:func:`set_mask`).
     Leaves the model with every passing kind on. Returns ``{kind: passed}``."""
     lm = language_model
     model = lm.model
@@ -1020,7 +1238,7 @@ def selftest(language_model, rows: int = 2, seed: int = 0) -> dict[str, bool]:
     visits = list(model.layer_indices)
     hidden = int(model.embed_norm.weight.shape[0])
     key = mx.random.key(seed)
-    keys = iter(mx.random.split(key, 128))
+    keys = iter(mx.random.split(key, 512))
 
     def rand(shape, dtype=mx.float32):
         return mx.random.normal(shape, key=next(keys)).astype(dtype)
@@ -1066,6 +1284,101 @@ def selftest(language_model, rows: int = 2, seed: int = 0) -> dict[str, bool]:
         return (all(bool(mx.array_equal(u, v)) for u, v in zip(a, b)) and len(sa) == len(sb)
                 and all(bool(mx.array_equal(u, v)) for u, v in zip(sa, sb)))
 
+    def kv_run(index, window=5):
+        """The in-place caches (``inkling_cache``) against the stock ones on one layer, through
+        the calls a generation makes: decode steps, a prefill-sized chunk, and verifies inside
+        mlx-vlm's speculative transaction committed in part, in full and at one row — on a
+        ``window``-key window with 2 spare rows, so it fills, slides and is rebuilt. Checked
+        with the fused attention body (views with the sink row) and with the stock body (what a
+        prefill chunk takes). Outputs must match bit for bit."""
+        from mlx_vlm.speculative.cache_state import start_speculative_cache
+
+        from .inkling_cache import convert
+
+        # (rows, rows kept): kept None = an ordinary call, else a verify committed there
+        plan = [(1, None), (1, None), (4, 2), (1, None), (3, 3), (4, 1), (1, None), (6, None),
+                (2, 1), (1, None), (5, 4), (3, 1), (1, None), (1, None)]
+        xs = [rand((1, n, hidden), mx.bfloat16) for n, _ in plan]
+        blocks = [rand((1, 1, hidden), mx.bfloat16)] if layers[index].attention_input is not None else []
+
+        def run(new, fused):
+            set_enabled(lm, False)
+            if fused:
+                set_enabled(lm, True, ("attn",))
+            entry = lm.make_cache()[visits.index(index)]
+            kv = entry.caches[0]
+            if hasattr(kv, "max_size"):
+                entry.caches = (type(kv)(max_size=window, keep=0), *entry.caches[1:])
+            if new:
+                convert([entry])
+                if not is_sink_cache(entry.caches[0]):
+                    raise RuntimeError("no in-place cache for this layer's KV cache")
+                entry.caches[0].step = 2
+            outs = []
+            for x, (n, keep) in zip(xs, plan):
+                bl = [mx.broadcast_to(b, (1, n, hidden)) for b in blocks]
+                if keep is None:
+                    outs.append(layers[index](x, bl, entry, None))
+                    mx.eval(outs[-1])
+                    continue
+                txn = start_speculative_cache([entry], n)
+                outs.append(layers[index](x, bl, entry, None))
+                mx.eval(outs[-1])
+                txn.commit(keep)
+            return outs
+
+        ref = run(False, False)
+        return all(bool(mx.array_equal(a, b))
+                   for arm in ((True, True), (True, False))
+                   for a, b in zip(run(*arm), ref))
+
+    def model_run():
+        taps = [1, len(visits)]
+        ids = [mx.array([[3]]), mx.array([[5, 7][:rows] + [11] * max(0, rows - 2)])]
+        runs = []
+        for on in (False, True):
+            set_enabled(lm, True)
+            set_enabled(lm, on, ("model",))
+            cache = make_cache(lm)
+            outs = []
+            for x in ids:
+                out, caps = model(x, cache=cache, capture_layer_ids=taps)
+                outs.extend([out, *caps])
+                mx.eval(outs)
+            st = _state_arrays([part for entry in cache for part in entry.caches])
+            mx.eval(st)
+            runs.append((outs, st))
+        (a, sa), (b, sb) = runs
+        return (all(bool(mx.array_equal(u, v)) for u, v in zip(a, b)) and len(sa) == len(sb)
+                and all(bool(mx.array_equal(u, v)) for u, v in zip(sa, sb)))
+
+    def mask_run(index):
+        """The one-launch mask + sink column against mlx-vlm's kernel and concatenate on this
+        layer's own projection: one row and several, key counts on both sides of the sliding
+        cap and of the relative-position extent. Bit for bit."""
+        import sys
+
+        attn = layers[index].self_attn
+        lang = sys.modules[type(attn).__mro__[1].__module__]
+        d_rel = int(attn.rel_proj.shape[0])
+        edge = attn.sliding or attn.rel_extent
+        for n in (1, rows, MAX_ROWS):
+            for size in sorted({n, n + 7, edge - 1 + n, edge + 5 + n}):
+                if attn.sliding and size > attn.sliding - 1 + n:
+                    continue                     # more keys than a sliding call can see
+                r = rand((1, n, attn.n_heads, d_rel), mx.bfloat16)
+                sinks = rand((1, n, attn.n_heads), mx.bfloat16)
+                ref = mx.concatenate(
+                    [lang.banded_additive_mask(r, attn.rel_proj.astype(r.dtype), size - n, size,
+                                               attn.sliding, attn.rel_extent, left_padding=None,
+                                               shape_ref=mx.zeros((1, 1, size, 1), r.dtype)),
+                     sinks.transpose(0, 2, 1)[..., None]], axis=-1)
+                got = fused_mask(r, _rel_transposed(attn, r.dtype), sinks, size, attn.sliding,
+                                 attn.rel_extent)
+                if got.shape != ref.shape or not bool(mx.array_equal(got, ref)):
+                    return False
+        return True
+
     sliding = next((i for i, layer in enumerate(layers) if layer.is_sliding and i > 0), None)
     globl = next((i for i, layer in enumerate(layers) if not layer.is_sliding), None)
     core = next((i for i, layer in enumerate(layers) if getattr(layer, "controllers", None)), None)
@@ -1073,6 +1386,14 @@ def selftest(language_model, rows: int = 2, seed: int = 0) -> dict[str, bool]:
     result: dict[str, bool] = {}
     lm.__dict__[_OFF] = ()
     installed = {kind for _, kind in _fused_modules(lm)}
+    if "attn" in installed:
+        # first, so the attention and cache checks below run on the mask they will ship with
+        try:
+            ok = bool(probes) and all(mask_run(i) for i in probes)
+        except Exception:  # noqa: BLE001 — the kernel does not build here: keep the stock pair
+            ok = False
+        result[MASK_KIND] = ok
+        set_mask(lm, ok)
     for kind in EXACT_KINDS:
         if kind not in installed:
             continue
@@ -1085,6 +1406,12 @@ def selftest(language_model, rows: int = 2, seed: int = 0) -> dict[str, bool]:
         except Exception:  # noqa: BLE001 — a kernel this GPU cannot launch: keep the stock path
             ok = False
         result[kind] = ok
+    if "attn" in installed:
+        try:
+            ok = bool(probes) and all(kv_run(i) for i in probes)
+        except Exception:  # noqa: BLE001 — another mlx-vlm cache layout: keep the stock caches
+            ok = False
+        result[KV_KIND] = ok
     if "moe" in installed:
         # a decode step through the whole layer (bit for bit, states included), then the
         # multi-row call against single-row stock calls
@@ -1118,6 +1445,18 @@ def selftest(language_model, rows: int = 2, seed: int = 0) -> dict[str, bool]:
     except Exception:  # noqa: BLE001
         ok = False
     result["ctrl"] = ok
-    lm.__dict__[_OFF] = tuple(kind for kind, passed in result.items() if not passed)
+    lm.__dict__[_OFF] = tuple(kind for kind, passed in result.items()
+                              if not passed and kind not in (KV_KIND, MASK_KIND))
+    lm.__dict__[_KV] = bool(result.get(KV_KIND))
+    if "model" in installed:
+        # the loop last, around the pieces that passed: whole forwards (a decode step, then a
+        # wider call on the same caches) with and without it — outputs, taps and cache states
+        try:
+            ok = model_run()
+        except Exception:  # noqa: BLE001
+            ok = False
+        result["model"] = ok
+        if not ok:
+            lm.__dict__[_OFF] += ("model",)
     set_enabled(lm, True)
     return result
