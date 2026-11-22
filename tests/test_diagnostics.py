@@ -192,6 +192,17 @@ class TestInstalledModels:
         assert rows["deepseek-ai/dspark_qwen3_4b_block7"]["kind"] == "drafter"
         assert rows["mlx-community/Qwen3-4B-8bit"]["kind"] == "model"
 
+    def test_a_target_that_bundles_its_drafter_is_a_model(self, tmp_path):
+        """Inkling 2 ships its DSpark head inside the target repo, so the registry names the
+        same repo as target and drafter. It is a chat model: listed as one, with its pairing."""
+        hub, plain = self._fake_caches(tmp_path)
+        _write(tmp_path / "hub" / "models--thinkingmachines--Inkling-2-Mini" / "blobs" / "i", 300)
+        _write(tmp_path / "plain" / "Inkling-2-Mini" / "model.safetensors", 300)
+        rows = {r["repo"]: r for r in diagnostics.installed_models(hub, plain)}
+        for repo in ("thinkingmachines/Inkling-2-Mini", "Inkling-2-Mini"):
+            assert rows[repo]["kind"] == "model"
+            assert rows[repo]["registry_id"] == "inkling-2-mini"
+
     def test_registry_pairing_is_annotated_quant_agnostically(self, tmp_path):
         hub, plain = self._fake_caches(tmp_path)
         rows = {r["repo"]: r for r in diagnostics.installed_models(hub, plain)}

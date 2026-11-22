@@ -648,6 +648,48 @@ def test_load_target_names_the_fix_on_an_mlx_vlm_without_the_looped_model(tmp_pa
     assert MLX_VLM_HINT in str(err.value) and "git+https" in str(err.value)
 
 
+@pytest.mark.parametrize("has_loop", [False, True])
+def test_the_registry_row_answers_before_any_download(monkeypatch, capsys, has_loop):
+    """The checkpoint's config is on disk only after 19 GB: the registry row has to say that
+    this mlx-vlm cannot load the model, to the loader, the server and the app's inventory."""
+    import sys
+    import types
+
+    from mlx_dspark import diagnostics, download, load
+    from mlx_dspark.inkling import MLX_VLM_HINT
+    from mlx_dspark.server import Engine
+
+    fake = types.ModuleType(_INKLING_CFG)
+    if has_loop:
+        fake.LoopConfig = object
+    monkeypatch.setitem(sys.modules, _INKLING_CFG, fake)
+    repo = "thinkingmachines/Inkling-2-Mini"
+    assert load.runtime_gap(repo) == (None if has_loop else MLX_VLM_HINT)
+    assert load.runtime_gap("mlx-community/Qwen3-4B-8bit") is None
+    assert load.runtime_gap(None) is None
+    rows = {r["id"]: r for r in diagnostics.model_inventory(ram_gb=48)}
+    assert rows["inkling-2-mini"]["blocked"] == (None if has_loop else MLX_VLM_HINT)
+    assert rows["qwen3-4b"]["blocked"] is None
+    from mlx_dspark.cli import cmd_models
+
+    cmd_models([])
+    listed = capsys.readouterr().out
+    assert "(in the model repo)" in listed                    # not the target's name twice
+    assert ("Not loadable on this install" in listed) is (not has_loop)
+    if has_loop:
+        return
+
+    def fetched(*a, **k):
+        raise AssertionError("a load that cannot succeed must not download")
+
+    monkeypatch.setattr(load, "_resolve", fetched)
+    monkeypatch.setattr(download, "ensure_local", fetched)
+    with pytest.raises(ValueError, match="needs a newer mlx-vlm"):
+        load.load_target(repo)
+    with pytest.raises(ValueError, match="needs a newer mlx-vlm"):
+        Engine.load(mode="auto", model=repo)
+
+
 # ---------------------------------------------------------------- the Target (mlx-vlm inkling2)
 def _tiny_inkling():
     from mlx_dspark.inkling import mlx_vlm_supports_inkling2

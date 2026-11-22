@@ -18,7 +18,7 @@ import re
 import subprocess
 import sys
 
-from .load import REGISTRY
+from .load import REGISTRY, runtime_gap
 from .roofline import (
     REFERENCE_BANDWIDTH_GB_S,
     bandwidth_scale,
@@ -204,12 +204,13 @@ def _human_size(n: int) -> str:
 
 
 def _drafter_repos() -> set[str]:
-    """Every drafter repo the registry names (gguf: scheme reduced to its repo)."""
+    """Every drafter repo the registry names (gguf: scheme reduced to its repo). A head that
+    ships inside its target's repo (Inkling 2) is not one: that repo is the model."""
     repos = set()
     for entry in REGISTRY:
         for key in ("dspark", "dflash"):
             repo = entry.get(key)
-            if not repo:
+            if not repo or repo == entry["target"]:
                 continue
             if repo.startswith("gguf:"):
                 repo = repo[len("gguf:"):].rsplit("/", 1)[0]
@@ -428,6 +429,9 @@ def model_inventory(ram_gb: float | None = _DETECT) -> list[dict]:  # type: igno
             "drafter_installed": _is_local(drafter),
             # Ready to run right now, with no download at all.
             "ready": _is_local(entry["target"]) and _is_local(drafter),
+            # Why this row cannot load on the installed packages (None = it can): a client
+            # can say so instead of offering a download that ends in a refused load.
+            "blocked": runtime_gap(entry["target"]),
         })
     return rows
 

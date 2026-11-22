@@ -294,10 +294,10 @@ REGISTRY = [
     # reference head (51/51). Verify runs inside mlx-vlm's own speculative-cache transaction; the MoE
     # at verify widths and the fp32 head run mlx-dspark kernels (inkling_kernels.py), and decode /
     # verify forwards run the fused pieces of inkling_fused.py (~2,500 GPU launches per token
-    # instead of ~7,000: plain decode 24.0 -> 29.7 tok/s). Measured 2026-11-21 (M4 Pro, mlx 0.32.4,
-    # Automatic power mode, `benchmark --trials 3`, zero flags), baseline = the fused forward:
-    # **cap 2 = 1.18x** (0.99x chat / 1.22x code / 1.34x math, accept 2.14, baseline 29.7 tok/s);
-    # over the stock forward the same head is 1.40x at cap 3 (33.5 tok/s vs 35.1 here). Lookup off
+    # instead of ~7,000). Measured 2026-11-22 (M4 Pro, mlx 0.32.4, `benchmark --trials 3`, zero
+    # flags), baseline = mlx-dspark's own plain decode: **cap 3 = 1.37x** (1.06x chat / 1.40x code
+    # / 1.67x math, accept 2.41, baseline 34.6 tok/s, DSpark 47.5); the stock mlx-vlm forward
+    # decodes at 24.9 tok/s, so 1.91x over what a plain mlx-vlm user gets. Lookup off
     # (MoE: a free draft still pulls fresh experts per row; re-measured 2026-11-22 with the fused
     # pieces taking 33 rows: x1.90 on a verbatim rewrite, x0.91 on a reordering edit, x0.95-1.07 on
     # chat / code / math — content-dependent, so it stays off). Lossless (token forcing against the
@@ -305,7 +305,7 @@ REGISTRY = [
     # event). See NOTES "Inkling-2-Mini ported", "Inkling fused forward".
     {"id": "inkling-2-mini", "target": "thinkingmachines/Inkling-2-Mini",
      "dspark": "thinkingmachines/Inkling-2-Mini", "bundled_head": True, "lookup_drafts": False,
-     "ram": "~22 GB", "speedup": "~1.2× (1.3× math)"},
+     "model_type": "inkling2_loop", "ram": "~22 GB", "speedup": "~1.4× (1.7× math)"},
 ]
 
 # legacy `--family` / load_pair("qwen3") values -> a concrete target repo (deprecated).
@@ -324,6 +324,23 @@ def _registry_entry(target: str) -> dict | None:
         eid = entry["id"]
         if eid in key or eid.replace("-", "") in key_nodash:
             return entry
+    return None
+
+
+def runtime_gap(repo_or_path: str | None) -> str | None:
+    """Why this target cannot load on the installed packages, as far as its registry row can
+    tell — so before anything is downloaded. None = no known gap.
+
+    ``load_target`` reads the same answer from a checkpoint's own config, which it has only
+    after the weights are local: without this, a first ``--model thinkingmachines/Inkling-2-Mini``
+    on an mlx-vlm that lacks the looped model fetched 19 GB and then refused to load it."""
+    entry = _registry_entry(repo_or_path) if repo_or_path else None
+    model_type = str((entry or {}).get("model_type", ""))
+    if model_type.startswith("inkling2"):
+        from .inkling import MLX_VLM_HINT, mlx_vlm_supports_inkling2
+
+        if not mlx_vlm_supports_inkling2(model_type):
+            return MLX_VLM_HINT
     return None
 
 
@@ -1118,6 +1135,9 @@ def load_target(repo_or_path: str = DEFAULT_TARGET, *, require_tap: bool = False
     import json
     import sys
 
+    gap = runtime_gap(repo_or_path)
+    if gap:                                  # known from the registry row: before the download
+        raise ValueError(f"{repo_or_path}: {gap}")
     path = _resolve(repo_or_path)
     cfg: dict = {}
     cfg_path = os.path.join(path, "config.json")

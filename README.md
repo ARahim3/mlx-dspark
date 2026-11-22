@@ -1346,7 +1346,8 @@ are bundled.
     released (there is no other quant to pick; mlx-dspark runs the official checkpoint as-is).
     Its DSpark head ships **inside the model repo** (`mtp.safetensors`), so the drafter resolves
     to the target itself, and reads its own 8-bit copy of the output head. **Needs mlx-vlm from
-    git** until a release ships the looped `inkling2` model (0.8.0 has the plain one only).
+    git** until a release ships the looped `inkling2` model (0.8.0 has the plain one only):
+    `uv pip install 'mlx-vlm @ git+https://github.com/Blaizzy/mlx-vlm'` — on an older mlx-vlm the load says so before anything is downloaded.
     Measured 2026-11-22 on mlx 0.32.4, lookup drafts off (this pair's shipped default, like
     every MoE row; on a verbatim rewrite `--lookup-drafts` is worth turning on — a pass that
     checks 32 copied tokens costs 175 ms on mlx-dspark's forward, and fixing typos in a document

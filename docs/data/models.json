@@ -928,7 +928,7 @@
       "tools": null,
       "thinking": true,
       "summary": "47.5 tok/s where mlx-vlm's own code runs this model at 24.9 (1.91×): mlx-dspark's own forward makes plain decoding 39% faster, and the DSpark head Thinking Machines ships inside the model repo adds 1.37× on top (1.67× on math, 1.40× on code).",
-      "caveat": "Needs an mlx-vlm with the looped inkling2 model, which no release ships yet (0.8.0 has the plain one only): install mlx-vlm from git until one does.",
+      "caveat": "Needs an mlx-vlm with the looped inkling2 model, which no release ships yet (0.8.0 has the plain one only). Until one does: `uv pip install 'mlx-vlm @ git+https://github.com/Blaizzy/mlx-vlm'`. On an older mlx-vlm the load says so before anything is downloaded.",
       "variants": [
         {
           "registry": "inkling-2-mini",

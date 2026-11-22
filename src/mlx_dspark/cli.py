@@ -1004,12 +1004,20 @@ def cmd_models(argv: list[str]) -> None:
         dspark = e.get("dspark", "—")
         if dspark.startswith("gguf:"):     # PrismML GGUF drafter: converted on first use
             dspark = dspark[len("gguf:"):].rsplit("/", 1)[-1] + " (auto-converted)"
+        elif e.get("bundled_head"):        # Inkling 2: the head ships inside the target repo
+            dspark = "(in the model repo)"
         rows.append((e["target"], dspark, e.get("dflash", "—"), e["ram"]))
     widths = [max(len(r[i]) for r in rows) for i in range(4)]
     for i, r in enumerate(rows):
         print("  " + "  ".join(c.ljust(widths[j]) for j, c in enumerate(r)))
         if i == 0:
             print("  " + "  ".join("-" * widths[j] for j in range(4)))
+    from .load import runtime_gap
+
+    for e in REGISTRY:                     # a row this install cannot load says why, and the fix
+        gap = runtime_gap(e["target"])
+        if gap:
+            print(f"\nNot loadable on this install — {e['target']}: {gap}")
     print("\nAny other target works too — pass its HF repo/path as --model plus --drafter <repo>.\n"
           "Use --mode baseline for plain target decoding (no drafter).")
 

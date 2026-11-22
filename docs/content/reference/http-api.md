@@ -70,7 +70,7 @@ These are what the Mac app drives. Each is a plain HTTP endpoint first, so a scr
 | `POST /admin/load/cancel` | Cancel a download in progress. |
 | `POST /admin/unload` | Free the model; the server stays up. |
 | `GET /admin/status` | Loading state and errors. |
-| `GET /admin/models` | Registry models, what's on disk (Hugging Face cache, LM Studio, your model folders), disk usage, and this Mac's bandwidth relative to the M4 Pro the published numbers came from. Answers without a model. |
+| `GET /admin/models` | Registry models, what's on disk (Hugging Face cache, LM Studio, your model folders), disk usage, and this Mac's bandwidth relative to the M4 Pro the published numbers came from. A registry row that cannot load on the installed packages carries the reason in `blocked` (otherwise `null`). Answers without a model. |
 | `GET /admin/integrations` | Ready-to-paste configs for Claude Code, Codex, OpenCode, pi and any OpenAI-compatible app, filled in with this server's real address, model and key. |
 | `POST /admin/race` | Run several decoders on one prompt and stream the result as SSE, ending with a token-by-token identical-output verdict. Body: `{"prompt": "…", "arms": [{"mode": "dspark", "cap": 4}, {"mode": "baseline"}], "max_tokens": 200}`. |
 

@@ -681,7 +681,11 @@ class Engine:
         # worth cancelling and showing progress for — all happens here, where
         # /admin/load/cancel and /health's download progress can reach it.
         from .download import ensure_local
+        from .load import runtime_gap
 
+        gap = runtime_gap(target_repo)
+        if gap:                              # a load that cannot succeed downloads nothing
+            raise ValueError(f"{target_repo}: {gap}")
         ensure_local(target_repo)
         ensure_local(drafter_repo)
 
