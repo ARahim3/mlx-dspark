@@ -452,6 +452,60 @@ def test_small_m_cap_is_cached_with_the_verdicts(monkeypatch, tmp_path):
         sk.set_s_cap(sk.S_MAX)
 
 
+def test_small_m_verdicts_are_not_shared_across_target_bits(monkeypatch, tmp_path):
+    """--target-bits quantizes the target's dense layers at load, so the same repo has other
+    weight shapes: the released weights' verdict (raced first) must not answer for them — it
+    left the 8-bit attention projections off the kernel without racing them."""
+    import sys
+    from types import SimpleNamespace
+
+    import mlx.core as mx
+
+    calib = sys.modules["mlx_dspark.calibrate"]
+    smm = sys.modules["mlx_dspark.small_m_qmm"]
+    sk = sys.modules["mlx_dspark.skinny_qmm"]
+    monkeypatch.setattr(mx, "device_info", lambda: {"architecture": "applegpu_g16s"})
+    raced = []
+
+    def measured(model, drafter, **k):
+        raced.append(model.tag)
+        return [f"{model.tag}-shape"]
+    monkeypatch.setattr(smm, "measure_shapes", measured)
+
+    def run(bits):
+        target = SimpleNamespace(model=SimpleNamespace(tag=f"tb{bits}"), target_bits=bits)
+        return calib.small_m_qmm_shapes(target, target_repo="m", cache_dir=str(tmp_path),
+                                        verbose=False)
+    try:
+        assert run(0) == ["tb0-shape"] and run(8) == ["tb8-shape"]
+        assert run(0) == ["tb0-shape"] and run(8) == ["tb8-shape"]      # each from its own entry
+        assert raced == ["tb0", "tb8"]
+    finally:
+        sk.set_s_cap(sk.S_MAX)
+
+
+def test_calibrate_takes_the_parked_clock_from_the_target(tmp_path):
+    """--max-draft auto clocks a parked step at scheduling unless the target asks for the
+    sync-to-sync clock (Inkling 2): every other target keeps the clock its parking behaviour
+    was measured with."""
+    import sys
+    from types import SimpleNamespace
+
+    calib = sys.modules["mlx_dspark.calibrate"]
+    entry = {"verify": {str(w): 20.0 + 5 * w for w in range(1, 10)},
+             "drafter": {str(c): 4.0 for c in range(1, 9)}, "overhead": 0.0,
+             "verify_depth": {"d0": 512, "d1": 16384, "unsupported": True}}
+    drafter = SimpleNamespace(config=SimpleNamespace(block_size=8, target_layer_ids=[1, 2]))
+    for tag, sync in (("", False), ("|x", True)):
+        calib.save_cached(calib._cache_key("dspark", "m", "m") + tag, entry, str(tmp_path))
+        target = SimpleNamespace(calibration_tag=tag, kv_bits=None)
+        if sync:
+            target.parked_sync_clock = True
+        ctrl = calib.calibrate(target, drafter, mode="dspark", target_repo="m", drafter_repo="m",
+                               cache_dir=str(tmp_path), verbose=False)
+        assert ctrl.parked_sync_clock is sync and ctrl.allow_zero
+
+
 class TestBandwidthCache:
     """The bandwidth microbench is measured once per chip x mlx and cached like the curves."""
 

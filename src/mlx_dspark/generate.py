@@ -1387,12 +1387,21 @@ def speculative_generate(
             drafter.update_context(fused, ctx_offset=n_cached, ctx_caches=ctx_caches)
             n_cached += 1
             mx.async_eval(nxt_arr, [c.k for c in ctx_caches])
+            # Each parked step's clock stops either when the step is SCHEDULED (the historical
+            # clock) or when its token is on the host (CapController.parked_sync_clock). The
+            # first charges a sprint's first step only its graph build and leaves the last
+            # step's GPU wait in the next round's period — the probe's — so probes read slower
+            # than they are and parked steps faster.
+            sync_clock = getattr(cap_controller, "parked_sync_clock", False)
             while True:
                 steps -= 1
+                if sync_clock:
+                    nxt = int(nxt_arr.item())
                 now = time.perf_counter()
                 cap_controller.update(0, 0, round_ms=(now - _rt) * 1e3, committed=1)
                 _rt = now
-                nxt = int(nxt_arr.item())
+                if not sync_clock:
+                    nxt = int(nxt_arr.item())
                 out_ids.append(nxt)
                 accept_lengths.append(1)
                 target_forwards += 1

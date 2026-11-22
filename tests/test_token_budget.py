@@ -43,6 +43,46 @@ def test_speculative_generate_returns_exactly_the_budget(budget):
         assert res.finish_reason == "length"
 
 
+class _ParkedController:
+    """Parked from the first round, a cap-1 probe every ``probe_every`` rounds."""
+
+    probe_every = 3
+
+    def __init__(self, sync_clock):
+        self.parked_sync_clock = sync_clock
+        self.cap = 0
+        self.rounds = 0
+        self.seen = []
+
+    def set_depth(self, n):
+        pass
+
+    def update(self, accepted_n, cap_used, *, round_ms=None, committed=None):
+        assert round_ms is not None and round_ms >= 0 and committed >= 1
+        self.seen.append((cap_used, committed))
+        self.rounds += 1
+        self.cap = 1 if self.rounds % self.probe_every == 0 else 0
+
+
+def test_parked_sprint_clock_changes_no_token_and_no_round():
+    # CapController.parked_sync_clock only moves WHEN a parked step's clock is read (at
+    # scheduling, or once its token is on the host): same tokens, same rounds, same budget
+    t = Target(_tiny_dense(), tokenizer=None)
+    d = _tiny_dspark(32)
+    budget = 14
+    ref = greedy_generate(t, _Tok(), prompt_ids=PROMPT, max_new_tokens=budget).token_ids
+    runs = []
+    for sync in (False, True):
+        ctrl = _ParkedController(sync)
+        res = speculative_generate(t, _Tok(), d, prompt_ids=PROMPT, max_new_tokens=budget,
+                                   max_draft_tokens=None, cap_controller=ctrl,
+                                   lookup_drafts=False)
+        assert res.token_ids == ref and len(res.token_ids) == budget
+        assert any(cap == 0 for cap, _ in ctrl.seen) and any(cap == 1 for cap, _ in ctrl.seen)
+        runs.append(ctrl.seen)
+    assert runs[0] == runs[1]
+
+
 def test_lookup_generate_returns_exactly_the_budget():
     t = Target(_tiny_dense(), tokenizer=None)
     # a repetitive prompt so the n-gram index fires copy drafts longer than the budget

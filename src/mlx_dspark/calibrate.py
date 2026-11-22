@@ -612,6 +612,10 @@ class CapController:
         # rounds skip the drafter graph entirely, and biasing the comparison slightly
         # toward parking is the conservative direction (its downside is bounded).
         self.overhead_ms = float(overhead_ms)
+        # How the dspark loop clocks a parked step (generate.speculative_generate's parked
+        # sprint): False = at scheduling, True = when its token reaches the host. See there;
+        # calibrate() turns it on per target.
+        self.parked_sync_clock = False
 
     # -- cost model --
     def set_depth(self, n_ctx: int) -> None:
@@ -1105,6 +1109,11 @@ def small_m_qmm_shapes(target, drafter=None, *, target_repo: str,
         return []
 
     key = _cache_key("smallm", target_repo, drafter_repo)
+    # --target-bits quantizes the target's own dense layers at load: other shapes than the
+    # released weights have, so the two must not share a verdict (the released entry, raced
+    # first, left the 8-bit attention projections off the kernel without ever racing them)
+    if getattr(target, "target_bits", 0):
+        key += f"|tb{target.target_bits}"
     entry = None if refresh else load_cached(key, cache_dir)
     if entry is not None and ("s_cap" not in entry or entry.get("s_max") != _sk.S_MAX):
         entry = None                        # unknown launch size: re-measure once
@@ -1580,6 +1589,8 @@ def calibrate(target, drafter, *, mode: str, target_repo: str, drafter_repo: str
                          # high caps (and observed round timings ground the rest).
                          allow_zero=(mode == "dspark"),
                          overhead_ms=float(entry.get("overhead", 0.0)))
+    # the target names its parked-step clock (Target.parked_sync_clock; Inkling 2 only so far)
+    ctrl.parked_sync_clock = bool(getattr(target, "parked_sync_clock", False))
     if verbose:
         r = ctrl.info()["predicted_rates"]
         best = max(r, key=r.get)
