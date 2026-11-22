@@ -87,13 +87,18 @@ SLOW_ROUND_LOG_S = float(os.environ.get("MLX_DSPARK_SLOW_ROUND_LOG_S", "") or 10
 # still fail there — its raise_exception carries the model-specific list — but this boundary
 # check turns typos into a clear 400 before any template runs.
 REASONING_EFFORTS = ("low", "medium", "high", "xhigh")
+# What a REQUEST may say on top of those — current OpenAI clients send both, Codex through the
+# Responses API. "none" is thinking off (the template's own off switch, see
+# _apply_request_effort); "minimal" maps to the nearest level the template has. The server-side
+# default (--reasoning-effort, /admin/load) keeps REASONING_EFFORTS: off has its own setting there.
+REQUEST_EFFORTS = ("none", "minimal", *REASONING_EFFORTS)
 
 
-def _reasoning_effort(value) -> str:
+def _reasoning_effort(value, allowed=REASONING_EFFORTS) -> str:
     """Normalize a reasoning-effort value, raising ValueError for anything unknown."""
-    if not isinstance(value, str) or value.lower() not in REASONING_EFFORTS:
+    if not isinstance(value, str) or value.lower() not in allowed:
         raise ValueError(
-            f"reasoning_effort must be one of {', '.join(REASONING_EFFORTS)}, got {value!r}")
+            f"reasoning_effort must be one of {', '.join(allowed)}, got {value!r}")
     return value.lower()
 
 
@@ -102,14 +107,28 @@ def _map_effort_to_vocab(e: str, vocab) -> str:
 
     ``vocab`` (None, or the template's supported set) unchanged returns ``e`` when it's
     None/empty or already contains ``e``. Otherwise pick the nearest on the
-    low<medium<high<xhigh ordinal scale, ties -> the LOWER index (less thinking / faster):
-    'high' -> 'medium' for a {low, medium, xhigh} template (issue #19). Pure so it's
-    unit-testable model-free."""
+    none<minimal<low<medium<high<xhigh ordinal scale, ties -> the LOWER index (less thinking /
+    faster): 'high' -> 'medium' for a {low, medium, xhigh} template (issue #19), 'minimal' ->
+    'low' there. Pure so it's unit-testable model-free."""
     if not vocab or e in vocab:
         return e
-    want = REASONING_EFFORTS.index(e)
-    return min(vocab, key=lambda s: (abs(REASONING_EFFORTS.index(s) - want),
-                                     REASONING_EFFORTS.index(s)))
+    want = REQUEST_EFFORTS.index(e)
+    return min(vocab, key=lambda s: (abs(REQUEST_EFFORTS.index(s) - want),
+                                     REQUEST_EFFORTS.index(s)))
+
+
+def _apply_request_effort(engine, tkw: dict, effort) -> None:
+    """A request's ``reasoning_effort`` onto its chat-template kwargs. Raises ValueError for a
+    value outside :data:`REQUEST_EFFORTS`.
+
+    ``"none"`` means thinking OFF, so it becomes ``enable_thinking=False`` — the off switch of
+    every template, which ``encode_messages`` makes stick where the template has no such flag
+    (``reasoning_effort="none"`` on Inkling 2, a closed empty block on LFM2.5). Anything else is
+    mapped to the nearest level this template accepts (``Engine.map_reasoning_effort``)."""
+    if isinstance(effort, str) and effort.lower() == "none":
+        tkw["enable_thinking"] = False
+        return
+    tkw["reasoning_effort"] = engine.map_reasoning_effort(effort)
 
 
 def _target_config(target_repo: str) -> dict | None:
@@ -555,7 +574,7 @@ class Engine:
         vocab = None
         if self.supports_reasoning_effort:
             ok = set()
-            for e in REASONING_EFFORTS:
+            for e in REQUEST_EFFORTS[1:]:               # "none" is the off switch, not a level
                 try:
                     encode_messages(self.tokenizer, [{"role": "user", "content": "hi"}],
                                     enable_thinking=True, reasoning_effort=e)
@@ -576,8 +595,11 @@ class Engine:
         low<medium<high<xhigh scale, ties rounding DOWN (toward LESS thinking): "high" ->
         "medium" on Qwen3.8. Dropping it instead would fall back to the template's own default
         — which is ``xhigh`` = the *most* thinking, the opposite of what a capped client wants.
-        Still raises ValueError for a value outside the union (a real typo -> clear 400)."""
-        return _map_effort_to_vocab(_reasoning_effort(effort), self.reasoning_effort_vocab)
+        Still raises ValueError for a value outside the union (a real typo -> clear 400).
+        Requests go through :func:`_apply_request_effort`, which turns "none" into thinking
+        off before this is asked."""
+        return _map_effort_to_vocab(_reasoning_effort(effort, REQUEST_EFFORTS),
+                                    self.reasoning_effort_vocab)
 
     @property
     def is_muse(self) -> bool:
@@ -2642,7 +2664,7 @@ def make_handler(engine: Engine, api_key: str | None):
             effort = req.get("reasoning_effort")
             if effort is not None:
                 try:
-                    template_kwargs["reasoning_effort"] = engine.map_reasoning_effort(effort)
+                    _apply_request_effort(engine, template_kwargs, effort)
                 except ValueError as e:
                     return self._send_error(400, str(e))
             try:
@@ -2658,7 +2680,7 @@ def make_handler(engine: Engine, api_key: str | None):
             if thinking is not None:
                 start_payload["thinking"] = thinking
             if effort is not None:
-                start_payload["reasoning_effort"] = template_kwargs["reasoning_effort"]
+                start_payload["reasoning_effort"] = template_kwargs.get("reasoning_effort", "none")
             self._sse(start_payload, "start")
             try:
                 engine.race(prompt_ids, arms, max_tokens,
@@ -2833,9 +2855,9 @@ def make_handler(engine: Engine, api_key: str | None):
                 # "medium" rather than 400); a value outside the union is still a clear 400.
                 # NOTE: the effort hint lands at the head of the prompt (a system-block
                 # instruction), so changing it mid-conversation is a full prefix-cache miss —
-                # clients should treat it as per-conversation.
+                # clients should treat it as per-conversation. "none" is thinking off.
                 try:
-                    tkw["reasoning_effort"] = engine.map_reasoning_effort(req["reasoning_effort"])
+                    _apply_request_effort(engine, tkw, req["reasoning_effort"])
                 except ValueError as e:
                     return self._send_error(400, str(e))
             if req.get("tools"):                      # let the template render the tool schemas
@@ -2884,7 +2906,7 @@ def make_handler(engine: Engine, api_key: str | None):
                     and tkw.get("enable_thinking") is not False):
                 # unknown effort (ValueError) falls through -> the server-side default stands
                 with contextlib.suppress(ValueError):
-                    tkw["reasoning_effort"] = engine.map_reasoning_effort(oc["effort"])
+                    _apply_request_effort(engine, tkw, oc["effort"])
             conv = normalize_tool_messages(A.convert_messages(messages, req.get("system")))
             return encode_messages(engine.tokenizer, conv, **tkw)
 
@@ -3025,8 +3047,10 @@ def make_handler(engine: Engine, api_key: str | None):
                 tkw["tools"] = tools
             reasoning = req.get("reasoning")
             if isinstance(reasoning, dict) and reasoning.get("effort"):
+                # mapped like the other dialects: "none" is thinking off, "minimal" and a level
+                # this template lacks go to its nearest one (Codex sends all of them)
                 try:
-                    tkw["reasoning_effort"] = _reasoning_effort(reasoning["effort"])
+                    _apply_request_effort(engine, tkw, reasoning["effort"])
                 except ValueError as e:
                     return self._send_json(400, R.error_body(str(e)))
             try:

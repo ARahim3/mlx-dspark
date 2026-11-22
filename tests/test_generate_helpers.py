@@ -373,3 +373,96 @@ def test_force_close_thinking_skipped_without_generation_prompt():
     ids = g.encode_messages(tok, [{"role": "user", "content": "hi"}],
                             add_generation_prompt=False, enable_thinking=False)
     assert "</think>" not in _decode_all(tok, ids)
+
+
+# ------------------------------------------------- thinking off where effort is the only switch
+
+
+class _EffortOnlyTok(_CharTemplateTok):
+    """Inkling 2's shape: ``reasoning_effort`` levels from none up, default high, no
+    ``enable_thinking`` anywhere in the template."""
+
+    chat_template = ("{% set effort_map = {'none': 0.0, 'low': 0.2, 'high': 0.9} %}"
+                     "Thinking effort level: {{ effort_map[reasoning_effort or 'high'] }}")
+    levels = {"none": 0.0, "low": 0.2, "high": 0.9}
+
+    def apply_chat_template(self, messages, add_generation_prompt=True, **kw):
+        effort = kw.get("reasoning_effort") or "high"
+        if effort not in self.levels:
+            raise RuntimeError(f"Unknown reasoning_effort: {effort}")
+        text = f"effort {self.levels[effort]}\nu:" + messages[-1]["content"] + "\na\n"
+        return [ord(c) for c in text]
+
+
+def test_thinking_off_becomes_effort_none_where_effort_is_the_only_switch():
+    tok = _EffortOnlyTok()
+    msgs = [{"role": "user", "content": "hi"}]
+    assert _decode_all(tok, g.encode_messages(tok, msgs)).startswith("effort 0.9")
+    assert _decode_all(tok, g.encode_messages(tok, msgs, enable_thinking=True)).startswith("effort 0.9")
+    off = g.encode_messages(tok, msgs, enable_thinking=False)
+    assert _decode_all(tok, off).startswith("effort 0.0")
+    # off is off: an effort sent along with it does not switch reasoning back on
+    assert g.encode_messages(tok, msgs, enable_thinking=False, reasoning_effort="high") == off
+    assert _decode_all(tok, g.encode_messages(tok, msgs, reasoning_effort="low")).startswith(
+        "effort 0.2")
+    # history renders the same way (the prefix-cache probes diff the two)
+    hist = g.encode_messages(tok, msgs, add_generation_prompt=False, enable_thinking=False)
+    assert _decode_all(tok, hist).startswith("effort 0.0")
+
+
+def test_thinking_off_leaves_other_templates_alone():
+    class _NoNone(_EffortOnlyTok):                       # effort levels, but no "none" among them
+        chat_template = "{{ reasoning_effort }} low high"
+        levels = {"low": 0.2, "high": 0.9}
+
+    tok = _NoNone()
+    msgs = [{"role": "user", "content": "hi"}]
+    assert g.encode_messages(tok, msgs, enable_thinking=False) == g.encode_messages(tok, msgs)
+
+    class _Flagged(_EffortOnlyTok):                      # Qwen3.8-class: its own on/off flag
+        chat_template = "{{ enable_thinking }} {{ reasoning_effort }}"
+
+    tok = _Flagged()
+    assert g.encode_messages(tok, msgs, enable_thinking=False) == g.encode_messages(tok, msgs)
+    # LFM2.5 and friends (no effort at all) keep the force-close path
+    tok = _CharTemplateTok()
+    assert _decode_all(tok, g.encode_messages(tok, msgs, enable_thinking=False)).endswith(
+        "<think></think>\n\n")
+
+
+def test_thinking_off_on_the_real_inkling_template():
+    import os
+
+    path = os.path.expanduser("~/.cache/mlx_dspark/models/Inkling-2-Mini/chat_template.jinja")
+    if not os.path.isfile(path):
+        import pytest
+
+        pytest.skip("Inkling-2-Mini is not on this machine")
+    import jinja2
+
+    env = jinja2.Environment()
+
+    def raise_exception(message):
+        raise jinja2.TemplateError(message)
+
+    env.globals["raise_exception"] = raise_exception
+    env.filters["tojson"] = lambda v, **k: __import__("json").dumps(v)
+
+    import re
+
+    class _Tok(_CharTemplateTok):
+        # transformers' {% generation %} marker tags are not plain Jinja
+        chat_template = re.sub(r"{%-?\s*(end)?generation\s*-?%}", "", open(path).read())
+
+        def apply_chat_template(self, messages, add_generation_prompt=True, **kw):
+            text = env.from_string(self.chat_template).render(
+                messages=messages, add_generation_prompt=add_generation_prompt, **kw)
+            return [ord(c) for c in text]
+
+    tok = _Tok()
+    msgs = [{"role": "user", "content": "hi"}]
+    on = _decode_all(tok, g.encode_messages(tok, msgs))
+    off = _decode_all(tok, g.encode_messages(tok, msgs, enable_thinking=False))
+    assert "Thinking effort level: 0.9<|end_message|>" in on        # the template's default
+    assert "Thinking effort level: 0<|end_message|>" in off         # ... and its "none"
+    assert off == _decode_all(tok, g.encode_messages(tok, msgs, reasoning_effort="none"))

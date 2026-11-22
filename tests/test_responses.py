@@ -288,6 +288,10 @@ class _FakeEngine:
     context_window = None
     is_muse = False
     is_inkling = False        # mirrors Engine.is_inkling (Inkling 2 sub-messages off)
+    # the real Engine's reasoning-effort logic (pure over self.tokenizer)
+    supports_reasoning_effort = S.Engine.supports_reasoning_effort
+    reasoning_effort_vocab = S.Engine.reasoning_effort_vocab
+    map_reasoning_effort = S.Engine.map_reasoning_effort
 
     def __init__(self, response_text="Hello world"):
         self.tokenizer = _FakeTok()
@@ -484,3 +488,34 @@ def test_responses_unknown_request_fields_never_fail(api):
                                       "parallel_tool_calls": True, "store": False,
                                       "previous_response_id": None, "metadata": {"a": 1}})
     assert r["object"] == "response"
+
+
+class _EffortTemplateTok(_FakeTok):
+    """A Qwen3.8-shaped template: accepts low / medium / xhigh and raises on anything else."""
+
+    chat_template = "{% if reasoning_effort %}hint{% endif %}{{ enable_thinking }}"
+
+    def __init__(self):
+        self.kwargs = []
+
+    def apply_chat_template(self, messages, add_generation_prompt=True, **kw):
+        if kw.get("reasoning_effort") not in (None, "low", "medium", "xhigh"):
+            raise RuntimeError(f"Unexpected reasoning effort {kw['reasoning_effort']}")
+        self.kwargs.append(kw)
+        return [1, 2, 3]
+
+
+def test_reasoning_effort_is_mapped_like_the_other_dialects(api):
+    """Codex sends none / minimal / high through `reasoning.effort`: none is thinking off,
+    the others go to the nearest level the template has — none of them is a 400."""
+    eng, base = api
+    eng.tokenizer = _EffortTemplateTok()
+    for effort, want in (("none", {"enable_thinking": False}), ("minimal", {"reasoning_effort": "low"}),
+                         ("high", {"reasoning_effort": "medium"}), ("xhigh", {"reasoning_effort": "xhigh"})):
+        _post(base, "/v1/responses", {"input": "hi", "reasoning": {"effort": effort}})
+        got = eng.tokenizer.kwargs[-1]
+        assert {k: got.get(k) for k in want} == want and ("reasoning_effort" in got) == (
+            "reasoning_effort" in want), effort
+    with pytest.raises(urllib.error.HTTPError) as e:
+        _post(base, "/v1/responses", {"input": "hi", "reasoning": {"effort": "extreme"}})
+    assert e.value.code == 400 and "none, minimal, low" in e.value.read().decode()

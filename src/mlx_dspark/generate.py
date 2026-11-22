@@ -170,9 +170,15 @@ def encode_messages(tokenizer, messages: list[dict], add_generation_prompt: bool
     ``template_kwargs`` are passed straight to the chat template — this is how the server
     forwards e.g. ``enable_thinking=False`` (Qwen3) or ``tools=[...]``. Unknown kwargs are
     harmless for templates that ignore them; if a tokenizer rejects them outright we retry
-    without them rather than fail the request.
+    without them rather than fail the request. ``enable_thinking=False`` is made to stick on
+    templates without that flag: ``reasoning_effort="none"`` where effort is the only control
+    (:func:`_effort_is_the_off_switch`), a closed empty block where the template prefills an
+    opener (:func:`_force_close_thinking`).
     """
     if getattr(tokenizer, "chat_template", None):
+        if template_kwargs.get("enable_thinking") is False and _effort_is_the_off_switch(tokenizer):
+            # no on/off flag in this template, only effort levels: off is its lowest one
+            template_kwargs = {**template_kwargs, "reasoning_effort": "none"}
         try:
             r = tokenizer.apply_chat_template(
                 messages, add_generation_prompt=add_generation_prompt, **template_kwargs)
@@ -186,6 +192,30 @@ def encode_messages(tokenizer, messages: list[dict], add_generation_prompt: bool
     # No template: best-effort flat concat (rare for the instruct targets we ship).
     text = "\n".join(str(m.get("content", "")) for m in messages)
     return list(tokenizer.encode(text))
+
+
+_EFFORT_OFF: dict[str, bool] = {}     # chat template -> "thinking off" is reasoning_effort="none"
+
+
+def _effort_is_the_off_switch(tokenizer) -> bool:
+    """Whether this template's only reasoning control is ``reasoning_effort`` and it takes
+    ``"none"`` — Inkling 2: effort levels from none to max, no ``enable_thinking`` flag, and a
+    default of high. There a client's "thinking off" (``enable_thinking=False``, Anthropic
+    ``thinking: disabled``, the server's thinking default) rendered the default effort and the
+    answer arrived behind a full reasoning pass. Probed once per template: one that rejects
+    ``"none"`` keeps its own behavior."""
+    template = str(getattr(tokenizer, "chat_template", "") or "")
+    hit = _EFFORT_OFF.get(template)
+    if hit is None:
+        hit = "reasoning_effort" in template and "enable_thinking" not in template
+        if hit:
+            try:
+                tokenizer.apply_chat_template([{"role": "user", "content": "hi"}],
+                                              add_generation_prompt=True, reasoning_effort="none")
+            except Exception:  # noqa: BLE001 — the template has no such level
+                hit = False
+        _EFFORT_OFF[template] = hit
+    return hit
 
 
 def _force_close_thinking(tokenizer, ids: list[int]) -> list[int]:

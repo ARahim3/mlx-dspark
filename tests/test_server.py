@@ -561,6 +561,32 @@ def test_map_effort_to_vocab():
     sparse = frozenset({"low", "xhigh"})                        # nearest by distance, no tie
     assert S._map_effort_to_vocab("high", sparse) == "xhigh"    # high(2): xhigh d1 < low d2
     assert S._map_effort_to_vocab("medium", sparse) == "low"    # medium(1): low d1 < xhigh d2
+    # the request-only values: the least thinking the template has
+    assert S._map_effort_to_vocab("minimal", qwen) == "low"
+    assert S._map_effort_to_vocab("none", qwen) == "low"
+    inkling = frozenset({"minimal", "low", "medium", "high", "xhigh"})
+    assert S._map_effort_to_vocab("minimal", inkling) == "minimal"
+
+
+def test_request_effort_none_is_thinking_off_and_minimal_maps_down(server):
+    """A request's `reasoning_effort: "none"` is the template's off switch (enable_thinking
+    False, no effort kwarg); "minimal" reaches a {low, medium, xhigh} template as "low". Both
+    were a 400 before. The server-side default keeps its own vocabulary."""
+    eng, base = server
+    eng.tokenizer = _Qwen38Tok()
+    if hasattr(eng, "_effort_vocab"):
+        del eng._effort_vocab
+    body = {"messages": [{"role": "user", "content": "hi"}]}
+    _post(base, "/v1/chat/completions", {**body, "reasoning_effort": "none"})
+    kw = eng.tokenizer.template_kwargs[-1]
+    assert kw.get("enable_thinking") is False and "reasoning_effort" not in kw
+    _post(base, "/v1/chat/completions", {**body, "reasoning_effort": "minimal"})
+    kw = eng.tokenizer.template_kwargs[-1]
+    assert kw["reasoning_effort"] == "low" and "enable_thinking" not in kw
+    assert S._reasoning_effort("None", S.REQUEST_EFFORTS) == "none"
+    with pytest.raises(ValueError):
+        S._reasoning_effort("none")                  # not a server-default value
+    assert eng.reasoning_effort_vocab == frozenset({"low", "medium", "xhigh"})
 
 
 class _Qwen38Tok(_FakeTok):
