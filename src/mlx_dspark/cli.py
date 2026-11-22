@@ -199,9 +199,12 @@ def cmd_generate(argv: list[str]) -> None:
     label = labels[args.mode]
     print(f"loading {args.mode}: target={target_repo}"
           + (f", drafter={drafter_repo}" if drafter_repo else ""))
-    target, tok = load_target(target_repo, require_tap=args.mode in ("dspark", "dflash"),
-                              kv_bits=args.kv_bits or None,
-                              target_bits=args.target_bits or None)
+    try:
+        target, tok = load_target(target_repo, require_tap=args.mode in ("dspark", "dflash"),
+                                  kv_bits=args.kv_bits or None,
+                                  target_bits=args.target_bits or None)
+    except ValueError as e:               # a refused load names its reason and the fix: say
+        ap.error(str(e))                  # that, not a traceback (as `serve` does)
     drafter = None
     if args.mode == "dspark":
         drafter, _ = load_drafter(drafter_repo, quantize=args.drafter_bits > 0,
@@ -867,9 +870,12 @@ def cmd_benchmark(argv: list[str]) -> None:
           + (f"target bits: {args.target_bits} (bf16 attention + output head quantized at load; "
              f"not the released weights)\n" if args.target_bits else "")
           + "loading + warming up…")
-    target, tok = load_target(
-        target_repo, require_tap=any(m in ("dspark", "dflash") for m in modes),
-        target_bits=args.target_bits or None)
+    try:
+        target, tok = load_target(
+            target_repo, require_tap=any(m in ("dspark", "dflash") for m in modes),
+            target_bits=args.target_bits or None)
+    except ValueError as e:               # a refused load: its reason and the fix, no traceback
+        ap.error(str(e))
     greedy_generate(target, tok, "Tell me about the sea.", max_new_tokens=100)
 
     results = {"device": dev, "mlx": mx.__version__, "target": target_repo,
