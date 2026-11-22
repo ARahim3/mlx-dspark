@@ -45,7 +45,7 @@ On a datacenter GPU, verifying 8 rows costs about the same as 1, so the answer i
 
 **With no `--max-draft`** (the default), the first run of each model measures this Mac's curves: verify cost at each width, the drafter's cost, and how verify cost grows with context depth. That takes about 5–20 seconds and is cached per model, quantization and MLX version. The engine derives the best fixed cap from those curves. That's the "derived cap" every published number uses.
 
-**`--max-draft auto`** goes further: it picks the cap *every round*, from the measured curves, live acceptance and observed round times. It can also **park** speculation entirely (plain decoding with periodic probe rounds) on content where speculation would lose. It's the safest single flag, and the recommended one for [Bonsai](/models/ternary-bonsai-27b/).
+**`--max-draft auto`** picks the cap *every round* instead, from the measured curves, live acceptance and observed round times. It can also **park** speculation entirely (plain decoding with periodic probe rounds) on content where speculation would lose, which is why it is the recommended setting for [Bonsai](/models/ternary-bonsai-27b/), a pair that hovers around break-even. Elsewhere it is not the faster choice: in our measurements it lands at the derived cap on some pairs and a few percent under it on others (up to 12% under on one), because it spends rounds exploring caps the derived one already ruled out. Use the default unless you have a reason not to.
 
 **`--max-draft N`** pins it. A cap you set is never overridden, not even by the depth adjustment below. Pin only a value you've measured on this Mac.
 

@@ -93,7 +93,7 @@ Any app that talks to an OpenAI-compatible server works the same way: point it a
 
 **Pick a model, not a configuration.** `--model` takes any Hugging Face repo or local path, exactly like `mlx-lm`. For [the measured models](/models/), the matching drafter *and* that pair's best settings resolve automatically, for any quantization of the model. Anything else still gets drafter-free speculation with the default `--mode auto`, or name a drafter with `--drafter <repo>`.
 
-**Don't set the draft cap.** The published speedups were measured on one M4 Pro. Your Mac's optimum is different, so mlx-dspark measures it on first run and derives its own. If you only remember one flag, `--max-draft auto` adapts the cap every round while it generates. Pin `--max-draft N` only if you've measured a better value. [Why](/concepts/draft-caps/).
+**Don't set the draft cap.** The published speedups were measured on one M4 Pro. Your Mac's optimum is different, so mlx-dspark measures it on first run and derives its own. That default is the one to use. `--max-draft auto` adapts the cap every round instead; it helps on a pair that hovers around break-even and otherwise lands at or slightly under the default. Pin `--max-draft N` only if you've measured a better value. [Why](/concepts/draft-caps/).
 
 **It's lossless by construction.** The model checks every drafted token, so output matches plain decoding in every mode and at every cap. Sampling with `--temperature` stays lossless too: you get an exact sample from the model at that temperature.
 

@@ -94,8 +94,9 @@ unquantized matmul pays a ~2× cost cliff at verify width 2). Details in
 <sub>Nothing in this table is hand-tuned per model, and none of it is pinned to this M4 Pro:
 with no `--max-draft`, mlx-dspark measures **your** machine's verify/drafter cost curves once
 (~5 s, cached per model + quant + mlx version) and derives the draft cap from them — an M1 or
-an M5 gets *its own* optimum, not the one these rows were measured at. `--max-draft auto`
-additionally adapts the cap per round while generating. See [Tuning](#tuning).</sub>
+an M5 gets *its own* optimum, not the one these rows were measured at. That default is the
+setting to use; `--max-draft auto` adapts the cap per round instead and mostly lands at or a
+little under it. See [Tuning](#tuning).</sub>
 
 **Copy-heavy code editing goes further:** when the model re-emits or refactors code already in its
 context (the daily agent/assistant workload), match-scaled lookup drafts reach **4.5× on Gemma-12B**
@@ -169,8 +170,10 @@ things worth knowing, then you can stop reading:
 - **Don't set the draft cap.** The speedups above were measured on one M4 Pro — your machine's
   optimum is different, so mlx-dspark **measures your Mac** on a pair's first run (~5 s, cached)
   and derives its own cap from those curves. An M1 and an M5 each get their own answer.
-  `--max-draft auto` additionally adapts per round while generating (the safest choice if you
-  only remember one flag); `--max-draft N` pins a value only if you've measured a better one.
+  That default is the fastest setting on most pairs. `--max-draft auto` adapts the cap per round
+  instead and can stop drafting where it would lose: worth it on a pair that hovers around
+  break-even (the 2-bit Bonsai), at or a few percent under the default elsewhere.
+  `--max-draft N` pins a value only if you've measured a better one.
 - **It's lossless by construction.** The target verifies every drafted token, so the output is
   identical to running the target alone — every mode, every cap, only the speed changes. Want
   proof and your own numbers? `mlx-dspark benchmark --model <repo> --trials 3` is the same
@@ -605,7 +608,7 @@ that trip people up:
   curves (per model + quant + mlx version). A faster, higher-bandwidth machine can land *lower*,
   not higher — an M5 Max may pick cap 2 for the 8-bit 27B where this M4 Pro picks 7, because
   cheaper verify shifts the optimum down, and forcing 7 there is a small net loss. Prefer no
-  flag, or `--max-draft auto`.
+  flag.
 - **`--confidence-threshold` is drafter-specific, not just quant-specific.** It only pays when
   the drafter leaves *acceptance headroom* for early truncation to recover. On Qwen3.8-27B-4bit
   the `RadixArk` head did, and gained from `--max-draft 7 --confidence-threshold 0.3`, while the
