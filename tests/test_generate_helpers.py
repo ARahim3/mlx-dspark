@@ -466,3 +466,65 @@ def test_thinking_off_on_the_real_inkling_template():
     assert "Thinking effort level: 0.9<|end_message|>" in on        # the template's default
     assert "Thinking effort level: 0<|end_message|>" in off         # ... and its "none"
     assert off == _decode_all(tok, g.encode_messages(tok, msgs, reasoning_effort="none"))
+
+
+# ----------------------------------------------- a long prompt's scratch is handed back once
+
+
+def test_prefill_scratch_is_released_only_after_a_multi_chunk_prompt(monkeypatch):
+    """The prefill loops clear MLX's buffer cache between chunks; the last chunk's scratch is
+    released once the prompt is evaluated, and a prompt read in one chunk is left alone."""
+    import mlx.core as mx
+
+    cleared = []
+    monkeypatch.setattr(mx, "clear_cache", lambda: cleared.append(1))
+
+    class _T:
+        prefill_chunk = 512
+
+    g._release_prefill_scratch(_T(), 512)
+    g._release_prefill_scratch(_T(), 40)
+    assert cleared == []
+    g._release_prefill_scratch(_T(), 513)
+    assert cleared == [1]
+    monkeypatch.setattr(g, "PREFILL_CHUNK", 2048)
+    g._release_prefill_scratch(object(), 2048)             # no chunk of its own: the module knob
+    g._release_prefill_scratch(object(), 2049)
+    assert cleared == [1, 1]
+
+
+def test_generate_loops_release_the_scratch_of_a_chunked_prompt(monkeypatch):
+    import mlx.core as mx
+    from test_dspark_tree import _tiny_dspark
+    from test_tree import _tiny_dense, _tiny_dflash2_for, _Tok
+
+    from mlx_dspark.lookup import lookup_generate
+    from mlx_dspark.target import Target
+
+    released = []
+    real = g._release_prefill_scratch
+    monkeypatch.setattr(g, "_release_prefill_scratch",
+                        lambda target, rows: released.append(rows) or real(target, rows))
+    import mlx_dspark.lookup as lk
+
+    monkeypatch.setattr(lk, "_release_prefill_scratch", g._release_prefill_scratch)
+    monkeypatch.setattr(g, "PREFILL_CHUNK", 8)
+    cleared = []
+    real_clear = mx.clear_cache
+    monkeypatch.setattr(mx, "clear_cache", lambda: cleared.append(1) or real_clear())
+    t = Target(_tiny_dense(), tokenizer=None)
+    prompt = [3 + i % 50 for i in range(21)]                # three chunks of 8
+    ref = g.greedy_generate(t, _Tok(), prompt_ids=prompt, max_new_tokens=6).token_ids
+    n_greedy = len(cleared)
+    assert released == [21] and n_greedy == 3               # two between chunks + one after
+    spec = g.speculative_generate(t, _Tok(), _tiny_dspark(32), prompt_ids=prompt,
+                                  max_new_tokens=6, lookup_drafts=False).token_ids
+    dfl = g.dflash_generate(t, _Tok(), _tiny_dflash2_for(t), prompt_ids=prompt,
+                            max_new_tokens=6).token_ids
+    lkp = lookup_generate(t, _Tok(), prompt_ids=prompt, max_new_tokens=6).token_ids
+    assert released == [21] * 4 and len(cleared) == 4 * n_greedy
+    assert spec[:6] == ref[:6] and dfl[:6] == ref[:6] and lkp[:6] == ref[:6]
+    released.clear()
+    cleared.clear()
+    g.greedy_generate(t, _Tok(), prompt_ids=prompt[:8], max_new_tokens=3)      # one chunk
+    assert released == [8] and cleared == []

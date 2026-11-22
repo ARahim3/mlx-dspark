@@ -579,6 +579,7 @@ def greedy_generate(
     if on_prefill is not None:
         on_prefill(cache, None, len(ids))   # caches hold exactly `ids` right now
     mx.eval(logits)                          # settle prompt-eval so the prefill/decode timing split is
+    _release_prefill_scratch(target_model, len(suffix))
     t_prefill = time.time()                  # honest (values are unchanged; this only fixes the clock)
     out_ids: list[int] = []
     pen = _Penalizer(presence_penalty, frequency_penalty)
@@ -825,6 +826,7 @@ def dflash_generate(
     if on_prefill is not None:
         _mark(len(ids))                # caches hold exactly `ids` (stable == n templates)
     mx.eval(logits)                    # settle prompt-eval so the prefill/decode timing split is honest
+    _release_prefill_scratch(target_model, len(suffix))
     t_prefill = time.time()
     pending_ctx = _fused_all()         # the first draft call appends the suffix's ctx
     if trimmed["dropped"]:
@@ -1103,6 +1105,17 @@ CPU_SPLIT = None           # prefill CPU co-prefill: {"min_rows": N, "fracs": {w
 # fp-tie class (like the last-row head) and its fraction is a measured constant; the
 # CLI/server set it from calibrate.apply_cpu_split (cached). M4 Pro / Qwen3.8-27B-4bit:
 # 1.41x prefill at a 0.3 fraction, greedy continuation token-identical.
+
+
+def _release_prefill_scratch(target, rows: int) -> None:
+    """Hand a long prompt's scratch back before decoding. The prefill loops clear MLX's buffer
+    cache between chunks but not after the last one, so its temporaries — attention scores and
+    masks, GEMM outputs a chunk wide — stayed cached for the whole generation: 1.2 GB after a
+    2,600-token prompt and 2 GB after 8k on Inkling-2-Mini (3.4 vs 1.5 GB cached twelve steps
+    into decoding). Clearing once, after the prompt is evaluated, costs ~10 ms on the first
+    decode step (it allocates afresh). Prompts read in one chunk are left alone."""
+    if rows > _target_chunk(target):
+        mx.clear_cache()
 
 
 def _target_chunk(target) -> int:
@@ -1391,6 +1404,7 @@ def speculative_generate(
     if on_prefill is not None:
         on_prefill(cache, ctx_caches, len(ids))   # caches hold exactly `ids` right now
     mx.eval(logits)                    # settle prompt-eval so the prefill/decode timing split is honest
+    _release_prefill_scratch(target_model, len(suffix))
     t_prefill = time.time()
     n_cached = len(ids)
     pending = _pick(logits[0, -1], temperature, top_p, top_k)  # first committed token

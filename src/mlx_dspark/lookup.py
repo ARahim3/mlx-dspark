@@ -34,6 +34,7 @@ from .generate import (
     _make_target_cache,
     _pick,
     _prefill_plain,
+    _release_prefill_scratch,
     _spec_sample_accept,
     _Streamer,
     _with_small_m,
@@ -199,6 +200,7 @@ def lookup_generate(
     if on_prefill is not None:
         on_prefill(cache, None, len(ids))   # caches hold exactly `ids` right now
     pending = _pick(logits[0, -1], temperature, top_p, top_k)
+    _release_prefill_scratch(target_model, len(suffix))
     out_ids: list[int] = [pending]
     index.extend([pending])
     accept_lengths: list[int] = []
