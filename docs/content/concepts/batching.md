@@ -38,6 +38,8 @@ Inkling batches on mlx-dspark's own forward for this model, and the two ways of 
 
 Each request keeps its own cache, so prompts of different lengths need no padding and the prefix cache serves each request as usual. A long prompt arriving mid-session is read a chunk at a time, sharing the time evenly with the requests already streaming.
 
+Those caches cost memory the one-at-a-time queue never needed (about 1 GB per extra request, more with long prompts), so a request joins others only while macOS can spare it: under memory pressure, or when its estimated caches would leave less than a tenth of RAM reclaimable, it waits for a running request to finish instead. A request that is alone is always served.
+
 Total tokens per second on an M4 Pro, eight varied prompts, against one request at a time:
 
 | Requests at once | Total tok/s | Each request | vs one, plain decoding (36.5) | vs one, with the drafter (48.6) |

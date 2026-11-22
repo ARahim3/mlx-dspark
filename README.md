@@ -980,7 +980,9 @@ landing in the middle of a long one saw its first token after 0.44 s instead of 
 
 Each request keeps its own cache — prompts of different lengths need no padding, the prefix
 cache serves every request as usual — and a long prompt arriving mid-session is read a chunk at
-a time, sharing the time evenly with the requests already streaming.
+a time, sharing the time evenly with the requests already streaming. Those caches cost memory
+(about 1 GB per extra request), so a request joins others only while macOS can spare it; under
+memory pressure it waits for a running one to finish.
 
 Total tok/s, 8 varied prompts, 96 tokens each, M4 Pro, mlx 0.32.4 (paired in one process):
 
