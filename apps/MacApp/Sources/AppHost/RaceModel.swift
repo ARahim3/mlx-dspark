@@ -36,6 +36,10 @@ final class RaceModel: ObservableObject {
     /// Text shown during replay, keyed by lane index.
     @Published var replayText: [Int: String] = [:]
     @Published var replayReasoning: [Int: String] = [:]
+    /// The replay STAGE: the prompt, the result and the lanes alone — what a screen recording
+    /// wants. Entered by Replay, kept after the replay ends (so the last frame holds), left by
+    /// Done / Esc or a new run.
+    @Published var staged = false
 
     @Published var prompt: String = RacePrompt.presets[0].text
     @Published var maxTokens: Int = 200
@@ -66,6 +70,7 @@ final class RaceModel: ObservableObject {
         guard phase != .running, !selectedArms.isEmpty else { return }
         cancel()
         lanes = selectedArms.enumerated().map { Lane(index: $0.offset, label: $0.element.label) }
+        staged = false
         verdict = nil
         replayText = [:]
         isReplaying = false
@@ -111,6 +116,7 @@ final class RaceModel: ObservableObject {
     func replay() {
         guard phase == .done, !lanes.isEmpty else { return }
         replayTask?.cancel()
+        staged = true
         isReplaying = true
         replayText = Dictionary(uniqueKeysWithValues: lanes.map { ($0.index, "") })
         replayReasoning = replayText
@@ -127,6 +133,9 @@ final class RaceModel: ObservableObject {
                 return
             }
 
+            // A beat on the empty stage first, so a recording opens on a clean frame.
+            try? await Task.sleep(nanoseconds: 700_000_000)
+            if Task.isCancelled { return }
             let started = Date()
             for entry in timeline {
                 if Task.isCancelled { break }
@@ -139,7 +148,9 @@ final class RaceModel: ObservableObject {
                 self.replayText[entry.lane, default: ""] += entry.token.text
                 self.replayReasoning[entry.lane, default: ""] += entry.token.reasoning
             }
-            self.isReplaying = false
+            // A cancelled replay was replaced (Replay again) or dismissed: its successor, or
+            // whoever cancelled it, owns the flag.
+            if !Task.isCancelled { self.isReplaying = false }
         }
     }
 
@@ -148,6 +159,22 @@ final class RaceModel: ObservableObject {
         replayTask?.cancel()
         isReplaying = false
         if phase == .running { phase = .idle }
+    }
+
+    /// Back from the stage to the race controls.
+    func leaveStage() {
+        replayTask?.cancel()
+        isReplaying = false
+        staged = false
+    }
+
+    /// How much of a lane's output the replay has shown so far (1 when nothing is replaying).
+    func replayProgress(lane index: Int) -> Double {
+        guard isReplaying, let lane = lanes.first(where: { $0.index == index }) else { return 1 }
+        let total = lane.text.count + lane.reasoning.count
+        guard total > 0 else { return 1 }
+        let shown = (replayText[index]?.count ?? 0) + (replayReasoning[index]?.count ?? 0)
+        return min(1, Double(shown) / Double(total))
     }
 
     /// Fastest lane vs the slowest, for the headline number.

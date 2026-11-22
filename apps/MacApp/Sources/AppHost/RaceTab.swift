@@ -9,6 +9,32 @@ struct RaceTab: View {
     @EnvironmentObject private var race: RaceModel
 
     var body: some View {
+        Group {
+            if race.staged, !race.lanes.isEmpty {
+                RaceStage(race: race)
+            } else {
+                workbench
+            }
+        }
+        .onAppear {
+            if race.selectedArms.isEmpty {
+                race.selectedArms = race.defaultArms(available: model.availableRaceArms)
+            }
+        }
+        // A hot swap can change what's raceable (a drafterless target has no dspark arm);
+        // stale arms would 400 the next run.
+        .onChange(of: model.availableRaceArms) { before, available in
+            let valid = Set(available)
+            // ... and a model with a stock arm changes the default matchup (stock on the left)
+            let stockChanged = before.contains("stock") != available.contains("stock")
+            if race.phase != .running,
+               stockChanged || race.selectedArms.contains(where: { !valid.contains($0.mode) }) {
+                race.selectedArms = race.defaultArms(available: available)
+            }
+        }
+    }
+
+    private var workbench: some View {
         VStack(alignment: .leading, spacing: 14) {
             RaceControls(race: race)
 
@@ -31,22 +57,80 @@ struct RaceTab: View {
                     .frame(height: 240)
             }
         }
-        .onAppear {
-            if race.selectedArms.isEmpty {
-                race.selectedArms = race.defaultArms(available: model.availableRaceArms)
+    }
+}
+
+/// The replay, staged for the screen recording it exists for: the prompt, the result, the
+/// verdict in a line, and the lanes at the full height of the window. Nothing to operate —
+/// the two controls it has fade out while the replay plays.
+struct RaceStage: View {
+    @ObservedObject var race: RaceModel
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            HStack(alignment: .top, spacing: 12) {
+                Text(race.prompt)
+                    .font(.callout).foregroundStyle(.secondary)
+                    .lineLimit(2)
+                Spacer(minLength: 12)
+                HStack(spacing: 12) {
+                    Button { race.replay() } label: {
+                        Image(systemName: "arrow.counterclockwise")
+                    }
+                    .help("Replay again")
+                    Button { race.leaveStage() } label: { Image(systemName: "xmark") }
+                        .keyboardShortcut(.cancelAction)
+                        .help("Back to the race controls (Esc)")
+                }
+                .buttonStyle(.borderless)
+                .foregroundStyle(.secondary)
+                // Out of the picture while it plays (Esc still leaves the stage)
+                .opacity(race.isReplaying ? 0 : 1)
+                .allowsHitTesting(!race.isReplaying)
+                .animation(.easeOut(duration: 0.25), value: race.isReplaying)
             }
-        }
-        // A hot swap can change what's raceable (a drafterless target has no dspark arm);
-        // stale arms would 400 the next run.
-        .onChange(of: model.availableRaceArms) { before, available in
-            let valid = Set(available)
-            // ... and a model with a stock arm changes the default matchup (stock on the left)
-            let stockChanged = before.contains("stock") != available.contains("stock")
-            if race.phase != .running,
-               stockChanged || race.selectedArms.contains(where: { !valid.contains($0.mode) }) {
-                race.selectedArms = race.defaultArms(available: available)
+
+            HStack(alignment: .firstTextBaseline, spacing: 10) {
+                if let (fast, slow) = race.speedup, slow.tokensPerSec > 0 {
+                    Text(String(format: "%.2f×", fast.tokensPerSec / slow.tokensPerSec))
+                        .font(.system(size: 40, weight: .semibold, design: .rounded))
+                        .foregroundStyle(.tint)
+                    Text("\(fast.label) vs \(slow.label)")
+                        .font(.title3).foregroundStyle(.secondary)
+                        .lineLimit(1).minimumScaleFactor(0.7)
+                }
+                Spacer(minLength: 12)
+                if let verdict = race.verdict { VerdictPill(verdict: verdict) }
             }
+
+            HStack(alignment: .top, spacing: 12) {
+                ForEach(race.lanes) { lane in
+                    RaceLaneColumn(race: race, laneIndex: lane.index, staged: true)
+                }
+            }
+            .frame(maxHeight: .infinity)
         }
+        // The Lab scrolls; the stage takes exactly what is visible (its padding off), so the
+        // lanes use the window instead of a fixed strip under the fold.
+        .containerRelativeFrame(.vertical, alignment: .top) { height, _ in max(380, height - 32) }
+    }
+}
+
+/// The verdict in a line (the banner's paragraph is one hover away).
+struct VerdictPill: View {
+    let verdict: RaceVerdict
+
+    private var identical: Bool { verdict.identical ?? false }
+
+    var body: some View {
+        Label(identical ? "Identical output" : "Equally valid outputs",
+              systemImage: identical ? "checkmark.seal.fill" : "arrow.triangle.branch")
+            .font(.callout.weight(.medium))
+            .foregroundStyle(identical ? .green : .yellow)
+            .padding(.horizontal, 10).padding(.vertical, 5)
+            .background((identical ? Color.green : Color.yellow).opacity(0.12), in: Capsule())
+            .fixedSize()
+            .help(verdict.detail)
     }
 }
 
@@ -129,45 +213,54 @@ struct RaceControls: View {
 
             HStack(spacing: 8) {
                 // Toggle chips: pick the matchup. The server takes 2–4 arms; order is fixed
-                // to the candidate order so baseline always lands in the left lane.
-                ForEach(candidateArms) { arm in
-                    ArmChip(label: chipLabel(arm),
-                            isOn: race.selectedArms.contains(arm),
-                            disabled: race.phase == .running
-                                || (!race.selectedArms.contains(arm) && race.selectedArms.count >= 4))
-                        { toggle(arm) }
-                }
-                if drafterMode != nil {
-                    // Any cap 1–64, not just the preset chips — typed caps become chips.
-                    TextField("cap", text: $customCapText)
-                        .textFieldStyle(.roundedBorder)
-                        .frame(width: 40)
-                        .multilineTextAlignment(.center)
-                        .disabled(race.phase == .running)
-                        .onSubmit(addCustomCap)
-                        .help("Race any draft cap (1–64): type it and press Return. "
-                              + "The presets are just common picks.")
-                }
-                Spacer()
-                if race.phase == .running {
-                    ProgressView().controlSize(.small)
-                    Button("Stop") { race.cancel() }
-                } else {
-                    if race.phase == .done {
-                        Button(race.isReplaying ? "Replaying…" : "Replay side by side") {
-                            race.replay()
+                // to the candidate order so the reference always lands in the left lane. One
+                // line each; a row too long for the window scrolls sideways instead of
+                // breaking the labels mid-word.
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: 8) {
+                        ForEach(candidateArms) { arm in
+                            ArmChip(label: chipLabel(arm),
+                                    isOn: race.selectedArms.contains(arm),
+                                    disabled: race.phase == .running
+                                        || (!race.selectedArms.contains(arm)
+                                            && race.selectedArms.count >= 4))
+                                { toggle(arm) }
                         }
-                        .disabled(race.isReplaying)
-                        .help("Play every arm back on one clock at the speeds just measured. "
-                              + "The arms have to run one at a time, but the timings are real.")
+                        if drafterMode != nil {
+                            // Any cap 1–64, not just the preset chips — typed caps become chips.
+                            TextField("cap", text: $customCapText)
+                                .textFieldStyle(.roundedBorder)
+                                .frame(width: 44)
+                                .multilineTextAlignment(.center)
+                                .disabled(race.phase == .running)
+                                .onSubmit(addCustomCap)
+                                .help("Race any draft cap (1–64): type it and press Return. "
+                                      + "The presets are just common picks.")
+                        }
                     }
-                    Button("Run race") {
-                        commitMaxTokens()
-                        if let client = model.apiClient { race.run(client: client) }
-                    }
-                    .buttonStyle(.borderedProminent)
-                    .disabled(!model.isServerReady || race.selectedArms.count < 2)
+                    .padding(.vertical, 1)
                 }
+                HStack(spacing: 8) {
+                    if race.phase == .running {
+                        ProgressView().controlSize(.small)
+                        Button("Stop") { race.cancel() }
+                    } else {
+                        if race.phase == .done {
+                            Button("Replay") { race.replay() }
+                                .help("Play every arm back on one clock at the speeds just "
+                                      + "measured, on a clean stage made for screen recording: "
+                                      + "the prompt, the result and the lanes. The arms have to "
+                                      + "run one at a time, but the timings are real.")
+                        }
+                        Button("Run race") {
+                            commitMaxTokens()
+                            if let client = model.apiClient { race.run(client: client) }
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .disabled(!model.isServerReady || race.selectedArms.count < 2)
+                    }
+                }
+                .fixedSize()
             }
             if race.selectedArms.count < 2 {
                 Text("Pick at least two arms to race.")
@@ -229,8 +322,9 @@ private struct ArmChip: View {
             HStack(spacing: 4) {
                 Image(systemName: isOn ? "checkmark.circle.fill" : "circle")
                     .imageScale(.small)
-                Text(label)
+                Text(label).lineLimit(1)
             }
+            .fixedSize()
             .font(.caption.weight(.medium))
             .padding(.horizontal, 8).padding(.vertical, 4)
             .background(isOn ? AnyShapeStyle(.tint.opacity(0.18)) : AnyShapeStyle(.quaternary.opacity(0.6)),
@@ -298,7 +392,8 @@ struct ResultsTable: View {
                 HStack(spacing: 10) {
                     Text(result.label)
                         .font(.callout.weight(.medium))
-                        .frame(width: 120, alignment: .leading)
+                        .lineLimit(1).truncationMode(.middle)
+                        .frame(width: 190, alignment: .leading)
 
                     GeometryReader { geometry in
                         let fraction = fastest > 0 ? result.tokensPerSec / fastest : 0
@@ -344,6 +439,14 @@ struct RaceLanes: View {
 struct RaceLaneColumn: View {
     @ObservedObject var race: RaceModel
     let laneIndex: Int
+    /// On the replay stage: a larger header, a progress line that fills as the lane plays
+    /// back, and the full height of the stage instead of a fixed strip.
+    var staged = false
+
+    private var isFastest: Bool {
+        guard let mine = lane?.result?.tokensPerSec else { return false }
+        return mine >= (race.lanes.compactMap { $0.result?.tokensPerSec }.max() ?? 0)
+    }
 
     private var lane: RaceModel.Lane? {
         race.lanes.indices.contains(laneIndex) ? race.lanes[laneIndex] : nil
@@ -362,15 +465,26 @@ struct RaceLaneColumn: View {
     var body: some View {
         if let lane {
             VStack(alignment: .leading, spacing: 6) {
-                HStack(spacing: 6) {
-                    Text(lane.label).font(.caption.weight(.semibold))
+                HStack(alignment: .firstTextBaseline, spacing: 6) {
+                    Text(lane.label)
+                        .font(staged ? .headline : .caption.weight(.semibold))
+                        .lineLimit(1).truncationMode(.middle)
                     if lane.isRunning { ProgressView().controlSize(.small) }
                     Spacer()
                     // Shown during replay too — the replay is the shot people record.
                     if let result = lane.result {
                         Text(String(format: "%.0f tok/s", result.tokensPerSec))
-                            .font(.caption.monospacedDigit()).foregroundStyle(.tint)
+                            .font(staged ? .title3.weight(.semibold).monospacedDigit()
+                                         : .caption.monospacedDigit())
+                            .foregroundStyle(isFastest ? AnyShapeStyle(.tint)
+                                                       : AnyShapeStyle(.secondary))
                     }
+                }
+                if staged {
+                    // How far this lane has come: the faster one visibly pulls ahead.
+                    ProgressView(value: race.replayProgress(lane: laneIndex))
+                        .progressViewStyle(.linear)
+                        .tint(isFastest ? Color.accentColor : Color.secondary)
                 }
                 ScrollViewReader { proxy in
                     ScrollView {
@@ -388,7 +502,8 @@ struct RaceLaneColumn: View {
                         .padding(10)
                         Color.clear.frame(height: 1).id("lane-end")
                     }
-                    .frame(height: 340)
+                    .frame(height: staged ? nil : 340)
+                    .frame(maxHeight: staged ? .infinity : nil)
                     .background(.quaternary.opacity(0.25), in: RoundedRectangle(cornerRadius: 8))
                     // Follow the stream like a chat window: every appended token keeps the
                     // tail in view. Replay resets the text, which naturally scrolls back up.
