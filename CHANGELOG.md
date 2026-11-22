@@ -2,7 +2,7 @@
 
 All notable changes to `mlx-dspark`. Versions follow [SemVer](https://semver.org/) (pre-1.0: minor-ish features land as patch bumps).
 
-## [Unreleased]
+## [0.21.0] — 2026-11-23 — Inkling-2-Mini at 47.5 tok/s (24.9 in stock mlx-vlm) and batched serving for it, Tencent DSpine drafters, faster sampled requests
 
 ### Faster
 - **Sampled requests run each speculative round in one GPU round trip, as greedy ones do — every speculative mode.** With a temperature above 0 (what most API traffic uses: agents send one, and many models ship one in their `generation_config`; Inkling-2-Mini, Qwen3.8-27B and MiniCPM5-2B ship 1.0) each round used to wait for the sampled draft before it built the verify pass, then wait twice more inside the accept test. The draft now stays on the GPU, the drafter runs while the verify pass is being built, and the accept test and the replacement draw are part of the same graph. The random draws are made in the same order over the same values, so a seed gives exactly the tokens it gave before, checked against the previous code on each pair. M4 Pro, temperature 1, paired at the same seed: **Inkling-2-Mini +3.7%** (47.9 → 49.6 tok/s), **MiniCPM5-2B +6.4%** (134.6 → 143.2), Qwen3.8-27B-4bit with DFlash 2 +1.8% in library mode (3.3–3.9 ms a round). A sampled round now costs what a greedy one does to within a millisecond. Rounds with penalties or the confidence head keep the previous path.
