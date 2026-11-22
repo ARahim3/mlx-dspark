@@ -379,3 +379,105 @@ def test_batch_engine_runs_concurrent_inkling_requests_as_one_session():
         assert be.metrics()["batching"]["max_batch"] == 4
     finally:
         be.close()
+
+
+def _tiny_engine():
+    """A baseline-mode engine on the tiny model, built on the thread that will generate."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    from mlx_dspark import server as S
+
+    ex = ThreadPoolExecutor(max_workers=1)
+    t = ex.submit(lambda: _target()[0]).result()
+    engine = S.Engine(t, t.tokenizer, None, mode="baseline", model_id="tiny", target_repo="tiny",
+                      drafter_repo=None, max_draft_tokens=None, prefix_cache=False, executor=ex)
+    return S, ex, engine
+
+
+@metal
+def test_work_for_the_generation_thread_runs_while_the_scheduler_holds_it():
+    """A BatchEngine's scheduler occupies the engine's one thread for good; a race arm or the
+    memory guard's idle shed submitted to that thread used to wait behind it forever."""
+    import threading
+
+    from mlx_dspark.memory_guard import MemoryGuard
+
+    S, ex, engine = _tiny_engine()
+    be = S.BatchEngine(engine, max_batch=4)
+    try:
+        assert isinstance(engine._executor, S._SchedulerThread)
+        assert engine._executor.submit(threading.current_thread).result(timeout=20) is not None
+        with pytest.raises(ZeroDivisionError):                # an error reaches the caller
+            engine._executor.submit(lambda: 1 // 0).result(timeout=20)
+        # the Lab's race: every arm is a call on the generation thread
+        events = []
+        racer = threading.Thread(target=lambda: be.race(
+            PROMPTS[0], [{"mode": "baseline"}, {"mode": "lookup"}], 6,
+            lambda kind, data: events.append(kind)))
+        racer.start()
+        racer.join(timeout=60)
+        assert not racer.is_alive(), "the race never got the generation thread"
+        assert events.count("arm_done") == 2 and events[-1] == "verdict"
+        # the memory guard, built the way Engine.load builds it, sheds when idle
+        guard = MemoryGuard(prefix=None, submit=lambda fn: engine._executor.submit(fn),
+                            is_busy=lambda: engine._busy, poll=lambda: {"label": "normal"},
+                            log=lambda *_: None)
+        assert guard.request("warn")
+        for _ in range(200):
+            if guard.info()["sheds"]:
+                break
+            threading.Event().wait(0.05)
+        assert guard.info()["sheds"] == 1
+        # a call queued while requests decode runs when they are done, and they all finish
+        got = {}
+        asks = [threading.Thread(target=lambda i=i: got.__setitem__(i, be.generate(
+            PROMPTS[i], max_tokens=20, temperature=0.0, stop=None, seed=None)))
+            for i in range(2)]
+        for th in asks:
+            th.start()
+        call = engine._executor.submit(lambda: "after")
+        for th in asks:
+            th.join(timeout=120)
+        assert call.result(timeout=60) == "after" and len(got) == 2
+    finally:
+        be.close()
+    assert engine._executor is ex                              # handed back on close
+    assert ex.submit(lambda: 7).result(timeout=20) == 7
+
+
+@metal
+def test_a_newcomer_is_held_back_when_memory_is_short(monkeypatch):
+    """A lone request is always served; another joins only while the OS can spare its caches."""
+    import threading
+
+    S, _, engine = _tiny_engine()
+    be = S.BatchEngine(engine, max_batch=4)
+    gb = 1 << 30
+    job = S._Job(PROMPTS[1], {"max_tokens": 100}, None)
+    try:
+        be._memory = lambda: {"pressure": "normal", "total_bytes": 48 * gb, "free_percent": 40}
+        assert be._has_room(job, 0) and be._has_room(job, 3)
+        be._memory = lambda: {"pressure": "warn", "total_bytes": 48 * gb, "free_percent": 40}
+        assert be._has_room(job, 0) and not be._has_room(job, 1)
+        be._memory = lambda: {"pressure": "normal", "total_bytes": 32 * gb, "free_percent": 12}
+        assert not be._has_room(job, 1)             # 3.8 GB left, 1 GB needed, 3.2 GB reserve
+        assert not be._has_room(job, 2)
+        assert be.batch_stats["held_for_memory"] == 1          # counted once per request
+        be._memory = lambda: {"pressure": "normal"}            # the OS does not say: no gate
+        assert be._has_room(job, 1)
+        # end to end under pressure: three requests arrive together and take turns
+        be._memory = lambda: {"pressure": "critical", "total_bytes": 48 * gb, "free_percent": 3}
+        got = {}
+        asks = [threading.Thread(target=lambda i=i: got.__setitem__(i, be.generate(
+            PROMPTS[i], max_tokens=8, temperature=0.0, stop=None, seed=None)))
+            for i in range(3)]
+        for th in asks:
+            th.start()
+        for th in asks:
+            th.join(timeout=120)
+        want = be.engine._executor.submit(
+            lambda: [_greedy(engine.target, PROMPTS[i], 8).token_ids for i in range(3)]).result(60)
+        assert [got[i].token_ids for i in range(3)] == want
+        assert be.batch_stats["max_batch_seen"] == 1 and be.batch_stats["batched_requests"] == 0
+    finally:
+        be.close()

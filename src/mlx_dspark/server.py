@@ -33,7 +33,7 @@ import threading
 import time
 import traceback
 import uuid
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from types import SimpleNamespace
 from urllib.parse import urlsplit
@@ -897,7 +897,11 @@ class Engine:
             # boundary via _with_slow_round_log). See memory_guard.py.
             from .memory_guard import MemoryGuard
 
-            eng.memory_guard = MemoryGuard(prefix=eng.prefix, submit=eng._executor.submit,
+            # `submit` is looked up per shed: a BatchEngine's scheduler occupies the executor
+            # and stands a proxy in its place (an idle shed queued on the executor itself
+            # would sit behind the scheduler for the life of the process)
+            eng.memory_guard = MemoryGuard(prefix=eng.prefix,
+                                           submit=lambda fn: eng._executor.submit(fn),
                                            is_busy=lambda: eng._busy,
                                            on_shed=eng._on_memory_shed).start()
         return eng
@@ -1390,7 +1394,36 @@ class Engine:
         arms = ["baseline", "lookup"]
         if self.mode in ("dspark", "dflash") and self.drafter is not None:
             arms.insert(0, self.mode)
+        if self.stock_runtime():
+            arms.append("stock")
         return arms
+
+    def stock_runtime(self) -> str | None:
+        """What the ``stock`` race arm stands for — ``"mlx-vlm 0.8.0"``, ``"mlx-lm 0.32.2"`` —
+        or None where there is no such arm.
+
+        The arm is plain greedy decoding with everything of ours switched off: the target's
+        stock forward as the installed library runs it (``Target.stock_forward``) on MLX's
+        stock kernels (``generate.stock_kernels``). It is what a user of that library gets from
+        this model on this machine, beside what mlx-dspark's own plain decode and its drafter
+        give. Offered for mlx-lm targets and Inkling 2; not for the other mlx-vlm targets (not
+        built), nor for Inkling 2 with ``--target-bits`` (the stock forward would then run the
+        re-quantized weights, which is not what the stock library loads)."""
+        from importlib import metadata
+
+        t = self.target
+        if t is None:
+            return None
+        if getattr(t, "is_vlm", False):
+            if not getattr(t, "_inkling", False) or getattr(t, "target_bits", 0):
+                return None
+            package = "mlx-vlm"
+        else:
+            package = "mlx-lm"
+        try:
+            return f"{package} {metadata.version(package)}"
+        except metadata.PackageNotFoundError:
+            return package
 
     def race(self, prompt_ids: list[int], arms: list[dict], max_tokens: int, on_event) -> None:
         """Run the same prompt through several decode strategies and compare.
@@ -1413,6 +1446,8 @@ class Engine:
             cap = arm.get("cap")
             conf = arm.get("confidence")
             label = mode if cap is None else f"{mode} cap {cap}"
+            if mode == "stock":
+                label = f"stock {self.stock_runtime() or 'runtime'}"   # e.g. "stock mlx-vlm 0.8.0"
             if conf is not None:
                 label += f" conf {conf:g}"
             on_event("arm_start", {"index": index, "mode": mode, "cap": cap,
@@ -1526,6 +1561,13 @@ class Engine:
         """One arm, on the generation thread, with a cache of its own. ``confidence`` is a
         per-arm confidence-head threshold (None = the server's loaded setting) — what lets a
         measured bundle like Qwen3.8-27B-4bit's cap 7 + 0.3 race its plain-cap siblings."""
+        if mode == "stock":
+            # the library's forward on MLX's kernels: what the stock runtime gives this model
+            from .generate import stock_kernels
+
+            with self.target.stock_forward(), stock_kernels():
+                return greedy_generate(self.target, self.tokenizer, prompt_ids=prompt_ids,
+                                       max_new_tokens=max_tokens, on_text=on_text)
         ctrl = None
         if cap == "auto" and mode in ("dspark", "dflash"):
             # A FRESH controller per arm: the curves come from the disk cache (measured at
@@ -1687,6 +1729,39 @@ class _Job:
         self.done = threading.Event()
 
 
+class _Call:
+    """Work for the generation thread that is not a request — a race arm, an idle memory shed,
+    a warmup — queued for a :class:`BatchEngine`'s scheduler, which runs it between batches."""
+    __slots__ = ("args", "fn", "future", "kwargs")
+
+    def __init__(self, fn, args, kwargs):
+        self.fn, self.args, self.kwargs = fn, args, kwargs
+        self.future: Future = Future()
+
+    def run(self) -> None:
+        if not self.future.set_running_or_notify_cancel():
+            return
+        try:
+            self.future.set_result(self.fn(*self.args, **self.kwargs))
+        except BaseException as e:  # noqa: BLE001 — the caller's .result() re-raises it
+            self.future.set_exception(e)
+
+
+class _SchedulerThread:
+    """Stands in for an engine's executor while a :class:`BatchEngine`'s scheduler occupies its
+    one thread: ``submit`` queues the call for the scheduler. Submitted to the executor itself
+    it would wait behind the scheduler until the server shut down — which is what ``/admin/race``
+    and the memory guard's idle shed did with ``--max-batch`` on."""
+
+    def __init__(self, q):
+        self._q = q
+
+    def submit(self, fn, *args, **kwargs) -> Future:
+        call = _Call(fn, args, kwargs)
+        self._q.put(call)
+        return call.future
+
+
 class BatchEngine:
     """Batching wrapper around an :class:`Engine`. Concurrently-queued greedy **dspark**
     requests run as a **continuous** :class:`~mlx_dspark.batch_engine.SpecSlots` session
@@ -1713,7 +1788,13 @@ class BatchEngine:
         # Inkling 2 batches plain decoding on its own forward (inkling_batch.Session): any
         # sampling, prompts of any length, its prefix cache and — alone — its drafter.
         self._inkling = bool(getattr(engine, "is_inkling", False))
-        engine._executor.submit(self._scheduler)   # occupies the one MLX thread until close()
+        self._memory = system_memory               # the OS's view, for admission (see _has_room)
+        self._held: set[int] = set()               # requests held back for memory, counted once
+        self._thread = engine._executor
+        self._thread.submit(self._scheduler)       # occupies the one MLX thread until close()
+        # ... so everything else the engine sends to that thread (race arms, the memory guard's
+        # idle shed) is queued for the scheduler instead of behind it
+        engine._executor = _SchedulerThread(self._q)
         # concurrent.futures' shutdown hook joins the executor thread at interpreter exit —
         # a forever-looping scheduler would wedge the process (Ctrl-C'd server, scripts,
         # tests). Regular atexit handlers run BEFORE that join, so this unblocks it.
@@ -1721,7 +1802,11 @@ class BatchEngine:
 
     def close(self) -> None:
         """Stop the scheduler thread (idempotent). Queued jobs already picked up finish
-        normally; the sentinel is consumed at the next idle point."""
+        normally; the sentinel is consumed at the next idle point. The engine gets its
+        executor back first, so what it submits from here on runs once the scheduler has
+        left the thread."""
+        if isinstance(getattr(self.engine, "_executor", None), _SchedulerThread):
+            self.engine._executor = self._thread
         self._q.put(_STOP)
 
     def __getattr__(self, name):                    # delegate model_id/mode/spec_info/created/…
@@ -1755,7 +1840,11 @@ class BatchEngine:
                 job = self._q.get()
                 if job is _STOP:
                     return
+                if isinstance(job, _Call):
+                    job.run()
+                    continue
                 batch = [job]
+                calls: list[_Call] = []
                 end = time.time() + self.window_s
                 while len(batch) < self.max_batch:
                     rem = end - time.time()
@@ -1768,8 +1857,15 @@ class BatchEngine:
                     if nxt is _STOP:
                         self._q.put(nxt)     # finish this batch, exit on the next get()
                         break
+                    if isinstance(nxt, _Call):
+                        calls.append(nxt)    # after this batch
+                        break
                     batch.append(nxt)
-                self._run(batch)
+                try:
+                    self._run(batch)
+                finally:
+                    for call in calls:
+                        call.run()
             except Exception:  # noqa: BLE001 — a scheduler that dies wedges the server
                 for j in batch:
                     if not j.done.is_set():
@@ -1848,7 +1944,7 @@ class BatchEngine:
                         if nj is _STOP:
                             self._q.put(nj)      # session drains; scheduler exits after it
                             break
-                        if self._batchable_greedy(nj):
+                        if not isinstance(nj, _Call) and self._batchable_greedy(nj):
                             waiting.append(nj)
                         else:
                             deferred.append(nj)  # fairness: stop admitting, drain, then serve
@@ -1875,8 +1971,16 @@ class BatchEngine:
         self.batch_stats["batched_requests"] += admitted
         self.batch_stats["batches"] += 1
         self.batch_stats["max_batch_seen"] = max(self.batch_stats["max_batch_seen"], peak)
+        self._run_deferred(deferred)
+
+    def _run_deferred(self, deferred: list) -> None:
+        """What a session set aside until it drained: requests it could not take (serial), and
+        calls for the generation thread."""
         for j in deferred:
-            self._run_serial(j)
+            if isinstance(j, _Call):
+                j.run()
+            elif j is not _STOP:
+                self._run_serial(j)
 
     # --- Inkling 2: a session of requests on the model's own forward ---
     @staticmethod
@@ -1924,8 +2028,12 @@ class BatchEngine:
                         self._q.put(nj)          # the session drains; the scheduler exits after
                         deferred.append(_STOP)
                         break
-                    (waiting if self._inkling_batchable(nj) else deferred).append(nj)
-                while waiting and session.has_free_slot:
+                    if isinstance(nj, _Call) or not self._inkling_batchable(nj):
+                        deferred.append(nj)      # after the session; stops further admissions
+                    else:
+                        waiting.append(nj)
+                while (waiting and session.has_free_slot
+                       and self._has_room(waiting[0], session.n_active)):
                     job = waiting.pop(0)
                     p = job.params
                     run = SimpleNamespace(job=job, plan=None)
@@ -1934,6 +2042,7 @@ class BatchEngine:
                                   top_k=p["top_k"], stop=p["stop"], meta=run,
                                   prepare=self._inkling_prepare)
                     live[id(job)] = job
+                    self._held.discard(id(job))
                     session.admit(req)
                 done = session.tick()
                 # counters first: a client reading /metrics right after its response sees them
@@ -1962,9 +2071,37 @@ class BatchEngine:
         wall = time.time() - t0               # the requests overlapped: book the wall once
         eng.stats["generation_seconds"] += wall
         eng.stats["decode_seconds"] += max(0.0, wall - session.prefill_seconds)
-        for j in deferred:
-            if j is not _STOP:
-                self._run_serial(j)
+        self._run_deferred(deferred)
+
+    # A request that joins others brings its own caches (K / V for its prompt and its answer,
+    # the prefix cache's snapshot of them, its drafter context, the scratch of reading its
+    # prompt). The serial queue only ever held one request's; a session admits another only
+    # while the OS can still spare it.
+    ADMIT_RESERVE = 0.10                # of RAM that must stay reclaimable after admitting
+    ADMIT_FIXED_BYTES = 1 << 30         # per request, whatever its length (measured: ~1 GB)
+
+    def _has_room(self, job: _Job, active: int) -> bool:
+        """Whether ``job`` may join a session that already serves ``active`` requests. A lone
+        request is always admitted (it runs as it would without batching); a newcomer waits
+        while macOS reports memory pressure, or while its estimated footprint would leave
+        less than ``ADMIT_RESERVE`` of RAM reclaimable. It joins when a request finishes."""
+        if active <= 0:
+            return True
+        try:
+            mem = self._memory()
+        except Exception:  # noqa: BLE001 — no reading, no gate
+            return True
+        ok = mem.get("pressure") not in ("warn", "critical")
+        total, free = mem.get("total_bytes"), mem.get("free_percent")
+        if ok and total and free is not None:
+            per_token = (getattr(self.engine, "machine", None) or {}).get("kv_bytes_per_token") or 0
+            tokens = len(job.prompt_ids) + int(job.params["max_tokens"])
+            need = 2 * per_token * tokens + self.ADMIT_FIXED_BYTES     # caches + their snapshot
+            ok = total * free / 100 - need >= total * self.ADMIT_RESERVE
+        if not ok and id(job) not in self._held:
+            self._held.add(id(job))
+            self.batch_stats["held_for_memory"] = self.batch_stats.get("held_for_memory", 0) + 1
+        return ok
 
     def _inkling_prepare(self, req) -> None:
         """A request is about to read its prompt: take its prefix-cache plan now (the prefix
@@ -2486,6 +2623,9 @@ def make_handler(engine: Engine, api_key: str | None):
                     # A client must gate its conf-bundle arm on this — an engine without
                     # it would silently DROP the field and the lane label would lie.
                     "race_arm_confidence": True,
+                    # the runtime a "stock" race arm stands for ("mlx-vlm 0.8.0"), or null
+                    # when the loaded target has no such arm: a client offers the arm on it
+                    "race_stock": getattr(engine, "stock_runtime", lambda: None)(),
                     # whether the small-M MMA verify kernel is live for this load (the
                     # per-shape probe admitted shapes and it wasn't forced off) — pairs
                     # with serve --no-small-m / the /admin/load "small_m" override so a
@@ -2804,6 +2944,8 @@ def make_handler(engine: Engine, api_key: str | None):
                     if mode not in ("dspark", "dflash"):
                         return self._send_error(
                             400, f"cap 'auto' needs a drafter mode, not {mode!r}")
+                elif mode == "stock":
+                    cap = None                   # nothing drafts in the stock arm
                 elif cap is not None:
                     try:
                         cap = int(cap)

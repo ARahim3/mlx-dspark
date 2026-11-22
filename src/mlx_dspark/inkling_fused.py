@@ -38,6 +38,7 @@ the self-test has matched every exact piece to the stock forward at that width (
 from __future__ import annotations
 
 import math
+from contextlib import contextmanager
 from functools import lru_cache
 
 import mlx.core as mx
@@ -1567,6 +1568,41 @@ def disable(language_model, kinds) -> None:
 def enabled_kinds(language_model) -> tuple[str, ...]:
     """The kinds currently routed to their fused path (sorted)."""
     return tuple(sorted({kind for module, kind in _fused_modules(language_model) if _on(module)}))
+
+
+@contextmanager
+def stock(language_model):
+    """Run what is inside on mlx-vlm's STOCK forward — every fused piece, the in-place KV
+    caches, the packed attention and the head kernels off — and put all of it back on exit,
+    as it was (what the self-test rejected stays rejected). What a comparison against the
+    stock runtime runs (the server's ``stock`` race arm). Caches made inside are mlx-vlm's
+    own: a cache must not cross the boundary in either direction."""
+    from . import inkling_kernels as K
+
+    lm = language_model
+    missing = object()
+    flags = [(module, module.__dict__.get(_FLAG, missing)) for module, _ in _fused_modules(lm)]
+    attns = [layer.self_attn for layer in lm.model.layers
+             if getattr(layer, "self_attn", None) is not None]
+    packed = [(attn, attn.__dict__.get(_PACKED, missing)) for attn in attns]
+    held = {name: lm.__dict__.get(name, missing)
+            for name in (_KV, K._FAST_HEAD, K._DENSE_HEAD_KERNEL)}
+    try:
+        for module, _ in flags:
+            module.__dict__[_FLAG] = False
+        for attn in attns:
+            attn.__dict__[_PACKED] = 0
+        for name in held:
+            lm.__dict__[name] = False
+        yield
+    finally:
+        for owner, name, value in ([(m, _FLAG, v) for m, v in flags]
+                                   + [(a, _PACKED, v) for a, v in packed]
+                                   + [(lm, n, v) for n, v in held.items()]):
+            if value is missing:
+                owner.__dict__.pop(name, None)
+            else:
+                owner.__dict__[name] = value
 
 
 def _moe_selftest(language_model, rand, wide: bool = False) -> bool:

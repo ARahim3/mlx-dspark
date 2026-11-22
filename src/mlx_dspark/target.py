@@ -609,6 +609,21 @@ class Target:
             return None, fused
         return head(hn[:, -1:, :] if head_last_row else hn), fused
 
+    @contextmanager
+    def stock_forward(self):
+        """Run what is inside on the model's STOCK forward, as the installed mlx-lm / mlx-vlm
+        runs it. Every family but Inkling 2 already does outside the speculative loops (its
+        taps and verify kernels are theirs); Inkling 2 switches its fused forward, in-place
+        caches and head kernels off for the block (``inkling_fused.stock``). Make the caches
+        inside the block, and do not keep them past it."""
+        if self._inkling:
+            from .inkling_fused import stock
+
+            with stock(self.model.language_model):
+                yield
+        else:
+            yield
+
     # -- plain forward (no capture) for the greedy baseline --
     def plain(self, ids: mx.array, cache):
         self._flush_if_pending_for(cache)

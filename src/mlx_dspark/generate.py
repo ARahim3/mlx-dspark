@@ -13,6 +13,7 @@ acceptance length (tokens committed per target forward).
 
 from __future__ import annotations
 
+import contextlib
 import functools
 import json
 import time
@@ -1135,6 +1136,20 @@ def _cache_arrays(cache) -> list:
     depend on, only the caches tie the whole graph together."""
     states = [getattr(c, "state", None) for c in cache]
     return [v for _, v in tree_flatten(states) if isinstance(v, mx.array)]
+
+
+@contextlib.contextmanager
+def stock_kernels():
+    """Run what is inside on MLX's stock kernels: the prefill patches (dequantize-once GEMM,
+    CPU co-prefill) off for the block. The verify kernels (small-M, SDPA split, multi-row
+    attention) are scoped to the speculative loops and never reach a plain decode."""
+    global WIDE_GEMM_MIN_ROWS, WIDE_GEMM_SHAPES, CPU_SPLIT
+    saved = (WIDE_GEMM_MIN_ROWS, WIDE_GEMM_SHAPES, CPU_SPLIT)
+    WIDE_GEMM_MIN_ROWS = WIDE_GEMM_SHAPES = CPU_SPLIT = None
+    try:
+        yield
+    finally:
+        WIDE_GEMM_MIN_ROWS, WIDE_GEMM_SHAPES, CPU_SPLIT = saved
 
 
 def _mark_stops(marks, base: int, n: int) -> list[int]:
