@@ -34,13 +34,22 @@ description: The environment variables the engine reads, and where it keeps thin
 : Inkling 2 only: hand the expert kernels the full expert tensors instead of small views of them. MLX ends a GPU command buffer once the arrays bound in it pass a size limit, and one stacked expert tensor is over that limit on its own, so without the views every expert launch ends its buffer (about 1.4 ms of a 30 ms decode step). Same tokens either way. For comparison runs only.
 
 `MLX_DSPARK_INKLING_FAST_HEAD=0`
-: Inkling 2 only: compute the fp32 logits through mlx-vlm's stock path, which keeps a 1.85 GB fp32 copy of the output head, instead of mlx-dspark's kernel that reads the bf16 head directly. Slower and uses more memory. For comparison runs only.
+: Inkling 2 only: compute the fp32 logits through mlx-vlm's stock path, which keeps a 1.85 GB fp32 copy of the output head, instead of mlx-dspark's kernel that reads the bf16 head directly. Slower and uses more memory. With `--target-bits 8` it switches the 8-bit head's kernel back to MLX's quantized product as well. For comparison runs only.
 
 `MLX_DSPARK_INKLING_FUSED=0`
 : Inkling 2 only: run mlx-vlm's stock layer, attention and expert code for decode steps and verify passes instead of mlx-dspark's fused forward, which replaces runs of small GPU operations with single kernels (a decode step launches about 2,100 GPU kernels instead of about 7,000). Slower. For comparison runs only.
 
+`MLX_DSPARK_INKLING_KV_CACHE=0`
+: Inkling 2 only: use mlx-vlm's stock key/value caches instead of mlx-dspark's, which keep the rows in order with the attention sink's row inside the buffer so the attention reads them in place. The stock caches copy the whole cached keys and values at every layer visit and again to roll a verify pass back. Same tokens either way; slower, and more so the longer the conversation. For comparison runs only.
+
+`MLX_DSPARK_INKLING_MASK=0`
+: Inkling 2 only: build the attention's relative-position mask with mlx-vlm's stock kernel and a concatenate for the sink's column, instead of mlx-dspark's single kernel that writes both. Same values bit for bit; slower, and more so the longer the conversation. For comparison runs only.
+
+`MLX_DSPARK_INKLING_FOLD_BITS`
+: Inkling 2 only: bits of the drafter's Markov correction matrix, which one GPU kernel scans per drafted token (default 4; 8 is the other choice, and 0 keeps the reference's bf16 matrix with its full-vocabulary bias, softcap and argmax). Drafting only — the model still checks every token. Acceptance is the same at 4, 8 and bf16; each draft round is about 1 ms cheaper than the reference path.
+
 `MLX_DSPARK_INKLING_DRAFT_HEAD_BITS`
-: Inkling 2 only: bits of the drafter's own copy of the output head, which its draft logits go through (default 8; 0 uses the model's bf16 head). Drafting only — the model still checks every token. 8 bits leaves acceptance unchanged and makes each draft round about 1.7 ms cheaper; 4 bits is faster still but starts to cost acceptance.
+: Inkling 2 only: bits of the drafter's own copy of the output head, which its draft logits go through (default 6; 0 uses the model's bf16 head). Drafting only — the model still checks every token. 6 bits leaves acceptance unchanged and makes each draft round about 2 ms cheaper than the bf16 head; 4 bits is faster still but starts to cost acceptance. With `--target-bits 8` the drafter reads the model's own 8-bit head instead of a copy.
 
 `MLX_DSPARK_STREAM_KEEPALIVE_S`
 : Seconds between keep-alive frames on quiet streams (default 15). Lower it for aggressive proxies.
