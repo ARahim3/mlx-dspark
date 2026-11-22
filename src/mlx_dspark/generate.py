@@ -30,6 +30,10 @@ from .tree import device_tree
 from .wide_gemm import wide_matmul
 
 TAP = None  # set from drafter config at call time
+# A speculative-SAMPLING round (temperature > 0) as one graph with one sync, like a greedy
+# round: draft, verify and the accept test (see _spec_sample_accept_arr). False = the
+# two-phase round (draft synced before the verify is built, accept on the host): the A/B.
+SAMPLED_ONE_SYNC = True
 
 SMALL_M_IDS = None  # QuantizedLinear instances (by id) routed through the small-M MMA
 # kernel for verify-window forwards (4-bit 5-16 rows, 8-bit 6-16; see small_m_qmm.py). None disables.
@@ -835,7 +839,8 @@ def dflash_generate(
             if temperature > 0.0:
                 verify_ids = mx.array([[pending] + lk_draft])
                 v_logits, v_fused = target_model.verify(verify_ids, cache, tap)
-                mx.eval(v_logits, v_fused)
+                if not SAMPLED_ONE_SYNC:
+                    mx.eval(v_logits, v_fused)
                 vocab = v_logits.shape[-1]           # point-mass proposal: q one-hot per token
                 q_probs = (mx.arange(vocab)[None, :]
                            == mx.array(lk_draft)[:, None]).astype(mx.float32)
@@ -906,14 +911,30 @@ def dflash_generate(
                 head = drafter(block, pending_ctx, dcache, logits_start=1)[0][:cap]
                 q_probs = truncate_probs(mx.softmax(head / temperature, axis=-1), top_p, top_k)
                 draft_arr = sample_probs(q_probs)
-            mx.eval(draft_arr, q_probs)
-            drafted = [int(x) for x in draft_arr.tolist()]
+            if SAMPLED_ONE_SYNC:
+                # one graph, one sync, like the greedy round: the sampled draft stays on the
+                # GPU, the drafter launches while Python builds the verify graph, and the
+                # accept test is in-graph. Same random draws in the same order as the
+                # two-phase round below: same seed, same tokens.
+                mx.async_eval(draft_arr, q_probs)
+                verify_ids = mx.concatenate(
+                    [mx.array([pending], dtype=draft_arr.dtype), draft_arr]).reshape(1, -1)
+                v_logits, v_fused = target_model.verify(verify_ids, cache, tap)
+                n_arr, repl_arr = _spec_sample_accept_arr(
+                    v_logits[0], draft_arr, q_probs, temperature, top_p, top_k)
+                mx.eval(n_arr, repl_arr, draft_arr)
+                n, repl = int(n_arr.item()), int(repl_arr.item())
+                drafted = [int(x) for x in draft_arr.tolist()]
+            else:
+                mx.eval(draft_arr, q_probs)
+                drafted = [int(x) for x in draft_arr.tolist()]
 
-            verify_ids = mx.array([[pending] + drafted])
-            v_logits, v_fused = target_model.verify(verify_ids, cache, tap)
-            mx.eval(v_logits, v_fused)
+                verify_ids = mx.array([[pending] + drafted])
+                v_logits, v_fused = target_model.verify(verify_ids, cache, tap)
+                mx.eval(v_logits, v_fused)
 
-            n, repl = _spec_sample_accept(v_logits[0], drafted, q_probs, temperature, top_p, top_k)
+                n, repl = _spec_sample_accept(
+                    v_logits[0], drafted, q_probs, temperature, top_p, top_k)
             committed = drafted[:n] + [repl]             # accepted prefix + residual/bonus
         elif tree_on:
             # Tree round, ONE graph and one sync like the chain: the lattice -> a best-first
@@ -1172,22 +1193,37 @@ def _spec_sample_accept(v_logits, draft, q_probs, temperature, top_p=1.0, top_k=
     With ``top_p`` / ``top_k`` the *target* distribution ``p`` is truncated first, so the
     output is an exact sample from ``top-p/top-k(softmax(target / T))`` — still lossless, now
     wrt the client's requested truncation (the draft ``q_probs`` were truncated to match)."""
-    L = len(draft)
+    n_arr, repl_arr = _spec_sample_accept_arr(v_logits, draft, q_probs, temperature, top_p, top_k)
+    mx.eval(n_arr, repl_arr)
+    return int(n_arr.item()), int(repl_arr.item())
+
+
+def _spec_sample_accept_arr(v_logits, draft, q_probs, temperature, top_p=1.0, top_k=0):
+    """:func:`_spec_sample_accept` as a lazy graph: ``(n_accepted, replacement_token)`` as mx
+    scalars, so a sampled round can reach the device as one graph with one sync — draft,
+    verify and accept — like a greedy round. ``draft`` is the L drafted tokens as a list or a
+    (lazy) ``[L]`` array.
+
+    The rejected position is not known when the graph is built, so its rows are gathered by
+    the accepted length: the residual ``norm(max(0, p - q))`` there, or the target's own row
+    when every draft was accepted (the bonus). Two random draws in the order the host-side
+    version made them (the uniforms, then one categorical), over the same values: the same
+    seed gives the same tokens."""
+    idx = draft if isinstance(draft, mx.array) else mx.array(draft)
+    L = int(idx.shape[0])
     p = truncate_probs(mx.softmax(v_logits / temperature, axis=-1), top_p, top_k)  # [1+L, V]
     rows = mx.arange(L)
-    idx = mx.array(draft)
     pd = p[rows, idx]                                          # target prob of each drafted token
     qd = q_probs[rows, idx]                                    # draft prob it was sampled from
     u = mx.random.uniform(shape=(L,))
     accepted = u < mx.minimum(1.0, pd / mx.maximum(qd, 1e-9))
     # accepted-prefix length in-graph (cumprod stops at the first reject)
-    n = int(mx.cumprod(accepted.astype(mx.int32)).sum().item())
-    if n < L:
-        resid = mx.maximum(p[n] - q_probs[n], 0.0)            # residual at the rejected position
-        resid = resid / mx.maximum(resid.sum(), 1e-9)
-        repl = int(mx.random.categorical(mx.log(resid + 1e-20)).item())
-    else:
-        repl = int(sample_probs(p[L]).item())                # target bonus from the (truncated) p
+    n = mx.cumprod(accepted.astype(mx.int32)).sum()
+    p_n = mx.take(p, n, axis=0)                                # the target's row at position n
+    resid = mx.maximum(p_n - mx.take(q_probs, mx.minimum(n, L - 1), axis=0), 0.0)
+    resid = resid / mx.maximum(resid.sum(), 1e-9)              # residual at the rejected position
+    # all accepted (n == L): the bonus comes from the (truncated) target row itself
+    repl = sample_probs(mx.where(n < L, resid, p_n))
     return n, repl
 
 
@@ -1431,10 +1467,10 @@ def speculative_generate(
             draft, n = [], 0
             verify_ids = mx.array([[pending]])
             v_logits, v_fused = target_model.verify(verify_ids, cache, tap)
-            tt0 = mx.argmax(pen.apply(v_logits[0], draft), axis=-1)
-            mx.eval(tt0, v_fused)
-            committed = [int(tt0[0].item())] if temperature == 0.0 else [
-                _pick(pen.apply(v_logits[0], draft)[0], temperature, top_p, top_k)]
+            # argmax at temperature 0, else the sample — in the step's own graph: one sync
+            tok_arr = _sample_arr(pen.apply(v_logits[0], draft)[0], temperature, top_p, top_k)
+            mx.eval(tok_arr, v_fused)
+            committed = [int(tok_arr.item())]
         elif lk_draft:
             # ---- free lookup draft (a copy run was detected): verify the continuation of
             # the earlier occurrence instead of running the drafter this round. The drafter
@@ -1444,7 +1480,8 @@ def speculative_generate(
             if temperature > 0.0:
                 verify_ids = mx.array([[pending] + draft])
                 v_logits, v_fused = target_model.verify(verify_ids, cache, tap)
-                mx.eval(v_logits, v_fused)
+                if not SAMPLED_ONE_SYNC or pen.active:
+                    mx.eval(v_logits, v_fused)
                 vocab = v_logits.shape[-1]     # point-mass proposal: q is one-hot per token
                 q_probs = (mx.arange(vocab)[None, :]
                            == mx.array(draft)[:, None]).astype(mx.float32)
@@ -1482,11 +1519,29 @@ def speculative_generate(
             head_hidden = drafter.head_slice(block_hidden, cap)     # only the verified positions
             base_logits = drafter.compute_logits(head_hidden)[0]    # [cap, V]
 
-            if temperature > 0.0 or use_conf or pen.active:
-                # Two-phase path: the sampled path needs the q distributions, the confidence head
-                # truncates the draft, and penalties need the draft as a list (to penalize each
-                # verify position by the base counts + its draft prefix) — so the drafted tokens
-                # are materialized *before* the verify forward, one extra sync per round.
+            if temperature > 0.0 and SAMPLED_ONE_SYNC and not use_conf and not pen.active:
+                # Fused sampled path: the round reaches the device as one graph with a single
+                # sync, like the greedy one below. The sampled draft stays on the GPU, the
+                # drafter launches while Python builds the verify graph, and the accept test
+                # and the residual / bonus draw are in-graph (_spec_sample_accept_arr). Same
+                # random draws in the same order as the two-phase round: same seed, same tokens.
+                draft_arr, q_probs = drafter.sample_block_probs(
+                    base_logits, pending, temperature, top_p, top_k)
+                mx.async_eval(draft_arr, q_probs)
+                verify_ids = mx.concatenate(
+                    [mx.array([pending], dtype=draft_arr.dtype), draft_arr]).reshape(1, -1)
+                v_logits, v_fused = target_model.verify(verify_ids, cache, tap)
+                n_arr, repl_arr = _spec_sample_accept_arr(
+                    v_logits[0], draft_arr, q_probs, temperature, top_p, top_k)
+                mx.eval(n_arr, repl_arr, draft_arr)
+                n = int(n_arr.item())
+                draft = [int(x) for x in draft_arr.tolist()]
+                committed = draft[:n] + [int(repl_arr.item())]  # accepted prefix + residual/bonus
+            elif temperature > 0.0 or use_conf or pen.active:
+                # Two-phase path: the confidence head truncates the draft, and penalties need the
+                # draft as a list (to penalize each verify position by the base counts + its
+                # draft prefix) — so the drafted tokens are materialized *before* the verify
+                # forward, one extra sync per round. (Plain sampling takes the fused path above.)
                 if temperature > 0.0:
                     draft_arr, q_probs = drafter.sample_block_probs(
                         base_logits, pending, temperature, top_p, top_k)
