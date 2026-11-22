@@ -1376,7 +1376,10 @@ are bundled.
     of once per row and query head (5% of a 4-row verify pass at 2,600 tokens, 8% at 16,000).
     Plain decoding is 39% faster and a verify pass far cheaper (the same drafter
     on the stock forward reaches 28.9 tok/s). **The baseline column in this row is mlx-dspark's
-    own faster plain decode**, which is why the ratio there reads 1.37×. It is the first **looped mixture-of-experts** target: 24 layers
+    own faster plain decode**, which is why the ratio there reads 1.37×. To see all three on
+    your own Mac in one run, race them: `POST /admin/race` with a `stock` arm (the model on
+    mlx-vlm's own forward, every mlx-dspark kernel off) beside `baseline` and `dspark`.
+    It is the first **looped mixture-of-experts** target: 24 layers
     whose middle 12 run three times per token, 8 of 128 experts, the experts in NVFP4 / MXFP8 as
     released (there is no other quant to pick; mlx-dspark runs the official checkpoint as-is).
     Its DSpark head ships **inside the model repo** (`mtp.safetensors`), so the drafter resolves

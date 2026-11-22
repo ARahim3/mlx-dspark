@@ -97,14 +97,17 @@ source file is included; the module is written against mlx-dspark's own drafter 
 matrix-vector layout of MLX (`mlx/backend/metal/kernels/fp_quantized.h`, MIT License,
 Copyright © 2023 Apple Inc.), via mlx-vlm's `models/masked_quantized.py` (MIT License).
 
-`src/mlx_dspark/inkling_fused.py` contains two forward bodies adapted from mlx-vlm's
-Inkling 2 model (`mlx_vlm/models/inkling2/language.py`: `DecoderLayer.__call__` and
-`Attention.__call__`; Apache License 2.0, Copyright 2026 The HuggingFace Team, itself
-adapted for MLX from Transformers' Inkling2), with runs of small operations replaced by
-mlx-dspark's own Metal kernels, and the short-convolution expression of mlx-vlm's
-`models/inkling2/kernels.py` (MIT License). The kernels' reductions follow the layouts of
-MLX's own `rms_norm.metal` and `reduction/reduce_row.h` (MIT License, Copyright © 2024
-Apple Inc.) so that their results are bit-identical to the stock operations.
+`src/mlx_dspark/inkling_fused.py` contains three forward bodies adapted from mlx-vlm's
+Inkling 2 model (`mlx_vlm/models/inkling2/language.py`: `TextModel.__call__`,
+`DecoderLayer.__call__` and `Attention.__call__`; Apache License 2.0, Copyright 2026 The
+HuggingFace Team, itself adapted for MLX from Transformers' Inkling2), with runs of small
+operations replaced by mlx-dspark's own Metal kernels; the short-convolution expression of
+mlx-vlm's `models/inkling2/kernels.py` and the relative-position mask expression of its
+`models/inkling/language.py` (MIT License). The kernels' reductions follow the layouts of
+MLX's own `rms_norm.metal` and `reduction/reduce_row.h`, and the packed verify attention is
+derived from MLX's two-pass `sdpa_vector.h` (MIT License, Copyright © 2024 Apple Inc.).
+`src/mlx_dspark/inkling_batch.py` (batched decoding) follows the same three forward bodies
+with the sequence state held per request.
 
 Inkling 2 checkpoints (e.g. `thinkingmachines/Inkling-2-Mini`, Apache-2.0) are downloaded
 at runtime from their publisher.
