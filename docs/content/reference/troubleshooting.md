@@ -72,6 +72,16 @@ That's an old `mlx-vlm` 0.6.4 × `transformers` ≥ 5.12 incompatibility. Upgrad
 
 Speculation is a net loss on the 1-bit pack (0.71–0.77×), so mlx-dspark points you to plain generation with `mlx-vlm` instead. The ternary 2-bit build is the one to use with a drafter.
 
+## The Mac app
+
+### The app quits a second after the engine starts
+
+That is app 0.8.4 on some macOS versions (26.7.3, for one): it was built with a Swift compiler that mishandles `async let`, and it aborts on every launch. Update to app 0.8.5 or later (`brew upgrade --cask mlx-dspark`, or the DMG from Releases).
+
+### An engine keeps running after the app is gone, or the app moved off port 8484
+
+A crash or a force-quit used to leave the app's engine running in the background, holding port 8484 and, once a model was loaded, its memory, so the next launch fell back to another port. Since app 0.8.5 with engine 0.21.2 the engine exits with the app, and each launch stops any engine an earlier crash left behind. On older versions, stop it by hand: `pkill -f "com.arahim.mlx-dspark/runtime/venv/bin/mlx-dspark serve"`.
+
 ## Clients and agents
 
 ### `mlx-dspark claude` says there's no server
