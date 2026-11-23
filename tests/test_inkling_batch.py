@@ -33,6 +33,25 @@ def _target():
 PROMPTS = [[3, 7, 11], [2, 9, 30, 41, 5, 8, 13, 21, 34], [4, 6, 12, 19, 27, 33, 1, 14, 22, 35, 40, 44, 51, 17]]
 
 
+# ---------------------------------------------------------------- when batching cannot run
+def test_the_server_says_so_when_max_batch_cannot_be_honoured(monkeypatch, capsys):
+    """Issue #43: on an mlx-vlm whose caches the in-place ones did not match, --max-batch 2
+    silently served one request at a time (a 10 s first token for the second client)."""
+    from types import SimpleNamespace
+
+    from mlx_dspark import server as S
+    from mlx_dspark.inkling import MLX_VLM_INSTALL
+
+    engine = SimpleNamespace(mode="dspark", is_inkling=True,
+                             target=SimpleNamespace(model=SimpleNamespace(language_model=None)))
+    monkeypatch.setattr(B, "supported", lambda lm: False)
+    assert S.maybe_batch_engine(engine, 2) is engine
+    err = capsys.readouterr().err
+    assert "--max-batch 2 is OFF" in err and "one at a time" in err and MLX_VLM_INSTALL in err
+    assert S.maybe_batch_engine(engine, 1) is engine             # not asked for: nothing to say
+    assert capsys.readouterr().err == ""
+
+
 # ---------------------------------------------------------------- the two slot kernels
 @metal
 @pytest.mark.parametrize("rows", [1, 3, 8])

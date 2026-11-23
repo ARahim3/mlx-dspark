@@ -220,20 +220,43 @@ def is_sink_cache(kv) -> bool:
 def convert(caches: list) -> list:
     """Swap the KV half of each Inkling 2 layer-visit cache (``CacheList(kv, conv)``) for its
     in-place counterpart: ``RotatingKVCache(keep=0)`` -> ``WindowKVCache``, ``KVCache`` ->
-    ``SinkKVCache``. Fresh (empty) caches only; anything else is left as it is."""
+    ``SinkKVCache``, and mlx-vlm's own ``AttentionSinkKVCache`` (what its looped model makes
+    since 2026-11-22: the same layout, without the views the packed attention and a batched
+    step read) to the one its ``max_size`` names. Fresh (empty) caches only; anything else is
+    left as it is."""
     from mlx_vlm.models import cache as vlm_cache
 
     sink_cls, window_cls = classes()
+    upstream = getattr(vlm_cache, "AttentionSinkKVCache", None)
     for entry in caches:
         parts = getattr(entry, "caches", None)
         if not parts:
             continue
         kv = parts[0]
-        if type(kv) is vlm_cache.RotatingKVCache and kv.keys is None and kv.keep == 0:
+        if getattr(kv, "keys", None) is not None:
+            continue
+        if type(kv) is vlm_cache.RotatingKVCache and kv.keep == 0:
             new = window_cls(kv.max_size)
-        elif type(kv) is vlm_cache.KVCache and kv.keys is None:
+        elif type(kv) is vlm_cache.KVCache:
             new = sink_cls()
+        elif upstream is not None and type(kv) is upstream:
+            new = sink_cls() if kv.max_size is None else window_cls(kv.max_size)
         else:
             continue
         entry.caches = (new, *parts[1:])
     return caches
+
+
+def windowed(kv) -> bool:
+    """Whether ``kv`` (a stock or an in-place attention cache) is a sliding window."""
+    return getattr(kv, "max_size", None) is not None
+
+
+def small_window(kv, window: int):
+    """A fresh STOCK cache of ``kv``'s class over a ``window``-key window (the self-test fills,
+    wraps and rolls back a few keys instead of a thousand)."""
+    from mlx_vlm.models import cache as vlm_cache
+
+    if isinstance(kv, vlm_cache.RotatingKVCache):
+        return type(kv)(max_size=window, keep=0)
+    return type(kv)(window)

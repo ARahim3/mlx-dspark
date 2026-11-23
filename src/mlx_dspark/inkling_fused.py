@@ -43,7 +43,7 @@ from functools import lru_cache
 
 import mlx.core as mx
 
-from .inkling_cache import is_sink_cache
+from .inkling_cache import is_sink_cache, small_window, windowed
 
 MAX_ROWS = 33         # positions per call a fused piece accepts: the widest verify, a lookup
 #                       round's 32 copied tokens + the anchor (a drafter round is cap 7 + anchor)
@@ -1281,6 +1281,11 @@ def _attn_call(base):
             size = k.shape[2]
             mask = _attention_mask(self, lang, r, sinks, size, length, k)
             k, v = kv.sink_views()
+        elif callable(getattr(kv, "with_sink", None)):
+            # mlx-vlm's own sink cache (its looped model's since 2026-11-22): its views
+            size = k.shape[2]
+            mask = _attention_mask(self, lang, r, sinks, size, length, k)
+            k, v = kv.with_sink(size)
         else:
             # [keys in temporal order ‖ the sink's zero row] as ONE concatenate (stock: the
             # ring's reorder, a zeros fill, then another copy of the whole K and V)
@@ -1437,6 +1442,51 @@ def _moe_call(base):
 _CLASSES: dict[tuple[type, str], type] = {}
 
 
+def _same_default(value, default) -> bool:
+    return value is default or (type(value) is type(default)
+                                and type(value) in (bool, int, float, str) and value == default)
+
+
+def _tolerant(call, base):
+    """``call`` (a fused ``__call__`` written against one mlx-vlm) behind the signature of the
+    INSTALLED one. An argument ``call`` does not know is dropped when it carries the stock
+    method's own default — that is the call ``call`` was written for — and sends the call to the
+    stock method otherwise, as does anything else that cannot be matched. A newer mlx-vlm that
+    grows a parameter then runs, on the stock path where it must, instead of raising."""
+    import inspect
+
+    try:
+        known = inspect.signature(call).parameters
+        stock = inspect.signature(base.__call__).parameters
+    except (TypeError, ValueError):
+        return call
+    kinds = (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
+    if any(p.kind not in kinds for p in (*known.values(), *stock.values())):
+        return call
+    names, stock_names = list(known), list(stock)
+    if stock_names[:len(names)] != names:
+        # renamed or reordered parameters: not the method ``call`` was copied from
+        def __call__(self, *args, **kwargs):
+            return base.__call__(self, *args, **kwargs)
+
+        return __call__
+    if len(stock_names) == len(names):
+        return call
+    limit = len(names) - 1                       # positional arguments ``call`` takes after self
+    defaults = {name: p.default for name, p in stock.items() if name not in known}
+
+    def __call__(self, *args, **kwargs):
+        extra = [name for name in kwargs if name not in known]
+        if len(args) > limit or not all(
+                name in defaults and _same_default(kwargs[name], defaults[name]) for name in extra):
+            return base.__call__(self, *args, **kwargs)
+        for name in extra:
+            del kwargs[name]
+        return call(self, *args, **kwargs)
+
+    return __call__
+
+
 def _swap(module, make_call, tag: str) -> None:
     """Give ``module`` (one instance) a subclass of its own class whose ``__call__`` is fused."""
     base = type(module)
@@ -1444,7 +1494,7 @@ def _swap(module, make_call, tag: str) -> None:
         return
     cls = _CLASSES.get((base, tag))
     if cls is None:
-        cls = type(f"{tag}{base.__name__}", (base,), {"__call__": make_call(base)})
+        cls = type(f"{tag}{base.__name__}", (base,), {"__call__": _tolerant(make_call(base), base)})
         _CLASSES[(base, tag)] = cls
     module.__class__ = cls
 
@@ -1701,7 +1751,7 @@ def selftest(language_model, rows: int = 2, seed: int = 0) -> dict[str, bool]:
         wraps and is read back in temporal order (the attention body reorders the ring and adds
         the sink row in one copy; a load-time probe on a fresh 1024-key ring never wraps)."""
         kv = lm.make_cache()[visits.index(index)][0]
-        if not hasattr(kv, "max_size") or not hasattr(kv, "_temporal_order"):
+        if not windowed(kv):
             return True
         xs = [rand((1, 1, hidden), mx.bfloat16) for _ in range(steps)]
         blocks = [rand((1, 1, hidden), mx.bfloat16)] if layers[index].attention_input is not None else []
@@ -1711,7 +1761,7 @@ def selftest(language_model, rows: int = 2, seed: int = 0) -> dict[str, bool]:
             if on:
                 set_enabled(lm, True, ("attn",))
             cache = lm.make_cache()[visits.index(index)]
-            cache.caches = (type(kv)(max_size=window, keep=0), *cache.caches[1:])
+            cache.caches = (small_window(kv, window), *cache.caches[1:])
             outs = [layers[index](x, list(blocks), cache, None) for x in xs]
             st = _state_arrays(cache)
             mx.eval(outs, st)
@@ -1743,8 +1793,8 @@ def selftest(language_model, rows: int = 2, seed: int = 0) -> dict[str, bool]:
                 set_enabled(lm, True, ("attn",))
             entry = lm.make_cache()[visits.index(index)]
             kv = entry.caches[0]
-            if hasattr(kv, "max_size"):
-                entry.caches = (type(kv)(max_size=window, keep=0), *entry.caches[1:])
+            if windowed(kv):
+                entry.caches = (small_window(kv, window), *entry.caches[1:])
             if new:
                 convert([entry])
                 if not is_sink_cache(entry.caches[0]):

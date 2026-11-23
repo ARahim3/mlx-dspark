@@ -267,6 +267,54 @@ def test_packed_attention_refuses_shapes_it_was_not_written_for():
     assert not F._packed_ok(ok, 100)                 # more rows than one threadgroup holds
 
 
+# ---------------------------------------------------------------- a newer mlx-vlm's call shape
+# (issue #43: mlx-vlm's main gave DecoderLayer.__call__ a `speculative_verify` keyword and passed
+# it on every call; the wrappers were written against the older signature and raised TypeError)
+class _Layer:
+    def __call__(self, x, blocks, cache=None, messages=None, speculative_verify=False):
+        return ("stock", x, blocks, cache, messages, speculative_verify)
+
+
+def _fused(self, x, blocks, cache=None, messages=None):
+    return ("fused", x, blocks, cache, messages)
+
+
+def test_wrapper_takes_a_new_argument_at_its_default_and_leaves_the_rest_to_stock():
+    call = F._tolerant(_fused, _Layer)
+    layer = _Layer()
+    assert call(layer, 1, 2, 3, messages=4) == ("fused", 1, 2, 3, 4)
+    # what the newer forward sends on an ordinary call: the argument at the stock default
+    assert call(layer, 1, 2, cache=3, messages=4, speculative_verify=False) == ("fused", 1, 2, 3, 4)
+    # set, by keyword or by position: only the stock method knows what it means
+    assert call(layer, 1, 2, 3, None, speculative_verify=True) == ("stock", 1, 2, 3, None, True)
+    assert call(layer, 1, 2, 3, None, True) == ("stock", 1, 2, 3, None, True)
+    # 0 is not False: a value is the default only when it is the same kind of value
+    assert call(layer, 1, 2, speculative_verify=0)[0] == "stock"
+    with pytest.raises(TypeError):                   # an argument nobody knows still raises
+        call(layer, 1, 2, nonsense=1)
+
+
+def test_wrapper_is_the_fused_call_itself_on_the_signature_it_was_written_for():
+    class Same:
+        def __call__(self, x, blocks, cache=None, messages=None):
+            return "stock"
+
+    assert F._tolerant(_fused, Same) is _fused
+
+
+def test_wrapper_stays_on_stock_when_the_method_is_no_longer_the_one_it_copied():
+    class Renamed:
+        def __call__(self, x, residuals, cache=None, messages=None):
+            return ("stock", x, residuals)
+
+    class Variadic:
+        def __call__(self, x, *blocks, **options):
+            return "stock"
+
+    assert F._tolerant(_fused, Renamed)(Renamed(), 1, 2) == ("stock", 1, 2)
+    assert F._tolerant(_fused, Variadic) is _fused   # nothing to compare against: as before
+
+
 # ---------------------------------------------------------------- installed, against mlx-vlm
 def _tiny_bf16_inkling():
     return _tiny_bf16_model().language_model
@@ -356,8 +404,14 @@ def test_installed_exact_kinds_are_bit_identical_to_mlx_vlm(monkeypatch):
     ref, ref_states = _walk(lm, None)
     assert hits == {}                                          # off means the stock forward
     _walk(lm, F.EXACT_KINDS)
-    # 8 layer visits per forward (layers 2-3 run twice): 6 sliding, 2 global; 5 forwards
-    assert hits["_sconv_step"] == 5 * (8 * 2 + 6 * 2) and hits["fused_head_prep"] == 5 * 8
+    # 8 layer visits per forward (layers 2-3 run twice): 6 sliding, 2 global; 5 forwards. Where
+    # mlx-vlm's own loop hands its layers `speculative_verify` (main since 2026-11-23), the
+    # verify's layer bodies are mlx-vlm's — the fused loop, which keeps them, is off in this walk
+    import inspect
+
+    stock_layer = type(lm.model.layers[0]).__mro__[1].__call__
+    bodies = 4 if "speculative_verify" in inspect.signature(stock_layer).parameters else 5
+    assert hits["_sconv_step"] == bodies * 8 * 2 + 5 * 6 * 2 and hits["fused_head_prep"] == 5 * 8
     assert hits["_dyn_sconv_step"] == 5 * 2 * 2 and hits["fused_norm_cast"] > 5 * 8
     for kinds in (("sconv",), ("layer",), ("attn",), F.EXACT_KINDS):
         got, got_states = _walk(lm, kinds)

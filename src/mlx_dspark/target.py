@@ -172,8 +172,12 @@ class Target:
                 self.inkling_fused = inkling_fused.selftest(model.language_model)
                 off = sorted(k for k, ok in self.inkling_fused.items() if not ok)
                 if off:
+                    from .inkling import MLX_VLM_INSTALL
+
                     print(f"[inkling] fused forward: {', '.join(off)} failed the self-test "
-                          "against this mlx-vlm and stay on the stock path", file=sys.stderr)
+                          "against this mlx-vlm and stay on the stock path (slower; output is "
+                          "unchanged). This mlx-dspark was measured on another mlx-vlm commit — "
+                          f"to get them back: {MLX_VLM_INSTALL}", file=sys.stderr)
                 if os.environ.get("MLX_DSPARK_INKLING_GROUPED_MOE", "1").lower() in ("0", "false"):
                     inkling_fused.disable(model.language_model, ("moe",))
                     self.inkling_fused["moe"] = False

@@ -227,6 +227,36 @@ def test_load_drafter_routes_the_bundled_head_before_the_nvfp4_converter(tmp_pat
     assert L.drafter_lineage(str(path)) == "dspark"
 
 
+def test_a_local_copy_under_another_name_is_still_the_registered_pair(tmp_path):
+    """Issue #43: `--model ~/models/ink --mode dspark` said no drafter was registered — the
+    registry matched names only, and the head sits in that very directory."""
+    from mlx_dspark import load as L
+
+    (tmp_path / "ink-local").mkdir()
+    path = _write_target_dir(tmp_path / "ink-local")
+    entry = L._registry_entry(str(path))
+    assert entry is not None and entry["id"] == "inkling-2-mini"
+    assert L.resolve(str(path), mode="dspark") == (str(path), str(path))
+    assert L.lookup_drafts_default(str(path)) is False           # the pair's defaults follow
+    # another model's directory, a directory without a config, a repo id: no match by type
+    other = tmp_path / "other"
+    other.mkdir()
+    (other / "config.json").write_text(json.dumps({"model_type": "qwen3"}))
+    assert L._registry_entry(str(other)) is None
+    assert L._registry_entry(str(tmp_path)) is None
+    assert L._registry_entry("someone/unknown-model") is None
+    with pytest.raises(ValueError, match="no built-in dspark drafter"):
+        L.resolve(str(other), mode="dspark")
+
+
+def test_the_install_command_names_one_commit():
+    from mlx_dspark import inkling
+
+    assert len(inkling.MLX_VLM_COMMIT) == 40 and int(inkling.MLX_VLM_COMMIT, 16) >= 0
+    assert inkling.MLX_VLM_INSTALL.endswith(f"mlx-vlm@{inkling.MLX_VLM_COMMIT}'")
+    assert inkling.MLX_VLM_INSTALL in inkling.MLX_VLM_HINT
+
+
 def test_no_head_file_is_not_a_bundled_head(tmp_path):
     assert not has_bundled_head(str(_write_target_dir(tmp_path, with_head=False)))
 

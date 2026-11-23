@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import glob
+import json
 import os
 
 import mlx.core as mx
@@ -316,7 +317,10 @@ _FAMILY_ALIASES = {
 
 
 def _registry_entry(target: str) -> dict | None:
-    """Find the registry entry whose model id matches this target repo/path (quant-agnostic)."""
+    """Find the registry entry whose model id matches this target repo/path (quant-agnostic).
+    A local directory saved under another name is matched by its config's ``model_type``
+    against the rows that declare one (Inkling 2 ships its head inside the checkpoint, so
+    ``~/models/ink`` is still that pair — issue #43)."""
     key = os.path.basename(str(target).rstrip("/")).lower()
     key_nodash = key.replace("-", "")
     # longest id first so e.g. 'gemma-4-12b' wins over any shorter accidental match
@@ -324,6 +328,14 @@ def _registry_entry(target: str) -> dict | None:
         eid = entry["id"]
         if eid in key or eid.replace("-", "") in key_nodash:
             return entry
+    typed = [entry for entry in REGISTRY if entry.get("model_type")]
+    if typed and os.path.isdir(str(target)):
+        try:
+            with open(os.path.join(str(target), "config.json")) as f:
+                model_type = str(json.load(f).get("model_type", ""))
+        except (OSError, ValueError, AttributeError):
+            return None
+        return next((entry for entry in typed if entry["model_type"] == model_type), None)
     return None
 
 

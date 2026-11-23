@@ -91,6 +91,7 @@ def test_inkling_stock_switches_everything_off_and_puts_it_back():
 
     from mlx_dspark import inkling_fused as F
     from mlx_dspark import inkling_kernels as K
+    from mlx_dspark.inkling_cache import is_sink_cache
 
     t, lm = _target()
     attn = lm.model.layers[0].self_attn
@@ -110,7 +111,8 @@ def test_inkling_stock_switches_everything_off_and_puts_it_back():
 
     with t.stock_forward():
         assert F.enabled_kinds(lm) == () and not F.kv_caches(lm) and not F.packed_attn(lm)
-        assert type(t.make_cache()[0][0]).__name__ in ("RotatingKVCache", "KVCache")
+        made = t.make_cache()[0][0]                  # mlx-vlm's own cache, whichever it makes
+        assert not is_sink_cache(made) and type(made).__module__.startswith("mlx_vlm.")
         inside = run()
         mx.eval(inside)
     assert state() == before
