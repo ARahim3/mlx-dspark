@@ -799,17 +799,20 @@ final class AppModel: ObservableObject {
 
     func refreshDiagnostics() async {
         guard let client else { return }
-        async let report = try? client.doctor()
-        async let inventory = try? client.modelInventory()
-        async let curves = try? client.calibration()
-        doctorReport = await report
-        if let inventory = await inventory {
+        // Plain Task handles, not `async let`: with `async let` here (inlined into
+        // startServer), the app aborted in _swift_task_dealloc_specific during async-let
+        // teardown right after the engine came up (issue #44).
+        let reportTask = Task { try? await client.doctor() }
+        let inventoryTask = Task { try? await client.modelInventory() }
+        let curvesTask = Task { try? await client.calibration() }
+        doctorReport = await reportTask.value
+        if let inventory = await inventoryTask.value {
             models = inventory.models
             installedModels = inventory.installed ?? []
             diskUsage = inventory.disk
             bandwidth = inventory.bandwidth
         }
-        calibration = await curves
+        calibration = await curvesTask.value
     }
 
     /// Pull the latest aggregates (the SSE stream only pushes them periodically).
