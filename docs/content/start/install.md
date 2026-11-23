@@ -31,6 +31,16 @@ mlx-dspark doctor
 
 `doctor` checks that you're on Apple Silicon, reports the MLX stack it found and your memory, and lists every folder it will look in for models. Add `--models` to see which supported models fit this Mac and which are already downloaded.
 
+## Inkling-2-Mini: one more command
+
+No `mlx-vlm` release has Inkling-2-Mini's looped model yet. Until one does, install the `mlx-vlm` commit this pair was measured on. mlx-dspark tells you if it's missing before it downloads anything.
+
+```bash
+uv pip install 'mlx-vlm @ git+https://github.com/Blaizzy/mlx-vlm@d998a6207b7dc613b52618646dbea13a4799f7ca'
+```
+
+Use that commit rather than the tip of `mlx-vlm`'s `main`, which is still reworking this model. Every other model needs nothing beyond the install above.
+
 ## Or install the Mac app
 
 ```bash

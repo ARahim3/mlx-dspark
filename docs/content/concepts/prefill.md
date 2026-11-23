@@ -20,7 +20,7 @@ Everything else on this site measures *decoding*, how fast tokens come out once 
 
 M4 Pro, 2048-token prompt, median of 3, default settings.
 
-**Model size barely predicts this.** Prefill is compute-bound, so small dense models lead, and mixtures of experts punch far above their total size: an A3B model does only about 3.8B parameters' worth of arithmetic per token, however many experts it stores. The reverse shows up on Qwen3.8-27B: the 4-bit build prefills at the same rate as the 8-bit, because weight bits change decode speed (bandwidth-bound), not prefill. Looped Nanbeige runs every token through its layers twice, so the "3B" pays a 6B's arithmetic.
+**Model size barely predicts this.** Prefill is compute-bound, so small dense models lead, and mixtures of experts punch far above their total size: an A3B model does only about 3.8B parameters' worth of arithmetic per token, however many experts it stores. The reverse shows up on Qwen3.8-27B: the 4-bit build prefills at the same rate as the 8-bit, because weight bits change decode speed (bandwidth-bound), not prefill. Looped Nanbeige runs every token through its layers twice, so the "3B" pays a 6B's arithmetic. Inkling-2-Mini is looped too: its middle 12 layers run three times, 48 layer visits per token, and it prefills at 400 tok/s where Qwen3.6-35B-A3B, a mixture of experts of similar active size, reaches 960.
 
 ## What mlx-dspark does
 
