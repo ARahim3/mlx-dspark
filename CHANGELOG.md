@@ -2,6 +2,16 @@
 
 All notable changes to `mlx-dspark`. Versions follow [SemVer](https://semver.org/) (pre-1.0: minor-ish features land as patch bumps).
 
+## [0.21.1] — 2026-11-23 — Inkling-2-Mini runs on current mlx-vlm main again
+
+### Fixed
+- **Inkling-2-Mini on an mlx-vlm newer than the one 0.21.0 was measured on (issue #43, reported by @kylekillen).** Inkling needs mlx-vlm from git until a release has its looped model, and mlx-vlm's main reworked that model twice in the two days after 0.21.0: first its attention caches (2026-11-22), then the call signatures of its layers (2026-11-23). On the first, 0.21.0 switched off the pieces of its forward that no longer matched — as designed — but `--max-batch` stands on them and went back to one request at a time without saying so (a second client waited ~10 s for its first token). On the second it could not run the model at all (`TypeError` at the first prefill, every mode). Now: mlx-dspark's forward accepts whatever the installed mlx-vlm passes and hands anything it does not know to mlx-vlm's own code; its in-place KV caches replace mlx-vlm's new cache class as they did the old ones. On mlx-vlm main as of 2026-11-23 (`36565bc`) every piece passes its load-time check again, batching included, with the same tokens and the same speed as on the measured commit.
+- **`--max-batch` says so when it cannot be honoured on Inkling,** and the load-time note about a piece that fell back to mlx-vlm's code now says the output is unchanged and names the command that brings it back.
+- **A local Inkling directory under any name finds the drafter it ships (issue #43).** `--model ~/models/ink --mode dspark` reported that no drafter was registered: the registry matched the directory's name only. A local directory is now also matched by its config's `model_type`, so it gets the bundled head and the pair's measured defaults (cap, lookup drafts off) without `--drafter`.
+
+### Changed
+- **The Inkling install step names one mlx-vlm commit** — the one this pair was measured on — instead of the tip of main, in the README, the docs and the message mlx-dspark prints on an mlx-vlm without the looped model: `uv pip install 'mlx-vlm @ git+https://github.com/Blaizzy/mlx-vlm@d998a6207b7dc613b52618646dbea13a4799f7ca'`. That commit also works with 0.21.0.
+
 ## [0.21.0] — 2026-11-23 — Inkling-2-Mini at 47.5 tok/s (24.9 in stock mlx-vlm) and batched serving for it, Tencent DSpine drafters, faster sampled requests
 
 ### Faster
