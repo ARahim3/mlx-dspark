@@ -79,6 +79,31 @@ MODES = ("dspark", "dflash", "lookup", "baseline")
 # generations piling up behind that thread is exactly what looked like a wedged server.
 # Env-overridable for aggressive proxies (and for exercising the path without a 15 s wait).
 STREAM_KEEPALIVE_S = float(os.environ.get("MLX_DSPARK_STREAM_KEEPALIVE_S", "") or 15.0)
+
+
+def _start_keepalive(lock, done: threading.Event, gone: threading.Event,
+                     write) -> threading.Thread:
+    """The keep-alive thread every streaming dialect runs: every ``STREAM_KEEPALIVE_S`` until
+    ``done``, ``write()`` one keep-alive frame. ``done`` is checked again while holding the
+    stream's write ``lock``: the timer can fire just as the stream ends, and a keep-alive
+    written then landed AFTER the final frame (a chunk after ``data: [DONE]``, caught by CI
+    2026-11-23) or on the already-closed socket. A failed write is the disconnect signal
+    while nothing else streams: ``gone`` is set and the thread ends (``ValueError`` = the
+    handler has closed the file)."""
+    def run():
+        while not done.wait(STREAM_KEEPALIVE_S):
+            with lock:
+                if done.is_set():
+                    return
+                try:
+                    write()
+                except (OSError, ValueError):
+                    gone.set()
+                    return
+
+    thread = threading.Thread(target=run, daemon=True)
+    thread.start()
+    return thread
 # Log any inter-round gap longer than this (stderr, with mode/cap/ctx) — the remote
 # diagnostic for "generation stalled mid-stream" reports (issue #19). 0 disables.
 SLOW_ROUND_LOG_S = float(os.environ.get("MLX_DSPARK_SLOW_ROUND_LOG_S", "") or 10.0)
@@ -2515,7 +2540,8 @@ def make_handler(engine: Engine, api_key: str | None):
             super().setup()
             # SSE frames are written from the request thread and, during long prefills, from
             # the keep-alive heartbeat timer — one lock keeps frames from interleaving.
-            self._wlock = threading.Lock()
+            # Reentrant: the keep-alive holds it across its done-check and its _sse write.
+            self._wlock = threading.RLock()
 
         # -- low-level replies --
         def _route(self) -> str:
@@ -3375,16 +3401,8 @@ def make_handler(engine: Engine, api_key: str | None):
             # instead of holding the MLX thread for a client that's gone (issue #14).
             done = threading.Event()
             gone = threading.Event()
-
-            def _heartbeat():
-                while not done.wait(STREAM_KEEPALIVE_S):
-                    try:
-                        self._sse({"type": "ping"}, "ping")
-                    except Exception:  # noqa: BLE001 — socket gone; flag it and stand down
-                        gone.set()
-                        return
-
-            threading.Thread(target=_heartbeat, daemon=True).start()
+            _start_keepalive(self._wlock, done, gone,
+                             lambda: self._sse({"type": "ping"}, "ping"))
 
             def on_text(piece: str):
                 if gone.is_set():
@@ -3487,16 +3505,7 @@ def make_handler(engine: Engine, api_key: str | None):
             # Completions streaming paths — see their comments (STREAM_KEEPALIVE_S) for why.
             done = threading.Event()
             gone = threading.Event()
-
-            def _heartbeat():
-                while not done.wait(STREAM_KEEPALIVE_S):
-                    try:
-                        self._sse_comment("keepalive")
-                    except OSError:
-                        gone.set()
-                        return
-
-            threading.Thread(target=_heartbeat, daemon=True).start()
+            _start_keepalive(self._wlock, done, gone, lambda: self._sse_comment("keepalive"))
 
             # Reasoning is stripped rather than streamed as its own item (see
             # responses_api.py's module docstring for why); a tool-call gate holds back
@@ -3657,25 +3666,19 @@ def make_handler(engine: Engine, api_key: str | None):
             done = threading.Event()
             gone = threading.Event()
 
-            def _heartbeat():
-                while not done.wait(STREAM_KEEPALIVE_S):
-                    try:
-                        if chat:
-                            # A spec-legal EMPTY delta chunk, not an SSE comment: most
-                            # client SDKs never surface comments, so a comment doesn't
-                            # reset their inter-chunk idle timer and a long quiet stretch
-                            # (a 32k prefill, a long tool-gated tail) still times the
-                            # stream out client-side (issue #19's DSH at 300 s). An empty
-                            # delta parses as a normal chunk everywhere — OpenAI itself
-                            # emits them (role-only and final chunks).
-                            self._sse(base({}, None))
-                        else:
-                            self._sse_comment("keepalive")
-                    except OSError:
-                        gone.set()
-                        return
+            def _keepalive():
+                if chat:
+                    # A spec-legal EMPTY delta chunk, not an SSE comment: most client SDKs
+                    # never surface comments, so a comment doesn't reset their inter-chunk
+                    # idle timer and a long quiet stretch (a 32k prefill, a long tool-gated
+                    # tail) still times the stream out client-side (issue #19's DSH at
+                    # 300 s). An empty delta parses as a normal chunk everywhere — OpenAI
+                    # itself emits them (role-only and final chunks).
+                    self._sse(base({}, None))
+                else:
+                    self._sse_comment("keepalive")
 
-            threading.Thread(target=_heartbeat, daemon=True).start()
+            _start_keepalive(self._wlock, done, gone, _keepalive)
 
             def _alive():
                 if gone.is_set():
@@ -3706,8 +3709,9 @@ def make_handler(engine: Engine, api_key: str | None):
                 }
             final["x_mlx_dspark"] = engine.spec_info(res)
             self._sse(final)
-            self.wfile.write(b"data: [DONE]\n\n")
-            self.wfile.flush()
+            with self._wlock:
+                self.wfile.write(b"data: [DONE]\n\n")
+                self.wfile.flush()
 
         def _run_stream_body(self, prompt_ids, params, base, chat, req, want_tools,
                              alive, gone):

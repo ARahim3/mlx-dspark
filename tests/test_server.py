@@ -1122,6 +1122,78 @@ def test_tools_stream_streams_text_live_and_keepalives_are_real_chunks(monkeypat
         httpd.shutdown()
 
 
+class _TimerFiredAsStreamEnded(threading.Event):
+    """A keep-alive timer that fires at the worst moment: wait() reports a timeout although
+    the stream has already ended (set() was called) — the interleaving CI hit on 2026-11-23,
+    when a keep-alive chunk went out after `data: [DONE]`."""
+
+    def wait(self, timeout=None):
+        super().wait()
+        return False
+
+
+def test_keepalive_never_follows_the_streams_last_frame():
+    """The keep-alive re-checks `done` under the write lock, so a timer that fires as the
+    stream ends writes nothing; checking only before taking the lock let one frame through."""
+    lock, frames = threading.RLock(), []
+    done, gone = _TimerFiredAsStreamEnded(), threading.Event()
+    with lock:                                    # the stream's final frames are going out
+        thread = S._start_keepalive(lock, done, gone, lambda: frames.append("ping"))
+        time.sleep(0.02)                          # the keep-alive is parked on done.wait()
+        done.set()
+    thread.join(2.0)
+    assert not thread.is_alive() and frames == [] and not gone.is_set()
+
+
+def test_keepalive_writes_until_done_and_a_failed_write_is_a_disconnect(monkeypatch):
+    monkeypatch.setattr(S, "STREAM_KEEPALIVE_S", 0.002)
+    lock, frames = threading.RLock(), []
+    done, gone = threading.Event(), threading.Event()
+    thread = S._start_keepalive(lock, done, gone, lambda: frames.append("ping"))
+    deadline = time.time() + 2.0
+    while len(frames) < 3 and time.time() < deadline:
+        time.sleep(0.005)
+    done.set()
+    thread.join(2.0)
+    count = len(frames)
+    time.sleep(0.02)
+    assert count >= 3 and len(frames) == count and not gone.is_set()   # none after done
+    # a closed socket (OSError) or a file the handler already closed (ValueError)
+    for error in (BrokenPipeError, ValueError):
+        def fail(error=error):
+            raise error("gone")
+        done, gone = threading.Event(), threading.Event()
+        thread = S._start_keepalive(lock, done, gone, fail)
+        thread.join(2.0)
+        assert not thread.is_alive() and gone.is_set(), error
+        done.set()
+
+
+def test_no_dialect_writes_a_keepalive_after_its_last_frame(monkeypatch):
+    """End to end, keep-alives firing every half millisecond: each dialect's stream ends on its
+    own terminator (before the fix, 40 of 800 chat streams carried a keep-alive after
+    `data: [DONE]`). Correct code can never fail this; a regression fails it most runs."""
+    _, httpd = _slow_server(monkeypatch, keepalive=0.0005, pieces=4, delay=0.0005)
+    chat = {k: v for k, v in _TOOLS_STREAM_REQ.items() if k != "tools"}
+    cases = [
+        ("/v1/chat/completions", _TOOLS_STREAM_REQ, "data: [DONE]"),
+        ("/v1/chat/completions", chat, "data: [DONE]"),
+        ("/v1/messages", {"model": "x", "max_tokens": 64, "stream": True,
+                          "messages": [{"role": "user", "content": "hi"}]},
+         "event: message_stop"),
+        ("/v1/responses", {"model": "x", "input": "hi", "stream": True},
+         "event: response.completed"),
+    ]
+    try:
+        base = f"http://127.0.0.1:{httpd.server_address[1]}"
+        for path, req, last in cases:
+            for _ in range(40):
+                raw = _post(base, path, req, stream=True)
+                assert raw.rstrip().split("\n\n")[-1].startswith(last), (path, raw[-200:])
+    finally:
+        httpd.shutdown()
+
+
 def test_tools_stream_stops_generation_when_client_disconnects(monkeypatch):
     """A vanished client must stop a buffered-tools generation at the next round — not let
     it grind to max_tokens holding the single MLX thread while retries pile up behind it
