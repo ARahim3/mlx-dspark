@@ -2,6 +2,16 @@
 
 All notable changes to `mlx-dspark`. Versions follow [SemVer](https://semver.org/) (pre-1.0: minor-ish features land as patch bumps).
 
+## [0.21.2] — 2026-11-24 — Inkling-2-Mini knows its context limit; the engine exits with the Mac app
+
+### Fixed
+- **Inkling-2-Mini had no context limit in `serve`.** Its config states its maximum as `model_max_length` (1,048,576 tokens), not the `max_position_embeddings` the server read, so an over-long prompt was never refused with the "prompt is too long" error agent clients compact on, and the load-time note that warns when a full window cannot fit in memory was skipped. The server reads both now. The note also prices Inkling's cache correctly: only its 8 global-attention layer visits grow with the context (32 KB per token; the sliding-window layers are bounded), so on a 48 GB Mac it suggests `--context-window 425984`.
+- **The engine exits with the Mac app, even when the app crashes (issue #44, reported by @altvnk).** A crash or a force-quit skipped the app's own stop, so the engine ran on under launchd, holding the app's port and, once a model was loaded, its memory, and every relaunch started another. `serve` now ends when the process named in `MLX_DSPARK_PARENT_PID` ends, however it ends; the Mac app sets it to its own pid (app-v0.8.5). The kernel reports the exit (kqueue), so nothing polls; an older engine ignores the variable.
+- **A keep-alive could arrive after a stream's last frame.** When the 15-second keep-alive fired just as a stream ended, an empty chunk could follow `data: [DONE]` on Chat Completions, or the keep-alive thread hit the closed socket and logged a traceback. The keep-alive now re-checks, under the stream's write lock, that the stream is still open, on all three API dialects. Found by CI.
+
+### Changed
+- **The README is an entry point now:** about a third shorter, with the details on the [documentation site](https://arahim.dev/mlx-dspark/). It gains Inkling-2-Mini's prefill speed (400 tok/s on an M4 Pro) and puts its one-command mlx-vlm install step under Install.
+
 ## [0.21.1] — 2026-11-23 — Inkling-2-Mini runs on current mlx-vlm main again
 
 ### Fixed
