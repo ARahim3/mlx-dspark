@@ -1191,6 +1191,38 @@ def test_kv_bytes_per_token_dense_and_patterns():
     assert S._kv_bytes_per_token({}) is None                     # config doesn't say
 
 
+def test_inkling_states_its_window_as_model_max_length_and_grows_only_its_global_visits(
+        tmp_path, monkeypatch):
+    """Inkling-2-Mini's real layout. Its config has no max_position_embeddings, so the window
+    read None: no over-long-prompt refusal and no RAM note at load. And 20 of its 24 layers
+    attend a bounded window — counting all 24 would overstate the growing cache threefold."""
+    text = {"model_type": "inkling2_loop_text", "num_hidden_layers": 24,
+            "num_attention_heads": 24, "num_key_value_heads": 8, "head_dim": 128,
+            "hidden_size": 2304, "sliding_window_size": 1024, "model_max_length": 1048576,
+            "local_layer_ids": [0, 1, 2, 3, 4, 6, 7, 8, 9, 10, 12, 13, 14, 15, 16, 18, 19, 20,
+                                21, 22],
+            "loop_config": {"core_start": 6, "core_end": 18, "num_passes": 3}}
+    cfg = {"model_type": "inkling2_loop", "text_config": text}
+    # global layers 5 and 23 once, 11 and 17 on each of the loop's three passes
+    assert S._kv_bytes_per_token(cfg) == 8 * 8 * 128 * 4 == 32768
+    plain = {"text_config": {k: v for k, v in text.items() if k != "loop_config"}}
+    assert S._kv_bytes_per_token(plain) == 4 * 8 * 128 * 4          # the unlooped model
+
+    monkeypatch.setattr(S, "_target_config", lambda repo: cfg)
+    assert S._context_window("x") == 1048576
+    # learned positions still win where a config has both, and a sentinel is not a window
+    monkeypatch.setattr(S, "_target_config", lambda repo: {
+        "max_position_embeddings": 40960, "model_max_length": 1048576})
+    assert S._context_window("x") == 40960
+    monkeypatch.setattr(S, "_target_config", lambda repo: {"model_max_length": 10 ** 30})
+    assert S._context_window("x") is None
+    monkeypatch.setattr(S, "_target_config", lambda repo: {"model_max_length": True})
+    assert S._context_window("x") is None
+    # 48 GB Mac, ~21 GB resident: the full window cannot fit, and the note names one that does
+    note = S._context_ram_warning(32768, 1048576, 21 * 1024 ** 3, 36 * 1024 ** 3)
+    assert note and "1048576 tokens" in note and "--context-window" in note
+
+
 def test_kv_bytes_per_token_scales_with_kv_bits():
     """Quantized KV shrinks the estimate: bits + 0.5 bits/element of group scale+bias
     (group 64, 16-bit scale + bias), so kv8 = 8.5/16 and kv4 = 4.5/16 of full precision."""

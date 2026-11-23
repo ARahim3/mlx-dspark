@@ -149,15 +149,20 @@ def _context_window(target_repo: str) -> int | None:
     Used to reject an over-long prompt with the message Claude Code recognises as a context
     limit (see :func:`~mlx_dspark.anthropic_api.context_overflow_error`) instead of letting it
     run off the end of the model's positions. Multimodal repos nest the text config, so check
-    both. ``None`` when it can't be determined — the check is then skipped.
+    both. A model without learned positions states its limit as ``model_max_length`` instead
+    (Inkling 2: 1,048,576 — without it the check was skipped and a prompt past the machine's
+    memory was read rather than refused). ``None`` when it can't be determined — the check is
+    then skipped.
     """
     cfg = _target_config(target_repo)
     if cfg is None:
         return None
-    for c in (cfg, cfg.get("text_config") or {}):
-        n = c.get("max_position_embeddings")
-        if isinstance(n, int) and n > 0:
-            return n
+    for key in ("max_position_embeddings", "model_max_length"):
+        for c in (cfg, cfg.get("text_config") or {}):
+            n = c.get(key)
+            # an int that is a token count: tokenizers write 1e30 for "no limit"
+            if isinstance(n, int) and not isinstance(n, bool) and 0 < n <= 10_000_000:
+                return n
     return None
 
 
@@ -194,6 +199,18 @@ def _kv_bytes_per_token(cfg: dict, kv_bits: int | None = None) -> int | None:
         elif isinstance(c.get("full_attention_interval"), int) \
                 and c["full_attention_interval"] > 0:
             attn = layers // c["full_attention_interval"]
+        elif isinstance(c.get("local_layer_ids"), list):
+            # Inkling 2: the listed layers attend a sliding window (bounded), the rest the
+            # whole context — and a looped model keeps one cache per layer VISIT, so a global
+            # layer inside the loop's core counts once per pass (Inkling-2-Mini: layers 5 and
+            # 23 once, 11 and 17 three times = 8 growing caches, 32 KB per token).
+            local = {i for i in c["local_layer_ids"] if isinstance(i, int)}
+            loop = c.get("loop_config") if isinstance(c.get("loop_config"), dict) else {}
+            start, end, passes = (loop.get(k) for k in ("core_start", "core_end", "num_passes"))
+            looped = all(isinstance(v, int) and not isinstance(v, bool)
+                         for v in (start, end, passes)) and passes > 0
+            attn = sum((passes if looped and start <= i < end else 1)
+                       for i in range(layers) if i not in local)
         # Quantized KV shrinks the per-element bytes; each group of 64 adds a 16-bit
         # scale + bias (= 0.5 bits/element), so kv8 ≈ 0.53x and kv4 ≈ 0.28x of 16-bit.
         bytes_per_elem = 2.0 if not kv_bits else (kv_bits + 0.5) / 8
