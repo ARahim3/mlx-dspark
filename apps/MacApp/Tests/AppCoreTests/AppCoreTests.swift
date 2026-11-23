@@ -105,6 +105,26 @@ struct ServerSupervisorTests {
         let ports = try (0..<4).map { _ in try ServerSupervisor.freePort() }
         #expect(Set(ports).count > 1)
     }
+
+    /// Issue #44: a crashed app left its engine running under launchd. Only this runtime's
+    /// own `serve` with launchd as its parent is stopped — never a running app's engine,
+    /// never the user's own install, never another command of this runtime.
+    @Test func findsOnlyThisRuntimesOrphanedServe() {
+        let runtime = "/Users/x/Library/Application Support/com.arahim.mlx-dspark/runtime/venv/bin"
+        let engine = URL(fileURLWithPath: runtime + "/mlx-dspark")
+        let listing = """
+                1     0 /sbin/launchd
+             4242     1 \(runtime)/python \(runtime)/mlx-dspark serve --host 127.0.0.1 --port 8484 --no-model
+             4243  4100 \(runtime)/python \(runtime)/mlx-dspark serve --host 127.0.0.1 --port 8485 --no-model
+             4244     1 /Users/x/.venv/bin/python3 /Users/x/.venv/bin/mlx-dspark serve --port 8080
+             4245     1 \(runtime)/python \(runtime)/mlx-dspark doctor --json
+             4246     1 \(runtime)/python \(runtime)/mlx-dspark serveX
+            42470     1 \(runtime)/python \(runtime)/mlx-dspark serve
+            garbage line
+            """
+        #expect(ServerSupervisor.orphanedEngines(in: listing, engine: engine) == [4242, 42470])
+        #expect(ServerSupervisor.orphanedEngines(in: "", engine: engine).isEmpty)
+    }
 }
 
 @Suite("Engine source resolution")

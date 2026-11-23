@@ -38,6 +38,15 @@ swift build -c "$CONFIG"
 BUILT="$(swift build -c "$CONFIG" --show-bin-path)/$EXECUTABLE"
 [[ -f "$BUILT" ]] || { echo "error: no executable at $BUILT" >&2; exit 1; }
 
+# No `async let` in the app. Swift's compiler can free an async let's task-stack memory out of
+# order (swiftlang/swift#81771, open from Swift 6.1 on), and Xcode 26.2's Swift 6.2.3 did that
+# to app-v0.8.4: an abort on every launch on macOS 26.7 (issue #44). It is invisible in the
+# source and depends on the compiler, so check the binary itself.
+if nm -u "$BUILT" | grep -qE '_swift_asyncLet_(begin|start)$'; then
+    echo "error: the app uses \`async let\`; use Task handles instead (issue #44)" >&2
+    exit 1
+fi
+
 APP="${BUILD_DIR}/${BUNDLE_NAME}.app"
 echo "==> Assembling $APP"
 rm -rf "$APP"

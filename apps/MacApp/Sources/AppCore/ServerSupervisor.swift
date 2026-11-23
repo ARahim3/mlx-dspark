@@ -96,6 +96,7 @@ public actor ServerSupervisor {
     public func start(config: ServerConfig, readyTimeout: TimeInterval = 900) async throws -> Int {
         if case .ready = state { return port }
         await stop()
+        await stopOrphanedEngines()
 
         let chosenPort: Int
         if config.port > 0 {
@@ -143,6 +144,11 @@ public actor ServerSupervisor {
         var env = ProcessInfo.processInfo.environment
         env["PYTHONUNBUFFERED"] = "1"        // otherwise loading progress arrives only at exit
         env.removeValue(forKey: "VIRTUAL_ENV")
+        // The engine ends when this app ends, however it ends: a crash or a force-quit skips
+        // stop(), and the engine used to run on as launchd's child, holding the port and the
+        // model (issue #44). Older engines ignore the variable; what they leave behind is
+        // stopped on the next start (stopOrphanedEngines).
+        env[Self.parentPIDEnvironmentKey] = String(getpid())
         if let dirs = config.modelDirsEnvironmentValue {
             env[ServerConfig.modelDirsEnvironmentKey] = dirs
         }
@@ -202,6 +208,55 @@ public actor ServerSupervisor {
         if proc.isRunning { kill(proc.processIdentifier, SIGKILL) }
         process = nil
         transition(.stopped)
+    }
+
+    /// The variable that tells the engine which process to exit with (`parent_watch.py`).
+    public static let parentPIDEnvironmentKey = "MLX_DSPARK_PARENT_PID"
+
+    /// Engines of this app's private runtime that outlived the app that started them. A crash
+    /// or a force-quit ends the app without stopping its engine, which then runs on as a child
+    /// of launchd (pid 1), holding the fixed port and, once a model is loaded, its memory —
+    /// and every relaunch started one more (issue #44). Matched exactly: this runtime's
+    /// `serve` with launchd as its parent. A running app's engine has that app as its parent,
+    /// and a `mlx-dspark serve` from the user's own install runs another script, so neither
+    /// matches. `psOutput` is `ps -axww -o pid=,ppid=,command=`.
+    public static func orphanedEngines(in psOutput: String, engine: URL) -> [pid_t] {
+        // the runtime's launcher execs its python with the script path as the first argument
+        let marker = " " + engine.path + " serve"
+        return psOutput.split(separator: "\n").compactMap { line in
+            let fields = line.split(separator: " ", maxSplits: 2, omittingEmptySubsequences: true)
+            guard fields.count == 3, let pid = pid_t(fields[0]), let parent = pid_t(fields[1]),
+                  parent == 1, pid > 1 else { return nil }
+            let command = String(fields[2])
+            guard let found = command.range(of: marker) else { return nil }
+            let rest = command[found.upperBound...]
+            return rest.isEmpty || rest.hasPrefix(" ") ? pid : nil
+        }
+    }
+
+    /// Stop what ``orphanedEngines(in:engine:)`` finds: SIGTERM, up to 2 s to go, then
+    /// SIGKILL. Engines that watch for their app's exit never get here; this is for the ones
+    /// older engines left, so a relaunch gets its fixed port back. Returns how many it stopped.
+    @discardableResult
+    public func stopOrphanedEngines() async -> Int {
+        let listing = LineTail(limit: 100_000)
+        let code = try? await Shell.run(URL(fileURLWithPath: "/bin/ps"),
+                                        ["-axww", "-o", "pid=,ppid=,command="]) { line in
+            if line.stream == .stdout { listing.append(line.text) }
+        }
+        guard code == 0 else { return 0 }
+        let orphans = Self.orphanedEngines(in: listing.joined(), engine: engine)
+        guard !orphans.isEmpty else { return 0 }
+        for pid in orphans {
+            logStore.note("stopping an engine a previous app session left running (pid \(pid))")
+            kill(pid, SIGTERM)
+        }
+        let deadline = Date().addingTimeInterval(2)
+        while Date() < deadline, orphans.contains(where: { kill($0, 0) == 0 }) {
+            try? await Task.sleep(nanoseconds: 100_000_000)
+        }
+        for pid in orphans where kill(pid, 0) == 0 { kill(pid, SIGKILL) }
+        return orphans.count
     }
 
     private func childExited(code: Int32) {

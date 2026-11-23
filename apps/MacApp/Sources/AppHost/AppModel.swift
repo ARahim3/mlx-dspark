@@ -799,9 +799,10 @@ final class AppModel: ObservableObject {
 
     func refreshDiagnostics() async {
         guard let client else { return }
-        // Plain Task handles, not `async let`: with `async let` here (inlined into
-        // startServer), the app aborted in _swift_task_dealloc_specific during async-let
-        // teardown right after the engine came up (issue #44).
+        // Plain Task handles, not `async let`: Xcode 26.2's Swift 6.2.3 freed these async lets'
+        // task memory out of order (swiftlang/swift#81771), and app-v0.8.4 aborted right after
+        // the engine came up (issue #44). packaging/make_app.sh refuses any `async let` now.
+        // Concurrent on purpose: /doctor and /admin/models both scan the model folders.
         let reportTask = Task { try? await client.doctor() }
         let inventoryTask = Task { try? await client.modelInventory() }
         let curvesTask = Task { try? await client.calibration() }
