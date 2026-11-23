@@ -60,6 +60,9 @@ description: The environment variables the engine reads, and where it keeps thin
 `MLX_DSPARK_STREAM_KEEPALIVE_S`
 : Seconds between keep-alive frames on quiet streams (default 15). Lower it for aggressive proxies.
 
+`MLX_DSPARK_PARENT_PID`
+: `serve` only: a process ID to exit with. When that process ends, however it ends (a crash or a force-quit included), the server stops too. The Mac app sets it to its own ID, so a crashed app can't leave its engine running and holding the port.
+
 `MLX_DSPARK_SLOW_ROUND_LOG_S`
 : Log any gap between rounds longer than this many seconds to stderr, with mode, cap and context (default 10; 0 disables). Useful when reporting a stall.
 

@@ -536,6 +536,11 @@ def cmd_serve(argv: list[str]) -> None:
                     help="spill the prefix cache to --prefix-cache-dir once it exceeds this many MB "
                          "of RAM (0 = never spill; requires --prefix-cache-dir)")
     args = ap.parse_args(argv)
+    # Started by the Mac app: end with it, even when it crashes (issue #44). Before anything
+    # loads, so an app that dies mid-download doesn't leave the download running either.
+    from .parent_watch import watch_parent_from_env
+
+    watch_parent_from_env()
     if args.trust_remote_code:
         from . import load as _load
 
