@@ -59,7 +59,7 @@ chat/code/math), the Muse row per-content best (footnoted); full tables, baselin
 | **Qwen3.8-27B** (4-bit, DFlash 2)[^q38] | **3.17×** code · **3.13×** math · **2.49×** chat | **~37–47 tok/s** |
 | **Qwen3-8B** (8-bit) | **2.83×** math · **2.03×** code · 1.71× chat | ~50–83 tok/s |
 | **Qwen3.6-27B** (8-bit) | **2.67×** math · **2.26×** chat · 1.96× code | ~16–22 tok/s |
-| **Inkling-2-Mini** (NVFP4, looped MoE, DFlash 2)[^inkling] | **2.59× over stock mlx-vlm** (25.9 → 67.0 tok/s) · vs our own plain decode: **2.22×** code · **2.22×** math · 1.28× chat | ~46–79 tok/s |
+| **Inkling-2-Mini** (NVFP4, looped MoE, DFlash 2)[^inkling] | **2.59× over stock mlx-vlm** (25.9 → 67.0 tok/s) · vs our own plain decode: **2.22×** code · **2.22×** math · 1.28× chat | ~46–79 tok/s · opt-in `--target-bits 8`: **+12%** (+30% plain), not the released weights |
 | **Ornith-1.0-9B** (8-bit) | **2.53×** code · **2.48×** math · **2.21×** chat | ~59–68 tok/s |
 | **Qwen3-4B** (8-bit) | **2.46×** math · 1.78× chat · 1.72× code | ~89–126 tok/s |
 | **Qwen3-14B** (8-bit) | **2.36×** math · **2.11×** code · 1.62× chat | ~25–36 tok/s |
@@ -505,6 +505,12 @@ and caps are this M4 Pro's — yours are derived fresh on first run):
   `Qwen3-8B-8bit`, or `Qwen3-4B-8bit` (~89–126 tok/s, fits ~8 GB).
 - **~8 GB** — `MiniCPM5-2B-bf16` (**3.16×** mean, 4.21× on math, ~107–213 tok/s in ~6 GB
   resident — the best small-Mac pick, and a tool-calling model).
+- **Inkling-2-Mini** (~22 GB resident, 32 GB Macs and up) — 67 tok/s as released with its
+  DFlash 2 drafter. **`--target-bits 8` is an opt-in on top: about +30% plain decoding and +12%
+  with the drafter (74.8 tok/s).** It quantizes the attention projections and the output head,
+  which the checkpoint keeps in bf16, so it is no longer the model as released: about 1.6% of
+  next-token choices differ, always where the top two candidates were nearly tied. Off by
+  default; the Mac app has the same switch under the model's row.
 - **Raw tokens per second above all** — the MoEs: `Qwen3.6-35B-A3B-4bit` (~91–145 tok/s).
   Their *speedup ratio* is modest for a structural reason (sparse targets are already fast —
   see the MoE note under [Results](#results-at-a-glance)), but nothing here decodes faster.

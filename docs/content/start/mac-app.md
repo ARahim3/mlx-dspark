@@ -42,7 +42,7 @@ Chat
 : Saved sessions, markdown and syntax highlighting, collapsible reasoning, and per-turn timing: time to first token, decode speed, tokens accepted per round, and how much of the prompt the cache served.
 
 Models
-: The measured pairs with their speedups, anything already on disk (including LM Studio's MLX downloads and your own model folders), and any Hugging Face repo. It answers **"will this fit my Mac?" before you download**, and swaps models without restarting the server.
+: The measured pairs with their speedups, anything already on disk (including LM Studio's MLX downloads and your own model folders), and any Hugging Face repo. It answers **"will this fit my Mac?" before you download**, and swaps models without restarting the server. A model with a faster variant has a checkbox under its row: Inkling-2-Mini's **Load at 8-bit** (about +30% plain decoding, +12% with the drafter, and no longer the model as released, so it is off until you tick it). The app remembers the choice; the same switch is **Weights** in the decoding controls while the model is loaded.
 
 Agents
 : One-click setup for Claude Code, Codex, OpenCode, pi and any OpenAI-compatible app: the exact config for each, and a round-trip test.
