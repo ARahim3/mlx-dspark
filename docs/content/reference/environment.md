@@ -52,7 +52,10 @@ description: The environment variables the engine reads, and where it keeps thin
 : Inkling 2 only: run every verify pass's attention through MLX's own attention kernel instead of mlx-dspark's, which reads the cached keys and values once per key/value head for all the rows of the pass (MLX's reads them once per row and query head). mlx-dspark's is used for verify passes of 3 to 12 rows once a layer sees 1,024 keys, which is where it is faster; a decode step always uses MLX's. The two agree within floating-point rounding, not bit for bit. Slower on long conversations. For comparison runs only.
 
 `MLX_DSPARK_INKLING_WIDE_ROWS=0`
-: Inkling 2 only: keep mlx-dspark's fused forward to verify passes of at most 8 rows (a drafter round), so a wider one — a lookup round checking up to 32 copied tokens at once — runs mlx-vlm's stock code as before. Slower for lookup drafts (`--lookup-drafts`); nothing else changes. For comparison runs only.
+: Inkling 2 only: keep mlx-dspark's fused forward to calls of at most 8 rows (a drafter round), so a wider one — a short prompt, the new tokens of a follow-up turn, a lookup round checking up to 32 copied tokens at once — runs mlx-vlm's stock code. A slower first token on short prompts and slower lookup drafts (`--lookup-drafts`); it switches `MLX_DSPARK_INKLING_CHUNK_ROWS` off as well. For comparison runs only.
+
+`MLX_DSPARK_INKLING_CHUNK_ROWS=0`
+: Inkling 2 only: read prompts of 64 or more new tokens with mlx-vlm's stock code alone. By default mlx-dspark runs its bit-exact kernels (the short convolutions, the layer and attention bodies, the loop over the layers) around mlx-vlm's own experts there, which computes the same bits with far fewer GPU launches. Same tokens either way; reading a prompt is slower. For comparison runs only.
 
 `MLX_DSPARK_INKLING_FOLD_BITS`
 : Inkling 2 only: bits of the drafter's Markov correction matrix, which one GPU kernel scans per drafted token (default 4; 8 is the other choice, and 0 keeps the reference's bf16 matrix with its full-vocabulary bias, softcap and argmax). Drafting only — the model still checks every token. Acceptance is the same at 4, 8 and bf16; each draft round is about 1 ms cheaper than the reference path.

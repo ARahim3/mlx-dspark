@@ -701,7 +701,7 @@ Measured on an M4 Pro, 2048-token prompt, median of 3, default settings:
 | **Qwen3.6-35B-A3B** (4-bit, MoE) | **960 tok/s** | — (experts are `gather_qmm`, not split) | ~21 s |
 | **Qwen3-8B** (8-bit) | 488 tok/s | **636 tok/s** (1.30×) | ~31 s |
 | **Nanbeige4.2-3B** (bf16, looped) | **526 tok/s** | — (bf16 `nn.Linear` not yet split) | ~38 s |
-| **Inkling-2-Mini** (NVFP4, looped MoE) | **400 tok/s** | — (bf16 `nn.Linear` and routed experts, not split) | ~50 s |
+| **Inkling-2-Mini** (NVFP4, looped MoE) | **465 tok/s** | — (bf16 `nn.Linear` and routed experts, not split) | ~43 s |
 | **Gemma-4 12B** (8-bit) | 293 tok/s | **381 tok/s** (1.30×) | ~52 s |
 | **Qwen3.8-27B** (8-bit) | 138 tok/s | **182 tok/s** (1.31×) | ~110 s |
 | **Qwen3.8-27B** (4-bit) | 130 tok/s | **184 tok/s** (1.41×) | ~109 s |
