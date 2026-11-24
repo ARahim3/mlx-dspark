@@ -755,7 +755,7 @@ workload, mlx 0.32.4:
 | 4 | 86.7 | 21.7 | 2.37× | 1.78× |
 | 8 | **124.6** | 15.6 | **3.41×** | **2.57×** |
 
-With the DFlash 2 head (the default since 0.22) a lone request drafts with it and hands over the
+With the DFlash 2 head (the default since 0.21.3) a lone request drafts with it and hands over the
 same way. One request alone then decodes at ~63 tok/s on the benchmark prompts (this table's
 workload was not re-measured), so two requests at once mainly buy the second one its first token
 right away; the batch's total pulls ahead of a single stream from about four.
@@ -893,7 +893,7 @@ are bundled.
 
 [^inkling]: **Inkling-2-Mini** (Thinking Machines) — **mlx-vlm's own code (0.8.1) decodes this model
     at 25.9 tok/s on this Mac; mlx-dspark runs it at 35 tok/s plain and 67.0 tok/s with Inco AI's
-    DFlash 2 head, `incoai/Inkling-2-Mini-DFlash2` (2.59×)**, the default since 0.22: the head
+    DFlash 2 head, `incoai/Inkling-2-Mini-DFlash2` (2.59×)**, the default since 0.21.3: the head
     the model ships in its own repo gives 47.6 in the same run (`--mode dspark`), and with
     `--target-bits 8` the two give 74.8 and 54.3. (mlx-vlm's own speculative decoding with the
     bundled head reaches 23–37 tok/s on chat / code / math prompts where mlx-dspark with that

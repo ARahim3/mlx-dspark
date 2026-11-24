@@ -2,7 +2,7 @@
 
 All notable changes to `mlx-dspark`. Versions follow [SemVer](https://semver.org/) (pre-1.0: minor-ish features land as patch bumps).
 
-## [Unreleased] — Inkling-2-Mini at 67 tok/s with Inco AI's DFlash 2 head and tree verify (25.9 in stock mlx-vlm), on a released mlx-vlm
+## [0.21.3] — 2026-11-25 — Inkling-2-Mini 2.6× faster than stock mlx-vlm with Inco AI's DFlash 2 head
 
 ### Faster
 - **Inkling-2-Mini drafts with Inco AI's DFlash 2 head by default: 67.0 tok/s where the head the model ships gives 47.6, in the same run (M4 Pro, released weights, 1.90× our own plain decode, 2.59× stock mlx-vlm 0.8.1's 25.9); 74.8 vs 54.3 with `--target-bits 8`.** `incoai/Inkling-2-Mini-DFlash2` (a 990 MB second download) is accepted 4.3 tokens a round at cap 6, against 2.4 for the bundled head at cap 3; per prompt: code 2.22×, math 2.22×, chat 1.28×. `--mode auto`, `serve` and the Mac app pick it; `--mode dspark` keeps the bundled head. Copies of the model without the bundled head (mlx-community's conversions dropped it) now get a drafter too. Lossless: token forcing against the stock forward finds 22 near-tie mismatches in 2,048 positions at cap 6, the stock reference's own 22.
