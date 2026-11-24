@@ -351,7 +351,8 @@ struct TargetBitsToggle: View {
                 Task { await model.setTargetBits(on ? option.bits : 0, for: row.target) }
             })
         ) {
-            Text("Load at \(option.bits)-bit: \(option.gain). Off by default — \(option.caveat).")
+            Text("Faster: load its 16-bit layers at \(option.bits)-bit (\(option.gain)). "
+                 + "Off by default — \(option.caveat).")
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
@@ -360,8 +361,9 @@ struct TargetBitsToggle: View {
         .disabled(model.isModelLoading)
         .padding(.leading, 14)
         .help("Quantizes the parts of this model that its checkpoint keeps in 16-bit floats "
-              + "(the attention projections and the output head) when it loads. Faster, same "
-              + "memory, and no longer the model as released. Also under Decoding → Weights "
+              + "(the attention projections and the output head) to 8-bit when it loads; "
+              + "the experts stay as released. Faster, same memory, and no longer the model as "
+              + "released. `--target-bits 8` on the command line; also under Decoding → Weights "
               + "while the model is loaded.")
     }
 }

@@ -131,8 +131,8 @@ struct DecodingCard: View {
             + "you've measured a better fixed cap for this model. Applying reloads the "
             + "model in place (the server and its port stay up)."
         guard model.health?.targetBitsSupported == true else { return base }
-        return base + " Weights is the exception: 8-bit loads a faster version of this model "
-            + "that is not the one its authors released."
+        return base + " Weights is the exception: Faster loads this model's 16-bit layers at "
+            + "8-bit, which is no longer the model its authors released."
     }
 }
 
@@ -316,14 +316,15 @@ struct DecodingControls: View {
     @ViewBuilder private var weightsPicker: some View {
         Picker("Weights", selection: $weights) {
             Text("As released").tag("released")
-            Text("8-bit · faster").tag("8")
+            Text("Faster (16-bit layers at 8-bit)").tag("8")
         }
         .fixedSize()
         .help("This model's checkpoint quantizes only its experts: the attention projections "
               + "and the output head stay in 16-bit floats, and they are two thirds of what "
-              + "the model reads for every token. 8-bit quantizes them when the model loads: "
-              + "about 30% faster plain decoding and 12% faster with the drafter on an M4 "
-              + "Pro, same memory. It is then no longer the model as released — about 1.6% "
+              + "the model reads for every token. Faster loads those at 8-bit (the experts "
+              + "stay as released; `--target-bits 8` on the command line): about 30% faster "
+              + "plain decoding and 12% faster with the drafter on an M4 Pro, same memory. "
+              + "It is then no longer the model as released — about 1.6% "
               + "of next-token choices differ, always where the top two candidates were "
               + "nearly tied. Off by default; the app remembers your choice for this model.")
     }
