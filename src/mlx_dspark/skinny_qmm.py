@@ -155,7 +155,7 @@ _SRC = r"""
     for (int q = 0; q < S; ++q) v += part[q * (RT * NT * 64) + i];
     const int r = i / (NT * 64), t = (i / 64) % NT, e = i % 64;
     const int row = m0 + 8 * r + (e % 8), n = n0 + 8 * t + (e / 8);
-    if (row < R && n < N) OUT[size_t(row) * N + n] = T(v);
+    if (row < R && n < N) OUT[size_t(row) * N + n] = TO(v);
   }
 """
 
@@ -227,23 +227,28 @@ def geometry(n: int, rt: int = 1) -> tuple[int, int]:
     return nt, min(s, _s_cap)
 
 
-def plan(rows: int, n: int, k: int, bits: int, dtype=mx.bfloat16):
-    """``(template, grid, threadgroup)`` for ``rows`` × [n, k] (cached per module per rows)."""
+def plan(rows: int, n: int, k: int, bits: int, dtype=mx.bfloat16, out_dtype=None):
+    """``(template, grid, threadgroup)`` for ``rows`` × [n, k] (cached per module per rows).
+    ``out_dtype``: the output's dtype (default the input's) — fp32 for a head whose logits
+    must stay fp32 (Inkling 2); the accumulation is fp32 either way, only the store rounds."""
     rt = min(RT_MAX, (rows + 7) // 8)
     nt, s = geometry(n, rt)
-    template = [("T", dtype), ("K", k), ("N", n), ("BITS", bits), ("NT", nt), ("RT", rt), ("S", s)]
+    template = [("T", dtype), ("TO", out_dtype or dtype), ("K", k), ("N", n), ("BITS", bits),
+                ("NT", nt), ("RT", rt), ("S", s)]
     grid = (math.ceil(n / (8 * nt)) * s * 32, math.ceil(rows / (8 * rt)), 1)
     return template, grid, (s * 32, 1, 1)
 
 
 def qmm(x2: mx.array, weight: mx.array, scales: mx.array, biases: mx.array, bits: int,
-        _plan=None) -> mx.array:
-    """``x2 [rows, K] @ dequant(W)ᵀ`` for gs64 affine 4/8-bit ``W`` -> ``[rows, N]``."""
+        _plan=None, out_dtype=None) -> mx.array:
+    """``x2 [rows, K] @ dequant(W)ᵀ`` for gs64 affine 4/8-bit ``W`` -> ``[rows, N]`` (in
+    ``out_dtype``, default ``x2``'s; a cached ``_plan`` carries its own)."""
     rows, k = int(x2.shape[0]), int(x2.shape[1])
     n = int(weight.shape[0])
-    template, grid, tg = _plan or plan(rows, n, k, bits, x2.dtype)
+    template, grid, tg = _plan or plan(rows, n, k, bits, x2.dtype, out_dtype)
     return _kernel()(inputs=[x2, weight, scales, biases], template=template, grid=grid,
-                     threadgroup=tg, output_shapes=[(rows, n)], output_dtypes=[x2.dtype])[0]
+                     threadgroup=tg, output_shapes=[(rows, n)],
+                     output_dtypes=[dict(template)["TO"]])[0]
 
 
 def call(mod, x: mx.array, rows: int) -> mx.array:

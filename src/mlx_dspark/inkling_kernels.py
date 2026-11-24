@@ -805,6 +805,48 @@ def head_q8_f32(h: mx.array, qlinear) -> mx.array:
     )[0]
 
 
+# A quantized head on the matrix units for verify and draft widths. head_q8_f32 keeps an fp32
+# accumulator per (row, vocab lane) in registers: flat at the memory floor to 4 rows, then paying
+# per row. skinny_qmm reads each packed row once for up to 16 input rows on the 8x8 simdgroup
+# matrices, fp32 out. Inkling's head (201,024 x 2,304, 8-bit, fp32 scales), M4 Pro, dependent
+# chains, ms by rows (drafts/inkling/d2_head_probe.py):
+#     rows             1     4     5     7     8    12    16
+#     head_q8_f32   2.07  2.18  3.16  4.75  4.24  4.55  6.02
+#     skinny           -  2.15  2.16  2.18  2.18  2.66  2.69     (bf16 head_f32: 3.70 ... 3.82)
+# Its reduction order differs from head_q8_f32's by <= 2e-6 (fp-tie class) and is the same for
+# every row whatever the row count. Rows from HEAD_MMA_MIN_ROWS[bits] take it; fewer keep
+# head_q8_f32 (bit-identical to MLX's product at one row: decode and a 4-row verify unchanged).
+HEAD_MMA_MIN_ROWS = {8: 5, 4: 5}
+HEAD_MMA_MAX_ROWS = 16
+
+
+def head_mma_ok(qlinear) -> bool:
+    """Whether :func:`quantized_head_rows` can put this head on skinny_qmm (4/8-bit affine gs64)."""
+    from . import skinny_qmm as sk
+
+    return (isinstance(qlinear, nn.QuantizedLinear) and int(qlinear.bits) in HEAD_MMA_MIN_ROWS
+            and "bias" not in qlinear and mx.metal.is_available() and sk.fits(qlinear))
+
+
+def quantized_head_rows(h: mx.array, qlinear) -> mx.array:
+    """``h [R, H] (bf16) @ dequantized(qlinear)ᵀ`` as fp32 ``[R, V]`` for any ``R``: skinny_qmm
+    from ``HEAD_MMA_MIN_ROWS`` rows (launches of 16 past that), :func:`head_q8_f32` below it on an
+    8-bit head with fp32 scales, MLX's quantized matmul otherwise."""
+    from . import skinny_qmm as sk
+
+    rows = int(h.shape[0])
+    lo = HEAD_MMA_MIN_ROWS.get(int(qlinear.bits))
+    if lo is not None and rows >= lo and head_mma_ok(qlinear):
+        if rows > HEAD_MMA_MAX_ROWS:
+            return mx.concatenate([quantized_head_rows(h[a: a + HEAD_MMA_MAX_ROWS], qlinear)
+                                   for a in range(0, rows, HEAD_MMA_MAX_ROWS)], axis=0)
+        return sk.qmm(h, qlinear.weight, qlinear.scales, qlinear.biases, int(qlinear.bits),
+                      out_dtype=mx.float32)
+    if head_q8_ok(qlinear):
+        return head_rows(head_q8_f32, h, qlinear)
+    return qlinear(h.astype(mx.float32)).astype(mx.float32)
+
+
 def install_fast_head(language_model) -> bool:
     """Route an Inkling 2 language model's fp32 logits (``_logits_from_norm``) through
     :func:`head_f32` for calls of <= ``HEAD_WIDE_ROWS`` rows (decode, verify, a prefill's last row;
@@ -995,10 +1037,12 @@ def install_dense_bits(language_model, bits: int = 8, group_size: int = 64,
     fails that gate (3.65%, 8 large-margin events), so only 8 is accepted.
 
     The head copy keeps fp32 scales and accumulates in fp32, so the logits stay fp32 as the
-    checkpoint's ``fwd_output_dtype`` requires. Calls of up to ``HEAD_Q8_MAX_ROWS`` rows (decode,
-    verify) go through :func:`head_q8_f32` (``fast_head=False``: MLX's quantized matmul, the
-    A/B): flat at the memory floor for 1-4 rows where the stock product pays per row from the
-    third, bit-identical to it at one row, and every verify row equal to its decode row."""
+    checkpoint's ``fwd_output_dtype`` requires. Short calls (decode, verify) go through
+    :func:`quantized_head_rows` (``fast_head=False``: MLX's quantized matmul, the A/B): to 4 rows
+    :func:`head_q8_f32` — flat at the memory floor where the stock product pays per row from the
+    third, bit-identical to it at one row, every verify row equal to its decode row — and from 5
+    rows skinny_qmm on the matrix units (flat to 16: an 8-row verify's head 4.24 -> 2.18 ms; within
+    2e-6 of head_q8_f32)."""
     if bits not in DENSE_BITS:
         raise ValueError(f"target bits must be one of {DENSE_BITS} (got {bits}): 4-bit attention "
                          "measurably changes this model's output")
@@ -1039,7 +1083,7 @@ def install_dense_bits(language_model, bits: int = 8, group_size: int = 64,
                     and dtype == mx.bfloat16
                     and not self.training and mx.default_device() == mx.gpu):
                 flat = h.astype(dtype).reshape(rows, h.shape[-1])
-                logits = head_rows(head_q8_f32, flat, qh).reshape(*h.shape[:-1], -1)
+                logits = quantized_head_rows(flat, qh).reshape(*h.shape[:-1], -1)
             else:
                 logits = qh(h.astype(dtype).astype(mx.float32))
             cap = self.config.final_logit_softcapping
