@@ -1441,7 +1441,12 @@ def test_health_reports_target_bits(server):
         target_bits = 8
 
     eng.target = _T()
-    assert _get(base, "/health")["target_bits"] == 8
+    health = _get(base, "/health")
+    assert health["target_bits"] == 8
+    # ... and a client shows its switch only where the option applies (an Inkling 2 target)
+    assert health["target_bits_supported"] is False
+    _T._inkling = True
+    assert _get(base, "/health")["target_bits_supported"] is True
 
 
 def test_admin_load_rejects_bad_target_bits(holder_server):

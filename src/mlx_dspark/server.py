@@ -2793,6 +2793,10 @@ def make_handler(engine: Engine, api_key: str | None):
                     # released weights, 8 = the opt-in. 0 for every target it does not apply to.
                     "target_bits": int(getattr(getattr(engine, "target", None),
                                                "target_bits", 0) or 0),
+                    # ... and whether the loaded target takes that option at all, so a client
+                    # shows its switch only where /admin/load's "target_bits" does something
+                    "target_bits_supported": bool(getattr(getattr(engine, "target", None),
+                                                          "_inkling", False)),
                     # {code, level, message, action} rows a client shows as a banner: live
                     # macOS memory pressure + the engine's load-time notes (the context-
                     # window RAM estimate used to reach only stderr). Empty when all is well.

@@ -432,6 +432,10 @@ def model_inventory(ram_gb: float | None = _DETECT) -> list[dict]:  # type: igno
             # Why this row cannot load on the installed packages (None = it can): a client
             # can say so instead of offering a download that ends in a refused load.
             "blocked": runtime_gap(entry["target"]),
+            # A faster variant the row can be loaded as, off by default (None = it has none):
+            # {bits, gain, caveat} for `/admin/load`'s `target_bits` — Inkling 2's 8-bit
+            # attention + output head, which is not the model as released.
+            "target_bits_option": entry.get("target_bits_option"),
         })
     return rows
 

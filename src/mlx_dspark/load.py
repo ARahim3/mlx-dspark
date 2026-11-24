@@ -322,7 +322,14 @@ REGISTRY = [
     {"id": "inkling-2-mini", "target": "thinkingmachines/Inkling-2-Mini",
      "dspark": "thinkingmachines/Inkling-2-Mini", "bundled_head": True, "lookup_drafts": False,
      "dflash": "incoai/Inkling-2-Mini-DFlash2", "mode": "dflash", "accept_p": {"dflash": 0.80},
-     "model_type": "inkling2_loop", "ram": "~22 GB", "speedup": "~1.9× (2.2× code / math)"},
+     "model_type": "inkling2_loop", "ram": "~22 GB", "speedup": "~1.9× (2.2× code / math)",
+     # The opt-in `--target-bits 8` (see load_target): what a client says next to its switch.
+     # Measured 2026-11-24 on an M4 Pro: plain 35.2 -> 45.8 tok/s, DFlash 2 67.0 -> 74.8.
+     "target_bits_option": {
+         "bits": 8,
+         "gain": "+30% plain decoding, +12% with the drafter",
+         "caveat": "not the released weights: about 1.6% of next-token choices differ, "
+                   "all near-ties"}},
 ]
 
 # legacy `--family` / load_pair("qwen3") values -> a concrete target repo (deprecated).

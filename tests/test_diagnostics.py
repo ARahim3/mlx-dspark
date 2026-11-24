@@ -319,6 +319,21 @@ class TestBandwidthAndCeilings:
         monkeypatch.setattr(diagnostics, "_local_dir", lambda repo: None)
         assert diagnostics.local_weight_bytes("org/Nope") is None
 
+    def test_inventory_rows_carry_the_target_bits_option_where_a_row_has_one(self):
+        rows = {row["id"]: row for row in diagnostics.model_inventory(ram_gb=64)}
+        opt = rows["inkling-2-mini"]["target_bits_option"]
+        assert opt["bits"] == 8 and opt["gain"] and "released" in opt["caveat"]
+        assert all(row["target_bits_option"] is None
+                   for rid, row in rows.items() if rid != "inkling-2-mini")
+
+    def test_models_command_names_the_opt_in_and_what_it_costs(self, capsys):
+        from mlx_dspark import cli
+
+        cli.cmd_models([])
+        out = capsys.readouterr().out
+        assert "thinkingmachines/Inkling-2-Mini --target-bits 8" in out
+        assert "not the released weights" in out
+
     def test_inventory_rows_carry_ceiling_keys(self):
         for row in diagnostics.model_inventory(ram_gb=64):
             assert "weight_bytes" in row and "ceiling_tps" in row

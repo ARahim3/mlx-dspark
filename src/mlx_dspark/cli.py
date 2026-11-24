@@ -105,8 +105,8 @@ def cmd_generate(argv: list[str]) -> None:
     ap.add_argument("--target-bits", type=int, default=0, choices=[0, 8],
                     help="Inkling 2 only: quantize at load what its checkpoint keeps in bf16 and "
                          "reads every token (the attention projections and the output head) to "
-                         "8-bit; the experts stay as released. Plain decoding ~26%% faster, "
-                         "speculative ~7%%. NOT the released weights: about 1.6%% of next-token "
+                         "8-bit; the experts stay as released. Plain decoding ~30%% faster, "
+                         "~12%% with the drafter. NOT the released weights: about 1.6%% of next-token "
                          "choices differ, all near-ties (the released model differs from itself "
                          "on about 1%% between a decode step and a verify pass). 0 = as released "
                          "(default); ignored for other targets")
@@ -422,8 +422,8 @@ def cmd_serve(argv: list[str]) -> None:
     ap.add_argument("--target-bits", type=int, default=0, choices=[0, 8],
                     help="Inkling 2 only: quantize at load what its checkpoint keeps in bf16 and "
                          "reads every token (the attention projections and the output head) to "
-                         "8-bit; the experts stay as released. Plain decoding ~26%% faster, "
-                         "speculative ~7%%. NOT the released weights: about 1.6%% of next-token "
+                         "8-bit; the experts stay as released. Plain decoding ~30%% faster, "
+                         "~12%% with the drafter. NOT the released weights: about 1.6%% of next-token "
                          "choices differ, all near-ties (the released model differs from itself "
                          "on about 1%% between a decode step and a verify pass). 0 = as released "
                          "(default); ignored for other targets")
@@ -1032,6 +1032,11 @@ def cmd_models(argv: list[str]) -> None:
         gap = runtime_gap(e["target"])
         if gap:
             print(f"\nNot loadable on this install — {e['target']}: {gap}")
+    for e in REGISTRY:                     # an opt-in variant of a row: what it buys, what it costs
+        opt = e.get("target_bits_option")
+        if opt:
+            print(f"\nFaster, opt-in — {e['target']} --target-bits {opt['bits']}: {opt['gain']}; "
+                  f"{opt['caveat']}.")
     print("\nAny other target works too — pass its HF repo/path as --model plus --drafter <repo>.\n"
           "Use --mode baseline for plain target decoding (no drafter).")
 
