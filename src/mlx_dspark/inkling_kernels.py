@@ -818,6 +818,11 @@ def head_q8_f32(h: mx.array, qlinear) -> mx.array:
 # head_q8_f32 (bit-identical to MLX's product at one row: decode and a 4-row verify unchanged).
 HEAD_MMA_MIN_ROWS = {8: 5, 4: 5}
 HEAD_MMA_MAX_ROWS = 16
+# Simdgroups per threadgroup of a head launch: what skinny_qmm's geometry picks for a real
+# vocabulary (4 tiles x 8 chunks, 256 threads). Held here for ANY head: a narrow one would ask
+# for 32 (1,024 threads), which a GPU may refuse for the compiled kernel (ceilings seen: 384,
+# 448, 832) — and this path runs without the calibration that lowers skinny_qmm's own cap.
+HEAD_MMA_SIMDGROUPS = 8
 
 
 def head_mma_ok(qlinear) -> bool:
@@ -840,8 +845,10 @@ def quantized_head_rows(h: mx.array, qlinear) -> mx.array:
         if rows > HEAD_MMA_MAX_ROWS:
             return mx.concatenate([quantized_head_rows(h[a: a + HEAD_MMA_MAX_ROWS], qlinear)
                                    for a in range(0, rows, HEAD_MMA_MAX_ROWS)], axis=0)
-        return sk.qmm(h, qlinear.weight, qlinear.scales, qlinear.biases, int(qlinear.bits),
-                      out_dtype=mx.float32)
+        bits = int(qlinear.bits)
+        launch = sk.plan(rows, int(qlinear.weight.shape[0]), int(h.shape[1]), bits, h.dtype,
+                         mx.float32, s_max=HEAD_MMA_SIMDGROUPS)
+        return sk.qmm(h, qlinear.weight, qlinear.scales, qlinear.biases, bits, _plan=launch)
     if head_q8_ok(qlinear):
         return head_rows(head_q8_f32, h, qlinear)
     return qlinear(h.astype(mx.float32)).astype(mx.float32)

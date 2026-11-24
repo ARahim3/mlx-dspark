@@ -345,7 +345,16 @@ def test_fused_route_selects_weighs_and_sorts_like_the_stock_ops(rows):
     logits = mx.random.normal((rows, experts), key=mx.random.key(rows)) * 3
     bias = mx.random.normal((experts,), key=mx.random.key(99)) * 0.1
     indices, weights = _route_reference(logits, bias, k, 8.0)
-    eids, src, order, wts = fused_route(logits, bias, k, 8.0)
+    try:
+        eids, src, order, wts = fused_route(logits, bias, k, 8.0)
+        mx.eval(eids, src, order, wts)
+    except ValueError as e:
+        # one threadgroup holds every (row, expert): 1,024 threads at 8 rows, which a GPU may
+        # refuse for the compiled kernel. Production finds out at load (the self-test's first
+        # call is that launch) and keeps the stock experts.
+        if "threads per threadgroup" not in str(e):
+            raise
+        pytest.skip(f"launch geometry unavailable on this GPU: {e}")
     assert bool(mx.array_equal(wts, weights.reshape(-1)))                  # bit for bit
     flat = indices.reshape(-1).astype(mx.int32)
     assert bool(mx.array_equal(flat[order], eids))                         # same selection ...

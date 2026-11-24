@@ -227,12 +227,17 @@ def geometry(n: int, rt: int = 1) -> tuple[int, int]:
     return nt, min(s, _s_cap)
 
 
-def plan(rows: int, n: int, k: int, bits: int, dtype=mx.bfloat16, out_dtype=None):
+def plan(rows: int, n: int, k: int, bits: int, dtype=mx.bfloat16, out_dtype=None,
+         s_max: int | None = None):
     """``(template, grid, threadgroup)`` for ``rows`` × [n, k] (cached per module per rows).
     ``out_dtype``: the output's dtype (default the input's) — fp32 for a head whose logits
-    must stay fp32 (Inkling 2); the accumulation is fp32 either way, only the store rounds."""
+    must stay fp32 (Inkling 2); the accumulation is fp32 either way, only the store rounds.
+    ``s_max``: a caller's own ceiling on the simdgroups per threadgroup, for a launch that must
+    be admitted without the calibration that sets :func:`s_cap` (see :func:`set_s_cap`)."""
     rt = min(RT_MAX, (rows + 7) // 8)
     nt, s = geometry(n, rt)
+    if s_max is not None:
+        s = max(1, min(s, int(s_max)))
     template = [("T", dtype), ("TO", out_dtype or dtype), ("K", k), ("N", n), ("BITS", bits),
                 ("NT", nt), ("RT", rt), ("S", s)]
     grid = (math.ceil(n / (8 * nt)) * s * 32, math.ceil(rows / (8 * rt)), 1)

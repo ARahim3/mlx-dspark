@@ -63,9 +63,9 @@ CASES = [
 def test_matches_reference_as_well_as_mlx(B, hq, hk, q_len, L, d, causal):
     q, k, v = _mk(B, hq, hk, q_len, L, d, slack=37)
     scale = d ** -0.5
-    out = multirow_sdpa(q, k, v, scale=scale, causal=causal and q_len > 1)
     mask = "causal" if causal and q_len > 1 else None
     try:
+        out = multirow_sdpa(q, k, v, scale=scale, causal=causal and q_len > 1)
         mine = _err(out, q, k, v, mask is not None)
     except ValueError as e:
         # A geometry this GPU won't launch (GitHub's virtualized M1 caps the compiled kernel
