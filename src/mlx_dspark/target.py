@@ -203,12 +203,21 @@ class Target:
                         in ("0", "false") or not self.inkling_fused.get(inkling_fused.KV_KIND)):
                     inkling_fused.set_packed(model.language_model, False)
                     self.inkling_fused[inkling_fused.PACKED_KIND] = False
-                # Calls wider than a drafter round (9 to 33 positions: a lookup round's copy
-                # draft) take the fused pieces too once the self-test matched them to the stock
-                # forward at that width; MLX_DSPARK_INKLING_WIDE_ROWS=0 keeps them at 8 (the A/B).
+                # Calls wider than a drafter round (9 to 63 positions: a lookup round's copy
+                # draft, a short prompt, a follow-up turn's new tokens) take the fused pieces too
+                # once the self-test matched them to the stock forward at that width;
+                # MLX_DSPARK_INKLING_WIDE_ROWS=0 keeps them at 8 (the A/B). Past that, up to a
+                # prefill chunk, the bit-exact pieces alone run around the stock experts — the
+                # stock forward's bits without most of its launches;
+                # MLX_DSPARK_INKLING_CHUNK_ROWS=0 leaves those calls to the stock forward.
                 if os.environ.get("MLX_DSPARK_INKLING_WIDE_ROWS", "1").lower() in ("0", "false"):
                     inkling_fused.set_rows(model.language_model, inkling_fused.VECTOR_ROWS)
                     self.inkling_fused[inkling_fused.WIDE_KIND] = False
+                    self.inkling_fused[inkling_fused.CHUNK_KIND] = False
+                elif os.environ.get("MLX_DSPARK_INKLING_CHUNK_ROWS", "1").lower() in ("0", "false"):
+                    inkling_fused.set_rows(model.language_model,
+                                           inkling_fused.rows_limit(model.language_model))
+                    self.inkling_fused[inkling_fused.CHUNK_KIND] = False
                 # a curve is priced by the forward that measured it: tag the fused set
                 on = inkling_fused.enabled_kinds(model.language_model)
                 if on:

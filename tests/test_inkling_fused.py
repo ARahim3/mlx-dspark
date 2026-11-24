@@ -551,10 +551,11 @@ def _walk_wide(lm, on_kinds, width, make_cache=None):
     return outs, states
 
 
-@pytest.mark.parametrize("width", [9, 16, 33])
+@pytest.mark.parametrize("width", [9, 16, 33, 63])
 def test_calls_wider_than_a_drafter_round_stay_bit_identical(monkeypatch, width):
-    """A lookup round verifies up to 32 copied tokens: past 8 rows MLX's attention leaves its
-    vector kernels, so the exact pieces are checked against the stock forward there too."""
+    """A lookup round verifies up to 32 copied tokens, and a short prompt is a call of up to
+    MAX_ROWS rows: past 8 rows MLX's attention leaves its vector kernels, so the exact pieces
+    are checked against the stock forward there too."""
     from mlx_dspark import inkling_cache as C
 
     assert width <= F.MAX_ROWS
@@ -609,8 +610,89 @@ def test_selftest_keeps_wide_calls_on_the_stock_path_when_they_do_not_match(monk
     monkeypatch.setattr(F, "fused_norm_cast", drifting)
     result = F.selftest(lm)
     assert result[F.WIDE_KIND] is False and F.rows_limit(lm) == F.VECTOR_ROWS
+    assert result[F.CHUNK_KIND] is False and F.chunk_limit(lm) == F.VECTOR_ROWS
     assert all(result[k] for k in (*F.EXACT_KINDS, F.KV_KIND, F.PACKED_KIND, "model"))
     assert all(F._on(m) for m, _ in F._fused_modules(lm))        # narrow calls keep every piece
+
+
+def _walk_chunks(lm, make_cache, widths):
+    """Prefill calls of ``widths`` rows, one after another on one cache (taps captured): the
+    outputs of each and the cache states they leave."""
+    cache = make_cache()
+    outs, at = [], 0
+    for width in widths:
+        ids = mx.array([[(6 + 5 * (at + i)) % 60 for i in range(width)]])
+        out = lm(inputs=ids, cache=cache, capture_layer_ids=[1, 5, 8])
+        outs.extend([out.logits, *out.hidden_states])
+        mx.eval(outs)
+        at += width
+    states = F._state_arrays([part for c in cache for part in c.caches])
+    mx.eval(states)
+    return outs, states
+
+
+@pytest.mark.parametrize("widths", [(64, 64), (100, 70, 81), (F.CHUNK_ROWS, 65)])
+def test_prefill_chunks_take_the_exact_pieces_and_keep_the_stock_bits(monkeypatch, widths):
+    """Past MAX_ROWS a call is a prefill chunk: the bit-exact pieces run around the STOCK
+    residual mixes, controllers and experts, so the whole forward — logits, taps, cache states —
+    is the stock forward's, bit for bit, on the stock caches and on the in-place ones."""
+    lm = _tiny_bf16_inkling()
+    F.install(lm, enabled=False)
+    ref, ref_states = _walk_chunks(lm, lm.make_cache, widths)
+    result = F.selftest(lm)
+    assert result[F.CHUNK_KIND] is True
+    assert F.rows_limit(lm) == F.MAX_ROWS and F.chunk_limit(lm) == F.CHUNK_ROWS
+    limits = {kind: m.__dict__[F._ROWS] for m, kind in F._fused_modules(lm)}
+    assert all(limits[k] == F.CHUNK_ROWS for k in F.CHUNK_KINDS)
+    assert all(limits[k] == F.MAX_ROWS for k in F.ROUNDING_KINDS)
+    assert all(w > F.MAX_ROWS for w in widths)
+    hits = _count_fused_calls(monkeypatch)
+    scheduled = []
+    stock_async = F.mx.async_eval
+    monkeypatch.setattr(F.mx, "async_eval", lambda *a: scheduled.append(a) or stock_async(*a))
+    for in_place in (False, True):
+        hits.clear()
+        scheduled.clear()
+        got, got_states = _walk_chunks(
+            lm, (lambda: F.make_cache(lm)) if in_place else lm.make_cache, widths)
+        assert all(bool(mx.array_equal(a, b)) for a, b in zip(got, ref))
+        if not in_place:      # (the in-place caches keep their rows in another layout: what
+            #                    they hold is checked by the calls that read it, above)
+            assert len(got_states) == len(ref_states)
+            assert all(bool(mx.array_equal(a, b)) for a, b in zip(got_states, ref_states))
+        assert hits["fused_head_prep"] == 8 * len(widths)        # every visit's attention body
+        # ... and none of the rounding kinds: those stop at MAX_ROWS
+        assert not hits.get("fused_controller") and not hits.get("fused_attention_residual")
+        assert len(scheduled) == len(widths) * (8 // F.SCHEDULE_EVERY)   # the fused loop
+    # the A/B: without the chunk limit those calls are the stock forward
+    F.set_rows(lm, F.rows_limit(lm))
+    assert F.chunk_limit(lm) == F.MAX_ROWS
+    hits.clear()
+    got, _ = _walk_chunks(lm, lm.make_cache, widths)
+    assert all(bool(mx.array_equal(a, b)) for a, b in zip(got, ref)) and not hits
+    # a call every piece takes has the rounding kinds too
+    hits.clear()
+    _walk_chunks(lm, lm.make_cache, (F.MAX_ROWS,))
+    assert hits["fused_head_prep"] == 8 and hits["fused_controller"] and hits["fused_attention_residual"]
+
+
+def test_selftest_keeps_chunks_on_the_stock_path_when_they_do_not_match(monkeypatch):
+    lm = _tiny_bf16_inkling()
+    F.install(lm, enabled=False)
+    stock = F.fused_norm_cast
+
+    def drifting(norm, x):                       # only at a width no verify has
+        out = stock(norm, x)
+        return out * 2 if x.shape[1] > F.MAX_ROWS else out
+
+    monkeypatch.setattr(F, "fused_norm_cast", drifting)
+    result = F.selftest(lm)
+    assert result[F.WIDE_KIND] is True and result[F.CHUNK_KIND] is False
+    assert F.rows_limit(lm) == F.MAX_ROWS and F.chunk_limit(lm) == F.MAX_ROWS
+    ids = mx.array([[(3 + 7 * i) % 60 for i in range(F.MAX_ROWS + 9)]])
+    got = lm(inputs=ids, cache=lm.make_cache()).logits
+    F.set_enabled(lm, False)
+    assert bool(mx.array_equal(got, lm(inputs=ids, cache=lm.make_cache()).logits))
 
 
 def test_layer_visit_loop_is_bit_identical_and_reads_messages_once_per_pass(monkeypatch):
@@ -655,8 +737,8 @@ def test_selftest_passes_then_turns_off_a_body_that_no_longer_matches(monkeypatc
     F.install(lm, enabled=False)
     assert F.selftest(lm) == dict.fromkeys(
         (*F.EXACT_KINDS, F.KV_KIND, F.MASK_KIND, F.PACKED_KIND, *F.ROUNDING_KINDS,
-         *F.LOOP_KINDS, F.WIDE_KIND), True)
-    assert F.rows_limit(lm) == F.MAX_ROWS
+         *F.LOOP_KINDS, F.WIDE_KIND, F.CHUNK_KIND), True)
+    assert F.rows_limit(lm) == F.MAX_ROWS and F.chunk_limit(lm) == F.CHUNK_ROWS
     assert all(F._on(m) for m, _ in F._fused_modules(lm))
     # the cleared in-place caches are what make_cache hands out
     from mlx_dspark import inkling_cache as C
@@ -801,5 +883,5 @@ def test_fused_exact_kinds_stay_bit_identical_on_the_8bit_model(monkeypatch):
     assert all(bool(mx.array_equal(a, b)) for a, b in zip(got_states, ref_states))
     assert F.selftest(lm) == dict.fromkeys(
         (*F.EXACT_KINDS, F.KV_KIND, F.MASK_KIND, F.PACKED_KIND, *F.ROUNDING_KINDS,
-         *F.LOOP_KINDS, F.WIDE_KIND), True)
-    assert F.rows_limit(lm) == F.MAX_ROWS
+         *F.LOOP_KINDS, F.WIDE_KIND, F.CHUNK_KIND), True)
+    assert F.rows_limit(lm) == F.MAX_ROWS and F.chunk_limit(lm) == F.CHUNK_ROWS

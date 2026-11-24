@@ -3,9 +3,10 @@
 One decode step of the stock mlx-vlm forward launches ~7,000 GPU kernels for 48 layer visits, most
 of them a few thousand elements wide: about half of a step's time is the launches, not the weights
 (NOTES "Inkling fused forward"). Each piece here replaces a run of small stock operations with one
-Metal kernel, for calls of one batch row and at most ``MAX_ROWS`` positions (a decode step or a
-speculative verify — up to a lookup round's 32 copied tokens and their anchor); anything else —
-prefill chunks, the CPU, training — takes the stock path.
+Metal kernel, for calls of one batch row: every piece up to ``MAX_ROWS`` positions (a decode step,
+a speculative verify, a short prompt or a follow-up turn's new tokens), and the bit-exact pieces
+alone up to ``CHUNK_ROWS`` (a prefill chunk — a forward bit-identical to the stock one, without
+most of its launches); anything else — the CPU, training, a batch — takes the stock path.
 
 Installed per INSTANCE (a class swap on the model's own modules, like ``inkling_kernels``): nothing
 global is patched and other models are untouched. ``set_enabled(lm, False)`` routes every call back
@@ -31,8 +32,10 @@ is bit-identical to the stock module's single-row call (the stock multi-row call
 routing scores differently from its own single-row call; this one does not).
 
 Calls of up to ``VECTOR_ROWS`` positions are a drafter round (MLX's attention still runs its
-vector kernels there); up to ``MAX_ROWS`` they are a lookup round's long copy draft, taken once
-the self-test has matched every exact piece to the stock forward at that width (``set_rows``).
+vector kernels there); up to ``MAX_ROWS`` they are a lookup round's long copy draft or a short
+prompt, taken once the self-test has matched every exact piece to the stock forward at that width
+(``set_rows``); up to ``CHUNK_ROWS`` they are prefill chunks, which ``CHUNK_KINDS`` take once the
+self-test's ``chunk`` stage has matched them there.
 """
 
 from __future__ import annotations
@@ -45,12 +48,20 @@ import mlx.core as mx
 
 from .inkling_cache import is_sink_cache, small_window, windowed
 
-MAX_ROWS = 33         # positions per call a fused piece accepts: the widest verify, a lookup
-#                       round's 32 copied tokens + the anchor (a drafter round is cap 7 + anchor)
+MAX_ROWS = 63         # positions per call EVERY fused piece accepts: a verify (a lookup round is
+#                       32 copied tokens + the anchor, a drafter round cap 7 + anchor) and a short
+#                       prompt. 63, not more: from 64 rows MLX's sorted expert gather is out of
+#                       its 17-63-row dead zone and the stock experts are the cheaper ones (M4 Pro,
+#                       one forward on a fresh cache: 56 rows 409 ms stock / 226 fused, 64 rows
+#                       283 / 252, 80 rows 322 / 307 against 302 for CHUNK_KINDS alone)
+CHUNK_ROWS = 512      # positions per call the bit-exact pieces (CHUNK_KINDS) accept: a prefill
+#                       chunk (Target.prefill_chunk), where the launches they save are a tenth of
+#                       the forward and the experts / residual mixes are the stock modules
 VECTOR_ROWS = 8       # where MLX's SDPA still runs its vector kernels: the widest drafter round,
 #                       and the limit until the self-test clears the wider calls (set_rows)
 _FLAG = "_mlx_dspark_fused"
 _ROWS = "_mlx_dspark_rows"      # per fused module: the positions per call it accepts
+_CHUNK = "_mlx_dspark_chunk_rows"   # per model: what CHUNK_KINDS accept (>= the model's _ROWS)
 
 
 def _gpu() -> bool:
@@ -1735,8 +1746,12 @@ ALL_KINDS = EXACT_KINDS + LOOP_KINDS + ROW_EXACT_KINDS + ROUNDING_KINDS
 KV_KIND = "kv"
 MASK_KIND = "mask"
 # ... whether the pieces also hold for calls wider than a drafter round (up to MAX_ROWS: a lookup
-# round's long copy draft), each against the stock forward at that width
+# round's long copy draft, a short prompt), each against the stock forward at that width
 WIDE_KIND = "wide"
+# ... and whether the bit-exact ones hold at a prefill chunk's width (CHUNK_ROWS), where they run
+# around the STOCK experts, residual mixes and controllers: the stock forward's bits
+CHUNK_KIND = "chunk"
+CHUNK_KINDS = EXACT_KINDS + LOOP_KINDS
 # ... and whether a verify over a long window takes the packed attention (within rounding of the
 # stock call; needs the in-place caches)
 PACKED_KIND = "vattn"
@@ -1745,18 +1760,28 @@ PACKED_TOL_STOCK = 2e-2    # vs the stock module, which rounds more inside (meas
 _KV = "_mlx_dspark_kv_caches"
 
 
-def set_rows(language_model, rows: int) -> None:
-    """The positions per call the fused pieces accept: ``VECTOR_ROWS`` (a drafter round) or
-    ``MAX_ROWS`` (a lookup round too; the self-test decides at load, this is the A/B)."""
+def set_rows(language_model, rows: int, chunk: int | None = None) -> None:
+    """The positions per call the fused pieces accept. ``rows``, every piece: ``VECTOR_ROWS`` (a
+    drafter round) or ``MAX_ROWS`` (a lookup round and a short prompt too). ``chunk``, the
+    bit-exact pieces alone (``CHUNK_KINDS``): up to ``CHUNK_ROWS``, a prefill chunk; ``None`` =
+    no wider than ``rows``. The self-test decides both at load; this is the A/B."""
     rows = max(1, min(int(rows), MAX_ROWS))
-    for module, _ in _fused_modules(language_model):
-        module.__dict__[_ROWS] = rows
+    chunk = max(rows, min(int(chunk or 0), CHUNK_ROWS))
+    for module, kind in _fused_modules(language_model):
+        module.__dict__[_ROWS] = chunk if kind in CHUNK_KINDS else rows
     language_model.__dict__[_ROWS] = rows
+    language_model.__dict__[_CHUNK] = chunk
 
 
 def rows_limit(language_model) -> int:
-    """The widest call the fused pieces take on this model."""
+    """The widest call EVERY fused piece takes on this model (a verify, a short prompt)."""
     return language_model.__dict__.get(_ROWS, VECTOR_ROWS)
+
+
+def chunk_limit(language_model) -> int:
+    """The widest call the bit-exact pieces take on this model (a prefill chunk where the
+    self-test cleared it; else :func:`rows_limit`)."""
+    return max(rows_limit(language_model), language_model.__dict__.get(_CHUNK, 0))
 
 
 def kv_caches(language_model) -> bool:
@@ -2033,8 +2058,10 @@ def selftest(language_model, rows: int = 2, seed: int = 0) -> dict[str, bool]:
     kernel and concatenate (:func:`set_mask`); ``vattn`` whether the packed verify attention
     (:func:`packed_attention`) stays within rounding of the stock call and leaks nothing from a
     later row into an earlier one (:func:`set_packed`); ``wide`` whether all of it also holds
-    for calls of up to ``MAX_ROWS`` positions — a lookup round — which then take the fused
-    pieces too (:func:`set_rows`; otherwise they stop at ``VECTOR_ROWS``, a drafter round).
+    for calls of up to ``MAX_ROWS`` positions — a lookup round, a short prompt — which then take
+    the fused pieces too (:func:`set_rows`; otherwise they stop at ``VECTOR_ROWS``, a drafter
+    round); ``chunk`` whether the bit-exact pieces also match the stock forward at a prefill
+    chunk's width (``CHUNK_ROWS``), which they then take around the stock experts.
     Leaves the model with every passing kind on. Returns ``{kind: passed}``."""
     lm = language_model
     model = lm.model
@@ -2088,13 +2115,13 @@ def selftest(language_model, rows: int = 2, seed: int = 0) -> dict[str, bool]:
         return (all(bool(mx.array_equal(u, v)) for u, v in zip(a, b)) and len(sa) == len(sb)
                 and all(bool(mx.array_equal(u, v)) for u, v in zip(sa, sb)))
 
-    def kv_run(index, window=5, plan=None):
+    def kv_run(index, window=5, plan=None, arms=((True, True), (True, False))):
         """The in-place caches (``inkling_cache``) against the stock ones on one layer, through
         the calls a generation makes: decode steps, a prefill-sized chunk, and verifies inside
         mlx-vlm's speculative transaction committed in part, in full and at one row — on a
         ``window``-key window with 2 spare rows, so it fills, slides and is rebuilt. Checked
         with the fused attention body (views with the sink row) and with the stock body (what a
-        prefill chunk takes). Outputs must match bit for bit."""
+        call past the fused limits takes). Outputs must match bit for bit."""
         from mlx_vlm.speculative.cache_state import start_speculative_cache
 
         from .inkling_cache import convert
@@ -2133,7 +2160,7 @@ def selftest(language_model, rows: int = 2, seed: int = 0) -> dict[str, bool]:
 
         ref = run(False, False)
         return all(bool(mx.array_equal(a, b))
-                   for arm in ((True, True), (True, False))
+                   for arm in arms
                    for a, b in zip(run(*arm), ref))
 
     def model_run(rows=rows, first=True):
@@ -2275,6 +2302,46 @@ def selftest(language_model, rows: int = 2, seed: int = 0) -> dict[str, bool]:
                 return False
         return True
 
+    def bank_run(n):
+        """The loop's ONE read of a pass's messages against the stock loop's read per layer
+        (mlx-vlm's expression) at ``n`` positions, for banks of 1 to 4 states: the same rows of
+        one larger product — on the kernels MLX picks at that width."""
+        if model.loop is None:
+            return True
+        queries = model.message_queries
+        per_layer, scale = int(queries.shape[1]), hidden ** -0.5
+        for states in (1, 2, 3, 4):
+            bank = mx.fast.rms_norm(rand((1, n, states, hidden), mx.bfloat16).astype(mx.float32),
+                                    None, 1e-6)
+            scores = (queries.reshape(-1, queries.shape[-1]) @ bank.swapaxes(-1, -2)) * scale
+            once = mx.softmax(scores, axis=-1) @ bank
+            for j in range(int(queries.shape[0])):
+                ref = mx.softmax((queries[j] @ bank.swapaxes(-1, -2)) * scale, axis=-1) @ bank
+                if not bool(mx.array_equal(once[..., j * per_layer: (j + 1) * per_layer, :], ref)):
+                    return False
+        return True
+
+    def chunk_run():
+        """A prefill chunk (``CHUNK_ROWS`` positions): the bit-exact pieces that passed, alone —
+        the experts, residual mixes and controllers are the stock modules at this width —
+        against the stock forward on the sliding, global and core probes, outputs and cache
+        states; the in-place caches under the fused attention body through a chunk that fills
+        the window, a verify that slides it and a step; and the loop's one message read."""
+        exact = tuple(kind for kind in EXACT_KINDS if result.get(kind))
+        if not exact:
+            return False
+        set_rows(lm, rows_limit(lm), CHUNK_ROWS)
+        if not all(layer_run(i, exact, rows=CHUNK_ROWS) for i in probes):
+            return False
+        if core is not None and not layer_run(core, exact, rand((1, CHUNK_ROWS, 4, hidden)),
+                                              rows=CHUNK_ROWS):
+            return False
+        if result.get(KV_KIND) and result.get("attn") and not all(
+                kv_run(i, window=CHUNK_ROWS + 2, arms=((True, True),),
+                       plan=[(1, None), (CHUNK_ROWS, None), (4, 2), (1, None)]) for i in probes):
+            return False
+        return not result.get("model") or bank_run(CHUNK_ROWS)
+
     sliding = next((i for i, layer in enumerate(layers) if layer.is_sliding and i > 0), None)
     globl = next((i for i, layer in enumerate(layers) if not layer.is_sliding), None)
     core = next((i for i, layer in enumerate(layers) if getattr(layer, "controllers", None)), None)
@@ -2369,6 +2436,13 @@ def selftest(language_model, rows: int = 2, seed: int = 0) -> dict[str, bool]:
         ok = False
     result[WIDE_KIND] = ok
     set_rows(lm, MAX_ROWS if ok else VECTOR_ROWS)
+    # ... and a prefill chunk, for the bit-exact pieces alone
+    try:
+        chunk = bool(probes) and chunk_run()
+    except Exception:  # noqa: BLE001 — a kernel this GPU cannot launch at that width
+        chunk = False
+    result[CHUNK_KIND] = chunk
+    set_rows(lm, MAX_ROWS if ok else VECTOR_ROWS, CHUNK_ROWS if chunk else None)
     set_packed(lm, bool(result.get(PACKED_KIND)))
     set_enabled(lm, True)
     return result
