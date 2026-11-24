@@ -12,7 +12,7 @@ import mlx.core as mx
 import numpy as np
 
 from mlx_dspark.dflash_model import (
-    CtxRotatingKVCache,
+    CtxWindowCache,
     DFlashConfig,
     DFlashCtxWindow,
     DFlashDraftModel,
@@ -105,7 +105,8 @@ def test_window_through_prefix_cache_boundary_and_rung_trim():
 # ------------------------------------------------- attention refactor equivalence
 
 def _orig_attention_call(attn, x, x_ctx, rope, cache):
-    """The pre-refactor __call__ body, verbatim — the reference the extraction must match."""
+    """The attention written out the plain way — append the ctx rows, concatenate the block's
+    onto the window, mask by position — the reference the in-place write must match."""
     from mlx_lm.models.base import create_causal_mask
 
     B, L, _ = x.shape
@@ -233,49 +234,48 @@ def _rows(a, b):
 
 
 def test_ctx_cache_single_row_append_after_skip_past_window():
-    """Issue #33's exact state: a rotating ctx cache whose absolute offset is far past the
-    window while the buffer is part-filled (a prefix-cache window trimmed to the shared
-    prefix after a memory-guard shed dropped the rungs), then single-row appends (0-accept
-    rounds). Upstream's arithmetic sized the growth from the absolute offset
-    (``max_size - 30000`` -> "Negative dimensions not allowed"); rows must land in order at
-    absolute positions and the buffer must grow from the rows it holds."""
+    """Issue #33's exact state: a ctx cache whose absolute offset is far past the window while
+    the buffer is part-filled (a prefix-cache window trimmed to the shared prefix after a
+    memory-guard shed dropped the rungs), then single-row appends (0-accept rounds). mlx-lm's
+    rotating cache sized its growth from the absolute offset (``max_size - 30000`` ->
+    "Negative dimensions not allowed"); rows must land in order at absolute positions and the
+    buffer must grow from the rows it holds."""
     max_size = 15
-    c = CtxRotatingKVCache(max_size=max_size, keep=0)
+    c = CtxWindowCache(max_size)
     c.skip(30_000)                                     # restore: window.start
     k, _ = c.update_and_fetch(*_rows(0, 4))            # window rows (4 < max_size)
     assert c.offset == 30_004 and k.shape[2] == 4
-    for i in range(4, 20):                             # single rows through the fill + wrap
+    for i in range(4, 20):                             # single rows through the fill + slide
         k, v = c.update_and_fetch(*_rows(i, i + 1))
         assert c.offset == 30_000 + i + 1, i
-        assert k.shape[2] == min(i + 1, max_size), (i, k.shape)
-        held = sorted(int(x) for x in np.array(k).reshape(-1))   # never zero-fill padding
+        held = [int(x) for x in np.array(k).reshape(-1)]            # in order, never padding
         assert held == list(range(max(0, i + 1 - max_size), i + 1)), (i, held)
         assert np.array_equal(np.array(k), np.array(v))
 
 
-def test_ctx_cache_multi_row_after_partial_fill_matches_upstream_fresh_path():
-    """Both append paths on the run-ahead state must equal upstream's plain fresh path
-    (same rows, no skip) — the rebase changes nothing but the coordinates."""
-    c = CtxRotatingKVCache(max_size=8, keep=0)
+def test_ctx_cache_run_ahead_offset_changes_only_the_coordinates():
+    """Single- and multi-row appends on the run-ahead state hold the rows a cache that never
+    skipped holds — the skip moves the absolute position and nothing else."""
+    c = CtxWindowCache(8)
     c.skip(5000)
-    ref = CtxRotatingKVCache(max_size=8, keep=0)
+    ref = CtxWindowCache(8)
     for a, b in [(0, 3), (3, 4), (4, 10), (10, 11), (11, 12)]:
         k, _ = c.update_and_fetch(*_rows(a, b))
         kr, _ = ref.update_and_fetch(*_rows(a, b))
         assert np.array_equal(np.array(k), np.array(kr)), (a, b)
         assert c.offset == ref.offset + 5000
-    got = sorted(int(x) for x in np.array(k).reshape(-1))
-    assert got == list(range(12 - 8, 12)), got            # the last max_size rows, all real
+    got = [int(x) for x in np.array(k).reshape(-1)]
+    assert got == list(range(12 - 8, 12)), got            # the last max_size rows, in order
 
 
-def test_skip_ctx_refuses_a_plain_kv_cache_and_is_a_noop_at_zero():
+def test_skip_ctx_refuses_an_unbounded_cache_and_is_a_noop_at_zero():
     import pytest
     from mlx_lm.models.cache import KVCache
-    c = KVCache()
-    skip_ctx(c, 0)
-    assert c.offset == 0
-    with pytest.raises(ValueError):
-        skip_ctx(c, 3)
+    for c in (KVCache(), CtxWindowCache()):            # a full-attention layer keeps every row
+        skip_ctx(c, 0)
+        assert c.offset == 0
+        with pytest.raises(ValueError):
+            skip_ctx(c, 3)
 
 
 def test_restore_of_a_trimmed_window_then_one_row_round_matches_skipped_fresh_path():

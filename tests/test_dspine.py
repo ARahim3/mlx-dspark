@@ -416,13 +416,13 @@ def test_is_causal_false_changes_the_sliding_block_output():
     mx.random.seed(5)
     causal, bidir = _attn("sliding_attention", None), _attn("sliding_attention", False)
     bidir.update(causal.parameters())
-    from mlx_dspark.dflash_model import CtxRotatingKVCache, _build_rope
+    from mlx_dspark.dflash_model import CtxWindowCache, _build_rope
 
     rope = _build_rope(16, 1e7, 512, None)
     x = mx.random.normal((1, 4, H))
     ctx = mx.random.normal((1, 6, H))
-    out_c = causal(x, ctx, rope, CtxRotatingKVCache(max_size=15))
-    out_b = bidir(x, ctx, rope, CtxRotatingKVCache(max_size=15))
+    out_c = causal(x, ctx, rope, CtxWindowCache(15))
+    out_b = bidir(x, ctx, rope, CtxWindowCache(15))
     assert not mx.allclose(out_c[:, 0], out_b[:, 0], atol=1e-5).item()   # row 0 now sees rows 1..3
     assert mx.allclose(out_c[:, 3], out_b[:, 3], atol=1e-5).item()       # the last row saw all anyway
 

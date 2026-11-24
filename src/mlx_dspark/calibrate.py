@@ -1324,14 +1324,18 @@ _MULTIROW_MAX_GEN = 16
 
 
 def _drafter_attn_dims(drafter):
-    """``(hq, hk, d)`` of a DSpark drafter's context cross-attention when it can take the
-    kernel (unmasked block, no sinks), else None. DFlash-lineage heads (causal block,
-    sliding window, sinks) pass array masks and never reach the kernel; DFlash drafters'
-    own attention is sliding-window over <= 2k rows — neither is worth a probe."""
+    """``(hq, hk, d)`` of a drafter's context attention when it can take the kernel, else
+    None: a DSpark drafter's cross-attention (unmasked block, no sinks), and a DFlash-lineage
+    head whose block shares one ctx window (``DFlashAttention.block_window``: unmasked or
+    string-causal over the window — 1.44 -> 0.60 ms for a round's 5 calls at a full 2,048
+    window on Inkling's head). Any other DFlash-lineage head (a window per block row, sinks)
+    passes array masks and never reaches the kernel: not worth a probe."""
     layers = getattr(drafter, "layers", None) or []
     a = getattr(layers[0], "self_attn", None) if layers else None
     if a is None or not hasattr(a, "n_kv_heads") or not hasattr(a, "head_dim"):
         return None
+    if getattr(a, "block_window", False):
+        return int(a.n_heads), int(a.n_kv_heads), int(a.head_dim)
     if getattr(a, "causal_block", False) or getattr(a, "sliding_window", None) \
             or getattr(a, "sink", False) or not hasattr(a, "update_ctx"):
         return None

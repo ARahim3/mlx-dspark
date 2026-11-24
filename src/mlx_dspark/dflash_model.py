@@ -82,64 +82,107 @@ whole block of mask positions in a single parallel (block-diffusion) pass.
 from __future__ import annotations
 
 import math
+import os
 from dataclasses import dataclass, field
 from typing import Any
 
 import mlx.core as mx
 import mlx.nn as nn
 from mlx_lm.models.base import create_causal_mask
-from mlx_lm.models.cache import KVCache, RotatingKVCache
 from mlx_lm.models.qwen3 import MLP
 from mlx_lm.models.rope_utils import initialize_rope
 
 
-class CtxRotatingKVCache(RotatingKVCache):
-    """mlx-lm's :class:`RotatingKVCache` with the ctx contract this drafter needs:
-    ``offset`` is the ABSOLUTE position (what rope reads) and may run AHEAD of the rows the
-    buffer holds — a prefix-cache restore presets it to the window's start, and the prefill
-    bound / the sliding skip advance it past rows that were never written.
+class CtxWindowCache:
+    """One draft layer's ctx K / V rows, kept in TEMPORAL ORDER in one buffer that the block
+    attention reads in place.
 
-    Upstream's bookkeeping assumes ``offset == rows appended`` until the buffer first fills:
-    the single-row path grows the buffer by ``max_size - offset`` and writes at index
-    ``offset``, and the multi-row path's temporal reorder compares ``_idx < offset``. With
-    a run-ahead offset the single-row path is wrong as soon as the buffer is not yet full —
-    ``max_size - offset`` goes negative once offset > max_size ("[full] Negative dimensions
-    not allowed", issue #33: a memory-guard shed dropped the rungs, the next request's
-    window was trimmed to the shared prefix, and the first 0-accept round appended one
-    row into a part-filled buffer at offset ~30k). So: :meth:`skip` records the run-ahead,
-    and every append runs upstream's arithmetic in its own coordinates (offset temporarily
-    rebased to rows appended), then restores the absolute offset. Nothing else changes —
-    full buffers rotate exactly as before, and rope keeps reading ``offset``."""
+    :meth:`put` writes a round's ``[new ctx rows ‖ block rows]`` right after the valid rows and
+    returns views ``[window ‖ block rows]``. The ctx rows join the window — its last ``max_size``
+    rows (``sliding_window - 1``; ``None`` = every row, a full-attention layer) — and the block
+    rows are scratch the next call overwrites, so a round copies nothing: when the buffer runs
+    out, the rows still visible move to the front of a fresh one, once per ``step`` ctx rows.
 
-    def __init__(self, max_size, keep=0):
-        super().__init__(max_size, keep)
-        self.skipped = 0            # positions advanced without a write (absolute - appended)
+    Temporal order is load-bearing: :meth:`DFlashAttention._block_mask` is POSITIONAL (a
+    sliding layer hides each block row's oldest ctx rows by index). mlx-lm's rotating cache,
+    which this replaced, handed back its ring as stored after a one-row append — the newest ctx
+    row at index 0, hidden from every draft slot after each round that accepted nothing.
+
+    ``offset`` is the ABSOLUTE position of the next ctx row (what rope reads) and may run ahead
+    of the rows held: a prefix-cache restore presets it to the window's start, and the prefill
+    bound / the sliding skip advance it past rows that were never written (:meth:`skip`). The
+    buffer's own bookkeeping never reads it (issue #33: sizing a buffer from an absolute
+    offset)."""
+
+    step = 256                  # spare ctx rows a fresh buffer gets: one compaction per `step`
+
+    def __init__(self, max_size: int | None = None):
+        self.max_size = max_size
+        self.keys = None
+        self.values = None
+        self.offset = 0
+        self._start = 0             # valid ctx rows are [_start, _end) of the buffer
+        self._end = 0
+
+    @property
+    def rows(self) -> int:
+        """Ctx rows the window holds."""
+        return self._end - self._start
 
     def skip(self, n: int) -> None:
         """Advance the absolute position past ``n`` rows that will never be appended."""
         self.offset += n
-        self.skipped += n
+
+    def put(self, keys, values, n_ctx: int):
+        """Write ``keys`` / ``values`` ``[B, kv_heads, n_ctx + scratch, D]`` after the valid
+        rows; the first ``n_ctx`` rows join the window. -> ``(K, V, ctx_len)``: views of
+        ``[the window's ctx rows ‖ the scratch rows]`` and how many of them are ctx."""
+        s = int(keys.shape[2])
+        end = self._end
+        new_end = end + n_ctx
+        first = self._start
+        if self.max_size is not None:
+            first = max(first, new_end - self.max_size)     # oldest row still in the window
+        if self.keys is None or end + s > int(self.keys.shape[2]):
+            # no room: [rows still visible ‖ new rows ‖ spare] as one fresh buffer
+            old = self.keys is not None and first < end
+            b, h, _, d = keys.shape
+            spare = self.step + (s - n_ctx)
+            self.keys = mx.concatenate(
+                ([self.keys[..., first:end, :]] if old else [])
+                + [keys, mx.zeros((b, h, spare, d), keys.dtype)], axis=2)
+            self.values = mx.concatenate(
+                ([self.values[..., first:end, :]] if old else [])
+                + [values, mx.zeros((b, h, spare, values.shape[3]), values.dtype)], axis=2)
+            self._end = (end - first if old else 0) + n_ctx
+            self._start = 0 if self.max_size is None else max(0, self._end - self.max_size)
+        else:
+            self.keys[..., end: end + s, :] = keys
+            self.values[..., end: end + s, :] = values
+            self._start, self._end = first, new_end
+        self.offset += n_ctx
+        hi = self._end + (s - n_ctx)
+        return (self.keys[..., self._start: hi, :], self.values[..., self._start: hi, :],
+                self._end - self._start)
 
     def update_and_fetch(self, keys, values):
-        self.offset -= self.skipped
-        try:
-            return super().update_and_fetch(keys, values)
-        finally:
-            self.offset += self.skipped
+        """Append ctx rows only (no scratch) -> the window's ``(keys, values)``."""
+        k, v, _ = self.put(keys, values, int(keys.shape[2]))
+        return k, v
 
 
 def skip_ctx(cache, n: int) -> None:
-    """Advance a drafter ctx cache's absolute position past ``n`` never-appended rows.
-    Rotating caches record the run-ahead (:meth:`CtxRotatingKVCache.skip`); a plain
-    :class:`KVCache` (full-attention layer) only ever sees ``n == 0`` — its window is
-    unbounded, so nothing is dropped ahead of it — and keeps upstream's bookkeeping."""
+    """Advance a drafter ctx cache's absolute position past ``n`` never-appended rows. Only a
+    sliding layer's bounded window may run ahead of its rows (:meth:`CtxWindowCache.skip`); a
+    full-attention layer's cache only ever sees ``n == 0`` — its window is unbounded, so
+    nothing is dropped ahead of it."""
     if n <= 0:
         return
-    if hasattr(cache, "skip"):
+    if getattr(cache, "max_size", None) is not None and hasattr(cache, "skip"):
         cache.skip(n)
     else:
-        raise ValueError(f"{type(cache).__name__} cannot skip {n} ctx rows: only a rotating "
-                         "(sliding-window) ctx cache may run ahead of its rows")
+        raise ValueError(f"{type(cache).__name__} cannot skip {n} ctx rows: only a sliding-"
+                         "window ctx cache may run ahead of its rows")
 
 
 @dataclass
@@ -211,6 +254,14 @@ class DFlashAttention(nn.Module):
         # z-lab / SGLang: `is_causal` when declared, else sliding layers causal, full layers not
         self.block_causal = (self.is_sliding if config.block_causal is None
                              else bool(config.block_causal))
+        self.head_dim = config.head_dim
+        # A sliding layer's block rows each have their own window (row i sees the last
+        # ``window - 1 - i`` ctx rows): an array mask once ctx + block pass the window. True =
+        # the whole block reads the LAST row's window instead — each row a subset of its own,
+        # short of it by at most ``L - 1`` of its oldest rows — so the call needs no array mask
+        # and is one the multi-row attention kernel serves (multirow_attn.eligible). Per head,
+        # where measured: :meth:`DFlashDraftModel.share_block_window`.
+        self.block_window = False
         self.q_proj = nn.Linear(dim, n_heads * config.head_dim, bias=False)
         self.k_proj = nn.Linear(dim, n_kv_heads * config.head_dim, bias=False)
         self.v_proj = nn.Linear(dim, n_kv_heads * config.head_dim, bias=False)
@@ -218,43 +269,50 @@ class DFlashAttention(nn.Module):
         self.q_norm = nn.RMSNorm(config.head_dim, eps=config.rms_norm_eps)
         self.k_norm = nn.RMSNorm(config.head_dim, eps=config.rms_norm_eps)
 
-    def append_ctx(self, x_ctx, rope, cache):
-        """Project + rope + append ctx rows into this layer's cache, returning the cache's
-        full (keys, values). The ctx half of ``__call__``, split out so a prefix-cache
-        restore can rebuild the drafter context without running a draft block (kv-proj-only,
-        the same path SGLang's worker feeds context through). A sliding layer keeps only the
-        last ``window - 1`` rows and advances ``cache.offset`` past the skipped ones —
-        identical to the old inline logic."""
-        B, S, _ = x_ctx.shape
+    def _window_rows(self, x_ctx, cache):
+        """The ctx rows a sliding layer can keep — the last ``window - 1`` — with the cache's
+        absolute position advanced past the rest."""
+        S = x_ctx.shape[1]
         if self.is_sliding:
             keep_ctx = self.sliding_window - 1
             if keep_ctx < S:
-                skip = S - keep_ctx
-                x_ctx = x_ctx[:, skip:]
-                S = x_ctx.shape[1]
-                skip_ctx(cache, skip)
-        ctx_keys = self.k_proj(x_ctx)
-        ctx_values = self.v_proj(x_ctx)
-        ctx_keys = self.k_norm(ctx_keys.reshape(B, S, self.n_kv_heads, -1)).transpose(0, 2, 1, 3)
-        ctx_values = ctx_values.reshape(B, S, self.n_kv_heads, -1).transpose(0, 2, 1, 3)
-        ctx_keys = rope(ctx_keys, offset=cache.offset)
-        return cache.update_and_fetch(ctx_keys, ctx_values)
+                skip_ctx(cache, S - keep_ctx)
+                x_ctx = x_ctx[:, S - keep_ctx:]
+        return x_ctx
+
+    def _kv(self, rows, rope, offset: int):
+        """Rows ``[B, S, H]`` at absolute positions ``offset..`` -> their roped keys and
+        values ``[B, kv_heads, S, head_dim]``."""
+        B, S, _ = rows.shape
+        keys = self.k_norm(self.k_proj(rows).reshape(B, S, self.n_kv_heads, -1)).transpose(0, 2, 1, 3)
+        values = self.v_proj(rows).reshape(B, S, self.n_kv_heads, -1).transpose(0, 2, 1, 3)
+        return rope(keys, offset=offset), values
+
+    def append_ctx(self, x_ctx, rope, cache):
+        """Project + rope + append ctx rows into this layer's cache, returning the window's
+        (keys, values). The ctx half of ``__call__``, split out so a prefix-cache restore can
+        rebuild the drafter context without running a draft block (kv-proj-only, the same path
+        SGLang's worker feeds context through). A sliding layer keeps only the last
+        ``window - 1`` rows and advances ``cache.offset`` past the skipped ones."""
+        x_ctx = self._window_rows(x_ctx, cache)
+        keys, values = self._kv(x_ctx, rope, cache.offset)
+        return cache.update_and_fetch(keys, values)
 
     def __call__(self, x, x_ctx, rope, cache):
         B, L, _ = x.shape
-        keys, values = self.append_ctx(x_ctx, rope, cache)
-        # cache.offset is now past the appended ctx — the block rows rope right after it
-        queries = self.q_proj(x)
-        prop_keys = self.k_proj(x)
-        prop_values = self.v_proj(x)
-        queries = self.q_norm(queries.reshape(B, L, self.n_heads, -1)).transpose(0, 2, 1, 3)
-        prop_keys = self.k_norm(prop_keys.reshape(B, L, self.n_kv_heads, -1)).transpose(0, 2, 1, 3)
-        prop_values = prop_values.reshape(B, L, self.n_kv_heads, -1).transpose(0, 2, 1, 3)
-        queries = rope(queries, offset=cache.offset)
-        prop_keys = rope(prop_keys, offset=cache.offset)
-        ctx_len = keys.shape[2]
-        keys = mx.concatenate([keys, prop_keys], axis=2)
-        values = mx.concatenate([values, prop_values], axis=2)
+        x_ctx = self._window_rows(x_ctx, cache)
+        S = x_ctx.shape[1]
+        pos = cache.offset                       # the ctx rows rope from here, the block after
+        ctx_keys, ctx_values = self._kv(x_ctx, rope, pos)
+        prop_keys, prop_values = self._kv(x, rope, pos + S)
+        queries = self.q_norm(self.q_proj(x).reshape(B, L, self.n_heads, -1)).transpose(0, 2, 1, 3)
+        queries = rope(queries, offset=pos + S)
+        # one write of [ctx ‖ block] into the layer's buffer; the attention reads a view of it
+        keys, values, ctx_len = cache.put(mx.concatenate([ctx_keys, prop_keys], axis=2),
+                                          mx.concatenate([ctx_values, prop_values], axis=2), S)
+        if self.block_window and self.is_sliding and ctx_len + L > self.sliding_window:
+            drop = min(ctx_len, ctx_len + L - self.sliding_window)
+            keys, values, ctx_len = keys[..., drop:, :], values[..., drop:, :], ctx_len - drop
         mask = self._block_mask(L, ctx_len)
         output = mx.fast.scaled_dot_product_attention(queries, keys, values, scale=self.scale, mask=mask)
         return self.o_proj(output.transpose(0, 2, 1, 3).reshape(B, L, -1))
@@ -563,6 +621,17 @@ class DFlashDecoderLayer(nn.Module):
         return h + mlp
 
 
+def _block_window_default(measured: bool) -> bool:
+    """Whether a head's block shares one ctx window: ``measured`` (the pair was measured with
+    it) unless ``MLX_DSPARK_DFLASH_BLOCK_WINDOW`` says 1 / 0."""
+    env = os.environ.get("MLX_DSPARK_DFLASH_BLOCK_WINDOW", "").strip().lower()
+    if env in ("1", "true", "on"):
+        return True
+    if env in ("0", "false", "off"):
+        return False
+    return measured
+
+
 class DFlashDraftModel(nn.Module):
     def __init__(self, config: DFlashConfig):
         super().__init__()
@@ -614,6 +683,16 @@ class DFlashDraftModel(nn.Module):
         """Every layer attends the block causally (rows 0..t never see rows > t)."""
         return all(layer.self_attn.block_causal for layer in self.layers)
 
+    def share_block_window(self, on: bool = True) -> None:
+        """Every sliding layer's block reads its LAST row's ctx window (no array mask: see
+        ``DFlashAttention.block_window``) instead of a window per row. Changes what is drafted
+        by the oldest ``L - 1`` ctx rows of ~``sliding_window``, so it is on only for heads
+        whose acceptance was measured with it: :meth:`bind` turns it on for Inkling 2's DFlash 2
+        head (NOTES "The DFlash drafter's ctx window …"); ``MLX_DSPARK_DFLASH_BLOCK_WINDOW``
+        (1 / 0) forces it for any head — the A/B."""
+        for layer in self.layers:
+            layer.self_attn.block_window = bool(on)
+
     def draft_width(self, cap: int) -> int:
         """Block rows to feed for a round verifying ``cap`` drafts: the anchor + ``cap`` masks on
         a block-causal head (exact truncation — attention and the bridge's messages both flow
@@ -632,6 +711,7 @@ class DFlashDraftModel(nn.Module):
         from .inkling import dflash_bindings
 
         inkling = dflash_bindings(target_model)
+        self.share_block_window(_block_window_default(measured=inkling is not None))
         if inkling is not None:
             embed, head, head_src, vocab = inkling
             self.embed_tokens, self.embed_scale = embed, 1.0
@@ -712,9 +792,9 @@ class DFlashDraftModel(nn.Module):
             if layer_type == "sliding_attention":
                 if self.config.sliding_window is None:
                     raise ValueError("Draft config must define sliding_window for sliding_attention layers.")
-                caches.append(CtxRotatingKVCache(max_size=self.config.sliding_window - 1, keep=0))
+                caches.append(CtxWindowCache(self.config.sliding_window - 1))
             else:
-                caches.append(KVCache())
+                caches.append(CtxWindowCache())
         return caches
 
     def project_ctx(self, target_hidden):

@@ -891,8 +891,8 @@ def dflash_generate(
         # Rows the bound discarded would have been skipped inside append_ctx anyway; its
         # skip logic advances the cache's absolute position past them so rope positions
         # stay absolute — reproduce that here (the window restore above did the same).
-        # skip_ctx, not a bare offset bump: the rotating cache must know the offset runs
-        # ahead of its rows, or a later single-row append mis-sizes the buffer (issue #33).
+        # skip_ctx, not a bare offset bump: only a sliding layer's window may run ahead of
+        # its rows (a full-attention layer never drops any, and skip_ctx refuses it).
         for c in dcache:
             skip_ctx(c, trimmed["dropped"])
     pending = _pick(logits[0, -1], temperature, top_p, top_k)

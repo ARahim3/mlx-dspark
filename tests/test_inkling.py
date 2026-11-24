@@ -1023,6 +1023,8 @@ def test_a_dflash_head_binds_the_inkling_embed_head_and_real_vocabulary():
     assert d.embed_scale == 1.0
     assert mx.array_equal(d.embed_tokens(ids), lm.model.embed_norm(lm.model.embed_tokens(ids)))
     assert d.vocab_out == 60                                  # unpadded_vocab_size, not 64
+    # the pair measured with the block on one ctx window (no array mask at depth)
+    assert all(layer.self_attn.block_window for layer in d.layers)
     h = mx.random.normal((3, 128))
     assert mx.allclose(d.lm_head(h), lm.lm_head(h).astype(mx.float32), atol=1e-4)
 
