@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import atexit
 import contextlib
+import gc
 import json
 import os
 import queue as _queue
@@ -1465,6 +1466,13 @@ class Engine:
         self.target = None
         self.drafter = None
         self.cap_controller = None
+        self._depth_capper = None
+        # A model can sit in reference cycles — Inkling 2's own forward binds methods and
+        # keeps per-module caches on the model's modules — and only the cyclic collector frees
+        # a cycle. It has no reason to run by itself here: the weights are a few thousand
+        # Python objects. Without this a hot swap left the old copy resident (Inkling-2-Mini:
+        # 19 -> 37 -> 54 GB over three reloads, and the fourth took the machine into swap).
+        gc.collect()
         with contextlib.suppress(Exception):  # best-effort; a failed cache clear is not fatal
             mx.clear_cache()                 # return the just-freed buffers to the OS
 

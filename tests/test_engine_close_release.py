@@ -46,6 +46,28 @@ def test_prefix_cache_release_drops_the_factories_and_the_target_with_them():
     prefix.release()                             # idempotent
 
 
+def test_close_frees_a_model_that_sits_in_a_reference_cycle():
+    """Inkling 2's fused forward binds methods and caches on the model's own modules: the model
+    is cyclic garbage once the engine lets go, and only the collector frees that. close() runs
+    it — a hot swap otherwise kept every earlier copy of the weights."""
+    import gc
+
+    class _Cyclic(_Target):
+        def __init__(self):
+            self.bound = self.make_cache          # self -> bound method -> self
+
+    target = _Cyclic()
+    ref = weakref.ref(target)
+    eng = _shell_engine(target, None, None)
+    del target
+    gc.disable()                                  # as in a server between two collections
+    try:
+        eng.close()
+        assert ref() is None
+    finally:
+        gc.enable()
+
+
 def test_memory_guard_stop_lets_go_of_the_prefix_cache():
     target = _Target()
     ref = weakref.ref(target)
