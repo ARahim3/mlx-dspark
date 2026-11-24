@@ -431,8 +431,8 @@ def cmd_serve(argv: list[str]) -> None:
                     help="serve up to N concurrent requests through one batched target "
                          "forward (dense mlx-lm targets in dspark/baseline mode, hybrids in "
                          "baseline mode: ~1.5-2.5x aggregate throughput at 2-4 concurrent; "
-                         "Inkling 2 in dspark/baseline mode, up to 8: a request that is alone "
-                         "keeps the drafter, overlapping requests decode together). "
+                         "Inkling 2 in dspark/dflash/baseline mode, up to 8: a request that "
+                         "is alone keeps the drafter, overlapping requests decode together). "
                          "1 = serialized (default)")
     ap.add_argument("--context-window", type=int, default=None,
                     help="cap the prompt length (default: the target's own trained limit). "

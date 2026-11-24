@@ -922,3 +922,130 @@ def test_bind_target_drafts_from_the_8bit_head_a_target_bits_target_already_hold
     ctx = wide.make_ctx_cache()
     wide.update_context(mx.random.normal((1, 6, 4 * 256)), ctx_offset=0, ctx_caches=ctx)
     assert _draft(wide, ctx, 3, 6).shape == (7,)
+
+
+# ---------------------------------------------------------------- a DFlash-lineage head on Inkling 2
+# incoai/Inkling-2-Mini-DFlash2: the reference (its shipped SGLang patch) binds the bundled DSpark
+# head's own inputs — embed_norm ∘ embed_tokens, the target's head, the real vocabulary.
+
+def test_dflash_bindings_are_for_inkling_models_only():
+    from types import SimpleNamespace
+
+    from mlx_dspark.inkling import dflash_bindings
+
+    assert dflash_bindings(object()) is None
+    assert dflash_bindings(SimpleNamespace(model_type="qwen3")) is None
+    assert dflash_bindings(SimpleNamespace(model_type="inkling2_loop")) is None   # no LM
+
+
+@metal
+@pytest.mark.parametrize("dense,bits", [(False, 0), (False, 8), (False, 4), (True, 8)])
+def test_draft_logits_are_a_quantized_heads_fp32_product(monkeypatch, dense, bits):
+    # --target-bits 8: the 8-bit copy the target's own logits use (nothing new is built);
+    # released weights: a drafter-only copy at DFLASH_HEAD_BITS, built once per model (0: the
+    # bf16 head through head_f32). fp32 out, any leading shape, rows on either side of the
+    # matrix-unit crossover.
+    from types import SimpleNamespace
+
+    from mlx_dspark import inkling as I
+    from mlx_dspark.inkling import dflash_bindings, draft_logits
+    from mlx_dspark.inkling_kernels import _DENSE_HEAD
+
+    monkeypatch.setattr(I, "DFLASH_HEAD_BITS", bits)
+    mx.random.seed(3)
+    head = nn.Linear(256, 96, bias=False)
+    head.weight = (mx.random.normal((96, 256)) * 0.2).astype(mx.bfloat16)
+    embed_tokens, embed_norm = nn.Embedding(96, 256), nn.RMSNorm(256)
+    inner = SimpleNamespace(embed=lambda ids: embed_norm(embed_tokens(ids)))
+    lm = SimpleNamespace(lm_head=head, model=inner,
+                         config=SimpleNamespace(unpadded_vocab_size=90))
+    if dense:
+        q = nn.QuantizedLinear.from_linear(head, group_size=64, bits=8)
+        q.scales, q.biases = q.scales.astype(mx.float32), q.biases.astype(mx.float32)
+        lm.__dict__[_DENSE_HEAD] = q
+    project = draft_logits(lm)
+    if dense:
+        want_src = q
+        assert I._DFLASH_HEAD not in lm.__dict__              # shared, not copied
+    elif bits:
+        want_src = lm.__dict__[I._DFLASH_HEAD][1]
+        assert want_src.bits == bits
+        assert draft_logits(lm) is not None and lm.__dict__[I._DFLASH_HEAD][1] is want_src
+    else:
+        want_src = head
+    for rows in (3, 7, 18):
+        hidden = mx.random.normal((1, rows, 256)).astype(mx.bfloat16)
+        got = project(hidden)
+        assert got.shape == (1, rows, 96) and got.dtype == mx.float32
+        want = want_src(hidden.astype(mx.float32)).astype(mx.float32)
+        assert mx.allclose(got, want, atol=2e-3, rtol=2e-3), rows
+    embed, _, rows_src, vocab = dflash_bindings(
+        SimpleNamespace(model_type="inkling2_loop", language_model=lm))
+    assert vocab == 90 and rows_src is head
+    ids = mx.array([[4, 7, 1]])
+    assert mx.array_equal(embed(ids), embed_norm(embed_tokens(ids)))
+
+
+def _tiny_inkling_dflash2(target, softcap_mode="after_correction"):
+    """A DFlash 2 head shaped for _tiny_inkling: four taps of its 128-wide stream (the bundled
+    head's visits and the final-norm one), its 64-row padded vocabulary, Inkling's softcap."""
+    from mlx_dspark.dflash_model import DFlashConfig, DFlashDraftModel
+
+    cfg = DFlashConfig(
+        hidden_size=128, num_hidden_layers=2, num_attention_heads=2, num_key_value_heads=1,
+        head_dim=16, intermediate_size=128, vocab_size=64, rms_norm_eps=1e-6, rope_theta=1e4,
+        max_position_embeddings=512, block_size=8, target_layer_ids=(1, 3, 5, 8),
+        num_target_layers=8, mask_token_id=58, selector_rank=8, selector_top_k=4,
+        conv_kernel_size=2, conv_group_size=16, final_logit_softcapping=30.0,
+        selector_softcap_mode=softcap_mode, layer_types=("sliding_attention",) * 2,
+        sliding_window=16, block_causal=False,
+    )
+    mx.random.seed(21)
+    d = DFlashDraftModel(cfg)
+    sel = d.candidate_selector
+    sel.predecessor_codebook = mx.random.normal((64, 8))
+    sel.successor_codebook = mx.random.normal((64, 8))
+    mx.eval(d.parameters())
+    return d.bind(target.model)
+
+
+def test_a_dflash_head_binds_the_inkling_embed_head_and_real_vocabulary():
+    from mlx_dspark.target import Target
+
+    model = _tiny_inkling()
+    t = Target(model, tokenizer=None)
+    d = _tiny_inkling_dflash2(t)
+    lm = model.language_model
+    ids = mx.array([[1, 5, 9]])
+    assert d.embed_scale == 1.0
+    assert mx.array_equal(d.embed_tokens(ids), lm.model.embed_norm(lm.model.embed_tokens(ids)))
+    assert d.vocab_out == 60                                  # unpadded_vocab_size, not 64
+    h = mx.random.normal((3, 128))
+    assert mx.allclose(d.lm_head(h), lm.lm_head(h).astype(mx.float32), atol=1e-4)
+
+
+class _CharTok:
+    """Just enough tokenizer for the generate loops: no eos ids, char-decode."""
+
+    def decode(self, ids):
+        return "".join(chr(65 + (i % 26)) for i in ids)
+
+
+def test_dflash_generate_on_inkling_reproduces_greedy_decoding():
+    # the dflash loop on Inkling's transactional verify: taps of the bundled head's kind, the
+    # drafter's ctx window past the target's 8-token one, chains only (no tree on a VLM target)
+    from mlx_dspark.generate import dflash_generate, greedy_generate
+    from mlx_dspark.target import Target
+
+    t = Target(_tiny_inkling(), tokenizer=None)
+    d = _tiny_inkling_dflash2(t)
+    prompt = [1, 5, 9, 2, 7, 3, 11, 4, 6, 8, 10, 12, 14]
+    ref = greedy_generate(t, _CharTok(), prompt_ids=prompt, max_new_tokens=30).token_ids
+    for cap in (None, 3):
+        res = dflash_generate(t, _CharTok(), d, prompt_ids=prompt, max_new_tokens=30,
+                              max_draft_tokens=cap, tree=0)
+        assert res.token_ids[:30] == ref[:30], cap
+        assert res.tree_rounds == 0
+    sampled = dflash_generate(t, _CharTok(), d, prompt_ids=prompt, max_new_tokens=12,
+                              temperature=0.8, seed=1)
+    assert len(sampled.token_ids) >= 12 and max(sampled.token_ids) < 60

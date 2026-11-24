@@ -527,16 +527,9 @@ class Engine:
             checkpoint = not target_cache_reusable(self.target.make_cache())
         except Exception:  # noqa: BLE001
             return None
-        make_ctx = self.drafter.make_ctx_cache if self.mode == "dspark" else None
+        make_ctx = (self.drafter.make_ctx_cache if self.mode in ("dspark", "dflash")
+                    else None)          # dflash: [DFlashCtxWindow] (DFlashDraftModel)
         if self.mode == "dflash":
-            from .dflash_model import DFlashCtxWindow
-
-            cfg = self.drafter.config
-            cap = None
-            if cfg.sliding_window and all(
-                    t == "sliding_attention" for t in cfg.layer_types):
-                cap = int(cfg.sliding_window) - 1
-            make_ctx = lambda: [DFlashCtxWindow(cap)]  # noqa: E731
             checkpoint = True
         return PrefixCache(self.target.make_cache, make_ctx,
                            l2_dir=l2_dir, max_ram_bytes=max(0, max_ram_mb) * 1024 * 1024,
@@ -1176,10 +1169,13 @@ class Engine:
         where it was derived (see the call site in :meth:`_begin_request`)."""
         eff_cap = self.max_draft_tokens
         if self._depth_capper is not None and self.mode in ("dspark", "dflash"):
-            from .calibrate import STATIC_PRIOR_P
+            from .calibrate import static_prior
             default = (self.max_draft_tokens if self.max_draft_tokens is not None
                        else self._depth_capper.max_cap)          # dflash: full block
-            eff_cap = self._depth_capper.depth_adjusted_cap(context, default, STATIC_PRIOR_P)
+            # the prior the default was derived with (the pair's measured one where the
+            # registry has it): at another prior the depth model would shrink the cap at once
+            p = static_prior(self.target_repo, self.mode, self.drafter_repo)
+            eff_cap = self._depth_capper.depth_adjusted_cap(context, default, p)
         return eff_cap
 
     def _end_prefill_progress(self, run) -> None:
@@ -2064,7 +2060,8 @@ class BatchEngine:
                 self._run_serial(j)
             return
         session = Session(
-            eng.target, eng.tokenizer, eng.drafter if eng.mode == "dspark" else None,
+            eng.target, eng.tokenizer,
+            eng.drafter if eng.mode in ("dspark", "dflash") else None,
             capacity=self.max_batch, solo=self._inkling_solo,
             waiting=lambda: not deferred and not self._q.empty())
         live: dict[int, _Job] = {}
@@ -2173,11 +2170,24 @@ class BatchEngine:
         the session's streamer (so it can be asked to yield)."""
         eng = self.engine
         temperature, top_p, top_k = req.sampling
+        cap = req.meta.plan.eff_cap if fresh else eng._cap_at(len(prompt_ids))
+        if eng.mode == "dflash":
+            # the drafter's state is the request's DFlashCtxWindow (req.ctx): restored from it,
+            # and left current when the loop yields (see dflash_generate's ``_streamer``)
+            return dflash_generate(
+                eng.target, eng.tokenizer, eng.drafter, prompt_ids=prompt_ids,
+                cache=req.cache, ctx_caches=req.ctx, reuse_len=reuse_len,
+                max_new_tokens=max_new_tokens, max_draft_tokens=cap,
+                cap_controller=eng.cap_controller,
+                temperature=temperature, top_p=top_p, top_k=top_k, on_round=req.on_round,
+                on_prefill=req.on_prefill if fresh else None,
+                prefill_marks=req.prefill_marks if fresh else None,
+                on_prefill_chunk=req.on_prefill_chunk if fresh else None,
+                tree=eng.tree_nodes, _streamer=req.streamer)
         return speculative_generate(
             eng.target, eng.tokenizer, eng.drafter, prompt_ids=prompt_ids,
             cache=req.cache, ctx_caches=req.ctx, reuse_len=reuse_len,
-            max_new_tokens=max_new_tokens,
-            max_draft_tokens=req.meta.plan.eff_cap if fresh else eng._cap_at(len(prompt_ids)),
+            max_new_tokens=max_new_tokens, max_draft_tokens=cap,
             cap_controller=eng.cap_controller, lookup_drafts=eng.lookup_drafts,
             lookup_long_draft=eng.lookup_long_draft,
             confidence_threshold=eng.confidence_threshold,
@@ -2237,7 +2247,8 @@ class BatchEngine:
 def maybe_batch_engine(engine: Engine, max_batch: int):
     """Wrap ``engine`` in a :class:`BatchEngine` iff batching can help and is safe here: opt-in
     (``max_batch > 1``), a batchable mlx-lm target, and a mode with a batched kernel
-    (dspark/baseline). Otherwise return the engine unchanged (serialized).
+    (dspark/baseline; Inkling 2 also dflash — its session batches plain decoding and runs
+    either drafter for a request that is alone). Otherwise return the engine unchanged.
 
     The two modes have different requirements: baseline batching needs only a batched forward
     (:func:`batchable`, which covers the qwen3_5 hybrids), while dspark batching additionally
@@ -2246,12 +2257,14 @@ def maybe_batch_engine(engine: Engine, max_batch: int):
     caches cannot roll back."""
     from .batch_engine import batch_spec_supported, batchable
 
-    if max_batch <= 1 or engine.mode not in ("dspark", "baseline"):
+    inkling = getattr(engine, "is_inkling", False)
+    if max_batch <= 1 or engine.mode not in (("dspark", "dflash", "baseline") if inkling
+                                             else ("dspark", "baseline")):
         return engine
-    if getattr(engine, "is_inkling", False):
+    if inkling:
         # Inkling 2 (an mlx-vlm target): batched plain decoding on its fused forward, the
-        # drafter for a request that is alone (inkling_batch) — when the pieces it stands on
-        # cleared their self-test at load.
+        # drafter — its DSpark head or a DFlash-lineage one — for a request that is alone
+        # (inkling_batch) — when the pieces it stands on cleared their self-test at load.
         from .inkling_batch import supported
 
         if supported(engine.target.model.language_model):

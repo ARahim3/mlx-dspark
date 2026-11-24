@@ -226,6 +226,69 @@ def test_transform_unary_applies_multiplier_then_softcap():
     assert out.dtype == mx.float32
 
 
+def test_transform_unary_after_correction_leaves_the_unary_raw():
+    model = _tiny_model(_tiny_config(output_multiplier=0.5, final_logit_softcapping=4.0,
+                                     selector_softcap_mode="after_correction"))
+    out = model._transform_unary(mx.array([[1.0, -2.0, 8.0]]))
+    assert np.allclose(np.array(out[0]), 0.5 * np.array([1.0, -2.0, 8.0]), atol=1e-6)
+
+
+def test_after_correction_softcap_caps_the_selector_sum_not_the_unary():
+    """incoai/Inkling-2-Mini-DFlash2 declares selector_softcap_mode: after_correction — its
+    shipped SGLang patch's ``post_softcap``: scores = cap·tanh((raw unary + bilinear) / cap).
+    The default (every earlier head) caps the unary logits, then adds the bilinear term."""
+    cap = 4.0
+    fused = mx.random.normal((1, 5, 128))
+    block = mx.array([[7] + [3] * 7])
+    for mode in ("after_correction", "before_correction"):
+        model = _tiny_model(_tiny_config(final_logit_softcapping=cap, selector_softcap_mode=mode))
+        cand, scores, hidden = model._lattice(block, fused, model.make_cache(), 7, 7)
+        logits = np.array(model.lm_head(hidden), dtype=np.float32)
+        cand_np = np.array(cand)
+        raw = np.take_along_axis(logits, cand_np, axis=-1)
+        if mode == "after_correction":
+            want = cap * np.tanh(_np_lattice(model.candidate_selector, cand_np, raw, hidden, 7)
+                                 / cap)
+        else:
+            want = _np_lattice(model.candidate_selector, cand_np, cap * np.tanh(raw / cap),
+                               hidden, 7)
+        assert np.allclose(np.array(scores), want, atol=1e-4), mode
+    # the cap is monotonic per row: the greedy chain is the raw sum's
+    model = _tiny_model(_tiny_config(final_logit_softcapping=cap,
+                                     selector_softcap_mode="after_correction"))
+    cand, scores, hidden = model._lattice(block, fused, model.make_cache(), 7, 7)
+    raw = np.take_along_axis(np.array(model.lm_head(hidden), dtype=np.float32), np.array(cand),
+                             axis=-1)
+    raw_sum = mx.array(_np_lattice(model.candidate_selector, np.array(cand), raw, hidden, 7))
+    assert model.candidate_selector.walk_greedy(scores, cand).tolist() == \
+        model.candidate_selector.walk_greedy(raw_sum, cand).tolist()
+
+
+def test_a_padded_target_vocabulary_bounds_candidates_logits_and_q():
+    """``valid_vocab`` (a padded head's real vocabulary, set by bind() — Inkling 2: 200,058 of
+    201,024 rows): no candidate, logit column or sampled q reaches past it, even when the
+    padding rows would win the top-K."""
+    model = _tiny_model()
+    head = model.lm_head
+    boost = mx.concatenate([mx.zeros((20,)), mx.full((12,), 100.0)])
+    model.lm_head = lambda h: head(h) + boost              # ids 20..31 would be every top-K
+    fused = mx.random.normal((1, 5, 128))
+    block = mx.array([[7] + [3] * 7])
+    _, cand, _ = model.select_block(block, fused, model.make_cache(), cap=7, anchor_id=7,
+                                    uniforms=mx.random.uniform(shape=(7,)))
+    assert int(mx.min(cand)) >= 20                          # unbounded: the padding wins
+    model.valid_vocab = 20
+    assert model.vocab_out == 20
+    ids, cand, q_rows = model.select_block(block, fused, model.make_cache(), cap=7,
+                                           anchor_id=7, uniforms=mx.random.uniform(shape=(7,)))
+    assert int(mx.max(cand)) < 20 and int(mx.max(ids)) < 20
+    dense = mx.put_along_axis(mx.zeros((7, model.vocab_out)), cand, q_rows, axis=1)
+    assert np.allclose(np.array(dense.sum(axis=-1)), 1.0, atol=1e-5)
+    assert model(block, fused, model.make_cache(), logits_start=1).shape[-1] == 20
+    greedy = model.select_block(block, fused, model.make_cache(), cap=7, anchor_id=7)[0]
+    assert int(mx.max(greedy)) < 20
+
+
 # ---------------------------------------------------------------- select_block
 
 def test_select_block_greedy_shapes_and_in_graph():
@@ -339,6 +402,42 @@ def test_load_dflash2_reads_muse_transform_fields_nested(tmp_path):
     assert abs(cfg.output_multiplier - 0.19611613513818404) < 1e-9
 
 
+@pytest.mark.parametrize("vocab", [200058, 248320, 4096])
+def test_topk_ids_is_the_argpartition_set(vocab):
+    # the two-stage selection (block maxima -> the k best blocks -> their top-k) returns the
+    # same SET as one argpartition over the row, also when the winners crowd into one block and
+    # when the vocabulary is not a multiple of the block (a -inf pad)
+    from mlx_dspark.dflash_model import topk_ids
+
+    mx.random.seed(5)
+    lg = mx.random.normal((7, vocab)) * 3
+    lg[2, 1000:1013] = 40.0 + mx.random.normal((13,))        # 13 of row 2's top-16 in one block
+    lg[4, vocab - 9:] = 50.0 + mx.random.normal((9,))         # winners inside the padded block
+    got = np.sort(np.array(topk_ids(lg, 16)), axis=-1)
+    want = np.sort(np.array(mx.argpartition(lg, kth=-16, axis=-1)[:, -16:]), axis=-1)
+    assert np.array_equal(got, want)
+    assert topk_ids(lg, 16).dtype == mx.int32
+
+
+def test_load_dflash2_reads_the_selector_softcap_mode(tmp_path):
+    _, cfg = load_dflash(_write_dflash2_ckpt(tmp_path), quantize=False)
+    assert cfg.selector_softcap_mode == "before_correction"           # every earlier head
+    cfg_dict = json.loads(json.dumps(DFLASH2_MIN))
+    cfg_dict["dflash_config"].update(selector_softcap_mode="after_correction",
+                                     final_logit_softcapping=30.0)
+    (tmp_path / "b").mkdir()
+    _, cfg = load_dflash(_write_dflash2_ckpt(tmp_path / "b", cfg_dict), quantize=False)
+    assert cfg.selector_softcap_mode == "after_correction"
+    assert cfg.final_logit_softcapping == 30.0
+
+
+def test_load_dflash2_refuses_an_unknown_selector_softcap_mode(tmp_path):
+    cfg_dict = json.loads(json.dumps(DFLASH2_MIN))
+    cfg_dict["dflash_config"]["selector_softcap_mode"] = "sideways"
+    with pytest.raises(ValueError, match="selector_softcap_mode"):
+        load_dflash(_write_dflash2_ckpt(tmp_path, cfg_dict), quantize=False)
+
+
 def test_load_dflash2_quantizes_backbone_but_not_conv_or_selector(tmp_path):
     path = _write_dflash2_ckpt(tmp_path)
     drafter, _ = load_dflash(path, quantize=True, bits=4, group_size=32)
@@ -357,3 +456,40 @@ def test_dflash2_architecture_without_selector_fields_refused_with_reason(tmp_pa
     (tmp_path / "config.json").write_text(json.dumps(cfg_dict))
     with pytest.raises(ValueError, match="selector_rank"):
         load_dflash(str(tmp_path))
+
+
+# ---------------------------------------------------------------- the drafter's state as a window
+
+def test_ctx_window_extend_appends_a_continuation_and_replaces_after_a_gap():
+    from mlx_dspark.dflash_model import DFlashCtxWindow
+
+    w = DFlashCtxWindow(cap=5)
+    rows = mx.arange(4 * 2, dtype=mx.float32).reshape(1, 4, 2)
+    w.extend(rows[:, :3], start=10)
+    assert (w.start, w.end) == (10, 13)
+    w.extend(rows[:, 3:], start=13)                      # continues: appended
+    assert (w.start, w.end, w.rows) == (10, 14, 4)
+    w.extend(rows, start=14)                             # continues past the cap: last 5 kept
+    assert (w.start, w.end, w.rows) == (13, 18, 5)
+    assert mx.array_equal(w.k[:, -4:], rows)
+    w.extend(rows[:, :2], start=40)                      # a gap: nothing to continue
+    assert (w.start, w.end, w.rows) == (40, 42, 2)
+
+
+def test_update_context_projects_what_the_window_keeps():
+    # the batched session's interface: fused target rows in, projected rows in the window; a
+    # chunk longer than the window projects only its last window-1 rows
+    model = _tiny_model(_tiny_config(layer_types=("sliding_attention",) * 2, sliding_window=6))
+    assert model.ctx_window_rows == 5
+    (window,) = model.make_ctx_cache()
+    assert window.cap == 5 and window.rows == 0
+    fused = mx.random.normal((1, 9, 128))
+    model.update_context(fused[:, :2], ctx_offset=0, ctx_caches=[window])
+    model.update_context(fused[:, 2:], ctx_offset=2, ctx_caches=[window])
+    assert (window.start, window.end) == (4, 9)
+    assert mx.allclose(window.k, model.project_ctx(fused)[:, 4:], atol=1e-5)
+    (w2,) = model.make_ctx_cache()
+    model.update_context(fused, ctx_offset=0, ctx_caches=[w2])         # one long chunk
+    assert (w2.start, w2.end) == (4, 9) and mx.allclose(w2.k, window.k, atol=1e-5)
+    full = _tiny_model()                                 # a full-attention layer: unbounded
+    assert full.ctx_window_rows is None and full.make_ctx_cache()[0].cap is None

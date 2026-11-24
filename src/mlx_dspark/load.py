@@ -304,9 +304,20 @@ REGISTRY = [
     # chat / code / math — content-dependent, so it stays off). Lossless (token forcing against the
     # STOCK forward: 0.91% near-tie rate vs stock greedy's own 1.37%, no excess large-margin
     # event). See NOTES "Inkling-2-Mini ported", "Inkling fused forward".
+    # `--mode auto` runs Inco AI's DFlash 2 head instead (incoai/Inkling-2-Mini-DFlash2, a 990 MB
+    # second download; its shipped SGLang patch defines the contract: the bundled head's taps,
+    # embed_norm ∘ embed_tokens, the real 200,058-token vocabulary, the selector's softcap after
+    # its correction). Measured 2026-11-24, paired in one run (M4 Pro, mlx 0.32.4, `benchmark
+    # --trials 3`): **cap 6 = 1.81x** (63.5 tok/s; 1.23x chat / 2.13x code / 2.08x math, accept
+    # 4.19) where the bundled head gives 1.36x (47.6); `--target-bits 8` 72.5 vs 54.8. Its cap is
+    # derived at the pair's measured acceptance prior (`accept_p`, a geometric fit of caps 3-7:
+    # 0.80-0.83), not the DSpark-fitted 0.70 that derived cap 3 (59.0). Lossless by the same gate
+    # (cap 6: 22 / 2,048 near-tie mismatches, the stock reference's own 22). `--max-batch` takes
+    # it as the lone request's drafter. See NOTES "DFlash2 on Inkling-2-Mini".
     {"id": "inkling-2-mini", "target": "thinkingmachines/Inkling-2-Mini",
      "dspark": "thinkingmachines/Inkling-2-Mini", "bundled_head": True, "lookup_drafts": False,
-     "model_type": "inkling2_loop", "ram": "~22 GB", "speedup": "~1.4× (1.7× math)"},
+     "dflash": "incoai/Inkling-2-Mini-DFlash2", "mode": "dflash", "accept_p": {"dflash": 0.80},
+     "model_type": "inkling2_loop", "ram": "~22 GB", "speedup": "~1.8× (2.1× code / math)"},
 ]
 
 # legacy `--family` / load_pair("qwen3") values -> a concrete target repo (deprecated).
@@ -383,6 +394,19 @@ def lookup_drafts_default(target: str | None) -> bool:
 # Registry rows may carry their own measured "drafter_window" (0 = full context).
 # NOTES "Engine pass 2026-09-27" §4.
 DRAFTER_WINDOW_DEFAULT = 4096
+
+
+def registry_accept_prior(target: str | None, mode: str, drafter: str | None) -> float | None:
+    """The registry row's measured acceptance prior (``accept_p``) for ``mode``, or None — also
+    when ``drafter`` is not the row's own drafter for that mode (another head's acceptance is
+    unknown). See :func:`~mlx_dspark.calibrate.static_prior`."""
+    entry = _registry_entry(target) if target else None
+    prior = (entry or {}).get("accept_p", {}).get(mode)
+    if not prior or not drafter or not entry.get(mode):
+        return None
+    own = _registry_drafter(entry, mode, target)
+    same = os.path.basename(str(drafter).rstrip("/")).lower()
+    return float(prior) if same == os.path.basename(str(own).rstrip("/")).lower() else None
 
 
 def drafter_window_default(target: str | None) -> int | None:
@@ -928,6 +952,13 @@ def load_dflash(repo_or_path: str, *, quantize: bool = True, bits: int = 4, grou
     block_causal = dfc.get("draft_block_causal")
     if block_causal is None:
         block_causal = cfg.get("is_causal")
+    # Where the selector's softcap applies (incoai/Inkling-2-Mini-DFlash2 declares
+    # after_correction; its shipped SGLang patch defaults every other head to before_correction).
+    softcap_mode = str(dfc.get("selector_softcap_mode") or "before_correction")
+    if softcap_mode not in ("before_correction", "after_correction"):
+        raise ValueError(
+            f"{repo_or_path}: dflash_config.selector_softcap_mode={softcap_mode!r} — mlx-dspark "
+            f"implements before_correction and after_correction.")
     config = DFlashConfig(
         hidden_size=cfg["hidden_size"], num_hidden_layers=cfg["num_hidden_layers"],
         num_attention_heads=cfg["num_attention_heads"], num_key_value_heads=cfg["num_key_value_heads"],
@@ -946,6 +977,7 @@ def load_dflash(repo_or_path: str, *, quantize: bool = True, bits: int = 4, grou
         conv_kernel_size=int(dfc.get("conv_kernel_size") or 0),
         conv_group_size=int(dfc.get("conv_group_size") or 16),
         output_multiplier=float(dfc.get("output_multiplier") or 1.0),
+        selector_softcap_mode=softcap_mode,
         block_causal=None if block_causal is None else bool(block_causal),
         **dspine,
     )

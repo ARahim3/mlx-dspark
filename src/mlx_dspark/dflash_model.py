@@ -170,6 +170,11 @@ class DFlashConfig:
     output_multiplier: float = 1.0   # scales the selector's unary logits (muse_glimmer); the
     # bilinear term is trained against the TRANSFORMED logit scale, so unlike the DSpark
     # reuse-head rule (raw lm_head only) the multiplier/softcap must be applied here.
+    # Where the selector's softcap applies (dflash_config.selector_softcap_mode, the reference
+    # patch shipped with incoai/Inkling-2-Mini-DFlash2): "before_correction" (the default, every
+    # earlier head) caps the unary logits and adds the bilinear term to them; "after_correction"
+    # (the Inkling 2 head) adds the bilinear term to the RAW unary logits and caps the sum.
+    selector_softcap_mode: str = "before_correction"
     # Block attention direction — z-lab's / SGLang's top-level `is_causal`, DSpine's
     # `dflash_config.draft_block_causal`. None = the z-lab default: sliding-window layers attend
     # the block causally, full-attention layers bidirectionally (block diffusion). True / False
@@ -351,6 +356,31 @@ class CandidateSelector(nn.Module):
     def walk_sampled(self, scores, candidate_ids, uniforms, temperature: float):
         """Sampled walk -> (drafted ids [g], q rows [g, K] the tokens were drawn from)."""
         return walk_sampled(scores, candidate_ids, uniforms, temperature)
+
+
+TOPK_BLOCK = 256
+
+
+def topk_ids(logits, k: int, block: int = TOPK_BLOCK):
+    """Ids ``[R, k]`` (int32, unordered) of the ``k`` largest values in each row of ``logits
+    [R, V]``: the set ``mx.argpartition`` over the whole row gives, in two cheap stages. Every
+    element of a row's top-k lies in a ``block`` whose maximum is at least the k-th largest
+    value, and at most ``k`` blocks qualify — so the top-k of the ``k`` blocks with the largest
+    maxima IS the row's top-k (an exact tie at the k-th value may resolve to another member of
+    the tie). A draft head's candidates over a 200k vocabulary: 7 rows 0.9 -> ~0.15 ms on an M4
+    Pro (NOTES "DFlash2 on Inkling-2-Mini"). Small vocabularies take one argpartition."""
+    rows, v = int(logits.shape[0]), int(logits.shape[-1])
+    nb = -(-v // block)
+    if nb < 4 * k:
+        return mx.argpartition(logits, kth=-k, axis=-1)[:, -k:].astype(mx.int32)
+    pad = nb * block - v
+    if pad:
+        logits = mx.concatenate([logits, mx.full((rows, pad), -float("inf"), logits.dtype)], axis=1)
+    blocks = logits.reshape(rows, nb, block)
+    best = mx.argpartition(blocks.max(axis=-1), kth=-k, axis=-1)[:, -k:]          # [R, k] blocks
+    cand = mx.take_along_axis(blocks, best[..., None], axis=1).reshape(rows, k * block)
+    pos = mx.argpartition(cand, kth=-k, axis=-1)[:, -k:]                          # [R, k]
+    return (mx.take_along_axis(best, pos // block, axis=1) * block + pos % block).astype(mx.int32)
 
 
 def walk_greedy(scores, candidate_ids):
@@ -557,6 +587,20 @@ class DFlashDraftModel(nn.Module):
         self.lm_head = None
         self._head_rows_src = None       # the module whose rows ARE the head (see head_rows)
         self.embed_scale = 1.0
+        self.valid_vocab = None          # the bound target's real vocabulary (see vocab_out)
+
+    @property
+    def vocab_out(self) -> int:
+        """Token ids a draft may take and the width of a sampled round's q: the bound target's
+        REAL vocabulary when its head is padded past it (Inkling 2: 200,058 of 201,024 rows —
+        the target's logits stop there, and the reference patch limits the candidates to it),
+        else the config's."""
+        return int(self.valid_vocab or self.config.vocab_size)
+
+    @property
+    def _softcap_after(self) -> bool:
+        return (self.config.selector_softcap_mode == "after_correction"
+                and self.config.final_logit_softcapping is not None)
 
     @property
     def selects_paths(self) -> bool:
@@ -579,7 +623,22 @@ class DFlashDraftModel(nn.Module):
         return max(2, min(bs, int(cap) + 1)) if self.block_causal else bs
 
     def bind(self, target_model):
-        """Wire the drafter to the *target's* embed_tokens + lm_head (DFlash reuses them)."""
+        """Wire the drafter to the *target's* embed_tokens + lm_head (DFlash reuses them).
+
+        Inkling 2 binds what its own draft heads read (SGLang's ``get_input_embeddings`` for the
+        model, which ``dflash_worker_v2`` embeds the block with): the FULL input embedding
+        ``embed_norm ∘ embed_tokens``, the head's fp32 logits, and its real vocabulary
+        (:func:`~mlx_dspark.inkling.dflash_bindings`)."""
+        from .inkling import dflash_bindings
+
+        inkling = dflash_bindings(target_model)
+        if inkling is not None:
+            embed, head, head_src, vocab = inkling
+            self.embed_tokens, self.embed_scale = embed, 1.0
+            self.lm_head, self._head_rows_src = head, head_src
+            self.valid_vocab = vocab
+            return self
+        self.valid_vocab = None
         if hasattr(target_model, "embed_tokens"):
             inner = target_model
         elif hasattr(target_model, "model") and hasattr(target_model.model, "embed_tokens"):
@@ -620,6 +679,33 @@ class DFlashDraftModel(nn.Module):
             raise TypeError(f"{type(src).__name__} exposes no head weight rows")
         return weight[ids]
 
+    # -- the drafter's whole state as a window of projected ctx rows: the prefix cache's
+    # checkpoints and the batched session (inkling_batch.Session) hold it this way ----------
+    @property
+    def ctx_window_rows(self) -> int | None:
+        """Projected ctx rows the drafter can ever attend: ``sliding_window - 1`` when every
+        layer is sliding, unbounded (None) when any layer attends the whole context."""
+        cfg = self.config
+        if cfg.sliding_window and cfg.layer_types and all(
+                t == "sliding_attention" for t in cfg.layer_types):
+            return int(cfg.sliding_window) - 1
+        return None
+
+    def make_ctx_cache(self) -> list:
+        """``[DFlashCtxWindow]``: what :func:`~mlx_dspark.generate.dflash_generate` takes as
+        ``ctx_caches`` to restore the drafter from, and keeps current when it yields."""
+        return [DFlashCtxWindow(self.ctx_window_rows)]
+
+    def update_context(self, target_hidden, ctx_offset: int = 0, ctx_caches=None) -> None:
+        """Add the fused target rows of positions ``[ctx_offset, ctx_offset + n)`` to the
+        window in ``ctx_caches`` (projected; only the rows the window can keep are projected).
+        The DSpark drafters' interface: chunked prefill and a batched session's steps feed it."""
+        n = int(target_hidden.shape[1])
+        keep = self.ctx_window_rows
+        if keep is not None and n > keep:
+            target_hidden, ctx_offset = target_hidden[:, n - keep:], int(ctx_offset) + n - keep
+        ctx_caches[0].extend(self.project_ctx(target_hidden), start=int(ctx_offset))
+
     def make_cache(self):
         caches = []
         for layer_type in self.config.layer_types:
@@ -658,6 +744,9 @@ class DFlashDraftModel(nn.Module):
         (rows 1.., see :meth:`DSpineCodeBridge.__call__`) its refinement redoes; ``None`` else."""
         h = self.embed_tokens(inputs) * self.embed_scale
         h_ctx = self.project_ctx(target_hidden)
+        # the ctx rows this call appends, projected: a loop that must hand the drafter's state
+        # on (dflash_generate under a batched session) keeps them for its DFlashCtxWindow
+        object.__setattr__(self, "_ctx_rows", h_ctx)
         bridge = self.selected_prefix_bridge
         last = len(self.layers) - 1
         normed, stash = None, None
@@ -677,6 +766,8 @@ class DFlashDraftModel(nn.Module):
 
     def __call__(self, inputs, target_hidden, cache, logits_start: int = 0):
         logits = self.lm_head(self.forward_hidden(inputs, target_hidden, cache, logits_start))
+        if self.valid_vocab is not None:
+            logits = logits[..., : self.vocab_out]
         if self.config.final_logit_softcapping is not None:
             cap = self.config.final_logit_softcapping
             logits = mx.tanh(logits / cap) * cap
@@ -686,11 +777,13 @@ class DFlashDraftModel(nn.Module):
         """DFlash 2 unary-logit transform (reference ``_transform_unary_logits``): fp32,
         then the target's output multiplier + softcap. The bilinear selector term is
         trained against THIS scale — feeding raw logits would misweight it (the inverse
-        of the DSpark reuse-head raw-lm_head rule; the reference code is the proof)."""
+        of the DSpark reuse-head raw-lm_head rule; the reference code is the proof).
+        ``selector_softcap_mode: after_correction`` moves the softcap past the correction
+        (:meth:`_lattice`): the unary logits stay raw here."""
         logits = logits.astype(mx.float32)
         if self.config.output_multiplier != 1.0:
             logits = logits * self.config.output_multiplier
-        if self.config.final_logit_softcapping is not None:
+        if self.config.final_logit_softcapping is not None and not self._softcap_after:
             cap = self.config.final_logit_softcapping
             logits = mx.tanh(logits / cap) * cap
         return logits
@@ -724,13 +817,20 @@ class DFlashDraftModel(nn.Module):
             return self._bridge_lattice(block, target_hidden, cache, cap, anchor_id)
         sel = self.candidate_selector
         hidden = self.forward_hidden(block, target_hidden, cache, logits_start=1)[0][:cap]
-        # trim a padded target head to the real vocab (reference: weight[:org_vocab_size])
-        # — a candidate id beyond it would gather garbage codebook rows
-        logits = self.lm_head(hidden)[..., : self.config.vocab_size]          # [cap, V]
-        k = sel.top_k
-        candidate_ids = mx.argpartition(logits, kth=-k, axis=-1)[:, -k:].astype(mx.int32)
+        # trim a padded target head to the real vocab (reference: weight[:org_vocab_size],
+        # and the Inkling 2 patch's valid_vocab_size) — a candidate id beyond it would gather
+        # garbage codebook rows, or propose a token the target's logits do not cover
+        logits = self.lm_head(hidden)[..., : self.vocab_out]                  # [cap, V]
+        candidate_ids = topk_ids(logits, sel.top_k)
         unary = self._transform_unary(mx.take_along_axis(logits, candidate_ids, axis=-1))
-        return candidate_ids, sel.lattice(candidate_ids, unary, hidden, anchor_id), hidden
+        scores = sel.lattice(candidate_ids, unary, hidden, anchor_id)
+        if self._softcap_after:
+            # the reference patch's CandidateSelector.post_softcap: the trained selector caps
+            # unary + correction together (monotonic per row, so the greedy walk is the raw
+            # sum's; the sampled walk's softmax is not)
+            cap_v = self.config.final_logit_softcapping
+            scores = mx.tanh(scores / cap_v) * cap_v
+        return candidate_ids, scores, hidden
 
     def _bridge_lattice(self, block, target_hidden, cache, cap: int, anchor_id: int):
         """DSpine: backbone (``cap + 1`` rows on a causal block) -> head top-K per slot ->
@@ -739,9 +839,8 @@ class DFlashDraftModel(nn.Module):
         bridge = self.selected_prefix_bridge
         hidden, stash = self._forward(block, target_hidden, cache, logits_start=1, want_stash=True)
         hidden = hidden[0][:cap]
-        logits = self.lm_head(hidden)[..., : self.config.vocab_size]          # [cap, V]
-        k = self.config.bridge_top_k
-        candidate_ids = mx.argpartition(logits, kth=-k, axis=-1)[:, -k:].astype(mx.int32)
+        logits = self.lm_head(hidden)[..., : self.vocab_out]                  # [cap, V]
+        candidate_ids = topk_ids(logits, self.config.bridge_top_k)
         scores = bridge.transition_table(
             stash["raw"][0][:cap], stash["rms"][0][:cap], stash["q"][0][:cap],
             candidate_ids, anchor_id, self.head_rows, self.norm.weight, self.norm.eps)
@@ -792,6 +891,13 @@ class DFlashCtxWindow:
             h_ctx = h_ctx[:, -self.cap:]
         self.k = h_ctx
         self.v = mx.array([end - h_ctx.shape[1]], dtype=mx.int32)
+
+    def extend(self, h_ctx, start: int) -> None:
+        """Add projected rows beginning at position ``start``: appended when they continue the
+        window (``start == end``), else they replace it (a gap leaves nothing to continue)."""
+        if self.k is not None and start == self.end:
+            h_ctx, start = mx.concatenate([self.k, h_ctx], axis=1), self.start
+        self.set(h_ctx, end=int(start) + int(h_ctx.shape[1]))
 
     def trim_to(self, n: int) -> None:
         """Drop rows at positions >= n (prefix-cache rung/store trim). Rows before the

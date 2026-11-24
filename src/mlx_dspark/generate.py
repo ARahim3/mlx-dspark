@@ -677,6 +677,7 @@ def dflash_generate(
     prefill_marks=None,
     on_prefill_chunk=None,
     tree: int | None = None,
+    _streamer=None,
 ) -> GenResult:
     """Speculative decoding with a **z-lab DFlash** (block-diffusion) drafter.
 
@@ -721,6 +722,12 @@ def dflash_generate(
     that round — the win on grounded re-emission that DFlash's learned drafter can't guarantee.
     A copy round skips the draft call, so its committed ctx rides ``pending_ctx`` (concatenated)
     for the next drafter round to append. Lossless (the target verifies every copied token).
+
+    ``_streamer``: a batched session (``inkling_batch.Session``) runs one request's lone
+    stretches through this loop and passes the streamer it keeps across them; when it asks the
+    loop to yield at a round boundary, the ``DFlashCtxWindow`` in ``ctx_caches`` is left ending
+    where the target cache does (the drafter's whole state), so the session's batched steps
+    continue it and the next stretch restores the drafter from it.
     """
     if seed is not None:
         mx.random.seed(seed)
@@ -757,7 +764,7 @@ def dflash_generate(
     target_model.reset_spec()                          # hybrid targets: clear capture state
     dcache = drafter.make_cache()                      # persistent draft ctx cache
     window = ctx_caches[0] if ctx_caches else None     # DFlashCtxWindow (see dflash_model)
-    st = _Streamer(tokenizer, eos_ids, on_text, stop)
+    st = _streamer if _streamer is not None else _Streamer(tokenizer, eos_ids, on_text, stop)
     t0 = time.time()
 
     # --- restore the drafter's ctx from the stored window (prefix-cache hit). A window
@@ -770,6 +777,24 @@ def dflash_generate(
         for c in dcache:
             skip_ctx(c, window.start)
         drafter.append_ctx(restored, dcache)
+
+    # Under a batched session the loop may have to hand the drafter's state on (it yields at a
+    # round boundary when another request wants in): keep the projected ctx rows it appends —
+    # each draft call's (``drafter._ctx_rows``), the restored window's — so the window can be
+    # left ending where the target cache does. A bounded tail: the window keeps no more.
+    track = window is not None and _streamer is not None
+    tail: list = []
+
+    def _keep(rows):
+        tail.append(rows)
+        if window.cap is None:
+            return
+        total = sum(int(r.shape[1]) for r in tail)
+        while len(tail) > 1 and total - int(tail[0].shape[1]) >= window.cap:
+            total -= int(tail.pop(0).shape[1])
+
+    if track and restored is not None:
+        _keep(restored)
 
     # --- prefill the suffix (chunked), accumulating the fused states the first draft call
     # consumes; at each server mark, refresh the window (the last <= cap projected rows
@@ -939,8 +964,10 @@ def dflash_generate(
                 draft_arr, cand_ids, q_rows = drafter.select_block(
                     block, pending_ctx, dcache, cap=cap, anchor_id=pending,
                     uniforms=uniforms, temperature=temperature)
+                # as wide as the target's logits: a padded head's real vocabulary (Inkling 2)
                 q_probs = mx.put_along_axis(
-                    mx.zeros((cap, drafter.config.vocab_size)), cand_ids, q_rows, axis=1)
+                    mx.zeros((cap, getattr(drafter, "vocab_out", drafter.config.vocab_size))),
+                    cand_ids, q_rows, axis=1)
             else:
                 head = drafter(block, pending_ctx, dcache, logits_start=1)[0][:cap]
                 q_probs = truncate_probs(mx.softmax(head / temperature, axis=-1), top_p, top_k)
@@ -1019,6 +1046,8 @@ def dflash_generate(
             drafted = draft_arr.tolist()
             tt = tt_arr.tolist()
             committed = drafted[:n] + [tt[n]]            # accepted prefix + bonus
+        if track:
+            _keep(drafter._ctx_rows)                     # the ctx rows this round's draft appended
         target_forwards += 1
         accept_lengths.append(len(committed))
         if cap_controller is not None:
@@ -1050,6 +1079,13 @@ def dflash_generate(
         pending = out_ids[-1]        # eos mid-committed ends the loop (not committed[-1])
         st.update(out_ids)
     target_model.flush_pending()      # deferred-commit rows -> stored state (storable caches)
+    if track and getattr(st, "yielded", False):
+        # handed back to the session mid-generation: the window ends where the target cache
+        # does — every committed token but the pending one — with the rows of the last round,
+        # which the next draft call would have appended, projected here
+        _keep(drafter.project_ctx(pending_ctx))
+        rows = tail[0] if len(tail) == 1 else mx.concatenate(tail, axis=1)
+        window.set(rows, end=len(ids) + len(out_ids) - 1)
     st.flush()
 
     secs = time.time() - t0

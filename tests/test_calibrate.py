@@ -567,3 +567,33 @@ def test_split_window_from_costs_finds_the_gqa16_cliff_the_old_probe_missed():
     # no cliff at all -> None (self-disables)
     flat = {q: 0.001 * q for q in range(1, 17)}
     assert split_window_from_costs(flat, 5) is None
+
+
+# ---------------------------------------------------------------- the pair's acceptance prior
+
+def test_registry_accept_prior_is_the_pairs_own_drafter_only():
+    from mlx_dspark.calibrate import STATIC_PRIOR_P, static_prior
+    from mlx_dspark.load import registry_accept_prior
+
+    ink, d2 = "thinkingmachines/Inkling-2-Mini", "incoai/Inkling-2-Mini-DFlash2"
+    assert registry_accept_prior(ink, "dflash", d2) == 0.80
+    assert registry_accept_prior(ink, "dflash", "/local/copy/Inkling-2-Mini-DFlash2") == 0.80
+    assert registry_accept_prior(ink, "dflash", "someone/Other-DFlash2") is None   # not measured
+    assert registry_accept_prior(ink, "dspark", ink) is None          # the bundled head: global
+    assert registry_accept_prior("mlx-community/Qwen3-8B-8bit", "dspark", None) is None
+    assert static_prior(ink, "dflash", d2) == 0.80
+    assert static_prior(ink, "dspark", ink) == STATIC_PRIOR_P
+    assert static_prior(None, "dflash", None) == STATIC_PRIOR_P
+
+
+def test_the_pairs_prior_derives_the_measured_best_cap_on_its_curve():
+    # Inkling-2-Mini + DFlash 2 on the M4 Pro (calibrated 2026-11-24): the verify curve rises
+    # ~4.4 ms a row and the draft round costs 5.7 ms. At the global 0.70 prior the argmax is
+    # cap 3 (benchmarked 59.0 tok/s); at the pair's measured 0.80 it is cap 6 (64.8, the best
+    # of caps 3-7).
+    from mlx_dspark.calibrate import STATIC_PRIOR_P, CapController
+
+    verify = {2: 32.7, 3: 38.4, 4: 43.0, 5: 48.2, 7: 55.8, 8: 59.3}
+    ctrl = CapController(verify, 5.7, max_cap=7)
+    assert ctrl.static_best(STATIC_PRIOR_P) == 3
+    assert ctrl.static_best(0.80) == 6

@@ -1609,6 +1609,20 @@ def calibrate(target, drafter, *, mode: str, target_repo: str, drafter_repo: str
 STATIC_PRIOR_P = 0.70
 
 
+def static_prior(target_repo: str | None, mode: str, drafter_repo: str | None) -> float:
+    """The acceptance prior the static cap is derived with for this pair: the registry row's
+    MEASURED per-position acceptance for ``mode`` (``accept_p``, a geometric fit of the pair's
+    per-cap benchmark) when the drafter is the row's own, else :data:`STATIC_PRIOR_P`. The cap
+    itself stays derived from this machine's curves; only the acceptance it assumes is the
+    pair's. Fitted on DSpark heads, 0.70 sits well under a selector head's acceptance: DFlash 2
+    on Inkling-2-Mini fits 0.80-0.83 at every cap 3-7, and at 0.70 the M4 Pro's curve derived
+    cap 3 (59.0 tok/s) where cap 6 measured 64.8 (NOTES "DFlash2 on Inkling-2-Mini")."""
+    from .load import registry_accept_prior
+
+    p = registry_accept_prior(target_repo, mode, drafter_repo)
+    return float(p) if p else STATIC_PRIOR_P
+
+
 def static_cap(target, drafter, *, mode: str, target_repo: str, drafter_repo: str | None,
                cache_dir: str | None = None, verbose: bool = False,
                fallback: int = 2) -> int:
@@ -1637,7 +1651,7 @@ def static_cap(target, drafter, *, mode: str, target_repo: str, drafter_repo: st
                          drafter_repo=drafter_repo, cache_dir=cache_dir, verbose=verbose)
     except Exception:  # noqa: BLE001 — calibration is an optimization, never a gate
         return fallback
-    return ctrl.static_best(STATIC_PRIOR_P)
+    return ctrl.static_best(static_prior(target_repo, mode, drafter_repo))
 
 
 # ---- tree verify budget (tree.py) ------------------------------------------------------

@@ -500,3 +500,76 @@ def test_a_newcomer_is_held_back_when_memory_is_short(monkeypatch):
         assert be.batch_stats["max_batch_seen"] == 1 and be.batch_stats["batched_requests"] == 0
     finally:
         be.close()
+
+
+# ---------------------------------------------------------------- a DFlash-lineage head alone
+def _tiny_dflash2(t):
+    """A DFlash 2 head on the fixture's 128-wide stream: the session's taps, the 64-row padded
+    vocabulary (60 real), Inkling's after-correction softcap, a 16-row sliding window."""
+    from mlx_dspark.dflash_model import DFlashConfig, DFlashDraftModel
+
+    cfg = DFlashConfig(
+        hidden_size=128, num_hidden_layers=2, num_attention_heads=2, num_key_value_heads=1,
+        head_dim=16, intermediate_size=128, vocab_size=64, rms_norm_eps=1e-6, rope_theta=1e4,
+        max_position_embeddings=512, block_size=8, target_layer_ids=tuple(TAP),
+        num_target_layers=8, mask_token_id=58, selector_rank=8, selector_top_k=4,
+        conv_kernel_size=2, conv_group_size=16, final_logit_softcapping=30.0,
+        selector_softcap_mode="after_correction", layer_types=("sliding_attention",) * 2,
+        sliding_window=16, block_causal=False)
+    mx.random.seed(21)
+    d = DFlashDraftModel(cfg)
+    d.candidate_selector.predecessor_codebook = mx.random.normal((64, 8))
+    d.candidate_selector.successor_codebook = mx.random.normal((64, 8))
+    mx.eval(d.parameters())
+    return d.bind(t.model)
+
+
+@metal
+def test_a_dflash2_head_drafts_for_a_lone_request_and_hands_over_both_ways():
+    """`--max-batch` in dflash mode: alone, the real dflash loop drafts; another request
+    arrives, it yields at a round and leaves its drafter's window ending where its cache does;
+    the batched steps continue that window; alone again, the loop restores the drafter from
+    it. Every request's tokens are its greedy run's."""
+    from mlx_dspark.generate import dflash_generate
+
+    t, _ = _target()
+    d = _tiny_dflash2(t)
+    want_a, want_b = _greedy(t, PROMPTS[2], 30), _greedy(t, PROMPTS[0], 5)
+    stretches = []
+
+    def solo(req, prompt, reuse_len, max_new_tokens, fresh):
+        w = req.ctx[0]
+        stretches.append((fresh, reuse_len, w.end if w.rows else None))
+        return dflash_generate(t, t.tokenizer, d, prompt_ids=prompt, cache=req.cache,
+                               ctx_caches=req.ctx, reuse_len=reuse_len,
+                               max_new_tokens=max_new_tokens, max_draft_tokens=4,
+                               _streamer=req.streamer)
+
+    arrivals = []
+    session = B.Session(t, t.tokenizer, d, solo=solo)
+    a = B.Request(PROMPTS[2], max_new_tokens=30, meta="a")
+    session.admit(a)
+    polls = [0]
+
+    def waiting():                      # the second request shows up a few rounds into the first
+        polls[0] += 1
+        if polls[0] == 4:
+            arrivals.append(B.Request(PROMPTS[0], max_new_tokens=5, meta="b"))
+        return bool(arrivals)
+
+    session.waiting = waiting
+    done = {}
+    for _ in range(300):
+        while arrivals and session.has_free_slot:
+            session.admit(arrivals.pop())
+        for req, res in session.tick():
+            done[req.meta] = res
+        if not session.n_active and not arrivals:
+            break
+    assert [fresh for fresh, _, _ in stretches] == [True, False]
+    _, resumed_at, window_end = stretches[1]
+    assert window_end == resumed_at                     # the drafter resumes from a whole window
+    assert session.peak == 2 and session.steps >= 4
+    assert a.solo_rounds > 0                            # rounds of the dflash loop (a random
+    #                                                     head drafts, the target rejects: still lossless)
+    assert done["a"].token_ids == want_a.token_ids and done["b"].token_ids == want_b.token_ids

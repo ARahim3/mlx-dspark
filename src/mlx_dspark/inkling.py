@@ -102,6 +102,96 @@ def mlx_vlm_supports_inkling2(model_type: str = "inkling2_loop") -> bool:
     return "loop" not in str(model_type) or hasattr(config, "LoopConfig")
 
 
+def dflash_bindings(model):
+    """What a DFlash-lineage head (``incoai/Inkling-2-Mini-DFlash2``) reads from an Inkling 2
+    target, or None for any other model: ``(embed, head, head_rows_src, vocab)``.
+
+    The head's reference (its shipped SGLang patch) binds the same things the bundled DSpark head
+    reads: the block embeds through the target's FULL input embedding, ``embed_norm ∘
+    embed_tokens`` (SGLang's ``Inkling2ForConditionalGeneration.get_input_embeddings``, which
+    ``dflash_worker_v2`` embeds the block with — not the raw table other DFlash pairs reuse); the
+    candidates come from the target's head; and only the real vocabulary is drafted from
+    (``get_dflash_valid_vocab_size``: 200,058 of the head's 201,024 rows, where the target's
+    logits stop). The taps are the bundled head's too (``target_layer_ids`` 5, 23, 41 and the
+    final-norm visit 48: "Both drafts use native post-residual visit features and final norm").
+    ``model`` is the mlx-vlm model (``Target.model``)."""
+    if not str(getattr(model, "model_type", "")).startswith("inkling2"):
+        return None
+    lm = getattr(model, "language_model", None)
+    inner = getattr(lm, "model", None)
+    if inner is None or not hasattr(inner, "embed"):
+        return None
+    vocab = getattr(lm.config, "unpadded_vocab_size", None) or lm.lm_head.weight.shape[0]
+    return inner.embed, draft_logits(lm), lm.lm_head, int(vocab)
+
+
+# Bits of the drafter-only copy of the released bf16 head that a DFlash-lineage head's candidates
+# go through (0 = the bf16 head itself, through head_f32). On --target-bits 8 the target's own
+# 8-bit copy serves and nothing is copied. Drafting only: the target verifies every token.
+DFLASH_HEAD_BITS = int(os.environ.get("MLX_DSPARK_INKLING_DFLASH_HEAD_BITS", "8") or 0)
+_DFLASH_HEAD = "_mlx_dspark_dflash_head"     # per language model: (bits, the drafter-only copy)
+
+
+def _dflash_head_copy(lm, bits: int):
+    """The drafter-only quantized copy of ``lm``'s bf16 head (affine, group 64, fp32 scales —
+    the layout the head kernels read), built once per model and bit width."""
+    held = lm.__dict__.get(_DFLASH_HEAD)
+    if held is not None and held[0] == bits and held[2] is lm.lm_head.weight:
+        return held[1]
+    q = nn.QuantizedLinear.from_linear(lm.lm_head, group_size=64, bits=bits)
+    q.scales, q.biases = q.scales.astype(mx.float32), q.biases.astype(mx.float32)
+    mx.eval(q.parameters())
+    lm.__dict__[_DFLASH_HEAD] = (bits, q, lm.lm_head.weight)
+    return q
+
+
+def draft_logits(language_model):
+    """``hidden [..., H]`` -> the target head's fp32 logits ``[..., V]`` before the softcap, for a
+    drafter that reads the target's head (DFlash 2's candidates, ``cap`` rows a round).
+
+    On ``--target-bits 8`` the 8-bit copy the target's own logits use; on the released weights a
+    drafter-only copy at ``DFLASH_HEAD_BITS`` (``MLX_DSPARK_INKLING_DFLASH_HEAD_BITS``; 0 = the
+    bf16 head through ``head_f32``) — both through ``inkling_kernels.quantized_head_rows``, on the
+    matrix units at draft widths, flat in the row count. Drafting only: the target verifies
+    every token, so the copy can move acceptance, never output."""
+    from .inkling_kernels import (
+        dense_head,
+        head_f32,
+        head_mma_ok,
+        head_q8_ok,
+        head_rows,
+        quantized_head_rows,
+    )
+
+    lm = language_model
+    gpu = mx.metal.is_available() and mx.default_device() == mx.gpu
+    qh = dense_head(lm)
+    head = getattr(lm, "lm_head", None)
+    bf16_head = (type(head) is nn.Linear and "bias" not in head
+                 and head.weight.dtype == mx.bfloat16 and head.weight.shape[1] % 256 == 0)
+    if gpu and qh is None and bf16_head and DFLASH_HEAD_BITS in (4, 8):
+        qh = _dflash_head_copy(lm, DFLASH_HEAD_BITS)
+    if gpu and qh is not None and (head_mma_ok(qh) or head_q8_ok(qh)):
+        def project(h):
+            flat = h.astype(mx.bfloat16).reshape(-1, h.shape[-1])
+            return quantized_head_rows(flat, qh).reshape(*h.shape[:-1], -1)
+
+        return project
+    if gpu and qh is None and bf16_head:
+        def project(h):
+            flat = h.astype(mx.bfloat16).reshape(-1, h.shape[-1])
+            return head_rows(head_f32, flat, head.weight).reshape(*h.shape[:-1], -1)
+
+        return project
+    src = qh if qh is not None else head
+
+    def project(h):                          # the stock products (CPU, another dtype)
+        x = h.astype(mx.float32) if qh is not None else h
+        return src(x).astype(mx.float32)
+
+    return project
+
+
 def draft_config(cfg: dict) -> DSparkConfig:
     """The head's :class:`DSparkConfig` from the TARGET's config.json (``mtp_config`` + the text
     config's vocab / softcap). Validates the contract this module implements."""

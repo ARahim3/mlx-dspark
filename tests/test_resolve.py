@@ -219,12 +219,27 @@ def test_resolve_mode_explicit_dspark_still_gets_the_dspark_heads():
 
 
 def test_resolve_mode_rows_without_best_mode_keep_dspark_first():
-    # rows without a "mode" stamp (everything but Qwen3.8-27B) are unchanged: dspark first
+    # rows without a "mode" stamp (all but the two Qwen3.8-27B rows and Inkling-2-Mini) are
+    # unchanged: dspark first
     from mlx_dspark.load import REGISTRY, resolve_mode
 
-    assert sum(1 for e in REGISTRY if e.get("mode")) == 2   # exactly the two Qwen3.8 rows
+    stamped = {e["id"] for e in REGISTRY if e.get("mode")}
+    assert stamped == {"qwen3.8-27b", "qwen3.8-27b-8bit", "inkling-2-mini"}
     mode, _t, _d = resolve_mode("mlx-community/Qwen3-4B-8bit", mode="auto")
     assert mode == "dspark"
+
+
+def test_inkling_auto_runs_its_dflash2_head_and_dspark_keeps_the_bundled_one():
+    # measured 2026-11-24: DFlash 2 1.81x vs the bundled DSpark head's 1.36x, paired — so
+    # auto (and the app) picks it; --mode dspark still drafts from the head in the model repo
+    from mlx_dspark.load import resolve_mode
+
+    ink = "thinkingmachines/Inkling-2-Mini"
+    assert resolve_mode(ink) == ("dflash", ink, "incoai/Inkling-2-Mini-DFlash2")
+    assert resolve_mode(ink, mode="dspark") == ("dspark", ink, ink)
+    # a copy without the bundled head (mlx-community's conversions dropped it) still drafts
+    copy = "mlx-community/Inkling-2-Mini-4bit"
+    assert resolve_mode(copy) == ("dflash", copy, "incoai/Inkling-2-Mini-DFlash2")
 
 
 def test_resolve_mode_explicit_dflash_resolves_dflash2_head():
