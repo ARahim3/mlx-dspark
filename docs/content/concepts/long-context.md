@@ -9,6 +9,8 @@ Agent clients like Claude Code, Codex and pi send 10–40k tokens with every req
 2. **A preallocated drafter context.** The DSpark drafter no longer copies its whole context twice per layer per round.
 3. **A 4096-token drafter window.** DeepSpec-style heads lose acceptance when they attend a context far longer than they were trained on. Attending only the most recent 4096 tokens restores their short-context acceptance at any depth. Heads trained with their own sliding window (DFlash 2, Red Hat's Qwen3.8 head, Nemotron, Muse) keep theirs.
 
+DFlash 2 and DSpine drafters keep their own sliding window of context (2,048 tokens on the DFlash 2 heads, 8,192 on DSpine). That window is held in order in one buffer the drafter's attention reads in place. Before that, once a conversation outgrew the window, each round that accepted no draft left the token just committed where the drafter could not see it, and the next drafts suffered for it: on Inkling-2-Mini the DFlash 2 head now gets 3.4% more tokens accepted per round at 2,600 and 8,000 tokens of context, and decodes 6% faster there (the Qwen3.8-27B rows below predate this).
+
 ## Measured at 16k and 32k
 
 Decode speed, prompt reading excluded, with agent-style content (source code plus a coding task, thinking off), against plain decoding at the same depth. Accepted tokens per round in parentheses:

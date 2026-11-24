@@ -27,6 +27,9 @@ description: The environment variables the engine reads, and where it keeps thin
 `MLX_DSPARK_EAGER_COMMIT=1`
 : Rebuild a hybrid target's recurrence state at every accept instead of folding the accepted rows into the next verify (the default since the deferred commit). Same tokens, a little slower. For comparison runs only.
 
+`MLX_DSPARK_DFLASH_BLOCK_WINDOW`
+: DFlash 2 and DSpine drafters: `1` makes every row of a draft block read the context window of the block's last row, `0` gives each row its own window. With one shared window the drafter's attention needs no mask once the context outgrows its window (2,048 tokens on the DFlash 2 heads), which is what lets the multi-row attention kernel serve it: about 1 ms a round on Inkling-2-Mini from 2,000 tokens of context. Each row then sees at most 7 fewer of its oldest ~2,040 context rows, so it is on only where acceptance was measured with it (Inkling-2-Mini's DFlash 2 head) and off elsewhere. Drafting only — the output is checked by the model either way. For comparison runs.
+
 `MLX_DSPARK_INKLING_GROUPED_MOE=0`
 : Inkling 2 only: run mlx-vlm's stock expert code instead of mlx-dspark's expert kernels, which read each expert's weights once for all the rows routed to it and do the routing and the route combine in one GPU launch each. Slower for decode steps and more so for verify passes. For comparison runs only.
 
