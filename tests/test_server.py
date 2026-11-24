@@ -563,6 +563,96 @@ def test_unstable_suffix_defaults_to_one_without_a_template():
     eng = _probe_engine(_FakeTok())                 # no chat_template attribute
     assert eng._boundary_probes() == []
     assert eng._unstable_suffix([1, 2, 3, 4]) == 1
+    assert eng._probed_unstable([1, 2, 3, 4]) is None
+    assert eng._stable_boundary(list(range(20))) == 19      # nothing known: one below
+
+
+class _StableTok(_ThinkTok):
+    """ChatML-shaped double: the generation prompt (10, 3) is exactly how a completed
+    assistant turn starts, so the whole prompt survives into the next turn."""
+
+    def apply_chat_template(self, messages, add_generation_prompt=True, **kw):
+        out = super().apply_chat_template(messages, add_generation_prompt=False)
+        if messages and messages[-1].get("role") == "assistant":
+            out = out[:-1]                          # (an open assistant turn is never rendered)
+        return out + ([10, 3] if add_generation_prompt else [])
+
+
+class _NoGenTok(_ThinkTok):
+    """Inkling-2-shaped double: the template adds NO generation prompt (the model opens its
+    own turn), so a prompt is the rendered conversation and all of it survives."""
+
+    def apply_chat_template(self, messages, add_generation_prompt=True, **kw):
+        return super().apply_chat_template(messages, add_generation_prompt=False)
+
+
+@pytest.mark.parametrize("tok_cls", [_StableTok, _NoGenTok])
+def test_a_short_stable_prompt_is_checkpointed_at_its_boundary(tok_cls):
+    """Few new tokens on a template that keeps the prompt boundary: the checkpoint is the
+    boundary itself — one forward — not one token below it (a second forward for the tail)."""
+    eng = _probe_engine(tok_cls())
+    msgs = [{"role": "user", "content": "hello"}]
+    prompt = eng.tokenizer.apply_chat_template(msgs)
+    nxt = eng.tokenizer.apply_chat_template(
+        msgs + [{"role": "assistant", "content": "b"}, {"role": "user", "content": "c"}])
+    assert nxt[:len(prompt)] == prompt              # what the probe measures
+    assert eng._probed_unstable(prompt) == 0 and eng._unstable_suffix(prompt) == 1
+    assert len(prompt) <= S.BOUNDARY_CHECKPOINT_MAX
+    assert eng._stable_boundary(prompt) == len(prompt)
+    long = eng.tokenizer.apply_chat_template([{"role": "user", "content": "x" * 200}])
+    assert eng._stable_boundary(long) == len(long) - 1          # many new tokens: one below
+    # ... unless most of them were restored from the prefix cache
+    assert eng._stable_boundary(long, reuse_len=len(long) - 30) == len(long)
+    assert eng._stable_boundary(long, reuse_len=len(long) - S.BOUNDARY_CHECKPOINT_MAX - 1) \
+        == len(long) - 1
+
+
+def test_an_unstable_tail_is_never_checkpointed_at_the_boundary():
+    eng = _probe_engine(_ThinkTok())                # the <think> opener does not survive
+    prompt = eng.tokenizer.apply_chat_template([{"role": "user", "content": "hello"}])
+    assert eng._stable_boundary(prompt) == len(prompt) - 2
+
+
+def test_boundary_checkpoint_serves_the_next_turn_and_a_repeat_reads_again():
+    """The request plan for a short stable prompt: its only mark is the prompt end (no split),
+    the snapshot taken there is what the next turn restores, and a byte-identical repeat —
+    which needs the last prompt token forwarded — starts from the previous boundary."""
+    import mlx.core as mx
+
+    from mlx_dspark.generate import _mark_stops
+    from mlx_dspark.prefix_cache import PrefixCache
+
+    class State:
+        def __init__(self):
+            self.state = [mx.zeros((1,))]
+
+        @property
+        def meta_state(self):
+            return ("x",)
+
+        @meta_state.setter
+        def meta_state(self, v):
+            pass
+
+    eng = _probe_engine(_NoGenTok())
+    eng.prefix = PrefixCache(lambda: [State()], None, min_reuse=4, checkpoint=True)
+    eng.prefix_cache_rungs = 0
+    msgs = [{"role": "user", "content": "hello there"}]
+    prompt = eng.tokenizer.apply_chat_template(msgs)
+    run = eng._begin_request(prompt, None)
+    assert run.reuse_len == 0 and run.prefill_marks == [len(prompt)]
+    assert _mark_stops(run.prefill_marks, 0, len(prompt)) == []        # one forward
+    run.on_prefill(run.cache, None, len(prompt))                       # the loops' final call
+    assert eng.prefix.info()["slots"][0]["tokens"] == len(prompt)
+    nxt = eng.tokenizer.apply_chat_template(
+        msgs + [{"role": "assistant", "content": "hi"}, {"role": "user", "content": "more"}])
+    run2 = eng._begin_request(nxt, None)
+    assert run2.reuse_len == len(prompt)                               # the whole first prompt
+    assert run2.prefill_marks == [len(nxt)]                            # few new tokens again
+    run2.on_prefill(run2.cache, None, len(nxt))
+    again = eng._begin_request(nxt, None)                              # regenerate
+    assert again.reuse_len == len(prompt)          # the first boundary, kept as a rung
+    assert again.prefill_marks == [len(nxt)]
 
 
 # --- reasoning effort (Qwen3.8-class chat-template kwarg) --------------------------------

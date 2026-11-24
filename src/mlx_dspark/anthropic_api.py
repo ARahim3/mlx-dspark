@@ -62,6 +62,22 @@ _TOOL_MARKERS = ("<tool_call>", "<|tool_call>", "<atem:function_calls>", "<atem:
                  "<|tool_call_start|>", "<function name=")
 _MAX_MARKER = max(len(m) for m in _TOOL_MARKERS)
 
+
+def _partial_marker(text: str, markers) -> int:
+    """How many trailing characters of ``text`` could still grow into one of ``markers``: the
+    length of its longest suffix that is a proper prefix of a marker (0 = none). This is what a
+    streamer holds back while no marker is complete, so a marker split across two pieces is
+    still seen. Holding a fixed longest-marker tail instead (what every splitter here did) is
+    just as safe and delays every piece by that many characters: Inkling 2's 27 were two or
+    three rounds between the first token and a stream's first delta."""
+    n = min(len(text), max(len(m) for m in markers) - 1)
+    while n > 0:
+        tail = text[-n:]
+        if any(len(m) > n and m.startswith(tail) for m in markers):
+            return n
+        n -= 1
+    return 0
+
 # Reasoning models wrap their chain of thought in these. Anthropic carries reasoning as
 # `thinking` content blocks, so the markup must never reach the client as assistant prose.
 # Gemma-4's pair is not a guess: its `tokenizer_config.json` ships the model's own response
@@ -83,7 +99,6 @@ _THINK_OPEN, _THINK_CLOSE = _THINK_PAIRS[0]
 # `<|eom|>`; fields.content.open_pattern = `to=user<|message|>`). See NOTES "Muse-Glimmer-30B".
 _MUSE_MSG, _MUSE_EOM, _MUSE_START = "<|message|>", "<|eom|>", "<|start|>"
 _MUSE_STRUCT = (_MUSE_MSG, _MUSE_EOM, _MUSE_START)
-_MUSE_HOLD = max(len(s) for s in _MUSE_STRUCT) - 1     # straddle look-back when streaming
 _MUSE_RECIPIENT = re.compile(r"to=([^\s<]+)\s*$")      # the recipient at the end of a header
 
 ANTHROPIC_VERSION = "2023-06-01"
@@ -123,9 +138,9 @@ class MuseChannelParser:
     ``<|message|>``, ``<|eom|>``): ``header`` buffers a sub-message header (the ``to=<recipient>``
     line) without emitting; on ``<|message|>`` the recipient decides the channel and we enter
     ``content``; ``<|eom|>`` ends the body (``idle``) until the next ``<|start|>`` opens the next
-    header. In ``content`` we hold back the last ``_MUSE_HOLD`` chars so a special token split
-    across two rounds is still recognised (the tool gate and stop-string scanner use the same
-    trick). ``feed`` is incremental; ``feed(text, final=True)`` in one shot is the whole-string
+    header. In ``content`` we hold back a tail that could still grow into a special token
+    (:func:`_partial_marker`), so one split across two rounds is still recognised (the tool gate
+    does the same). ``feed`` is incremental; ``feed(text, final=True)`` in one shot is the whole-string
     parse that :func:`split_thinking` uses."""
 
     def __init__(self):
@@ -149,7 +164,7 @@ class MuseChannelParser:
 
             if self.state == "content":
                 if idx == -1:                       # no marker yet: emit, holding back a tail
-                    hold = 0 if final else _MUSE_HOLD
+                    hold = 0 if final else _partial_marker(self.buf, _MUSE_STRUCT)
                     upto = max(0, len(self.buf) - hold)
                     if upto:
                         out.append((self.channel, self.buf[:upto]))
@@ -196,7 +211,6 @@ class MuseChannelParser:
 _INK_MODEL = "<|message_model|>"
 _INK_END = "<|end_message|>"
 _INK_KIND = re.compile(r"<\|content_([a-z_]+)\|>")
-_INK_HOLD = max(len(_INK_MODEL), len(_INK_END), len("<|content_invoke_tool_json|>")) - 1
 
 
 class InklingChannelParser:
@@ -208,8 +222,9 @@ class InklingChannelParser:
     ``thinking`` bodies are reasoning, ``text`` bodies the answer, and an ``invoke_tool_json`` body
     — ``{"name": …, "args": {…}}`` — is a tool call, re-emitted on the answer channel as a Hermes
     ``<tool_call>{"name", "arguments"}</tool_call>`` so :func:`~mlx_dspark.tools.parse_tool_calls`
-    and the streaming tool gate handle it like any other model's. Bodies are streamed with the
-    last :data:`_INK_HOLD` characters held back (a marker split across two rounds is still seen);
+    and the streaming tool gate handle it like any other model's. Bodies are streamed up to a
+    tail that could still grow into a marker (:func:`_partial_marker`: one split across two
+    rounds is still seen);
     a tool body is held whole until its ``<|end_message|>``. Text outside any sub-message is kept
     as answer unless it is only whitespace."""
 
@@ -243,7 +258,7 @@ class InklingChannelParser:
                 else:
                     end = len(_INK_END)
                 if j == -1:
-                    hold = 0 if final else _INK_HOLD
+                    hold = 0 if final else _partial_marker(self.buf, (_INK_END, _INK_MODEL))
                     upto = max(0, len(self.buf) - hold)
                     if upto:
                         out.append((self.channel, self.buf[:upto]))
@@ -390,7 +405,7 @@ class ThinkingStreamSplitter:
             if self.state == "thinking":
                 idx = self.buf.find(self.close)
                 if idx == -1:                       # no closer yet: emit, holding a straddle tail
-                    hold = 0 if final else len(self.close) - 1
+                    hold = 0 if final else _partial_marker(self.buf, (self.close,))
                     upto = max(0, len(self.buf) - hold)
                     if upto:
                         out.append(("reasoning", self.buf[:upto]))
@@ -668,9 +683,9 @@ class _ToolGate:
     """Splits streamed text into "safe to send now" and "part of a tool call".
 
     A native tool-call marker can straddle two generation rounds, so while no marker has been
-    seen we hold back the last ``_MAX_MARKER - 1`` characters (same trick the generator's
-    stop-string scanner uses). Once a complete marker appears the gate *trips*: everything from
-    the marker on is buffered for :func:`parse_tool_calls` and nothing further is streamed.
+    seen we hold back a tail that could still grow into one (:func:`_partial_marker`). Once a
+    complete marker appears the gate *trips*: everything from the marker on is buffered for
+    :func:`parse_tool_calls` and nothing further is streamed.
     """
 
     def __init__(self):
@@ -699,7 +714,7 @@ class _ToolGate:
             self.sent = hit
             return out
         self.scan = max(0, len(self.buf) - (_MAX_MARKER - 1))
-        safe = max(self.sent, len(self.buf) - (_MAX_MARKER - 1))
+        safe = max(self.sent, len(self.buf) - _partial_marker(self.buf, _TOOL_MARKERS))
         out = self.buf[self.sent:safe]
         self.sent = safe
         return out
@@ -839,7 +854,7 @@ class MessageStream:
                     ev += self._open_block("thinking")
                 i = self.pending.find(self.close)
                 if i == -1:
-                    hold = 0 if final else len(self.close) - 1
+                    hold = 0 if final else _partial_marker(self.pending, (self.close,))
                     upto = max(0, len(self.pending) - hold)
                     out, self.pending = self.pending[:upto], self.pending[upto:]
                     return ev + self._content_delta(out)

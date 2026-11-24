@@ -14,9 +14,11 @@ acceptance length (tokens committed per target forward).
 from __future__ import annotations
 
 import contextlib
+import copy
 import functools
 import json
 import time
+import weakref
 from dataclasses import dataclass
 
 import mlx.core as mx
@@ -405,6 +407,9 @@ class _FullDecodeDetokenizer:
         self._tok = tokenizer
         self.tokens: list[int] = []
 
+    def reset(self) -> None:
+        self.tokens = []
+
     def add_token(self, token: int) -> None:
         self.tokens.append(token)
 
@@ -416,7 +421,32 @@ class _FullDecodeDetokenizer:
         return self._tok.decode(self.tokens)
 
 
+_DETOK_PROTOS: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()   # tokenizer -> prototype
+
+
 def _make_detokenizer(tokenizer):
+    """A fresh streaming detokenizer for this tokenizer: a copy of one built ONCE per tokenizer
+    (:func:`_build_detokenizer`), reset. Building one is not cheap — the streaming classes map
+    every vocabulary id to its token text, and a plain fast tokenizer is serialized whole to
+    read its decoder type: 183 ms on Inkling-2-Mini's 200k vocabulary, 181 ms on Qwen3.8's,
+    paid by every streamed request before its prefill started (and 74–103 ms through mlx-lm
+    0.31's wrapper, which builds its own per call; 0.32 keeps a prototype like this one). The
+    copies share the read-only id -> text table; all per-stream state is what ``reset`` sets.
+    A tokenizer that cannot key the cache (unhashable test doubles) builds each time."""
+    try:
+        proto = _DETOK_PROTOS.get(tokenizer)
+        if proto is None:
+            proto = _DETOK_PROTOS[tokenizer] = _build_detokenizer(tokenizer)
+    except TypeError:                                 # not hashable / not weak-referenceable
+        return _build_detokenizer(tokenizer)
+    if not callable(getattr(proto, "reset", None)):
+        return _build_detokenizer(tokenizer)          # nothing to reset a copy with
+    detok = copy.copy(proto)
+    detok.reset()
+    return detok
+
+
+def _build_detokenizer(tokenizer):
     """Best available *streaming* detokenizer for this tokenizer, so streaming decodes only
     the new tokens each round instead of re-decoding the whole output (O(n) vs O(n²) over a
     generation — the re-decode dominated long/thinking outputs).
@@ -1123,6 +1153,11 @@ PREFILL_CHUNK = 2048  # long prompts prefill in pieces so activations stay bound
 # don't go below ~2048, SDPA's prefill efficiency falls off under q_len 1024 (measured
 # 50% of peak at 512, 70% at 1024, 85%+ from 2048 — NOTES "Prefill pass").
 
+PREFILL_CLEAR_ROWS = 64  # A prompt that fits one chunk but is split at a prefix-cache mark
+# clears MLX's buffer cache after a piece of at least this many rows (a prompt chunked for
+# SIZE clears after every piece, as before). Under it the piece's scratch is what the next
+# forward allocates again: clearing cost ~4 ms of a short prompt's first token for nothing.
+
 PREFILL_LAST_ROW_HEAD = True  # Project only the LAST row of the final prefill chunk to
 # vocab. Every prefill caller reads exactly logits[0, -1] (it becomes the first sampled
 # token), so the rest of that [chunk, vocab] matmul is thrown away — ~7-8% of prefill
@@ -1221,7 +1256,8 @@ def _prefill_plain(target, ids: list[int], cache, chunk: int | None = None,
                                        head_last_row=PREFILL_LAST_ROW_HEAD)
             if many and not last:
                 mx.eval(_cache_arrays(cache))
-                mx.clear_cache()
+                if len(ids) > chunk or end - i >= PREFILL_CLEAR_ROWS:
+                    mx.clear_cache()
                 if on_chunk is not None:
                     on_chunk(base + end)
             if on_mark is not None and end in stops:
@@ -1265,7 +1301,8 @@ def _prefill_tapped(target, ids: list[int], cache, tap, drafter=None, ctx_caches
                 # what force the rest of the forward and keep the graph from growing
                 mx.eval(_cache_arrays(cache),
                         [c.k for c in ctx_caches] if ctx_caches else fused)
-                mx.clear_cache()
+                if len(ids) > chunk or end - i >= PREFILL_CLEAR_ROWS:
+                    mx.clear_cache()
                 if on_chunk is not None:
                     on_chunk(ctx_offset + end)
             if on_mark is not None and end in stops:

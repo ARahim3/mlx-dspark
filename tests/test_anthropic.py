@@ -331,6 +331,56 @@ def test_gate_holds_back_a_possible_marker_prefix():
     assert g.buf == "hello there world!"
 
 
+def test_partial_marker_is_the_longest_tail_that_could_grow_into_a_marker():
+    marks = ("<|end_message|>", "<|message_model|>")
+    assert A._partial_marker("", marks) == 0
+    assert A._partial_marker("hello", marks) == 0
+    assert A._partial_marker("x" * 60, marks) == 0
+    assert A._partial_marker("hello<", marks) == 1
+    assert A._partial_marker("a < b <|m", marks) == 3
+    assert A._partial_marker("so<|end_mess", marks) == len("<|end_mess")
+    assert A._partial_marker("<|end_message|", marks) == len("<|end_message|")
+    assert A._partial_marker("<|end_message|>", marks) == 0        # complete: the caller's find
+    assert A._partial_marker("<|end_of", marks) == 0               # diverged from every marker
+
+
+def test_splitters_stream_text_at_once_and_hold_only_a_partial_marker():
+    """Every splitter held back a fixed longest-marker tail (27 characters on Inkling 2: two
+    or three rounds before a stream's first delta). Text that cannot begin a marker goes out
+    with the piece that brought it; a marker split across pieces is still caught."""
+    sp = A.ThinkingStreamSplitter(in_thinking="</think>")
+    assert sp.feed("ab") == [("reasoning", "ab")]
+    assert sp.feed("cd</thi") == [("reasoning", "cd")]
+    assert sp.feed("nk>ok") == [("answer", "ok")]
+    sp = A.ThinkingStreamSplitter(in_thinking="</think>")
+    assert sp.feed("a <") == [("reasoning", "a ")]                 # held: could be the closer
+    assert sp.feed("b") == [("reasoning", "<b")]                   # it was not
+
+    ink = A.InklingChannelParser()
+    assert ink.feed("<|message_model|><|content_thinking|>Hi") == [("reasoning", "Hi")]
+    assert ink.feed(" there<|end_") == [("reasoning", " there")]
+    assert ink.feed("message|><|message_model|><|content_text|>Yes") == [("answer", "Yes")]
+    assert ink.feed(".<|mess") == [("answer", ".")]
+    assert ink.feed("age_model|><|content_text|>More") == [("answer", "More")]
+
+    muse = A.MuseChannelParser()
+    assert muse.feed("<|start|>assistant to=self<|message|>weigh") == [("reasoning", "weigh")]
+    assert muse.feed("ing<|e") == [("reasoning", "ing")]
+    assert muse.feed("om|><|start|>assistant to=user<|message|>Done") == [("answer", "Done")]
+
+    st = A.MessageStream(model="m", input_tokens=1, in_thinking="</think>")
+    st.start()
+    first = st.delta("We")
+    assert [d["delta"]["thinking"] for n, d in first if n == "content_block_delta"] == ["We"]
+
+    gate = A._ToolGate()
+    assert gate.feed("Hello") == "Hello"
+    assert gate.feed(" there <tool") == " there "
+    assert gate.feed("_call>{}") == "" and gate.tripped and gate.sent_text == "Hello there "
+    gate = A._ToolGate()
+    assert gate.feed("a <") == "a " and gate.feed("b") == "<b" and not gate.tripped
+
+
 def test_gate_trips_on_marker_split_across_chunks():
     g = A._ToolGate()
     g.feed("call now<tool_")

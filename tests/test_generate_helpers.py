@@ -104,6 +104,62 @@ def test_fallback_detokenizer_for_minimal_tokenizers():
     assert isinstance(detok, g._FullDecodeDetokenizer)
 
 
+def test_streaming_detokenizer_is_built_once_per_tokenizer(monkeypatch):
+    # building one walks the whole vocabulary (and serializes a plain fast tokenizer): every
+    # streamed request paid ~0.2 s for it on a 200k vocabulary before its prefill started
+    built = []
+    real = g._build_detokenizer
+    monkeypatch.setattr(g, "_build_detokenizer", lambda tok: built.append(tok) or real(tok))
+    tok = _FakeTok()
+    a = g._make_detokenizer(tok)
+    a.add_token(ord("x"))
+    b = g._make_detokenizer(tok)
+    assert built == [tok] and a is not b
+    assert b.tokens == [] and a.text == "x"         # a copy starts empty and shares no state
+    b.add_token(ord("y"))
+    assert (a.text, b.text) == ("x", "y")
+    other = _FakeTok()
+    g._make_detokenizer(other)
+    assert built == [tok, other]                    # per tokenizer
+
+    class _Unhashable(_FakeTok):
+        __hash__ = None
+
+    odd = _Unhashable()                             # cannot key the cache: built each time
+    assert isinstance(g._make_detokenizer(odd), g._FullDecodeDetokenizer)
+    g._make_detokenizer(odd)
+    assert built == [tok, other, odd, odd]
+
+
+def test_two_streams_on_one_tokenizer_do_not_share_detokenizer_state():
+    __import__("pytest").importorskip("tokenizers")
+    from tokenizers import Tokenizer, decoders, models, pre_tokenizers, trainers
+    from transformers import PreTrainedTokenizerFast
+
+    tk = Tokenizer(models.BPE(unk_token=None))
+    tk.pre_tokenizer = pre_tokenizers.ByteLevel(add_prefix_space=False)
+    tk.decoder = decoders.ByteLevel()
+    tk.train_from_iterator(["hello world, hello streaming detokenizers!"] * 4,
+                           trainers.BpeTrainer(vocab_size=400, special_tokens=[]))
+    fast = PreTrainedTokenizerFast(tokenizer_object=tk)
+    texts = ["hello world, hello streaming!", "detokenizers hello, world"]
+    ids = [fast.encode(t) for t in texts]
+    chunks = [[], []]
+    sts = [g._Streamer(fast, set(), chunks[i].append, None) for i in range(2)]
+    for step in range(max(map(len, ids))):          # interleaved, as batched requests are
+        for i in range(2):
+            if step < len(ids[i]):
+                sts[i].update(ids[i][: step + 1])
+    for i in range(2):
+        sts[i].flush()
+        assert sts[i].text == fast.decode(ids[i]) == "".join(chunks[i])
+    # a later request starts clean
+    st = g._Streamer(fast, set(), None, ["zzz"])
+    st.update(ids[0])
+    st.flush()
+    assert st.text == fast.decode(ids[0])
+
+
 def test_stop_streaming_ends_generation_gracefully():
     # an on_text that raises StopStreaming (the server does this on client disconnect) must
     # flip `stopped` — so the loop ends normally — without propagating the exception
@@ -258,6 +314,40 @@ def test_prefill_plain_splits_chunks_at_marks_and_reports_positions():
     # on_mark fires with the caches holding exactly the first `pos` tokens (offset is
     # suffix-relative here: 3 and 9 of the 12)
     assert seen == [(8, 3), (14, 9)]
+
+
+def test_prefill_clears_the_buffer_cache_between_size_chunks_and_after_large_pieces(monkeypatch):
+    """A prompt split only by a prefix-cache mark does not pay an allocator clear after a
+    short piece (the tail forward allocates the same buffers again); a prompt chunked for size
+    clears after every piece, and a large piece before a mark still does."""
+    import mlx.core as mx
+
+    from mlx_dspark import generate as gen
+
+    class Layer:
+        state = None
+
+    class Tgt:
+        def prefill(self, ids, cache, tap=None, want_logits=True, head_last_row=True):
+            return (mx.zeros((1, 1, 4)) if want_logits else None), mx.zeros((1, ids.shape[1], 2))
+
+    cleared = []
+    monkeypatch.setattr(gen.mx, "clear_cache", lambda: cleared.append(1))
+    for run in (lambda ids, **kw: gen._prefill_plain(Tgt(), ids, [Layer()], **kw),
+                lambda ids, **kw: gen._prefill_tapped(Tgt(), ids, [Layer()], [0], **kw)):
+        def noop(pos):
+            return None
+
+        small = gen.PREFILL_CLEAR_ROWS - 1
+        for n, kw, want in (
+                (20, {"chunk": 2048, "marks": [19], "on_mark": noop}, 0),     # short + a mark
+                (20, {"chunk": 2048}, 0),                                     # one piece
+                (100, {"chunk": 2048, "marks": [99], "on_mark": noop}, 1),    # a large piece
+                (100, {"chunk": 2048, "marks": [small, 99], "on_mark": noop}, 0),   # two small
+                (20, {"chunk": 8}, 2)):                                       # size chunks
+            cleared.clear()
+            run(list(range(n)), **kw)
+            assert len(cleared) == want, (n, kw)
 
 
 def test_prefill_plain_on_chunk_reports_progress_after_each_evaluated_chunk():

@@ -112,6 +112,13 @@ SLOW_ROUND_LOG_S = float(os.environ.get("MLX_DSPARK_SLOW_ROUND_LOG_S", "") or 10
 # harmony-style templates low/medium/high). Values outside a given template's own vocabulary
 # still fail there — its raise_exception carries the model-specific list — but this boundary
 # check turns typos into a clear 400 before any template runs.
+# A request whose NEW tokens (the prompt past the reused prefix) number at most this is
+# checkpointed at its prompt boundary itself when the chat template keeps that boundary into the
+# next turn — one forward — instead of one token below it, which takes a second forward for the
+# tail (a decode step: ~35 ms of a 22-token Inkling-2-Mini request, with the snapshot and the
+# allocator clear between the two). What the token below buys is a byte-identical repeat as a
+# hit; under this many new tokens the repeat reads them again instead (see _stable_boundary).
+BOUNDARY_CHECKPOINT_MAX = 64
 REASONING_EFFORTS = ("low", "medium", "high", "xhigh")
 # What a REQUEST may say on top of those — current OpenAI clients send both, Codex through the
 # Responses API. "none" is thinking off (the template's own off switch, see
@@ -548,7 +555,9 @@ class Engine:
         prompt, then re-render it completed plus a next user turn, and diff the tails — once
         per thinking-flag variant, since ``enable_thinking`` changes the suffix. Returns
         ``[(generation-suffix tail ids, unstable count)]``, longest tail first; a request is
-        matched to its variant by comparing its prompt tail against the probes' tails."""
+        matched to its variant by comparing its prompt tail against the probes' tails. A
+        template that adds NO generation prompt (Inkling 2: the model opens its own turn) is
+        probed too, under the empty tail, which every prompt ends in."""
         if self._boundary_probes_cache is not None:
             return self._boundary_probes_cache
         probes: dict[tuple, int] = {}
@@ -570,7 +579,7 @@ class Engine:
                             msgs + [{"role": "assistant", "content": reply},
                                     {"role": "user", "content": "c"}], **kw)
                         u = max(u, len(p) - _lcp(p, nxt))
-                    if 0 < g <= 64 and u <= 64:       # sane template; tail is matchable
+                    if g <= 64 and u <= 64:           # sane template; tail is matchable
                         tail = tuple(p[len(p) - g:])
                         probes[tail] = max(probes.get(tail, 0), u)
                 except Exception:  # noqa: BLE001 — a probe failure just means fallback u=1
@@ -579,14 +588,34 @@ class Engine:
             ([list(t), u] for t, u in probes.items()), key=lambda x: -len(x[0]))
         return self._boundary_probes_cache
 
+    def _probed_unstable(self, prompt_ids: list[int]) -> int | None:
+        """Trailing tokens of THIS prompt that won't survive re-rendering, as its chat template's
+        probe measured them (0 = the whole prompt is a prefix of the next turn's); None when no
+        probe matches the prompt's tail (no template, or another prompt shape)."""
+        for tail, u in self._boundary_probes():
+            if len(prompt_ids) > len(tail) and (not tail or prompt_ids[-len(tail):] == tail):
+                return u
+        return None
+
     def _unstable_suffix(self, prompt_ids: list[int]) -> int:
         """Trailing tokens of THIS prompt that won't survive re-rendering (>= 1 — snapshotting
         at least one token below the boundary is also what makes a byte-identical repeat a
         hit: the loop re-forwards the tail and gets the logits a boundary snapshot can't)."""
-        for tail, u in self._boundary_probes():
-            if len(prompt_ids) > len(tail) and prompt_ids[-len(tail):] == tail:
-                return max(1, u)
-        return 1
+        return max(1, self._probed_unstable(prompt_ids) or 0)
+
+    def _stable_boundary(self, prompt_ids: list[int], reuse_len: int = 0) -> int:
+        """Where this request's checkpoint goes: the prompt boundary minus
+        :meth:`_unstable_suffix` — a split prefill, the tail forwarded after the snapshot — or
+        the prompt boundary ITSELF when the template's probe says all of the prompt survives
+        and at most ``BOUNDARY_CHECKPOINT_MAX`` tokens are new. That snapshot is taken after
+        the one forward that reads them; the next turn restores it like any other. Only a
+        byte-identical repeat differs: it restores the previous boundary and reads the new
+        tokens again (a hit needs the last prompt token forwarded, for its logits)."""
+        n = len(prompt_ids)
+        if (n - reuse_len <= BOUNDARY_CHECKPOINT_MAX
+                and self._probed_unstable(prompt_ids) == 0):
+            return n
+        return n - self._unstable_suffix(prompt_ids)
 
     @property
     def supports_reasoning_effort(self) -> bool:
@@ -916,6 +945,13 @@ class Engine:
         eng.warmup_enabled = warmup
         eng.load_notes = load_notes
         eng.machine = machine
+        # Build the streaming detokenizer's prototype now (one pass over the vocabulary,
+        # ~0.2 s on a 200k one) so the first streamed request does not pay for it; every
+        # request then takes a copy (generate._make_detokenizer).
+        with contextlib.suppress(Exception):
+            from .generate import _make_detokenizer
+
+            _make_detokenizer(tok)
         if warmup:
             # Warm the Metal kernels + ramp the clock BEFORE we report ready, so the first
             # real request doesn't eat the ~2 s cold-start (which otherwise lands entirely in
@@ -926,6 +962,15 @@ class Engine:
                 with contextlib.suppress(Exception):  # a phase signal must never fail a load
                     on_warmup()
             eng.warmup()
+        # Hand the load's scratch back. Loading, the self-tests, the calibration forwards and
+        # the warmup leave the allocator's buffer cache full of buffers no request will reuse
+        # (6.2 GB on Inkling-2-Mini), and nothing cleared it until a request split its prefill
+        # at a prefix-cache mark — ~0.25 s of that request's first token — or macOS reported
+        # pressure. On the MLX thread, like every other allocator call here.
+        with contextlib.suppress(Exception):
+            import mlx.core as mx
+
+            executor.submit(mx.clear_cache).result()
         if memory_guard:
             # After the warmup so the first shed can't land inside it. Polls macOS's own
             # pressure level; sheds on the MLX thread (idle: now; generating: at a round
@@ -1111,12 +1156,12 @@ class Engine:
             if self.prefix.wants_checkpoint():
                 # Snapshot at the STABLE prompt boundary (prompt minus the template's
                 # re-render-unstable tail — see _boundary_probes; also >= 1 below the
-                # boundary so an identical repeat hits), plus interior rungs every
+                # boundary so an identical repeat hits, except where few tokens are new:
+                # _stable_boundary), plus interior rungs every
                 # `prefix_cache_rungs` tokens and at the anchor acquire() suggested, so
                 # requests that diverge mid-prompt (new session on the same system prompt,
                 # compacted history) can partially reuse instead of missing outright.
-                n = len(prompt_ids)
-                stable = n - self._unstable_suffix(prompt_ids)
+                stable = self._stable_boundary(prompt_ids, reuse_len)
                 marks = set()
                 if self.prefix_cache_rungs:
                     marks.update(range(self.prefix_cache_rungs, stable,
