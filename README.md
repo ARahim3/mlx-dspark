@@ -135,17 +135,6 @@ what current speedup numbers are measured on). Model weights download from the H
 first use (none bundled). No server framework is pulled in — the API server is built on the standard
 library.
 
-**Inkling-2-Mini needs one more command.** No mlx-vlm release has its looped model yet, so until
-one does, install the mlx-vlm commit this pair was measured on (mlx-dspark tells you if it is
-missing before it downloads anything):
-
-```bash
-uv pip install 'mlx-vlm @ git+https://github.com/Blaizzy/mlx-vlm@d998a6207b7dc613b52618646dbea13a4799f7ca'
-```
-
-Use that commit rather than the tip of mlx-vlm's `main`, which is still reworking this model.
-Every other model here needs nothing beyond the `pip install` above.
-
 ## Quickstart
 
 ```bash

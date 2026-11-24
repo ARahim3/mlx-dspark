@@ -55,17 +55,16 @@ DRAFT_HEAD_BITS = int(os.environ.get("MLX_DSPARK_INKLING_DRAFT_HEAD_BITS", "6") 
 # per draft step (0 = the reference's bf16 [rank, V] matrix and full-vocab bias). See
 # _RnnMarkovHead.fold.
 FOLD_BITS = int(os.environ.get("MLX_DSPARK_INKLING_FOLD_BITS", "4") or 0)
-# Until an mlx-vlm RELEASE has the looped model, Inkling-2-Mini runs on a git install — of this
-# commit, the one the pair was measured on. mlx-vlm's main keeps changing the model's internals
-# (its caches and kernels, several times a day in the week of 2026-11-22); the fused pieces are
+# The mlx-vlm release the Inkling pair was measured on — the first one with the looped model,
+# and this package's floor (pyproject). mlx-vlm keeps changing the model's internals (its
+# caches and kernels, several times a day in the week of 2026-11-22); the fused pieces are
 # self-tested against whatever is installed and fall back to its stock forward, but only this
-# commit is the one the published numbers stand on.
-MLX_VLM_COMMIT = "d998a6207b7dc613b52618646dbea13a4799f7ca"
-MLX_VLM_INSTALL = ("uv pip install 'mlx-vlm @ git+https://github.com/Blaizzy/mlx-vlm@"
-                   f"{MLX_VLM_COMMIT}'")
-MLX_VLM_HINT = ("this Inkling 2 model needs a newer mlx-vlm: 0.8.0 ships the plain `inkling2` model "
-                "only, the looped one (Inkling-2-Mini, `inkling2_loop`) merged 2026-11-20, after it. "
-                f"Upgrade mlx-vlm, or until a release ships it: {MLX_VLM_INSTALL}")
+# release is the one the published numbers stand on.
+MLX_VLM_VERSION = "0.8.1"
+MLX_VLM_INSTALL = f"uv pip install 'mlx-vlm=={MLX_VLM_VERSION}'"
+MLX_VLM_HINT = (f"this Inkling 2 model needs a newer mlx-vlm: {MLX_VLM_VERSION} is the first release "
+                "with the looped model (Inkling-2-Mini, `inkling2_loop`). Upgrade it: "
+                "uv pip install -U mlx-vlm")
 
 
 def is_inkling_config(cfg: dict | None) -> bool:
@@ -92,7 +91,8 @@ def mlx_vlm_supports_inkling2(model_type: str = "inkling2_loop") -> bool:
 
     The module's presence does not answer for the looped model: mlx-vlm 0.8.0 ships
     ``models/inkling2`` for the plain one only, and ``inkling2_loop`` (Inkling-2-Mini) arrived
-    with ``LoopConfig`` after that release."""
+    with ``LoopConfig`` in 0.8.1 — this package's floor, so only an install that went around
+    its requirements gets a False here."""
     from importlib import import_module
 
     try:

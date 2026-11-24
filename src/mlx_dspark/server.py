@@ -2273,7 +2273,7 @@ def maybe_batch_engine(engine: Engine, max_batch: int):
 
         print(f"[inkling] --max-batch {max_batch} is OFF, requests are served one at a time: "
               "batched decoding stands on the fused forward and its KV caches, which did not "
-              "clear their self-test against this mlx-vlm. The commit this mlx-dspark was "
+              "clear their self-test against this mlx-vlm. The release this mlx-dspark was "
               f"measured on has them: {MLX_VLM_INSTALL}", file=sys.stderr)
         return engine
     ok = batch_spec_supported if engine.mode == "dspark" else batchable

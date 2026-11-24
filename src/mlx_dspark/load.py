@@ -289,7 +289,7 @@ REGISTRY = [
     # nothing else is fetched). model_type inkling2_loop: 24 layers, the middle 12 run three times
     # (48 visits, one KV/rotating-KV + conv-state CacheList each), 8 of 128 experts per token
     # (NVFP4 layers 0-19, MXFP8 20-23), bf16 attention, fp32 logits. Loads through mlx-vlm's inkling2
-    # model, which no mlx-vlm RELEASE ships yet (merged after 0.8.0; load_target names the fix). The
+    # model (mlx-vlm >= 0.8.1, this package's floor; load_target names the fix below it). The
     # head (inkling.py): per-layer context fusion, 8-row bidirectional block with a pure anchor slot,
     # the rnn_hidden Markov head folded through the target's head — draft blocks identical to the
     # reference head (51/51). Verify runs inside mlx-vlm's own speculative-cache transaction; the MoE

@@ -249,12 +249,15 @@ def test_a_local_copy_under_another_name_is_still_the_registered_pair(tmp_path):
         L.resolve(str(other), mode="dspark")
 
 
-def test_the_install_command_names_one_commit():
+def test_the_install_command_names_the_measured_release_and_the_floor_is_that_release():
+    from pathlib import Path
+
     from mlx_dspark import inkling
 
-    assert len(inkling.MLX_VLM_COMMIT) == 40 and int(inkling.MLX_VLM_COMMIT, 16) >= 0
-    assert inkling.MLX_VLM_INSTALL.endswith(f"mlx-vlm@{inkling.MLX_VLM_COMMIT}'")
-    assert inkling.MLX_VLM_INSTALL in inkling.MLX_VLM_HINT
+    assert inkling.MLX_VLM_INSTALL.endswith(f"'mlx-vlm=={inkling.MLX_VLM_VERSION}'")
+    assert inkling.MLX_VLM_VERSION in inkling.MLX_VLM_HINT and "git+" not in inkling.MLX_VLM_HINT
+    pyproject = Path(__file__).resolve().parents[1] / "pyproject.toml"
+    assert f'"mlx-vlm>={inkling.MLX_VLM_VERSION}"' in pyproject.read_text()
 
 
 def test_no_head_file_is_not_a_bundled_head(tmp_path):
@@ -675,7 +678,7 @@ def test_load_target_names_the_fix_on_an_mlx_vlm_without_the_looped_model(tmp_pa
     (tmp_path / "config.json").write_text(json.dumps({"model_type": "inkling2_loop"}))
     with pytest.raises(ValueError) as err:
         load_target(str(tmp_path))
-    assert MLX_VLM_HINT in str(err.value) and "git+https" in str(err.value)
+    assert MLX_VLM_HINT in str(err.value) and "uv pip install -U mlx-vlm" in str(err.value)
 
 
 @pytest.mark.parametrize("has_loop", [False, True])

@@ -20,9 +20,10 @@ dependencies = [
     "mlx>=0.32.0",
     "mlx-lm>=0.31.3",
     # mlx-vlm gives us Gemma-4 + the existing EAGLE3/DFlash spec-decode reference impl.
-    # Floor is 0.6.12: the first release shipping the muse_glimmer (Meta) module — earlier
-    # mlx-vlm can't load that target at all. 0.6.12 loads every other target here too.
-    "mlx-vlm>=0.6.12",
+    # Floor is 0.8.1: the first release shipping the looped inkling2 model (Inkling-2-Mini) —
+    # earlier mlx-vlm can't load that target at all (0.6.12 was the floor for muse_glimmer).
+    # Keep in step with inkling.MLX_VLM_VERSION, the release the Inkling pair was measured on.
+    "mlx-vlm>=0.8.1",
     "numpy",
     "huggingface-hub",
 ]
