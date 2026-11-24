@@ -211,6 +211,47 @@ struct HealthInfoTests {
         let none = #"{"status":"ok","model":"X","mode":"dspark","race_stock":null}"#
         #expect(try JSONDecoder().decode(HealthInfo.self, from: Data(none.utf8)).raceStock == nil)
     }
+
+    /// A model's faster variant (Inkling 2's 8-bit attention + output head): the engine reports
+    /// the bits in force and whether the loaded target has the option at all. The Weights
+    /// picker shows only on `true`; an older engine reports neither.
+    @Test func decodesTheTargetBitsOption() throws {
+        let json = #"{"status":"ok","model":"Inkling-2-Mini","mode":"dflash","target_bits":8,"target_bits_supported":true}"#
+        let health = try JSONDecoder().decode(HealthInfo.self, from: Data(json.utf8))
+        #expect(health.targetBits == 8)
+        #expect(health.targetBitsSupported == true)
+        let other = #"{"status":"ok","model":"Qwen3-4B-8bit","mode":"dspark","target_bits":0,"target_bits_supported":false}"#
+        #expect(try JSONDecoder().decode(HealthInfo.self, from: Data(other.utf8)).targetBitsSupported == false)
+        let old = #"{"status":"ok","model":"X","mode":"dspark"}"#
+        let before = try JSONDecoder().decode(HealthInfo.self, from: Data(old.utf8))
+        #expect(before.targetBits == nil)
+        #expect(before.targetBitsSupported == nil)
+    }
+}
+
+@Suite("Model inventory rows")
+struct ModelRowTests {
+    /// `/admin/models`: a row with an opt-in faster variant carries what it buys and what it
+    /// costs in the engine's words; other rows carry null, and older engines omit the key.
+    @Test func decodesARowsFasterVariant() throws {
+        let json = """
+        [{"id": "inkling-2-mini", "target": "thinkingmachines/Inkling-2-Mini",
+          "target_installed": true, "drafter_installed": true, "ready": true,
+          "target_bits_option": {"bits": 8, "gain": "+30% plain decoding, +12% with the drafter",
+                                 "caveat": "not the released weights"}},
+         {"id": "qwen3-4b", "target": "mlx-community/Qwen3-4B-8bit",
+          "target_installed": false, "drafter_installed": false, "ready": false,
+          "target_bits_option": null},
+         {"id": "from-an-older-engine", "target": "x/y",
+          "target_installed": false, "drafter_installed": false, "ready": false}]
+        """
+        let rows = try JSONDecoder().decode([ModelRow].self, from: Data(json.utf8))
+        #expect(rows[0].targetBitsOption?.bits == 8)
+        #expect(rows[0].targetBitsOption?.gain == "+30% plain decoding, +12% with the drafter")
+        #expect(rows[0].targetBitsOption?.caveat == "not the released weights")
+        #expect(rows[1].targetBitsOption == nil)
+        #expect(rows[2].targetBitsOption == nil)
+    }
 }
 
 @Suite("Install locations")

@@ -53,6 +53,11 @@ struct ModelsScreen: View {
                                  canLoad: row.target != model.model && !model.isModelLoading) {
                         Task { await model.switchModel(to: row.target) }
                     }
+                    // Outside the row's button on purpose: a control nested in a button
+                    // label does not reliably get its own clicks.
+                    if let option = row.targetBitsOption {
+                        TargetBitsToggle(row: row, option: option)
+                    }
                 }
                 if model.models.isEmpty {
                     ContentUnavailableView("No models listed", systemImage: "shippingbox")
@@ -327,6 +332,37 @@ struct ModelRowView: View {
         }
         .font(.caption)
         .foregroundStyle(.secondary)
+    }
+}
+
+/// The opt-in under a row that has a faster variant (Inkling 2: its attention projections and
+/// output head at 8-bit). What it buys and what it costs are the engine's words
+/// (`/admin/models` `target_bits_option`); the choice is remembered, and flipping it while
+/// that model is loaded reloads it in place.
+struct TargetBitsToggle: View {
+    @EnvironmentObject private var model: AppModel
+    let row: ModelRow
+    let option: TargetBitsOption
+
+    var body: some View {
+        Toggle(isOn: Binding(
+            get: { model.targetBits == option.bits },
+            set: { on in
+                Task { await model.setTargetBits(on ? option.bits : 0, for: row.target) }
+            })
+        ) {
+            Text("Load at \(option.bits)-bit: \(option.gain). Off by default — \(option.caveat).")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .toggleStyle(.checkbox)
+        .disabled(model.isModelLoading)
+        .padding(.leading, 14)
+        .help("Quantizes the parts of this model that its checkpoint keeps in 16-bit floats "
+              + "(the attention projections and the output head) when it loads. Faster, same "
+              + "memory, and no longer the model as released. Also under Decoding → Weights "
+              + "while the model is loaded.")
     }
 }
 

@@ -119,13 +119,20 @@ struct DecodingCard: View {
         Card(title: "Decoding", subtitle: model.decodingLine) {
             DecodingControls()
 
-            Text("Output is byte-identical in every mode — these change speed, not text. "
-                 + "Cap Auto calibrates this Mac once and adapts per round; pin a value if "
-                 + "you've measured a better fixed cap for this model. Applying reloads the "
-                 + "model in place (the server and its port stay up).")
+            Text(caption)
                 .font(.caption).foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
         }
+    }
+
+    private var caption: String {
+        let base = "Output is byte-identical in every mode — these change speed, not text. "
+            + "Cap Auto calibrates this Mac once and adapts per round; pin a value if "
+            + "you've measured a better fixed cap for this model. Applying reloads the "
+            + "model in place (the server and its port stay up)."
+        guard model.health?.targetBitsSupported == true else { return base }
+        return base + " Weights is the exception: 8-bit loads a faster version of this model "
+            + "that is not the one its authors released."
     }
 }
 
@@ -144,6 +151,8 @@ struct DecodingControls: View {
     @State private var contextWindow: String = "default"
     @State private var lookupDrafts: Bool = true
     @State private var kvBits: String = "default"
+    /// "released" / "8" — the loaded model's faster variant (`target_bits`).
+    @State private var weights: String = "released"
     /// "on" / "off" — the engine's thinking default for API requests that don't specify it.
     @State private var apiThinking: String = "on"
     @State private var applying = false
@@ -166,6 +175,13 @@ struct DecodingControls: View {
         guard let value, value == 4 || value == 8 else { return "default" }
         return String(value)
     }
+
+    /// Health's target_bits (0 = the released weights) as a picker tag.
+    private static func weightsTag(_ value: Int?) -> String {
+        value == 8 ? "8" : "released"
+    }
+
+    private var weightsSupported: Bool { model.health?.targetBitsSupported == true }
 
     /// Health's 0.0/0.2/0.3/0.5 as picker tags ("off"/"0.2"/…). Values outside the preset
     /// list (a server started with an unusual --confidence-threshold) round to one decimal
@@ -218,6 +234,12 @@ struct DecodingControls: View {
                             Spacer(minLength: 0)
                         }
                     }
+                    if weightsSupported {
+                        HStack(spacing: 14) {
+                            weightsPicker
+                            Spacer(minLength: 0)
+                        }
+                    }
                     if model.health?.lookupDrafts != nil {
                         HStack(spacing: 14) {
                             lookupToggle
@@ -257,8 +279,19 @@ struct DecodingControls: View {
                         if model.health?.thinkingDefault != nil {
                             apiThinkingPicker
                         }
-                        applyControl
+                        // (the Weights row below carries Apply when it is shown, so the
+                        //  second row never grows past the card)
+                        if !weightsSupported {
+                            applyControl
+                        }
                         Spacer(minLength: 0)
+                    }
+                    if weightsSupported {
+                        HStack(spacing: 14) {
+                            weightsPicker
+                            applyControl
+                            Spacer(minLength: 0)
+                        }
                     }
                 }
             }
@@ -273,8 +306,26 @@ struct DecodingControls: View {
             contextWindow = Self.contextTag(model.health?.contextWindow)
             lookupDrafts = model.health?.lookupDrafts ?? true
             kvBits = Self.kvTag(model.health?.kvBits)
+            weights = Self.weightsTag(model.health?.targetBits)
             apiThinking = model.health?.thinkingDefault ?? "on"
         }
+    }
+
+    /// Only rendered when `/health.target_bits_supported` is true (an Inkling 2 target on an
+    /// engine that reports it). Unlike every other control here this one changes OUTPUT.
+    @ViewBuilder private var weightsPicker: some View {
+        Picker("Weights", selection: $weights) {
+            Text("As released").tag("released")
+            Text("8-bit · faster").tag("8")
+        }
+        .fixedSize()
+        .help("This model's checkpoint quantizes only its experts: the attention projections "
+              + "and the output head stay in 16-bit floats, and they are two thirds of what "
+              + "the model reads for every token. 8-bit quantizes them when the model loads: "
+              + "about 30% faster plain decoding and 12% faster with the drafter on an M4 "
+              + "Pro, same memory. It is then no longer the model as released — about 1.6% "
+              + "of next-token choices differ, always where the top two candidates were "
+              + "nearly tied. Off by default; the app remembers your choice for this model.")
     }
 
     /// The engine's thinking default for *API* requests that don't say (issue #19): the
@@ -375,6 +426,7 @@ struct DecodingControls: View {
             || contextWindow != Self.contextTag(model.health?.contextWindow)
             || lookupDrafts != (model.health?.lookupDrafts ?? lookupDrafts)
             || kvBits != Self.kvTag(model.health?.kvBits)
+            || (weightsSupported && weights != Self.weightsTag(model.health?.targetBits))
             || apiThinking != (model.health?.thinkingDefault ?? apiThinking)
     }
 
@@ -392,6 +444,10 @@ struct DecodingControls: View {
                 // 0 (full precision). Gated on health reporting the field at all.
                 kvBits: kvBits == Self.kvTag(model.health?.kvBits) ? nil
                         : (kvBits == "default" ? 0 : Int(kvBits)),
+                // ALWAYS explicit where the option exists: the override is per load, so an
+                // Apply that changed only the mode or the cap would otherwise put the
+                // released weights back without saying so.
+                targetBits: weightsSupported ? (weights == "8" ? 8 : 0) : nil,
                 // Unchanged -> nil (keep); "on" -> true = the model's own default.
                 enableThinking: apiThinking == model.health?.thinkingDefault ? nil
                         : (apiThinking == "on"))

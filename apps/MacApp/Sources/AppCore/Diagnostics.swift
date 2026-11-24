@@ -59,6 +59,15 @@ public struct DoctorReport: Decodable, Sendable {
 }
 
 /// One registry model, annotated for *this* machine.
+/// A faster variant a registry row can be loaded as, off by default: `/admin/load`'s
+/// `target_bits` (Inkling 2's attention + output head at 8-bit). The engine states what it
+/// buys and what it costs; the app only relays it.
+public struct TargetBitsOption: Decodable, Sendable, Equatable {
+    public let bits: Int
+    public let gain: String
+    public let caveat: String
+}
+
 public struct ModelRow: Decodable, Sendable, Identifiable {
     public let id: String
     public let target: String
@@ -82,9 +91,12 @@ public struct ModelRow: Decodable, Sendable, Identifiable {
     /// until the weights are local (and on older engines).
     public let weightBytes: Int?
     public let ceilingTps: Double?
+    /// The row's opt-in faster variant, when it has one (nil otherwise, and on older engines).
+    public let targetBitsOption: TargetBitsOption?
 
     enum CodingKeys: String, CodingKey {
         case id, target, ram, fits, ready, speedup
+        case targetBitsOption = "target_bits_option"
         case weightBytes = "weight_bytes"
         case ceilingTps = "ceiling_tps"
         case dsparkDrafter = "dspark_drafter"

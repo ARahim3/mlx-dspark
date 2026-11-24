@@ -167,6 +167,13 @@ final class AppModel: ObservableObject {
 
     /// The target the server is (or will be) loaded with. Persisted after onboarding.
     @Published var model: String = Defaults.selectedModel ?? "mlx-community/Qwen3-4B-8bit"
+    /// The user's opt-in to a model's faster variant (`target_bits`; 0 = the released weights,
+    /// the default). Remembered across launches like the model choice it belongs to, because it
+    /// picks WHICH model runs: at 8 Inkling 2's attention and output head are quantized at
+    /// load, and its output is no longer the released model's.
+    @Published var targetBits: Int = Defaults.targetBits {
+        didSet { Defaults.targetBits = targetBits }
+    }
 
     // MARK: Onboarding
     /// Hardware + inventory, probed model-free before any server starts.
@@ -538,7 +545,7 @@ final class AppModel: ObservableObject {
             isCancellingLoad = false
         }
         do {
-            _ = try await client.loadModel(target)
+            _ = try await client.loadModel(target, targetBits: targetBitsOverride(for: target))
             // Re-point health at the new model and restart the telemetry stream (the old one
             // ended when the engine it was streaming from was torn down).
             currentHealth = try? await client.health()
@@ -557,6 +564,28 @@ final class AppModel: ObservableObject {
             currentHealth = try? await client.health()   // reflects the no-model state
             return false
         }
+    }
+
+    /// What to send as `target_bits` when loading `target`: the remembered opt-in where the
+    /// registry row has that variant, nil (the server's setting: the released weights)
+    /// everywhere else — an engine told to quantize a model that has no such option logs a
+    /// note on every load.
+    private func targetBitsOverride(for target: String) -> Int? {
+        guard targetBits != 0,
+              let option = models.first(where: { $0.target == target })?.targetBitsOption,
+              option.bits == targetBits else { return nil }
+        return targetBits
+    }
+
+    /// Opt in to (or out of) a row's faster variant. Remembered; and when that model is the
+    /// one loaded, it is reloaded in place with its current mode and cap.
+    func setTargetBits(_ bits: Int, for target: String) async {
+        targetBits = bits
+        guard target == model, isServerReady, !isModelLoading,
+              currentHealth?.targetBitsSupported == true,
+              (currentHealth?.targetBits ?? 0) != bits else { return }
+        await applyEngineSettings(mode: currentHealth?.mode, cap: currentHealth?.maxDraft,
+                                  targetBits: bits)
     }
 
     /// Cancel the in-flight first-time download (`/admin/load/cancel`). The blocked
@@ -634,7 +663,8 @@ final class AppModel: ObservableObject {
     /// speed changes.
     func applyEngineSettings(mode: String?, cap: String?, confidence: Double? = nil,
                              contextWindow: Int? = nil, lookupDrafts: Bool? = nil,
-                             kvBits: Int? = nil, enableThinking: Bool? = nil) async {
+                             kvBits: Int? = nil, targetBits: Int? = nil,
+                             enableThinking: Bool? = nil) async {
         guard let client = apiClient else { return }
         generationTask?.cancel()
         modelSwitchError = nil
@@ -657,7 +687,9 @@ final class AppModel: ObservableObject {
                                            contextWindow: contextWindow,
                                            lookupDrafts: lookupDrafts,
                                            kvBits: kvBits,
+                                           targetBits: targetBits,
                                            enableThinking: enableThinking)
+            if let targetBits { self.targetBits = targetBits }   // the choice sticks
             currentHealth = try? await client.health()
             startTelemetry()
             startMemoryPolling()
@@ -1195,6 +1227,12 @@ enum Defaults {
     static var appearance: String {
         get { store.string(forKey: "appearance") ?? "system" }
         set { store.set(newValue, forKey: "appearance") }
+    }
+
+    /// The opt-in to a model's faster variant (`target_bits`): 0 = the released weights.
+    static var targetBits: Int {
+        get { store.integer(forKey: "targetBits") }
+        set { store.set(newValue, forKey: "targetBits") }
     }
 
     /// The target chosen during onboarding. `nil` means onboarding hasn't run — the signal

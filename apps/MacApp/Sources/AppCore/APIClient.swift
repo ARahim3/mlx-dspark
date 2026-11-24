@@ -59,6 +59,13 @@ public struct HealthInfo: Decodable, Sendable, Equatable {
     /// `/admin/load` override, so the picker hides then (a control that silently does
     /// nothing is worse than none).
     public let kvBits: Int?
+    /// Inkling 2's bf16 attention projections and output head quantized at load: 0 = the
+    /// released weights, 8 = the opt-in (`--target-bits 8`; faster, and no longer the model as
+    /// released). 0 for every target the option does not apply to.
+    public let targetBits: Int?
+    /// Whether the loaded target takes that option at all — the gate for the Weights picker
+    /// (a switch that does nothing is worse than none). Nil on engines that predate it.
+    public let targetBitsSupported: Bool?
     /// Banner-worthy conditions: live macOS memory pressure and the engine's load-time notes
     /// (e.g. "this context window's KV cache can't fit alongside the weights"). Optional:
     /// older engines don't report it.
@@ -81,6 +88,8 @@ public struct HealthInfo: Decodable, Sendable, Equatable {
         case raceStock = "race_stock"
         case lookupDrafts = "lookup_drafts"
         case kvBits = "kv_bits"
+        case targetBits = "target_bits"
+        case targetBitsSupported = "target_bits_supported"
     }
 
     /// True when a model is loaded and serving (`status == "ok"`).
@@ -277,6 +286,7 @@ public struct APIClient: Sendable {
                           contextWindow: Int? = nil,
                           lookupDrafts: Bool? = nil,
                           kvBits: Int? = nil,
+                          targetBits: Int? = nil,
                           enableThinking: Bool? = nil) async throws -> LoadStatus {
         var payload: [String: Any] = ["model": target]
         if let mode { payload["mode"] = mode }
@@ -292,6 +302,10 @@ public struct APIClient: Sendable {
         // KV-cache quantization (issue #17): 0 = explicitly full precision, 4/8 = quantized;
         // nil = keep the server's setting. The caller gates on /health.kv_bits presence.
         if let kvBits { payload["kv_bits"] = kvBits }
+        // A row's faster variant (Inkling 2: 8 = its bf16 attention + output head at 8-bit,
+        // not the released weights; 0 = as released); nil = the server's setting. The caller
+        // sends it only where the row or /health says the option exists.
+        if let targetBits { payload["target_bits"] = targetBits }
         // Thinking default for API clients (issue #19): false = off unless a request asks,
         // true = the model's own default; nil = keep. Sticky across later swaps server-side.
         if let enableThinking { payload["enable_thinking"] = enableThinking }
