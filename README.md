@@ -57,9 +57,9 @@ chat/code/math), the Muse row per-content best (footnoted); full tables, baselin
 | **LFM2.5-2.6B** (bf16, conv-hybrid)[^lfm2] | **3.49×** math · **2.65×** code · **2.24×** chat | ~97–152 tok/s |
 | **Muse-Glimmer-30B** (8-bit, dense)[^muse] | **3.27×** math · **2.50×** code · **2.22×** chat | ~18–26 tok/s |
 | **Qwen3.8-27B** (4-bit, DFlash 2)[^q38] | **3.17×** code · **3.13×** math · **2.49×** chat | **~37–47 tok/s** |
+| **Inkling-2-Mini** (NVFP4, looped MoE, DFlash 2)[^inkling] | **3.01×** code · **3.01×** math · 1.75× chat over stock mlx-vlm (**2.59×** overall, 25.9 → 67.0 tok/s) · over our own plain decode: 2.22× · 2.22× · 1.28× | ~46–79 tok/s · opt-in `--target-bits 8`: **+12%** (+30% plain), not the released weights |
 | **Qwen3-8B** (8-bit) | **2.83×** math · **2.03×** code · 1.71× chat | ~50–83 tok/s |
 | **Qwen3.6-27B** (8-bit) | **2.67×** math · **2.26×** chat · 1.96× code | ~16–22 tok/s |
-| **Inkling-2-Mini** (NVFP4, looped MoE, DFlash 2)[^inkling] | **2.59× over stock mlx-vlm** (25.9 → 67.0 tok/s) · vs our own plain decode: **2.22×** code · **2.22×** math · 1.28× chat | ~46–79 tok/s · opt-in `--target-bits 8`: **+12%** (+30% plain), not the released weights |
 | **Ornith-1.0-9B** (8-bit) | **2.53×** code · **2.48×** math · **2.21×** chat | ~59–68 tok/s |
 | **Qwen3-4B** (8-bit) | **2.46×** math · 1.78× chat · 1.72× code | ~89–126 tok/s |
 | **Qwen3-14B** (8-bit) | **2.36×** math · **2.11×** code · 1.62× chat | ~25–36 tok/s |
