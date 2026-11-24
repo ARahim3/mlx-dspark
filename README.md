@@ -59,10 +59,10 @@ chat/code/math), the Muse row per-content best (footnoted); full tables, baselin
 | **Qwen3.8-27B** (4-bit, DFlash 2)[^q38] | **3.17×** code · **3.13×** math · **2.49×** chat | **~37–47 tok/s** |
 | **Qwen3-8B** (8-bit) | **2.83×** math · **2.03×** code · 1.71× chat | ~50–83 tok/s |
 | **Qwen3.6-27B** (8-bit) | **2.67×** math · **2.26×** chat · 1.96× code | ~16–22 tok/s |
+| **Inkling-2-Mini** (NVFP4, looped MoE, DFlash 2)[^inkling] | **2.55× over stock mlx-vlm** (24.9 → 63.5 tok/s) · vs our own plain decode: **2.13×** code · **2.08×** math · 1.23× chat | ~44–75 tok/s |
 | **Ornith-1.0-9B** (8-bit) | **2.53×** code · **2.48×** math · **2.21×** chat | ~59–68 tok/s |
 | **Qwen3-4B** (8-bit) | **2.46×** math · 1.78× chat · 1.72× code | ~89–126 tok/s |
 | **Qwen3-14B** (8-bit) | **2.36×** math · **2.11×** code · 1.62× chat | ~25–36 tok/s |
-| **Inkling-2-Mini** (NVFP4, looped MoE)[^inkling] | **1.91× over stock mlx-vlm** (24.9 → 47.5 tok/s) · vs our own plain decode: **1.67×** math · **1.40×** code · 1.06× chat | ~37–57 tok/s |
 | **Qwen3.6-35B-A3B** (4-bit, MoE)[^moe] | **1.67×** math · 1.24× code · 1.05× chat | **~91–145 tok/s** |
 | **Nemotron-3.5-Lightning-30B-A3B** (4-bit, MoE+Mamba)[^nemotron] | **1.34×** math · **1.27×** code · 1.07× chat | **~87–112 tok/s** |
 | **Ternary-Bonsai-27B** (2-bit) | **1.13×** code | ~26–29 tok/s |
@@ -377,7 +377,7 @@ on your Mac.
 | `LiquidAI/LFM2.5-8B-A1B-MLX-bf16`[^lfm2] | `LiquidAI/LFM2.5-8B-A1B-DSpark` (official) | — | ~19 GB |
 | `MercuriusDream/Nanbeige4.2-3B-mlx-bf16`[^nanbeige] | `Nanbeige/Nanbeige4.2-3B-DSpark` (official, SpecForge) | — | ~10 GB |
 | `mlx-community/MiniCPM5-2B-bf16`[^minicpm5] | `openbmb/MiniCPM5-2B-DSpark` (official, DeepSpec) | — | ~6 GB |
-| `thinkingmachines/Inkling-2-Mini`[^inkling] | ships inside the model repo (`mtp.safetensors`) | — | ~22 GB |
+| `thinkingmachines/Inkling-2-Mini`[^inkling] | ships inside the model repo (`mtp.safetensors`) | `incoai/Inkling-2-Mini-DFlash2` (**default**) | ~22 GB |
 | `mlx-community/Qwen3.6-35B-A3B-4bit`[^moe] | `Koopah/Qwen3.6-35B-A3B-NVFP4-DSPARK` (community) | — | ~23 GB |
 | `mlx-community/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-4bit`[^nemotron] | `mlx-community/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-DSpark-bf16` (NVIDIA head, MLX) | — | ~20 GB |
 | `prism-ml/Ternary-Bonsai-27B-mlx-2bit` | `Rahim/Ternary-Bonsai-27B-dspark` | — | ~12 GB |
@@ -577,7 +577,7 @@ row at 7 — same code, different measured curves
 | **Qwen3-8B** | 7 | 3.37 | 29.5 tok/s | 64.5 tok/s | **2.19×** | 1.71× / 2.03× / 2.83× |
 | **Qwen3-14B**[^qwen14b] | 4 | 2.87 | 15.3 tok/s | 31.0 tok/s | **2.03×** | 1.62× / 2.11× / 2.36× |
 | **Qwen3-4B** | 7 | 3.23 | 51.7 tok/s | 102.5 tok/s | **1.98×** | 1.78× / 1.72× / 2.46× |
-| **Inkling-2-Mini** (NVFP4, looped MoE)[^inkling] | 3 | 2.41 | 34.6 tok/s (stock mlx-vlm: 24.9) | 47.5 tok/s | **1.37×** (1.91× over stock) | 1.06× / 1.40× / 1.67× |
+| **Inkling-2-Mini** (NVFP4, looped MoE, DFlash 2)[^inkling] | 6 | 4.19 | 35.1 tok/s (stock mlx-vlm: 24.9) | 63.5 tok/s | **1.81×** (2.55× over stock) | 1.23× / 2.13× / 2.08× |
 | **Qwen3.6-35B-A3B** (4-bit, MoE, hybrid)[^community][^moe] | conf | 4.72 | 86.9 tok/s | 114.5 tok/s | **1.32×** | 1.05× / 1.24× / 1.67× |
 | **Nemotron-3.5-Lightning-30B-A3B** (4-bit, MoE+Mamba, hybrid)[^nemotron] | 3 | 3.28 | 91.4 tok/s | 100.9 tok/s | **1.10×** | 0.95× / 1.23× / 1.13× |
 | **Ternary-Bonsai-27B** (2-bit, hybrid) | 2 | 2.60 | 25.4 tok/s | 27.2 tok/s | **1.07×** | 1.01× / 1.13× / 1.07× |
@@ -754,11 +754,16 @@ alone keeps the drafter at full speed; two or more decode together; and an arriv
 for the request ahead of it (first token after 0.44 s instead of 8–11 s). Total tok/s, same
 workload, mlx 0.32.4:
 
-| requests at once | total tok/s | each request | vs one, plain (36.5) | vs one, with the drafter (48.6) |
+| requests at once | total tok/s | each request | vs one, plain (36.5) | vs one, with the DSpark head (48.6) |
 |---|---|---|---|---|
 | 2 | 58.8 | 29.4 | 1.61× | 1.21× |
 | 4 | 86.7 | 21.7 | 2.37× | 1.78× |
 | 8 | **124.6** | 15.6 | **3.41×** | **2.57×** |
+
+With the DFlash 2 head (the default since 0.22) a lone request drafts with it and hands over the
+same way. One request alone then decodes at ~63 tok/s on the benchmark prompts (this table's
+workload was not re-measured), so two requests at once mainly buy the second one its first token
+right away; the batch's total pulls ahead of a single stream from about four.
 
 Three things worth knowing:
 
@@ -770,7 +775,8 @@ Three things worth knowing:
   only the non-expert weights. Inkling, also an MoE, batches well: two thirds of the bytes it
   reads per token are dense attention and its output head, which every row shares.
 - **What batches:** dense mlx-lm models batch plain and DSpark decoding; hybrid models batch
-  plain decoding and keep DSpark one at a time; Gemma-4 serves one request at a time.
+  plain decoding and keep DSpark one at a time; Inkling-2-Mini batches plain decoding and runs
+  either of its drafters for a request that is alone; Gemma-4 serves one request at a time.
 
 More: [Batching](https://arahim.dev/mlx-dspark/concepts/batching/).
 
@@ -891,19 +897,26 @@ are bundled.
     drafts **off** (the pair's registry default); lossless on both quants (fp ties only).
 
 [^inkling]: **Inkling-2-Mini** (Thinking Machines) — **mlx-vlm's own code decodes this model at
-    24.9 tok/s on this Mac; mlx-dspark runs it at 34.6 tok/s plain and 47.5 tok/s with the
-    drafter (1.91×).** Both sides gain: the stock code launches about 7,000 small GPU kernels per
+    24.9 tok/s on this Mac; mlx-dspark runs it at 35 tok/s plain and 63.5 tok/s with Inco AI's
+    DFlash 2 head, `incoai/Inkling-2-Mini-DFlash2` (2.55×)**, the default since 0.22: the head
+    the model ships in its own repo gives 47.6 in the same run (`--mode dspark`), and with
+    `--target-bits 8` the two give 72.5 and 54.8. The DFlash 2 head is a 990 MB second download;
+    it binds what the bundled head reads (the same taps, the full input embedding, the real
+    200,058-token vocabulary), drafts its block's candidates through an 8-bit copy of the output
+    head on the GPU's matrix units, and its cap is derived at its own measured acceptance — 6 on
+    an M4 Pro (measured 2026-11-24, paired, mlx 0.32.4; lossless by token forcing against the
+    stock forward). Both sides gain: the stock code launches about 7,000 small GPU kernels per
     token on this model, mlx-dspark's own forward about 2,100; its expert kernels read each
     expert's weights once for all the rows routed to it; and its attention reads the cached keys
     and values in place where the stock code copies them at every layer (and again to roll a
     verify pass back — those copies alone are 7% of a decode step at a 2,600-token prompt and
     12% at 8,000), and on long prompts a verify pass reads them once per key/value head instead
     of once per row and query head (5% of a 4-row verify pass at 2,600 tokens, 8% at 16,000).
-    Plain decoding is 39% faster and a verify pass far cheaper (the same drafter
-    on the stock forward reaches 28.9 tok/s). **The baseline column in this row is mlx-dspark's
-    own faster plain decode**, which is why the ratio there reads 1.37×. To see all three on
-    your own Mac in one run, race them: `POST /admin/race` with a `stock` arm (the model on
-    mlx-vlm's own forward, every mlx-dspark kernel off) beside `baseline` and `dspark`.
+    Plain decoding is 39% faster and a verify pass far cheaper (the bundled head on the stock
+    forward reaches 28.9 tok/s). **The baseline column in this row is mlx-dspark's own faster
+    plain decode**, which is why the ratio there reads 1.81×. To see them on your own Mac in one
+    run, race them: `POST /admin/race` with a `stock` arm (the model on mlx-vlm's own forward,
+    every mlx-dspark kernel off) beside `baseline` and `dflash`.
     It is the first **looped mixture-of-experts** target: 24 layers
     whose middle 12 run three times per token, 8 of 128 experts, the experts in NVFP4 / MXFP8 as
     released (there is no other quant to pick; mlx-dspark runs the official checkpoint as-is).

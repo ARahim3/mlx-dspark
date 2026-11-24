@@ -2,6 +2,20 @@
 
 All notable changes to `mlx-dspark`. Versions follow [SemVer](https://semver.org/) (pre-1.0: minor-ish features land as patch bumps).
 
+## [Unreleased] — Inkling-2-Mini at 63.5 tok/s with Inco AI's DFlash 2 head (24.9 in stock mlx-vlm)
+
+### Faster
+- **Inkling-2-Mini drafts with Inco AI's DFlash 2 head by default: 63.5 tok/s where the head the model ships gives 47.6, in the same run (M4 Pro, released weights, 1.81× our own plain decode, 2.55× stock mlx-vlm's 24.9); 72.5 vs 54.8 with `--target-bits 8`.** `incoai/Inkling-2-Mini-DFlash2` (a 990 MB second download) is accepted 4.2 tokens a round at cap 6, against 2.4 for the bundled head at cap 3; per prompt: code 2.13×, math 2.08×, chat 1.23×. `--mode auto`, `serve` and the Mac app pick it; `--mode dspark` keeps the bundled head. Copies of the model without the bundled head (mlx-community's conversions dropped it) now get a drafter too. Lossless: token forcing against the stock forward finds 22 near-tie mismatches in 2,048 positions at cap 6, the stock reference's own 22.
+- **A DFlash 2 head's draft round on Inkling: 8.95 → 6.67 ms.** Its candidates go through an 8-bit copy of the output head on the GPU's matrix units (3.8 → 2.2 ms for the 7 rows of a round; the target's own 8-bit head on `--target-bits 8` serves instead of a copy), and the top 16 of 200,058 logits per row are picked in two stages, the 16 best blocks first (0.94 → 0.15 ms, the same set — also for Qwen3.8-27B's DFlash 2 head). `MLX_DSPARK_INKLING_DFLASH_HEAD_BITS` (0 = the bf16 head) is the A/B.
+- **`--target-bits 8`: an 8-row verify pass's output head 4.24 → 2.18 ms** on the matrix units, from 5 rows; decode and verify passes of up to 4 rows are unchanged.
+
+### Added
+- **`--max-batch` in dflash mode on Inkling-2-Mini:** two or more requests decode together as before, and a request that is alone drafts with the DFlash 2 head, hands over at a round when another arrives, and gets its drafter back, with its context, when it is alone again.
+- **DFlash 2 heads that cap their selector's scores after its correction** (`dflash_config.selector_softcap_mode: after_correction`, the Inkling head's contract) and draft from a padded head's real vocabulary.
+
+### Changed
+- **A pair's default cap can be derived at its own measured acceptance.** The cap is still the argmax over this machine's measured cost curves; the acceptance it assumes was one constant fitted on DSpark heads (0.70), under which Inkling's DFlash 2 head got cap 3 (59.0 tok/s) where cap 6 measured 64.8. A registry row now carries the measured figure (`accept_p`: 0.80 for this head, from caps 3–7) and the server's depth-aware capper uses the same one.
+
 ## [0.21.2] — 2026-11-24 — Inkling-2-Mini knows its context limit; the engine exits with the Mac app
 
 ### Fixed

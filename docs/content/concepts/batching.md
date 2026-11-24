@@ -32,7 +32,7 @@ mlx-dspark serve --model thinkingmachines/Inkling-2-Mini --max-batch 8
 
 Inkling batches on mlx-dspark's own forward for this model, and the two ways of getting more out of a weight read take turns:
 
-- **One request alone** runs exactly as without `--max-batch`: the drafter, at the same speed (measured within 1%).
+- **One request alone** runs exactly as without `--max-batch`: its drafter — the DFlash 2 head by default, or the bundled DSpark head with `--mode dspark` — at the same speed (measured within 1% for the DSpark head).
 - **Two or more at once** decode together, one token each per pass, up to 8. Sampled requests (what most clients send) batch like greedy ones.
 - **Arrivals don't wait.** A request running alone under the drafter hands over at its next round when another arrives, both decode together, and it gets the drafter back when it is alone again. Measured: a short request arriving in the middle of a long one saw its first token after 0.44 s instead of waiting 8 to 11 s for the long one to finish.
 
@@ -64,7 +64,7 @@ So speculation's value is largest for a *single* stream, and batching's is large
 
 - **Dense `mlx-lm` models** batch both plain and DSpark decoding.
 - **Hybrid models** (Ornith, Bonsai, Qwen3.6/3.8 and the other recurrent families) batch plain decoding. Their recurrent state is a fixed-size summary, so rows of different prompt lengths merge by plain concatenation. Batched *speculative* decoding stays dense-only: each row of a speculative round rolls back by a different amount, which a KV cache handles with per-row metadata but a recurrent state doesn't. Such a model batches its plain decoding and takes the serial path for speculation; nothing silently degrades.
-- **Inkling-2-Mini** batches plain decoding on its own forward, in DSpark and baseline mode, and keeps the drafter for a request that is alone ([above](#inkling-2-mini)).
+- **Inkling-2-Mini** batches plain decoding on its own forward, in DFlash, DSpark and baseline mode, and keeps the drafter for a request that is alone ([above](#inkling-2-mini)).
 - **Gemma-4** (through `mlx-vlm`, with a rotating cache) serves requests one at a time.
 - **`--kv-bits`** disables batching.
 

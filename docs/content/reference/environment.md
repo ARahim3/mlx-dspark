@@ -30,6 +30,9 @@ description: The environment variables the engine reads, and where it keeps thin
 `MLX_DSPARK_INKLING_GROUPED_MOE=0`
 : Inkling 2 only: run mlx-vlm's stock expert code instead of mlx-dspark's expert kernels, which read each expert's weights once for all the rows routed to it and do the routing and the route combine in one GPU launch each. Slower for decode steps and more so for verify passes. For comparison runs only.
 
+`MLX_DSPARK_INKLING_DFLASH_HEAD_BITS`
+: Inkling 2 only: the bits of the copy of the output head that the DFlash 2 head (`incoai/Inkling-2-Mini-DFlash2`) picks its draft candidates through on the released weights: 8 (default, about 0.5 GB), 4, or 0 for the bf16 head itself (slower: it reads 0.93 GB a round). With `--target-bits 8` the target's own 8-bit head is used and nothing is copied. Drafting only — the output is checked by the model either way; 4 bits measurably reorders the candidates. For comparison runs only.
+
 `MLX_DSPARK_INKLING_EXPERT_VIEWS=0`
 : Inkling 2 only: hand the expert kernels the full expert tensors instead of small views of them. MLX ends a GPU command buffer once the arrays bound in it pass a size limit, and one stacked expert tensor is over that limit on its own, so without the views every expert launch ends its buffer (about 1.4 ms of a 30 ms decode step). Same tokens either way. For comparison runs only.
 
