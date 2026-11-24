@@ -298,7 +298,7 @@ REGISTRY = [
     # instead of ~7,000). Measured 2026-11-22 (M4 Pro, mlx 0.32.4, `benchmark --trials 3`, zero
     # flags), baseline = mlx-dspark's own plain decode: **cap 3 = 1.37x** (1.06x chat / 1.40x code
     # / 1.67x math, accept 2.41, baseline 34.6 tok/s, DSpark 47.5); the stock mlx-vlm forward
-    # decodes at 24.9 tok/s, so 1.91x over what a plain mlx-vlm user gets. Lookup off
+    # decoded at 24.9 tok/s then (25.9 on mlx-vlm 0.8.1), 1.91x under what this gave. Lookup off
     # (MoE: a free draft still pulls fresh experts per row; re-measured 2026-11-22 with the fused
     # pieces taking 33 rows: x1.90 on a verbatim rewrite, x0.91 on a reordering edit, x0.95-1.07 on
     # chat / code / math — content-dependent, so it stays off). Lossless (token forcing against the
@@ -314,10 +314,15 @@ REGISTRY = [
     # 0.80-0.83), not the DSpark-fitted 0.70 that derived cap 3 (59.0). Lossless by the same gate
     # (cap 6: 22 / 2,048 near-tie mismatches, the stock reference's own 22). `--max-batch` takes
     # it as the lone request's drafter. See NOTES "DFlash2 on Inkling-2-Mini".
+    # Tree verify (`--tree auto`: an equal-width best-first tree through the fused forward,
+    # inkling_fused "tree verify") on mlx-vlm 0.8.1, same day, same method: **cap 6 = 1.90x**
+    # (67.0 tok/s; 1.28x chat / 2.22x code / 2.22x math, accept 4.30; chains 64.6 back to back),
+    # `--target-bits 8` 74.8; stock mlx-vlm 0.8.1 decodes at 25.9. See NOTES "Tree verify on
+    # Inkling-2-Mini".
     {"id": "inkling-2-mini", "target": "thinkingmachines/Inkling-2-Mini",
      "dspark": "thinkingmachines/Inkling-2-Mini", "bundled_head": True, "lookup_drafts": False,
      "dflash": "incoai/Inkling-2-Mini-DFlash2", "mode": "dflash", "accept_p": {"dflash": 0.80},
-     "model_type": "inkling2_loop", "ram": "~22 GB", "speedup": "~1.8× (2.1× code / math)"},
+     "model_type": "inkling2_loop", "ram": "~22 GB", "speedup": "~1.9× (2.2× code / math)"},
 ]
 
 # legacy `--family` / load_pair("qwen3") values -> a concrete target repo (deprecated).

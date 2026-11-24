@@ -163,13 +163,10 @@ def measure_tree_curve(target, tap: list[int], nodes: list[int], slots: int,
 
         def fn(dt=dt, w=dt.width):
             logits, _ = target.verify_tree(dt, cache, tap)
-            for c in cache:                      # roll back so every iteration is identical
-                if c is not None and hasattr(c, "trim"):
-                    c.trim(w)
+            target.abort_tree(cache, w)          # roll back so every iteration is identical
             return logits
 
         curve[n] = _bench(fn)
-    target._tree_stash = None                    # drop the last verify's captured rows
     return curve
 
 
@@ -206,11 +203,10 @@ def measure_tree_fallback_ratio(target, tap: list[int], cap: int,
 
     def tree():
         logits, _ = target.verify_tree(dt, cache, tap)
-        rollback()
+        target.abort_tree(cache, w)
         return logits
 
     c1, t, c2 = _bench(chain), _bench(tree), _bench(chain)
-    target._tree_stash = None
     return t / ((c1 + c2) / 2.0)
 
 

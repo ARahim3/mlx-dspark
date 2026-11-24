@@ -1131,12 +1131,22 @@ class Target:
     # tree_selftest() proves the plumbing on THIS model before the loop trusts it — a missed
     # patch (say, a family that applies rope elsewhere) would put rows at wrong positions,
     # i.e. the target would "decide" with the wrong model, so it fails closed to chains.
+    #
+    # Inkling 2 (mlx-vlm) takes none of those patches: its forward is our own fused one, whose
+    # kernels read the tree's structure directly (inkling_fused "tree verify": the short
+    # convolutions along a row's root path, the relative-position mask by depth, a commit along
+    # the accepted path) — _verify_tree_inkling / _tree_selftest_inkling below.
 
     @property
     def supports_tree(self) -> bool:
         """Structural eligibility for tree verify: mlx-lm text targets whose attention layers
         take ``self_attn.rope`` + a mask — dense families and the qwen3_5 gated-DeltaNet
-        hybrids. VLM, Mamba-2, short-conv, looped (nanbeige) and muse targets run chains."""
+        hybrids — and Inkling 2 on its fused forward with the in-place KV caches. Other VLM,
+        Mamba-2, short-conv, looped (nanbeige) and muse targets run chains."""
+        if self._inkling:
+            from .inkling_fused import tree_supported
+
+            return bool(self.inkling_fused) and tree_supported(self.model.language_model)
         return (not self.is_vlm and not self._muse and not self._nanbeige
                 and self._recurrence in (None, "gated_delta"))
 
@@ -1166,10 +1176,37 @@ class Target:
         return calls.get("gdu", 0) > 0 and calls.get("kernel", 0) == calls["gdu"]
 
     def _tree_conv_k(self) -> int:
-        """The linear layers' conv kernel size (the window DeviceTree.conv_idx must index)."""
+        """The linear layers' conv kernel size (the window DeviceTree.conv_idx must index);
+        Inkling 2's short convolutions' (4: the only width its fused kernels take)."""
         if self._recurrence == "gated_delta":
             return int(self._gdn_modules[0].conv_kernel_size)
         return 4
+
+    @property
+    def tree_max_nodes(self) -> int:
+        """The most drafted nodes one tree verify takes here: ``tree.TREE_MAX_NODES``, and on
+        Inkling 2 no more rows than its fused forward accepts in a call (8, or 33 where the
+        wide self-test passed)."""
+        from .tree import TREE_MAX_NODES
+
+        if self._inkling:
+            from .inkling_fused import rows_limit
+
+            return min(TREE_MAX_NODES, rows_limit(self.model.language_model) - 1)
+        return TREE_MAX_NODES
+
+    def abort_tree(self, cache, width: int) -> None:
+        """Undo a :meth:`verify_tree` that will not be committed (a timing harness): the caches
+        as before it."""
+        if self._inkling:
+            txn, self._txn = self._txn, None
+            if txn is not None:
+                txn.abort()
+            return
+        for c in cache:
+            if c is not None and hasattr(c, "trim"):
+                c.trim(width)
+        self._tree_stash = None
 
     @staticmethod
     def _kv_offset(cache) -> int:
@@ -1338,6 +1375,8 @@ class Target:
         from .tree import DeviceTree, to_device
 
         dt = tree if isinstance(tree, DeviceTree) else to_device(tree, self._tree_conv_k())
+        if self._inkling:
+            return self._verify_tree_inkling(dt, cache, tap)
         L = self._kv_offset(cache)
         w = dt.width
         mask = mx.concatenate([mx.ones((w, L), dtype=mx.bool_), dt.anc], axis=1)[None, None]
@@ -1371,7 +1410,17 @@ class Target:
                       the stored state is the one the forward wrote: the state after the rows
                       that were pending before it, which these rows start from); the conv
                       window = the last (kernel-1) rows of [pre-round window ‖ path].
-        Same result as a chain verify of the path followed by its rollback."""
+        Same result as a chain verify of the path followed by its rollback.
+
+        Inkling 2: the tree round's own commit (``inkling_fused.TreeRound.commit`` — each short
+        convolution's state the last taps along the path, each KV cache a counter or the
+        path's rows re-appended)."""
+        if self._inkling:
+            txn, self._txn = self._txn, None
+            if txn is None or not hasattr(txn, "kvs"):
+                raise RuntimeError("commit_tree() without a preceding verify_tree()")
+            txn.commit(path)
+            return
         if getattr(self, "_tree_stash", None) is None:
             raise RuntimeError("commit_tree() without a preceding verify_tree()")
         w, L, stash, kv_rows = self._tree_stash
@@ -1422,6 +1471,8 @@ class Target:
         NON-contiguous path must leave caches that give the chain-committed next-step logits."""
         from .tree import DraftTree
 
+        if self._inkling:
+            return self._tree_selftest_inkling()
         prompt = [1, 2, 3, 4, 5, 6]
         #            0   1   2   3   4   5       (rows)
         tree = DraftTree(tokens=[7, 8, 9, 10, 11, 12], parent=[-1, 0, 1, 0, 3, 1])
@@ -1466,6 +1517,148 @@ class Target:
         self.reset_spec()
         self._tree_selftest_worst = worst
         return ok
+
+    def _verify_tree_inkling(self, dt, cache, tap):
+        """Inkling 2 tree verify: the model's forward built inside ``inkling_fused.tree_round``,
+        whose fused pieces read the tree (no mlx-vlm transaction: that one commits a chain's
+        prefix only). The round is the open transaction until :meth:`commit_tree` — or
+        ``reset_spec`` / :meth:`abort_tree`, which put the caches back."""
+        from . import inkling_fused as F
+
+        if self._txn is not None:        # a previous verify was never rolled back
+            self.reset_spec()
+        lm = self.model.language_model
+        if dt.width > F.rows_limit(lm):
+            raise ValueError(f"a tree verify of {dt.width} rows is wider than this model's "
+                             f"fused forward takes ({F.rows_limit(lm)})")
+        with F.tree_round(dt, cache) as rnd:
+            out = lm(inputs=dt.tokens[None], cache=cache, capture_layer_ids=tap)
+        if not rnd.complete(len(lm.model.layer_indices)):
+            rnd.abort()
+            raise RuntimeError("Inkling tree verify: a layer visit left the fused tree path")
+        self._txn = rnd
+        self._spec_width = dt.width
+        fused = None if tap is None else mx.concatenate(out.hidden_states, axis=-1)
+        return out.logits, fused
+
+    # _tree_selftest_inkling's one bound that is not exact, relative L2 of a row's logits: a net
+    # for gross errors, not a yardstick. A side-branch row against a chain's row differs by the
+    # order MLX's attention sums the same products in (masked keys between the visible ones),
+    # and on this model any such difference can tip an expert-routing near-tie, which moves a
+    # row's logits by ~0.1 (two chain verifies of different WIDTH are 0.09-0.15 apart on
+    # Inkling-2-Mini; against the width-matched references here most side rows are equal bit
+    # for bit or under 0.01, with 0.03-0.12 where a routing flipped: 11 token sets, M4 Pro).
+    TREE_INKLING_GROSS = 0.3
+
+    def _tree_selftest_inkling(self) -> bool:
+        """Prove tree verify on THIS Inkling 2 model, once (see :meth:`tree_selftest`): the tree
+        kernels on its layers' own shapes (``inkling_fused.tree_selftest``), then whole
+        forwards on two caches, one taking trees and one chains.
+
+        Exact — the gate: a CHAIN-shaped tree returns the chain verify's bits — logits and
+        taps — also after a partial commit of each (so the two commits left the same state)
+        and after an aborted tree verify (so the abort put everything back); a branched
+        tree's MAIN path returns the bits of a chain verify of the same rows (the rows after
+        it are masked for it in both); and no row changes by a bit when a row OUTSIDE its
+        root path carries another token. Side-branch rows have no exact reference at this
+        level (their keys sit between masked ones; the kernel checks above are their exact
+        ones), so they, and one more step after committing a path through a side branch, are
+        held to a loose bound against chains of the same width (``TREE_INKLING_GROSS``). A
+        model whose sliding window is a few tokens (the tests' tiny one) runs all of it past
+        the window."""
+        from . import inkling_fused as F
+        from .tree import DraftTree, chain_tree
+
+        lm = self.model.language_model
+        self._tree_selftest_worst = None
+        if not F.tree_selftest(lm):
+            return False
+        tap = [1, len(lm.model.layer_indices)]
+        vocab = int(lm.model.embed_tokens.weight.shape[0])
+        window = max([int(layer.self_attn.sliding or 0) for layer in lm.model.layers
+                      if getattr(layer, "self_attn", None) is not None] or [0])
+
+        def tok(i):
+            return 3 + (7 * i) % max(1, vocab - 3)
+
+        def rel(a, b) -> float:
+            a, b = a.astype(mx.float32), b.astype(mx.float32)
+            return float(mx.sqrt(mx.sum(mx.square(a - b)) / (mx.sum(mx.square(b)) + 1e-30)))
+
+        def same(a, b) -> bool:
+            return a.shape == b.shape and bool(mx.array_equal(a, b))
+
+        prompt = mx.array([[tok(i) for i in range(window + 5 if 0 < window <= 64 else 6)]])
+
+        def prefilled():
+            c = self.make_cache()
+            mx.eval(self.run(prompt, c, tap)[0])
+            return c
+
+        def chain(tokens, cache, keep=None):
+            """A chain verify of ``tokens``: aborted, or committed at ``keep`` rows."""
+            out = self.verify(mx.array([tokens]), cache, tap)
+            mx.eval(*out)
+            if keep is None:
+                self.reset_spec()
+            else:
+                self.rollback(cache, len(tokens) - keep, tokens[1:keep])
+            return out
+
+        def branch(tree, cache, path=None):
+            """A tree verify: aborted, or committed along ``path``."""
+            out = self.verify_tree(tree, cache, tap)
+            mx.eval(*out)
+            if path is None:
+                self.abort_tree(cache, tree.width)
+            else:
+                self.commit_tree(cache, path)
+            return out
+
+        self.reset_spec()
+        try:
+            ct, cc = prefilled(), prefilled()
+            # 1. a chain as a tree, committed at three of its five rows
+            a = [tok(40 + i) for i in range(5)]
+            ref, got = chain(a, cc, 3), branch(chain_tree(a[0], a[1:]), ct, [0, 1, 2])
+            if not (same(got[0], ref[0]) and same(got[1], ref[1])):
+                return False
+            # 2. a branched tree            rows:  0   1   2   3   4   5
+            b = [tok(60 + i) for i in range(6)]
+            tree = DraftTree(tokens=b, parent=[-1, 0, 1, 0, 3, 1])
+            t_logits = branch(tree, ct)[0]
+            if not same(t_logits[0, :3], chain(b, cc)[0][0, :3]):    # the main path: rows 0-2
+                return False
+            other = DraftTree(tokens=b[:2] + [tok(77)] + b[3:], parent=tree.parent)
+            keep = mx.array([0, 1, 3, 4, 5])                 # row 2 is a leaf under row 1
+            if not same(branch(other, ct)[0][0, keep], t_logits[0, keep]):
+                return False
+
+            def led_by(path):
+                """The tree's tokens as a chain of its width that starts with ``path``."""
+                return [b[r] for r in path] + [x for r, x in enumerate(b) if r not in path]
+
+            worst = 0.0
+            for leaf_path in tree.leaf_paths():
+                ref = chain(led_by(leaf_path), cc)[0]
+                worst = max(worst, rel(t_logits[0, mx.array(leaf_path)],
+                                       ref[0, :len(leaf_path)]))
+            # ... and the caches under them still equal, bit for bit (commit 1, the aborts)
+            ref, got = chain(b[:3], cc), branch(chain_tree(b[0], b[1:3]), ct)
+            if not (same(got[0], ref[0]) and same(got[1], ref[1])):
+                return False
+            # 3. commit through the side branch, then one more step
+            path = [0, 3, 4]
+            branch(tree, ct, path)
+            chain(led_by(path), cc, len(path))
+            nxt = mx.array([[tok(99)]])
+            worst = max(worst, rel(self.run(nxt, ct, tap)[0], self.run(nxt, cc, tap)[0]))
+        except Exception:  # noqa: BLE001 — a kernel this GPU cannot build, an upstream change
+            self.reset_spec()
+            return False
+        self.reset_spec()
+        self._tree_selftest_worst = worst
+        return worst <= self.TREE_INKLING_GROSS
 
     # -- tap sanity probe (drafter modes) --
     def verify_tap(self) -> None:

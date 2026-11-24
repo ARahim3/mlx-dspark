@@ -749,6 +749,7 @@ def dflash_generate(
                and getattr(drafter, "selects_paths", False)
                and target_model.tree_ready())
     conv_k = target_model._tree_conv_k() if tree_on else 4
+    tree_cap = target_model.tree_max_nodes if tree_on else 0
     tree_rounds = 0
 
     ids = prompt_ids if prompt_ids is not None else encode_prompt(
@@ -1007,7 +1008,7 @@ def dflash_generate(
             # widen past the chain only at the FULL block (where the wide tree was priced) —
             # never when a depth capper / pinned cap shrank this round's cap (the server
             # passes that shrunk cap as max_draft_tokens, so cap_ceiling can't tell)
-            n_nodes = tree if (tree > cap and cap == kdraft) else cap
+            n_nodes = min(tree if (tree > cap and cap == kdraft) else cap, tree_cap)
             dtree = device_tree(cand_a, sc_a, n_nodes, pending, conv_k)
             mx.async_eval(dtree.tokens, dtree.parent)
             v_logits, v_fused = target_model.verify_tree(dtree, cache, tap)
@@ -1442,6 +1443,7 @@ def speculative_generate(
     tree_on = (tree is not None and temperature <= 0.0 and logprobs is None
                and hasattr(drafter, "tree_lattice") and target_model.tree_ready())
     conv_k = target_model._tree_conv_k() if tree_on else 4
+    tree_cap = target_model.tree_max_nodes if tree_on else 0
     tree_rounds = 0
     # `_streamer`: a caller that runs one generation as several calls of this loop (a batched
     # session handing a request over, inkling_batch.Session) passes the streamer it keeps
@@ -1701,7 +1703,7 @@ def speculative_generate(
                     # launch asynchronously so Python builds the verify graph meanwhile; wider
                     # than the chain only at the FULL block, where a wide tree was priced.
                     cand_t, sc = drafter.tree_lattice(base_logits, draft_arr, pending)
-                    n_nodes = tree if (tree > cap and cap == kdraft) else cap
+                    n_nodes = min(tree if (tree > cap and cap == kdraft) else cap, tree_cap)
                     dtree = device_tree(cand_t, sc, n_nodes, pending, conv_k)
                     mx.async_eval(dtree.tokens, dtree.parent)
                     v_logits, v_fused = target_model.verify_tree(dtree, cache, tap)

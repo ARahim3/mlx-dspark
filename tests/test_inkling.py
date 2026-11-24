@@ -1036,7 +1036,9 @@ class _CharTok:
 
 def test_dflash_generate_on_inkling_reproduces_greedy_decoding():
     # the dflash loop on Inkling's transactional verify: taps of the bundled head's kind, the
-    # drafter's ctx window past the target's 8-token one, chains only (no tree on a VLM target)
+    # drafter's ctx window past the target's 8-token one. Chains only, although trees are asked
+    # for: this fixture's stream is fp32, which the fused forward (bf16) does not take, so the
+    # tree self-test refuses and the loop keeps chains (test_inkling_tree.py has the trees)
     from mlx_dspark.generate import dflash_generate, greedy_generate
     from mlx_dspark.target import Target
 
@@ -1049,6 +1051,7 @@ def test_dflash_generate_on_inkling_reproduces_greedy_decoding():
                               max_draft_tokens=cap, tree=0)
         assert res.token_ids[:30] == ref[:30], cap
         assert res.tree_rounds == 0
+    assert not t.tree_ready() and t._txn is None
     sampled = dflash_generate(t, _CharTok(), d, prompt_ids=prompt, max_new_tokens=12,
                               temperature=0.8, seed=1)
     assert len(sampled.token_ids) >= 12 and max(sampled.token_ids) < 60

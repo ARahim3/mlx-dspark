@@ -65,12 +65,135 @@ def _rows(module) -> int:
     return module.__dict__.get(_ROWS, VECTOR_ROWS)
 
 
+# ---- tree verify --------------------------------------------------------------------------------
+# A verify whose rows are a draft TREE (tree.py: row 0 the anchor, each drafted row after its
+# parent, the main path first) instead of a chain. Three things in this forward follow a token's
+# position in time, and each takes a row's own root path instead:
+#   the short convolutions   a row's 3 earlier taps are its 3 nearest ANCESTORS (the committed
+#                            state where it has fewer) — `conv_idx`, read by the same kernels;
+#   the attention            of the tree's rows a row sees itself and its ancestors, and its
+#                            relative-position bias, sliding window and log scaling are taken
+#                            at the anchor's position plus its DEPTH — the mask kernel and the
+#                            packed attention read `depth` / `bits`;
+#   the caches               hold the rows in tree order until the commit moves the accepted
+#                            path into place (a counter when it is the main path's prefix).
+# Everything else is per row (experts, residual mixes, messages, controllers, the head). On a
+# chain-shaped tree every kernel evaluates the chain's own expression: bit-identical, which
+# Target.tree_selftest checks before a loop may use trees.
+_TREE = None            # the TreeRound whose graph is being built (the MLX thread is the only one)
+
+
+class TreeRound:
+    """One tree verify on Inkling 2: what the fused pieces read while its graph is built, what
+    its commit needs, and the transaction itself (``Target._txn``: ``active`` / ``abort`` as
+    mlx-vlm's, ``commit`` along a path).
+
+    ``convs``: per short convolution ``(conv cache, slot, the fp32 window [state ‖ rows])``;
+    ``kvs``: per attention ``(kv cache, the K rows, the V rows)`` as written; ``masks``:
+    attention calls that took the tree's mask. A visit that left the fused path recorded less
+    (:meth:`complete`). ``caches`` (the model's layer-visit caches): what :meth:`abort`
+    restores — every conv state and KV position as the round found them, whatever ran."""
+
+    def __init__(self, tree, caches=None):
+        self.depth, self.bits, self.conv_idx = tree.depth, tree.bits, tree.conv_idx
+        self.width = int(tree.width)
+        self.convs: list = []
+        self.kvs: list = []
+        self.masks = 0
+        self.active = True
+        self._held = [(entry.caches[1], list(entry.caches[1].cache), entry.caches[0],
+                       int(entry.caches[0].offset)) for entry in caches or ()]
+
+    def complete(self, visits: int) -> bool:
+        """Whether every one of ``visits`` layer visits ran its tree path: four convolutions,
+        one KV append and one tree mask each."""
+        return (len(self.convs) == 4 * visits and len(self.kvs) == visits
+                and self.masks == visits)
+
+    def commit(self, path) -> None:
+        """Leave the caches as a chain verify of ``path`` (accepted rows, root first) committed
+        in full would: each conv state the last taps along the path, each KV cache the path's
+        rows after the committed ones."""
+        if not self.active:
+            raise RuntimeError("this tree verify was already committed or aborted")
+        path = [int(r) for r in path]
+        keep = len(path)
+        if not path or path[0] != 0 or keep > self.width:
+            raise ValueError(f"not a root path of this tree: {path}")
+        contiguous = path == list(range(keep))
+        pidx = None if contiguous else mx.array(path, dtype=mx.int32)
+        picks: dict[int, mx.array] = {}
+        for cache, slot, window in self.convs:
+            k1 = int(window.shape[1]) - self.width           # the state's rows
+            if contiguous:
+                cache[slot] = mx.contiguous(window[:, keep: keep + k1])
+                continue
+            pick = picks.get(k1)
+            if pick is None:
+                taps = list(range(k1)) + [k1 + r for r in path]
+                pick = picks[k1] = mx.array(taps[len(taps) - k1:], dtype=mx.int32)
+            cache[slot] = mx.contiguous(window[:, pick])
+        for kv, keys, values in self.kvs:
+            if contiguous:                                   # the common case: a counter
+                kv.trim(self.width - keep)
+            else:
+                kv.trim(self.width)
+                kv.update_and_fetch(keys[..., pidx, :], values[..., pidx, :])
+        self._close()
+
+    def abort(self) -> None:
+        """Put the caches back as they were before the verify."""
+        if not self.active:
+            return
+        for conv, states, kv, offset in self._held:
+            conv.cache = list(states)
+            if kv.offset > offset:
+                kv.trim(kv.offset - offset)
+        self._close()
+
+    def _close(self) -> None:
+        self.convs, self.kvs, self._held, self.active = [], [], [], False
+
+
+@contextmanager
+def tree_round(tree, caches):
+    """Build one forward over ``caches`` as a tree verify of ``tree`` (a ``tree.DeviceTree``):
+    the fused pieces called inside take its structure. Yields the :class:`TreeRound`; a
+    forward that raises is aborted (the caches as before it)."""
+    global _TREE
+    if _TREE is not None:
+        raise RuntimeError("a tree verify is already being built")
+    rnd = _TREE = TreeRound(tree, caches)
+    try:
+        yield rnd
+    except BaseException:
+        rnd.abort()
+        raise
+    finally:
+        _TREE = None
+
+
+def tree_supported(language_model) -> bool:
+    """Whether this model's forward can run a tree verify: the pieces that carry a row's
+    position — the layer and attention bodies, the short convolutions, the one-launch mask —
+    on their fused path, and the in-place KV caches (a commit is their counter, or a
+    re-append)."""
+    lm = language_model
+    return (kv_caches(lm) and {"layer", "attn", "sconv"} <= set(enabled_kinds(lm))
+            and all(layer.self_attn.__dict__.get(_MASK) for layer in lm.model.layers
+                    if getattr(layer, "self_attn", None) is not None))
+
+
 # ---- short convolution + next state -------------------------------------------------------------
 # out[t, c]    = (sum_j ctx[t + j, c] * w[c, j] + x[t, c]) / sqrt(W + 1), ctx = [state ‖ x] (virtual)
 # window[s, c] = ctx[s, c] in fp32 — the stock path's concatenate; its last W-1 rows are the next
 #                state, and a speculative verify records the whole window for rollback.
-def _sconv_source(res: bool) -> str:
+def _sconv_source(res: bool, tree: bool = False) -> str:
     add = "conv = conv + float(res[t * res_strides[1] + c * res_strides[2]]);" if res else ""
+    # a tree verify reads each row's taps along its own root path: cidx[t, j] indexes
+    # [state ‖ x] (tree.DraftTree.conv_index) — t + j on a chain, the same sum in the same order
+    tap = ("int p = int(cidx[t * cidx_strides[0] + j * cidx_strides[1]]) - (W - 1);" if tree
+           else "int p = t + j - W + 1;")
     return r"""
     uint i = thread_position_in_grid.x;
     int L = x_shape[1], C = x_shape[2];
@@ -78,7 +201,7 @@ def _sconv_source(res: bool) -> str:
     int c = i % C, t = i / C;
     float value = 0;
     for (int j = 0; j < W; ++j) {
-        int p = t + j - W + 1;
+        """ + tap + r"""
         float xv = p < 0
             ? float(state[(p + W - 1) * state_strides[1] + c * state_strides[2]])
             : float(x[p * x_strides[1] + c * x_strides[2]]);
@@ -98,15 +221,16 @@ def _sconv_source(res: bool) -> str:
 """
 
 
-@lru_cache(maxsize=2)
-def _sconv_kernel(res: bool):
+@lru_cache(maxsize=4)
+def _sconv_kernel(res: bool, tree: bool = False):
     return mx.fast.metal_kernel(
-        name="mlx_dspark_inkling_sconv_state" + ("_res" if res else ""),
-        input_names=["state", "weight", "x", "divisor"] + (["res"] if res else []),
+        name="mlx_dspark_inkling_sconv_state" + ("_res" if res else "") + ("_tree" if tree else ""),
+        input_names=(["state", "weight", "x", "divisor"] + (["res"] if res else [])
+                     + (["cidx"] if tree else [])),
         output_names=["out", "window"],
         ensure_row_contiguous=False,
         compile_options={"math_mode": "safe"},
-        source=_sconv_source(res),
+        source=_sconv_source(res, tree),
     )
 
 
@@ -118,17 +242,22 @@ def _divisor(width: int) -> mx.array:
 
 
 def fused_short_convolution(state: mx.array, weight: mx.array, x: mx.array, width: int,
-                            res: mx.array | None = None, out_dtype=None):
+                            res: mx.array | None = None, out_dtype=None,
+                            cidx: mx.array | None = None):
     """``(out, window)`` for one batch row: the convolution output (``x``'s dtype, as stock) and
     the fp32 ``[1, width - 1 + L, C]`` concatenation ``[state ‖ x]`` whose tail is the next state.
 
     ``res`` / ``out_dtype`` fold the decoder layer's residual arithmetic into the launch, at the
     stock rounding points: the convolution is rounded to ``x``'s dtype, widened to fp32, ``res``
-    is added in fp32, and the sum is stored as ``out_dtype`` (default: ``x``'s dtype)."""
+    is added in fp32, and the sum is stored as ``out_dtype`` (default: ``x``'s dtype).
+
+    ``cidx`` (a tree verify): int32 ``[L, width]``, row ``t``'s taps as indices into
+    ``[state ‖ x]`` — its ``width - 1`` nearest ancestors and itself."""
     _, length, channels = x.shape
     out_dtype = out_dtype or x.dtype
-    inputs = [state, weight, x, _divisor(width)] + ([res] if res is not None else [])
-    return _sconv_kernel(res is not None)(
+    inputs = ([state, weight, x, _divisor(width)] + ([res] if res is not None else [])
+              + ([cidx] if cidx is not None else []))
+    return _sconv_kernel(res is not None, cidx is not None)(
         inputs=inputs,
         template=[("T", x.dtype), ("OT", out_dtype), ("W", width)],
         grid=(length * channels, 1, 1),
@@ -151,6 +280,13 @@ def _sconv_step(conv, x, cache, res=None, out_dtype=None):
     state = cache[idx]
     if state is None:
         state = mx.zeros((1, k - 1, x.shape[-1]))
+    tree = _TREE
+    if tree is not None:
+        out, window = fused_short_convolution(state, conv.conv.weight, x, k, res, out_dtype,
+                                              tree.conv_idx)
+        tree.convs.append((cache, idx, window))
+        cache[idx] = window[:, -(k - 1):]            # a placeholder: commit or abort sets it
+        return out
     out, window = fused_short_convolution(state, conv.conv.weight, x, k, res, out_dtype)
     if getattr(cache, "is_speculating", False):
         cache.record_speculative_window(idx, window, k - 1)
@@ -665,7 +801,11 @@ def fused_head_prep(qraw, kraw, vraw, rraw, q_scale, rel_scale, *, n_heads: int,
 # ---- attention: the global layers' dynamic short convolution --------------------------------------
 # out[t, c] = (sum_lag ctx[t - lag, c] * (static[lag, c] + dyn[t, head(c), lag]) + x[t, c]) / 3
 # (stock: ~40 launches per call — a concatenate, four slice-multiply-adds, casts).
-_DYN_SOURCE = r"""
+def _dyn_source(tree: bool = False) -> str:
+    # a tree verify: lag `lag` of row t is its lag-th ancestor (see _sconv_source)
+    tap = ("int p = int(cidx[t * cidx_strides[0] + (W - 1 - lag) * cidx_strides[1]]) - (W - 1);"
+           if tree else "int p = t - lag;")
+    return r"""
     uint i = thread_position_in_grid.x;
     int L = x_shape[1], C = x_shape[2];
     if (i >= uint(L * C)) return;
@@ -673,7 +813,7 @@ _DYN_SOURCE = r"""
     const int head = c / (C / HEADS);
     float acc = 0;
     for (int lag = 0; lag < W; ++lag) {
-        int p = t - lag;
+        """ + tap + r"""
         float v = p < 0
             ? float(state[(W - 1 + p) * state_strides[1] + c * state_strides[2]])
             : float(x[p * x_strides[1] + c * x_strides[2]]);
@@ -692,15 +832,15 @@ _DYN_SOURCE = r"""
 """
 
 
-@lru_cache(maxsize=1)
-def _dyn_kernel():
+@lru_cache(maxsize=2)
+def _dyn_kernel(tree: bool = False):
     return mx.fast.metal_kernel(
-        name="mlx_dspark_inkling_dynamic_sconv_state",
-        input_names=["state", "stat", "dyn", "x", "divisor"],
+        name="mlx_dspark_inkling_dynamic_sconv_state" + ("_tree" if tree else ""),
+        input_names=["state", "stat", "dyn", "x", "divisor"] + (["cidx"] if tree else []),
         output_names=["out", "window"],
         ensure_row_contiguous=False,
         compile_options={"math_mode": "safe"},
-        source=_DYN_SOURCE,
+        source=_dyn_source(tree),
     )
 
 
@@ -719,14 +859,20 @@ def _dyn_sconv_step(conv, x, dynamic_input, cache):
     state = cache[idx]
     if state is None:
         state = mx.zeros((1, k - 1, channels))
-    out, window = _dyn_kernel()(
-        inputs=[state, conv.static_weight, conv.weight_proj(dynamic_input), x, _dyn_divisor(k)],
+    tree = _TREE
+    out, window = _dyn_kernel(tree is not None)(
+        inputs=([state, conv.static_weight, conv.weight_proj(dynamic_input), x, _dyn_divisor(k)]
+                + ([tree.conv_idx] if tree is not None else [])),
         template=[("T", x.dtype), ("W", k), ("HEADS", conv.num_heads)],
         grid=(length * channels, 1, 1),
         threadgroup=(256, 1, 1),
         output_shapes=[x.shape, (1, k - 1 + length, channels)],
         output_dtypes=[x.dtype, mx.float32],
     )
+    if tree is not None:
+        tree.convs.append((cache, idx, window))
+        cache[idx] = window[:, -(k - 1):]            # a placeholder: commit or abort sets it
+        return out
     if getattr(cache, "is_speculating", False):
         cache.record_speculative_window(idx, window, k - 1)
     cache[idx] = window[:, -(k - 1):]
@@ -766,6 +912,19 @@ def _temporal_parts(kv, v: mx.array) -> list[mx.array]:
 # values sit together, and the sink's column written by the same launch. The value expression is
 # mlx-vlm's own (`_MASK_V2_SRC`, models/inkling/language.py, MIT): the same 16 products added in
 # the same order — bit-identical, which the self-test checks against the stock pair at load.
+# A tree verify (the last LQ keys are the tree's rows, main path first): a row's position is the
+# anchor's plus its DEPTH, so its distance to a committed key is taken from there, and of the
+# tree's own rows it sees itself and its ancestors (`bits`: one uint32 of them per row), each at
+# their difference in depth. On a chain that is the expression above: the same mask, bit for bit.
+_MASK_DIST = "const int dist = (i + (S - LQ)) - j;              // backward distance"
+_MASK_DIST_TREE = """const int C = S - LQ;                             // committed keys
+    int dist;                                         // backward distance; < 0 = not visible
+    if (j < C) {
+        dist = C + depth[i] - j;
+    } else {
+        const int row = j - C;
+        dist = ((bits[i] >> uint(row)) & 1u) ? depth[i] - depth[row] : -1;
+    }"""
 _MASK_SOURCE = r"""
     const int j = int(thread_position_in_grid.x);     // key; j == S is the sink's column
     const int i = int(thread_position_in_grid.y);     // query row
@@ -778,7 +937,7 @@ _MASK_SOURCE = r"""
         out[at] = sinks[size_t(i) * H + h];
         return;
     }
-    const int dist = (i + (S - LQ)) - j;              // backward distance
+    /*DIST*/
     T val;
     if (dist < 0) {
         val = (T)(-1e30f);                            // causal
@@ -800,13 +959,13 @@ _MASK = "_mlx_dspark_mask"          # per attention module: the one-launch mask 
 _REL_T = "_mlx_dspark_rel_t"        # per attention module: (rel_proj it was built from, its transpose)
 
 
-@lru_cache(maxsize=1)
-def _mask_kernel():
+@lru_cache(maxsize=2)
+def _mask_kernel(tree: bool = False):
     return mx.fast.metal_kernel(
-        name="mlx_dspark_inkling_mask_sink",
-        input_names=["rel", "proj", "sinks", "dims"],
+        name="mlx_dspark_inkling_mask_sink" + ("_tree" if tree else ""),
+        input_names=["rel", "proj", "sinks", "dims"] + (["depth", "bits"] if tree else []),
         output_names=["out"],
-        source=_MASK_SOURCE,
+        source=_MASK_SOURCE.replace("/*DIST*/", _MASK_DIST_TREE if tree else _MASK_DIST),
     )
 
 
@@ -828,13 +987,15 @@ def _rel_transposed(attn, dtype) -> mx.array:
 
 
 def fused_mask(rel: mx.array, proj_t: mx.array, sinks: mx.array, size: int, sliding: int,
-               rel_extent: int) -> mx.array:
+               rel_extent: int, tree=None) -> mx.array:
     """mlx-vlm's ``banded_additive_mask`` for the last ``L`` of ``size`` keys with the sink's
     logit as column ``size``: ``[1, H, L, size + 1]`` from ``rel [1, L, H, d_rel]``, ``proj_t
-    [extent, d_rel]`` and ``sinks [1, L, H]`` (all one dtype)."""
+    [extent, d_rel]`` and ``sinks [1, L, H]`` (all one dtype). ``tree`` (a :class:`TreeRound`):
+    the ``L`` rows are a verify tree's — positions by depth, of each other only ancestors."""
     _, rows, heads, d_rel = rel.shape
-    return _mask_kernel()(
-        inputs=[rel, proj_t, sinks, _dims(int(size))],
+    return _mask_kernel(tree is not None)(
+        inputs=([rel, proj_t, sinks, _dims(int(size))]
+                + ([tree.depth, tree.bits] if tree is not None else [])),
         template=[("T", rel.dtype), ("D_REL", int(d_rel)), ("REL_EXTENT", int(rel_extent)),
                   ("SLIDING", int(sliding))],
         grid=(size + 1, rows, heads),
@@ -844,12 +1005,17 @@ def fused_mask(rel: mx.array, proj_t: mx.array, sinks: mx.array, size: int, slid
     )[0]
 
 
-def _attention_mask(attn, lang, r, sinks, size, length, shape_ref):
+def _attention_mask(attn, lang, r, sinks, size, length, shape_ref, tree=None):
     """The attention's additive mask with the sink's column: one launch when the self-test
-    cleared it for this model, the stock kernel + concatenate otherwise."""
+    cleared it for this model, the stock kernel + concatenate otherwise (a tree verify has
+    only the launch: the stock mask is a chain's)."""
     if attn.__dict__.get(_MASK) and sinks.dtype == r.dtype and r.shape[0] == 1:
+        if tree is not None:
+            tree.masks += 1
         return fused_mask(r, _rel_transposed(attn, r.dtype), sinks, size, attn.sliding,
-                          attn.rel_extent)
+                          attn.rel_extent, tree)
+    if tree is not None:
+        raise RuntimeError("Inkling tree verify needs the one-launch attention mask")
     mask = lang.banded_additive_mask(r, attn.rel_proj.astype(r.dtype), size - length, size,
                                      attn.sliding, attn.rel_extent, left_padding=None,
                                      shape_ref=shape_ref)
@@ -899,8 +1065,20 @@ _PACKED_BLOCKS = 16                     # key blocks per KV head (threadgroups w
 
 
 def _packed_p1_source(nh: int, nkv: int, hd: int, drel: int, scale: float, rel_extent: int,
-                      sliding: int) -> str:
+                      sliding: int, tree: bool = False) -> str:
     g = nh // nkv
+    # a tree verify: the row's position is the anchor's plus its depth, and of the tree's own
+    # rows (the last QL keys) it sees itself and its ancestors (see _MASK_DIST_TREE)
+    q_abs = ("""const int n_ctx = TOTAL_S - QL;                    // committed keys
+    const int q_depth = depth[qi];
+    const uint q_bits = bits[qi];""" if tree else "const int q_abs = (TOTAL_S - QL) + qi;")
+    dist = ("""int dist;                                           // backward distance
+            if (key < n_ctx) {
+                dist = n_ctx + q_depth - key;
+            } else {
+                const int trow = key - n_ctx;
+                dist = (trow < QL && ((q_bits >> uint(trow)) & 1u)) ? q_depth - depth[trow] : -1;
+            }""" if tree else "const int dist = q_abs - key;                       // backward distance")
     bias = " + ".join(f"dot(rv{i}, as_type<float4>(uint4(*(const device packed_ushort4*)"
                       f"(p + {4 * i})) << 16))" for i in range(drel // 4))
     rload = "\n".join(
@@ -932,7 +1110,7 @@ def _packed_p1_source(nh: int, nkv: int, hd: int, drel: int, scale: float, rel_e
     const int valid_row = min(row, G * QL - 1);
     const int qi = valid_row % QL;
     const int hq = hk * G + valid_row / QL;
-    const int q_abs = (TOTAL_S - QL) + qi;
+    {q_abs}
 
     const device bfloat16_t* qrow = q + (size_t(qi) * NH + hq) * DH;
     simdgroup_matrix<bfloat16_t, 8, 8> Qf[DT];
@@ -1004,7 +1182,7 @@ def _packed_p1_source(nh: int, nkv: int, hd: int, drel: int, scale: float, rel_e
         #pragma unroll
         for (int j = 0; j < 4; ++j) {{
             const int key = kt + (j >> 1) * 8 + fn + (j & 1);
-            const int dist = q_abs - key;                       // backward distance
+            {dist}
             if (key >= k1 || dist < 0 || (SLIDING > 0 && dist >= SLIDING)) {{
                 s[j] = -INFINITY;                               // padding, causal, window cap
             }} else {{
@@ -1105,15 +1283,16 @@ def _packed_p2_source(nh: int, nkv: int, hd: int) -> str:
 """
 
 
-@lru_cache(maxsize=16)
+@lru_cache(maxsize=32)
 def _packed_kernels(nh: int, nkv: int, hd: int, drel: int, scale: float, rel_extent: int,
-                    sliding: int):
+                    sliding: int, tree: bool = False):
     p1 = mx.fast.metal_kernel(
-        name=f"mlx_dspark_inkling_packed_attn_p1_{nh}_{nkv}_{hd}_{drel}_{rel_extent}_{sliding}",
-        input_names=["q", "k_buf", "v_buf", "r", "rel_t", "meta"],
+        name=(f"mlx_dspark_inkling_packed_attn_p1_{nh}_{nkv}_{hd}_{drel}_{rel_extent}_{sliding}"
+              + ("_tree" if tree else "")),
+        input_names=["q", "k_buf", "v_buf", "r", "rel_t", "meta"] + (["depth", "bits"] if tree else []),
         output_names=["opart", "mpart", "lpart"],
         ensure_row_contiguous=False,
-        source=_packed_p1_source(nh, nkv, hd, drel, scale, rel_extent, sliding),
+        source=_packed_p1_source(nh, nkv, hd, drel, scale, rel_extent, sliding, tree),
     )
     p2 = mx.fast.metal_kernel(
         name=f"mlx_dspark_inkling_packed_attn_p2_{nh}_{nkv}_{hd}",
@@ -1148,23 +1327,24 @@ def _packed_ok(attn, length: int) -> bool:
 
 
 def packed_attention(attn, q: mx.array, k: mx.array, v: mx.array, r: mx.array, rel_t: mx.array,
-                     sinks: mx.array, gate: mx.array) -> mx.array:
+                     sinks: mx.array, gate: mx.array, tree=None) -> mx.array:
     """The gated attention output ``[1, L, heads * head_dim]`` (what mlx-vlm hands to ``o_proj``)
     for ``q [1, L, heads, head_dim]``, the cache's ``k`` / ``v [1, kv_heads, S, head_dim]`` in
     temporal order WITHOUT the sink row (views are read where they lie), ``r [1, L, heads,
     d_rel]``, ``rel_t [extent, d_rel]``, ``sinks [1, L, heads]`` and the gate projection
-    ``[1, L, heads * head_dim]`` — all bf16."""
+    ``[1, L, heads * head_dim]`` — all bf16. ``tree`` (a :class:`TreeRound`): the ``L`` rows are
+    a verify tree's, the last ``L`` keys theirs."""
     _, length, nh, hd = q.shape
     nkv, size = int(k.shape[1]), int(k.shape[2])
     rows = (nh // nkv) * length
     nsg = math.ceil(rows / 8)
     rp = nsg * 8
     p1, p2 = _packed_kernels(nh, nkv, hd, int(r.shape[-1]), float(hd) ** -0.5,
-                             int(attn.rel_extent), int(attn.sliding or 0))
+                             int(attn.rel_extent), int(attn.sliding or 0), tree is not None)
     meta, nb = _packed_meta(size)
     template = [("QL", length), ("RP", rp)]
     opart, mpart, lpart = p1(
-        inputs=[q, k, v, r, rel_t, meta],
+        inputs=[q, k, v, r, rel_t, meta] + ([tree.depth, tree.bits] if tree is not None else []),
         template=template,
         grid=(nkv * 32 * nsg, 1, nb),
         threadgroup=(32 * nsg, 1, 1),
@@ -1181,7 +1361,7 @@ def packed_attention(attn, q: mx.array, k: mx.array, v: mx.array, r: mx.array, r
     )[0]
 
 
-def _packed_reference(attn, q, k, v, r, rel_t, sinks, gate) -> mx.array:
+def _packed_reference(attn, q, k, v, r, rel_t, sinks, gate, tree=None) -> mx.array:
     """What :func:`packed_attention` computes, in plain fp32 MLX ops with nothing rounded
     inside: the additive mask with the sink's column (in the stream's dtype, as stock builds
     it), fp32 scores, softmax and values, the output rounded once, then the gate. The
@@ -1190,7 +1370,7 @@ def _packed_reference(attn, q, k, v, r, rel_t, sinks, gate) -> mx.array:
     _, rows, nh, hd = q.shape
     g = nh // k.shape[1]
     zero = _zero_row(1, int(k.shape[1]), hd, k.dtype)
-    mask = fused_mask(r, rel_t, sinks, int(k.shape[2]), attn.sliding, attn.rel_extent)
+    mask = fused_mask(r, rel_t, sinks, int(k.shape[2]), attn.sliding, attn.rel_extent, tree)
     kf = mx.repeat(mx.concatenate([k, zero], axis=2), g, axis=1).astype(mx.float32)
     vf = mx.repeat(mx.concatenate([v, zero], axis=2), g, axis=1).astype(mx.float32)
     scores = (q.transpose(0, 2, 1, 3).astype(mx.float32) @ kf.swapaxes(-1, -2)) * hd ** -0.5
@@ -1239,6 +1419,7 @@ def _attn_call(base):
                 and self.q_scale.dtype == mx.bfloat16 and self.rel_scale.dtype == mx.bfloat16):
             return base.__call__(self, x, key_input, value_input, cache, conv_mask)
         b, length, _ = x.shape
+        tree = _TREE                    # a tree verify's round (TreeRound), else None
         key_input = x if key_input is None else key_input
         value_input = x if value_input is None else value_input
         k = self.k_proj(key_input)
@@ -1258,12 +1439,18 @@ def _attn_call(base):
             offset = kv.offset
             # tau = 1 + alpha * log(max(position / n_floor, 1)) is exactly 1 up to n_floor
             if offset + length > cfg.log_scaling_n_floor:
-                positions = mx.arange(length) + mx.array(offset)[..., None] + 1
+                steps = mx.arange(length) if tree is None else tree.depth
+                positions = steps + mx.array(offset)[..., None] + 1
                 tau = 1 + cfg.log_scaling_alpha * mx.log(
                     mx.maximum(positions / cfg.log_scaling_n_floor, 1))
                 q = (q.astype(mx.float32) * tau[..., None, None]).astype(x.dtype)
                 r = (r.astype(mx.float32) * tau[..., None, None]).astype(x.dtype)
-        k, v = kv.update_and_fetch(k.transpose(0, 2, 1, 3), v.transpose(0, 2, 1, 3))
+        k, v = k.transpose(0, 2, 1, 3), v.transpose(0, 2, 1, 3)
+        if tree is not None:
+            if not is_sink_cache(kv):
+                raise RuntimeError("Inkling tree verify needs the in-place KV caches")
+            tree.kvs.append((kv, k, v))          # the rows as written: a commit re-appends them
+        k, v = kv.update_and_fetch(k, v)
         sinks = self.sink_proj(x)
         packed_from = self.__dict__.get(_PACKED)
         if (packed_from and PACKED_MIN_ROWS <= length <= PACKED_MAX_ROWS
@@ -1271,15 +1458,17 @@ def _attn_call(base):
                 and sinks.dtype == r.dtype == k.dtype == v.dtype == mx.bfloat16):
             # a verify over a long window: all rows of a KV head share one read of K and V
             # (NOT bit-identical to the stock call below — see packed_attention)
+            if tree is not None:
+                tree.masks += 1                  # the kernel takes the tree's mask itself
             return self.o_proj(packed_attention(
-                self, q, k, v, r, _rel_transposed(self, r.dtype), sinks, self.gate_proj(x)))
+                self, q, k, v, r, _rel_transposed(self, r.dtype), sinks, self.gate_proj(x), tree))
         q = q.transpose(0, 2, 1, 3)
         if is_sink_cache(kv):
             # inkling_cache: the rows are in temporal order and the sink's zero row sits in the
             # buffer behind them, so K and V are VIEWS — the same keys in the same order into
             # the same SDPA kernel, nothing copied
             size = k.shape[2]
-            mask = _attention_mask(self, lang, r, sinks, size, length, k)
+            mask = _attention_mask(self, lang, r, sinks, size, length, k, tree)
             k, v = kv.sink_views()
         elif callable(getattr(kv, "with_sink", None)):
             # mlx-vlm's own sink cache (its looped model's since 2026-11-22): its views
@@ -1699,6 +1888,135 @@ def _state_arrays(cache) -> list[mx.array]:
             if isinstance(a, mx.array):
                 out.append(a)
     return out
+
+
+def tree_selftest(language_model, seed: int = 0) -> bool:
+    """The tree variants of the kernels on this model's own shapes and weights (one sliding and
+    one global layer), before a model-level check (``Target.tree_selftest``) runs whole
+    forwards. Two exact properties each:
+
+    * on a CHAIN-shaped tree a tree kernel returns the chain kernel's bits — it evaluates the
+      same expression;
+    * on a branched tree, row ``i`` holds the bits the chain kernel gives the LAST row of a call
+      over ``i``'s root path — the convolutions (static with the folded residual, dynamic), and
+      the mask over committed keys on both sides of the sliding cap and of the
+      relative-position extent, with every row outside the path masked.
+
+    The packed attention is not exact against anything (see :func:`packed_attention`): on the
+    chain-shaped tree it must return the chain kernel's bits, on the branched one stay within
+    ``PACKED_TOL`` of the same arithmetic in fp32 ops under the tree's mask."""
+    from .tree import DraftTree, chain_tree, to_device
+
+    lm = language_model
+    layers = lm.model.layers
+    keys = iter(mx.random.split(mx.random.key(seed), 256))
+
+    def rand(shape, dtype=mx.bfloat16):
+        return mx.random.normal(shape, key=next(keys)).astype(dtype)
+
+    def same(a, b) -> bool:
+        return a.shape == b.shape and bool(mx.array_equal(a, b))
+
+    #                                  rows:  0  1  2  3  4  5  6  7
+    host = DraftTree(tokens=list(range(8)), parent=[-1, 0, 1, 2, 0, 4, 1, 6])
+    n = host.width
+    tree = TreeRound(to_device(host, 4))
+    chain = TreeRound(to_device(chain_tree(0, range(1, n)), 4))
+    paths = [mx.array(host.path_to(i), dtype=mx.int32) for i in range(n)]
+
+    def convs(layer) -> bool:
+        attn = layer.self_attn
+        hidden = int(layer.attn_sconv.conv.weight.shape[0])
+        x, res = rand((1, n, hidden)), rand((1, n, hidden), mx.float32)
+        state = rand((1, 3, hidden), mx.float32)
+        weight = layer.attn_sconv.conv.weight
+
+        def static(xs, rs, cidx=None):
+            return fused_short_convolution(state, weight, xs, 4, rs, mx.float32, cidx)[0]
+
+        got = static(x, res, tree.conv_idx)
+        if not same(static(x, res, chain.conv_idx), static(x, res)):
+            return False
+        if not all(same(got[:, i], static(x[:, p], res[:, p])[:, -1])
+                   for i, p in enumerate(paths)):
+            return False
+        conv = attn.k_sconv
+        if hasattr(conv, "conv"):                # a sliding layer: its K / V convs are static
+            return True
+        channels = int(conv.static_weight.shape[1])
+        xk, dyn_in = rand((1, n, channels)), rand((1, n, int(conv.weight_proj.weight.shape[1])))
+        kstate = rand((1, 3, channels), mx.float32)
+
+        def dynamic(xs, ds, cidx=None):
+            length = int(xs.shape[1])
+            return _dyn_kernel(cidx is not None)(
+                inputs=([kstate, conv.static_weight, conv.weight_proj(ds), xs, _dyn_divisor(4)]
+                        + ([cidx] if cidx is not None else [])),
+                template=[("T", xs.dtype), ("W", 4), ("HEADS", conv.num_heads)],
+                grid=(length * channels, 1, 1), threadgroup=(256, 1, 1),
+                output_shapes=[xs.shape, (1, 3 + length, channels)],
+                output_dtypes=[xs.dtype, mx.float32])[0]
+
+        got = dynamic(xk, dyn_in, tree.conv_idx)
+        return (same(dynamic(xk, dyn_in, chain.conv_idx), dynamic(xk, dyn_in))
+                and all(same(got[:, i], dynamic(xk[:, p], dyn_in[:, p])[:, -1])
+                        for i, p in enumerate(paths)))
+
+    def masks(attn) -> bool:
+        d_rel = int(attn.rel_proj.shape[0])
+        rel_t = _rel_transposed(attn, mx.bfloat16)
+        edge = attn.sliding or attn.rel_extent
+        for ctx in sorted({5, edge - 3, edge + 4}):
+            if ctx < 1:
+                continue
+            size = ctx + n
+            r, sinks = rand((1, n, attn.n_heads, d_rel)), rand((1, n, attn.n_heads))
+
+            def mask(rs, ss, keys_, t=None):
+                return fused_mask(rs, rel_t, ss, keys_, attn.sliding, attn.rel_extent, t)
+
+            if not same(mask(r, sinks, size, chain), mask(r, sinks, size)):
+                return False
+            got = mask(r, sinks, size, tree)
+            for i, p in enumerate(paths):
+                d = int(p.shape[0])
+                ref = mask(r[:, p], sinks[:, p], ctx + d)[:, :, -1]      # [1, H, ctx + d + 1]
+                row = got[:, :, i]                                       # [1, H, size + 1]
+                on = mx.concatenate([mx.arange(ctx), ctx + p, mx.array([size])])
+                off = mx.array([ctx + j for j in range(n) if j not in host.path_to(i)] or [0],
+                               dtype=mx.int32)
+                if not same(row[..., on], ref):
+                    return False
+                if len(host.path_to(i)) < n and float(row[..., off].astype(mx.float32).max()) > -1e29:
+                    return False
+        return True
+
+    def packed(attn) -> bool:
+        if not attn.__dict__.get(_PACKED):
+            return True                          # off for this model: trees take the SDPA call
+        d_rel = int(attn.rel_proj.shape[0])
+        rel_t = _rel_transposed(attn, mx.bfloat16)
+        edge = attn.sliding or attn.rel_extent
+        size = (min(edge + 6, attn.sliding - 1) if attn.sliding else edge + 6) + n
+        args = (rand((1, n, attn.n_heads, attn.head_dim)),
+                rand((1, attn.n_kv, size, attn.head_dim)),
+                rand((1, attn.n_kv, size, attn.head_dim)),
+                rand((1, n, attn.n_heads, d_rel)), rel_t, rand((1, n, attn.n_heads)),
+                rand((1, n, attn.n_heads * attn.head_dim)))
+        if not same(packed_attention(attn, *args, chain), packed_attention(attn, *args)):
+            return False
+        return _rel_l2(packed_attention(attn, *args, tree),
+                       _packed_reference(attn, *args, tree)) < PACKED_TOL
+
+    sliding = next((layer for i, layer in enumerate(layers) if layer.is_sliding and i > 0), None)
+    globl = next((layer for layer in layers if not layer.is_sliding), None)
+    probes = [layer for layer in (sliding, globl) if layer is not None]
+    try:
+        return bool(probes) and all(
+            convs(layer) and masks(layer.self_attn) and packed(layer.self_attn)
+            for layer in probes)
+    except Exception:  # noqa: BLE001 — a kernel this GPU cannot build: chains
+        return False
 
 
 def selftest(language_model, rows: int = 2, seed: int = 0) -> dict[str, bool]:
