@@ -748,6 +748,8 @@ class DFlashDraftModel(nn.Module):
         src = self._head_rows_src
         if src is None:
             raise RuntimeError("bind() the drafter to a target before reading head rows")
+        if hasattr(src, "dense_rows"):          # a Hadamard pack's head: stored rows are rotated
+            return src.dense_rows(ids)
         if hasattr(src, "scales"):              # nn.QuantizedLinear / nn.QuantizedEmbedding
             biases = getattr(src, "biases", None)
             return mx.dequantize(src.weight[ids], src.scales[ids],

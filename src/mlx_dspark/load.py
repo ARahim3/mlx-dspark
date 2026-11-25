@@ -1241,7 +1241,14 @@ def load_target(repo_or_path: str = DEFAULT_TARGET, *, require_tap: bool = False
 
         if not mlx_vlm_supports_inkling2(cfg["model_type"]):
             raise ValueError(f"{repo_or_path}: {MLX_VLM_HINT}")
-    if _route_target(cfg) == "mlx_lm":
+    from . import hadamard_pack
+
+    if hadamard_pack.is_pack(cfg):
+        # PrismML's Hadamard-rotated 2-bit packs (Ternary-Bonsai 2 / 2.5 27B): mlx-lm's qwen3_5
+        # text stack with its projections rotating their inputs (hadamard_pack). Neither
+        # mlx-lm nor mlx-vlm knows the model_type, and the pack's own runtime/ is not imported.
+        model, tokenizer = hadamard_pack.load(path, cfg, trust_remote_code=TRUST_REMOTE_CODE)
+    elif _route_target(cfg) == "mlx_lm":
         from mlx_lm import load as lm_load
 
         # tokenizer_config overrides mlx-lm's default {"trust_remote_code": True}: even a
