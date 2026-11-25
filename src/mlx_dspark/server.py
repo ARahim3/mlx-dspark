@@ -1196,19 +1196,20 @@ class Engine:
         # length. The trailing done-event fires from `finally` so an error or cancel
         # mid-prefill clears a client's progress display too. A prompt that fits in one
         # chunk emits nothing.
-        run = SimpleNamespace(
+        # 1-element box shared with on_prefill_chunk (like ttft above): closing over `run`
+        # creates a run -> on_prefill_chunk -> run cycle that pins run.cache until gen-2 GC.
+        progress_seen = [False]
+        _n_prompt = len(prompt_ids)
+
+        def on_prefill_chunk(pos, _req=recorder.request_id, _total=_n_prompt, _seen=progress_seen):
+            _seen[0] = True
+            self.rounds.publish({"type": "prefill", "req": _req, "mode": self.mode,
+                                 "processed": int(pos), "total": _total})
+        return SimpleNamespace(
             prompt_ids=prompt_ids, recorder=recorder, on_round=on_round, on_text=on_text,
             ttft=ttft, swap_before=swap_before, cold=cold, cache=cache, ctx=ctx,
             reuse_len=reuse_len, on_prefill=on_prefill, prefill_marks=prefill_marks,
-            eff_cap=eff_cap, progress_seen=False)
-        _n_prompt = len(prompt_ids)
-
-        def on_prefill_chunk(pos, _req=recorder.request_id, _total=_n_prompt, _run=run):
-            _run.progress_seen = True
-            self.rounds.publish({"type": "prefill", "req": _req, "mode": self.mode,
-                                 "processed": int(pos), "total": _total})
-        run.on_prefill_chunk = on_prefill_chunk
-        return run
+            eff_cap=eff_cap, progress_seen=progress_seen, on_prefill_chunk=on_prefill_chunk)
 
     def _cap_at(self, context: int):
         """The draft cap for a prompt of ``context`` tokens: the configured one, depth-adjusted
@@ -1225,11 +1226,13 @@ class Engine:
         return eff_cap
 
     def _end_prefill_progress(self, run) -> None:
-        if run.progress_seen:
+        # progress_seen is a 1-element box shared with on_prefill_chunk; do not "simplify"
+        # by capturing `run` in the closure (that cycle pins run.cache past request exit).
+        if run.progress_seen[0]:
             n = len(run.prompt_ids)
             self.rounds.publish({"type": "prefill", "req": run.recorder.request_id,
                                  "mode": self.mode, "processed": n, "total": n, "done": True})
-            run.progress_seen = False
+            run.progress_seen[0] = False
 
     def _finish_request(self, run, res: GenResult, *, store: bool = True,
                         timed: bool = True) -> GenResult:
