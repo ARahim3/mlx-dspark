@@ -26,6 +26,7 @@ New DSpark and DFlash drafters keep landing on Hugging Face in several different
 | **SpecForge / SGLang packaging** (`dflash_config` with `projector_type: dspark`) | `Nanbeige/Nanbeige4.2-3B-DSpark` | Runs via `--drafter`, with YaRN rope where the head uses it. |
 | **LiquidAI LFM2.5-DSpark** | `LiquidAI/LFM2.5-2.6B-DSpark` | Measured and registered, any quant. |
 | **PrismML dspark GGUF** (Bonsai 27B) | `prism-ml/Ternary-Bonsai-27B-gguf` | Pre-converted repacks resolve automatically. A future GGUF-only drop runs via `--drafter gguf:<repo>/<file>.gguf`, converted locally once. |
+| **PrismML MTP head** (Bonsai 2.5) | `mtp/mtp-v2-head.safetensors` inside `prism-ml/Ternary-Bonsai-2.5-27B-mlx-2bit` | Not yet. It is a Qwen3.5-style multi-token-prediction layer that drafts one token at a time, a different design from the DSpark and DFlash heads. The model itself runs (see below). |
 | **Full model with an embedded drafter** | `deepseek-ai/DeepSeek-V4-Pro-DSpark` (893 GB) | Doesn't run: a different architecture and packaging, out of scope for a Mac. |
 | **DFlash + Markov community hybrids** | `Hikari07jp/DSpark-Gemma-4-31B-draft` | Not yet. |
 
@@ -35,6 +36,7 @@ One measured example outside the registry: `makora-ai/gemma4-26b-a4b-dspark` on 
 
 - **Any dense `mlx-lm` text model** routes automatically. On load, a one-time probe checks that the hidden-state tap the drafter reads reproduces the model's own forward pass, and fails loudly if the model's family needs dedicated support.
 - **Hybrid and recurrent families already supported:** Qwen3.5/3.6/3.8 (linear attention), Nemotron-H (Mamba-2), LFM2 (short convolutions), Nanbeige (looped depth), and Gemma-4 and Muse through `mlx-vlm`. Their recurrent state can't be trimmed like a KV cache, so each verify round's inputs are recorded and the state is rebuilt exactly at the accept point.
+- **PrismML's Hadamard-rotated 2-bit packs** (`model_type: prism_hadamard_qwen35`, such as `prism-ml/Ternary-Bonsai-2.5-27B-mlx-2bit`) load without the Python the pack ships: each projection rotates its input the way the pack was built, and the rest is the Qwen3.5-family machinery above. Plain decoding runs at 25.2 tok/s on an M4 Pro, with the same output token for token as `mlx-vlm`'s own code running the same transform (24.8 tok/s). No DSpark or DFlash drafter has been published for it yet.
 - **Any model at all** runs drafter-free with `--mode lookup`, or `--mode auto`.
 
 ## Getting a good pairing
