@@ -1317,10 +1317,17 @@ def apply_sdpa_split(target, *, target_repo=None, enabled=None, cache_dir=None, 
 
 # ---- multi-row decode attention (multirow_attn.py) -----------------------------------
 
-# Verified end to end only on M4 (g16), like the small-M kernel — whose M5 (g17) stall the
-# microbench race could not see. Same hardware gate: a newer GPU generation must re-earn
-# the kernel by an end-to-end run; MLX_DSPARK_FORCE_MULTIROW=1 overrides for that A/B.
-_MULTIROW_MAX_GEN = 16
+# Verified end to end on M4 (g16) and M5 Pro (g17s, mlx 0.32.5 — base M5 and M5 Max
+# untested; 2,560 tokens across 737 rounds at 16K context, 0 stalls, p99=137.8 ms;
+# non-contiguous per-q gating skips M5's NAX fast paths). Newer GPU generations (g18+)
+# stay gated off until verified end to end; MLX_DSPARK_FORCE_MULTIROW=1 overrides for that
+# A/B.
+_MULTIROW_MAX_GEN = 17
+
+# M5 (g17+) introduced NAX fast paths at select q widths, making multirow_attn wins
+# non-contiguous; switch to per-q + tree probing (mra2) from this generation up while
+# keeping M1-M4 on the legacy contiguous mra1 probe.
+_MULTIROW_PER_Q_MIN_GEN = 17
 
 
 def _drafter_attn_dims(drafter):
@@ -1364,15 +1371,45 @@ def _foreign_geometry(hit: dict) -> bool:
     return (hit.get("report") or {}).get("max_sg") != MAX_SG
 
 
+def _format_multirow_window(win: dict) -> str:
+    if "q_min_kv" not in win:
+        return f"q {win['min_q']}-{win['max_q']} from kv {win['min_kv']}"
+
+    def _runs(qmk: dict) -> str:
+        by_kv: dict[int, list[int]] = {}
+        for q, kv in sorted((int(k), int(v)) for k, v in qmk.items()):
+            by_kv.setdefault(kv, []).append(q)
+        parts = []
+        for kv, qs in sorted(by_kv.items()):
+            runs, lo, hi = [], qs[0], qs[0]
+            for q in qs[1:]:
+                if q == hi + 1:
+                    hi = q
+                else:
+                    runs.append(f"{lo}-{hi}" if hi > lo else str(lo))
+                    lo = hi = q
+            runs.append(f"{lo}-{hi}" if hi > lo else str(lo))
+            parts.append(f"q {','.join(runs)} from kv {kv}")
+        return "; ".join(parts) if parts else "causal off"
+
+    s = _runs(win["q_min_kv"])
+    if "tree_q_min_kv" in win:
+        s += f" (tree: {_runs(win['tree_q_min_kv'])})"
+    return s
+
+
 def multirow_windows(shapes, *, cache_dir=None, refresh=False, verbose=True) -> list:
     """Measured :class:`~mlx_dspark.multirow_attn.Window` per attention shape — raced and
-    numerics-checked once per (chip x mlx x shape), ~2 s each, cached."""
+    numerics-checked once per (chip x mlx x shape), ~0.5 s each (~3.6 s on M5+), cached."""
     from .multirow_attn import Window, measure_window
 
     dev = mx.device_info().get("device_name", "unknown")
+    gen = _gpu_gen()
+    per_q = gen is not None and gen >= _MULTIROW_PER_Q_MIN_GEN
+    tag = "mra2" if per_q else "mra1"
     out = []
     for hq, hk, d in shapes:
-        key = f"v{SCHEMA}|{dev}|mlx{mx.__version__}|mra1|{hq}x{hk}x{d}"
+        key = f"v{SCHEMA}|{dev}|mlx{mx.__version__}|{tag}|{hq}x{hk}x{d}"
         hit = None if refresh else load_cached(key, cache_dir)
         if hit is not None and (_stale_mra_refusal(hit) or _foreign_geometry(hit)):
             hit = None
@@ -1380,11 +1417,11 @@ def multirow_windows(shapes, *, cache_dir=None, refresh=False, verbose=True) -> 
             if verbose:
                 print(f"calibrating multi-row attention kernel for {hq}x{hk}x{d} "
                       "(one-time, cached)…", flush=True)
-            win, report = measure_window(hq, hk, d, verbose=verbose)
+            win, report = measure_window(hq, hk, d, verbose=verbose, per_q=per_q)
             hit = {"window": win, "report": report}
             save_cached(key, hit, cache_dir)
             if verbose:
-                state = (f"q {win['min_q']}-{win['max_q']} from kv {win['min_kv']}"
+                state = (_format_multirow_window(win)
                          if win else f"off ({report.get('reason', 'no win')})")
                 print(f"  multirow-attn {hq}x{hk}x{d}: {state}", flush=True)
         if hit.get("window"):

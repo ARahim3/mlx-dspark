@@ -177,23 +177,28 @@ def test_measure_window_stops_below_an_unlaunchable_q(monkeypatch):
     # switching the whole shape off (v0.20.0 did: one refused q16 cost Qwen3.8 its q 2-8).
     real = mra.multirow_sdpa
 
-    def limited(q, k, v, *, scale, causal):
+    def limited(q, k, v, *, scale, causal, tree_anc=None):
         if q.shape[2] >= 8:
             raise ValueError(_LIMIT)
-        return real(q, k, v, scale=scale, causal=causal)
+        return real(q, k, v, scale=scale, causal=causal, tree_anc=tree_anc)
 
     times = iter([2.0, 1.0] * 64)          # (mlx, kernel) per timed probe: the kernel wins
     monkeypatch.setattr(mra, "multirow_sdpa", limited)
     monkeypatch.setattr(mra, "_chain_ms", lambda fn, q, kvs: next(times))
     monkeypatch.setattr(mra, "PROBE_KV", (1024,))
-    window, report = mra.measure_window(32, 2, 128)
+    window, report = mra.measure_window(32, 2, 128, per_q=False)
     assert window == {"min_q": 2, "max_q": 6, "min_kv": 1024}
     assert report["points"]["q8@1024"] == "unavailable"
     assert "threads per threadgroup" in report["unavailable"]
 
+    monkeypatch.setattr(mra, "_race_pair", lambda fx, fm, q, kvs, kv: (2.0, True))
+    window_pq, report_pq = mra.measure_window(32, 2, 128, per_q=True)
+    assert window_pq == {"min_q": 2, "max_q": 7, "min_kv": 1024}
+    assert report_pq["probe"] == 3
+
 
 def test_measure_window_refused_at_the_first_q_is_off(monkeypatch):
-    def refused(q, k, v, *, scale, causal):
+    def refused(q, k, v, *, scale, causal, tree_anc=None):
         raise ValueError(_LIMIT)
 
     monkeypatch.setattr(mra, "multirow_sdpa", refused)
@@ -210,6 +215,7 @@ def test_only_stale_unavailable_verdicts_are_reprobed(tmp_path, monkeypatch):
     import importlib
 
     C = importlib.import_module("mlx_dspark.calibrate")
+    monkeypatch.setattr(C, "_gpu_gen", lambda: 16)
     dev = mx.device_info().get("device_name", "unknown")
     key = lambda s: f"v{C.SCHEMA}|{dev}|mlx{mx.__version__}|mra1|{s}"  # noqa: E731
     cache = str(tmp_path)
@@ -243,6 +249,7 @@ def test_windows_probed_at_another_launch_size_are_reprobed(tmp_path, monkeypatc
     import importlib
 
     C = importlib.import_module("mlx_dspark.calibrate")
+    monkeypatch.setattr(C, "_gpu_gen", lambda: 16)
     dev = mx.device_info().get("device_name", "unknown")
     key = lambda s: f"v{C.SCHEMA}|{dev}|mlx{mx.__version__}|mra1|{s}"  # noqa: E731
     cache = str(tmp_path)
@@ -270,3 +277,217 @@ def test_measure_window_stamps_its_launch_size(monkeypatch):
     monkeypatch.setattr(mra, "PROBE_Q", (2,))
     _, report = mra.measure_window(32, 8, 128)
     assert report["max_sg"] == mra.MAX_SG
+
+
+def test_noncontiguous_window_and_per_q_min_kv_gating():
+    # M5 NAX-gap pattern: q=2..5, 9..15 win (with q=15 needing deeper KV), q=6..8, 16 lose causal,
+    # while tree_mask recovers q=6..8.
+    w = Window(
+        8, 2, 64,
+        q_min_kv={"2": 64, "4": 64, "5": 64, "9": 64, "15": 128},
+        tree_q_min_kv={"2": 64, "4": 64, "5": 64, "6": 64, "7": 64, "8": 64, "9": 64, "15": 128},
+    )
+    assert hash(w)  # frozen & hashable after dict normalization
+    cfg = MultirowConfig((w,))
+    for ql, L, exp in [(2, 64, True), (3, 128, False), (5, 64, True), (6, 128, False),
+                       (8, 128, False), (9, 64, True), (15, 64, False), (15, 128, True),
+                       (16, 128, False)]:
+        q, k, v = _mk(1, 8, 2, ql, L, 64)
+        assert eligible(q, k, v, "causal", None, cfg) is exp
+    # Tree mask path admits q=6..8 while causal passes them through bit-exact to stock.
+    q6, k6, v6 = _mk(1, 8, 2, 6, 128, 64)
+    assert not eligible(q6, k6, v6, "causal", None, cfg)
+    assert eligible(q6, k6, v6, None, None, cfg, tree=True)
+    stock = mra._ORIG_SDPA(q6, k6, v6, scale=0.125, mask="causal")
+    rows = mx.arange(128 - 6, 128).reshape(6, 1)
+    cols = mx.arange(128).reshape(1, 128)
+    arr_mask = (cols <= rows).reshape(1, 1, 6, 128)
+    anc = mx.array([(1 << (i + 1)) - 1 for i in range(6)], dtype=mx.uint32)
+    with multirow_attention(cfg), mra.tree_mask(arr_mask, anc):
+        causal_out = mx.fast.scaled_dot_product_attention(q6, k6, v6, scale=0.125, mask="causal")
+        tree_out = mx.fast.scaled_dot_product_attention(q6, k6, v6, scale=0.125, mask=arr_mask)
+    assert float(mx.abs(causal_out.astype(mx.float32) - stock.astype(mx.float32)).max()) == 0.0
+    assert _err(tree_out, q6, k6, v6, True) < 0.02
+
+
+def test_measure_window_noncontiguous_with_tree_recovery_and_json_roundtrip(tmp_path, monkeypatch):
+    import importlib
+
+    C = importlib.import_module("mlx_dspark.calibrate")
+    monkeypatch.setattr(C, "_gpu_gen", lambda: 17)
+    monkeypatch.setattr(mra, "PER_Q_PROBE_Q", (2, 4, 6, 8, 9, 16))
+    monkeypatch.setattr(mra, "PROBE_KV", (1024, 4096))
+
+    # Simulate M5 NAX gaps at q=6,8,16 for causal, while tree_mask wins at q=6,8 (still loses at 16).
+    causal_win = {(2, 1024), (2, 4096), (4, 4096), (9, 1024), (9, 4096)}
+    tree_win = {(6, 4096), (8, 4096)}
+    seen_causal = set()
+
+    def fake_race(fx, fm, q, kvs, kv):
+        ql = int(q.shape[2])
+        if (ql, kv) not in seen_causal:
+            seen_causal.add((ql, kv))
+            won = (ql, kv) in causal_win
+        else:
+            won = (ql, kv) in tree_win
+        return (2.0, True) if won else (0.67, False)
+
+    monkeypatch.setattr(mra, "_race_pair", fake_race)
+    win, report = mra.measure_window(8, 2, 64, per_q=True)
+    assert report["probe"] == 3
+    assert win == {
+        "q_min_kv": {"2": 1024, "4": 4096, "9": 1024},
+        "tree_q_min_kv": {"2": 1024, "4": 4096, "6": 4096, "8": 4096, "9": 1024},
+    }
+    cache = str(tmp_path)
+    dev = mx.device_info().get("device_name", "unknown")
+    key = f"v{C.SCHEMA}|{dev}|mlx{mx.__version__}|mra2|8x2x64"
+    C.save_cached(key, {"window": win, "report": {"probe": 3, "max_sg": mra.MAX_SG}}, cache)
+    loaded = C.multirow_windows([(8, 2, 64)], cache_dir=cache, verbose=False)
+    assert len(loaded) == 1
+    assert loaded[0].min_kv_for(2) == 1024
+    assert loaded[0].min_kv_for(4) == 4096
+    assert loaded[0].min_kv_for(6) is None
+    assert loaded[0].min_kv_for(6, tree=True) == 4096
+    assert loaded[0].min_kv_for(16, tree=True) is None
+
+
+def test_m5_uses_mra2_cache_key_and_bypasses_stale_mra1(tmp_path, monkeypatch):
+    import importlib
+
+    C = importlib.import_module("mlx_dspark.calibrate")
+    dev = mx.device_info().get("device_name", "unknown")
+    cache = str(tmp_path)
+    mra1_key = f"v{C.SCHEMA}|{dev}|mlx{mx.__version__}|mra1|8x2x64"
+    stale_win = {"min_q": 2, "max_q": 4, "min_kv": 16384}
+    C.save_cached(mra1_key, {"window": stale_win, "report": {"probe": 2, "max_sg": mra.MAX_SG}}, cache)
+
+    seen_per_q = []
+
+    def fake(hq, hk, d, **kw):
+        seen_per_q.append(kw.get("per_q"))
+        return {"q_min_kv": {"2": 1024, "9": 4096}}, {"probe": 3, "max_sg": mra.MAX_SG}
+
+    monkeypatch.setattr(mra, "measure_window", fake)
+    # On g16 (M4), mra1 stands untouched and never re-probes.
+    monkeypatch.setattr(C, "_gpu_gen", lambda: 16)
+    wins16 = C.multirow_windows([(8, 2, 64)], cache_dir=cache, verbose=False)
+    assert seen_per_q == []
+    assert wins16[0].max_q == 4
+
+    # On g17 (M5), stale mra1 (e.g. from FORCE_MULTIROW) is ignored and mra2 is calibrated.
+    monkeypatch.setattr(C, "_gpu_gen", lambda: 17)
+    wins17 = C.multirow_windows([(8, 2, 64)], cache_dir=cache, verbose=False)
+    assert seen_per_q == [True]
+    assert wins17[0].q_min_kv == ((2, 1024), (9, 4096))
+    assert C.load_cached(f"v{C.SCHEMA}|{dev}|mlx{mx.__version__}|mra2|8x2x64", cache) is not None
+    # mra1 remains untouched so older builds reading mra1 never see q_min_kv.
+    assert C.load_cached(mra1_key, cache)["window"] == stale_win
+
+
+def test_per_q_borderline_confirmation_rejects_noisy_flip(monkeypatch):
+    monkeypatch.setattr(mra, "PER_Q_PROBE_Q", (2, 4, 6))
+    monkeypatch.setattr(mra, "PROBE_KV", (1024,))
+    # Exercises the real _race_pair -> _abba_race confirmation path:
+    # q=2 is borderline on pass 1 (1.18 >= 1.15) then loses confirmation (1.05).
+    # q=4 is borderline on pass 1 (1.18 >= 1.15) and passes confirmation (1.21).
+    # q=6 is a clear loser (1.08 < 1.15) and does NOT trigger a confirmation pass.
+    seq = iter([
+        (1.18, 1.15), (1.05, 1.02),   # q=2: pass 1 + confirm (fails)
+        (1.18, 1.15), (1.21, 1.18),   # q=4: pass 1 + confirm (passes)
+        (1.08, 1.05),                 # q=6: clear loser (no confirm)
+        (0.67, 0.65),                 # q=2 tree_miss (loses)
+        (0.67, 0.65),                 # q=6 tree_miss (loses)
+    ])
+    monkeypatch.setattr(mra, "_abba_race", lambda *a, **kw: next(seq))
+    win, rep = mra.measure_window(8, 2, 64, per_q=True)
+    assert win == {"q_min_kv": {"4": 1024}}
+    assert rep["points"]["q2@1024"] == 1.05
+    assert rep["points"]["q6@1024"] == 1.08
+
+
+def test_abba_race_runs_interleaved_and_confirms_inconsistent_blocks(monkeypatch):
+    q, k, v = _mk(1, 8, 2, 2, 64, 64)
+    fx = lambda qq, kk, vv: mra._ORIG_SDPA(qq, kk, vv, scale=0.125, mask="causal")  # noqa: E731
+    fm = lambda qq, kk, vv: mra.multirow_sdpa(qq, kk, vv, scale=0.125, causal=True)  # noqa: E731
+    med, mn = mra._abba_race(fx, fm, q, [(k, v)], iters=1, blocks=3)
+    assert med >= mn > 0.0
+
+    # Even if median >= thr (1.25), an inconsistent block (min < thr) triggers re-check.
+    calls = iter([(1.25, 1.10), (1.12, 1.05)])
+    monkeypatch.setattr(mra, "_abba_race", lambda *a, **kw: next(calls))
+    r, won = mra._race_pair(fx, fm, q, [(k, v)], 1024, thr=1.15)
+    assert won is False and r == 1.12
+
+
+def test_tree_miss_exception_recorded_in_report(monkeypatch):
+    monkeypatch.setattr(mra, "PER_Q_PROBE_Q", (2, 6, 8))
+    monkeypatch.setattr(mra, "PROBE_KV", (1024,))
+    real = mra.multirow_sdpa
+
+    def fail_tree(q, k, v, *, scale, causal, tree_anc=None):
+        if tree_anc is not None:
+            raise RuntimeError("boom")
+        return real(q, k, v, scale=scale, causal=causal)
+
+    # q=2 wins causal (ratio 2.0); q=6,8 lose causal (0.5) -> q=6 errors in tree and stops before q=8.
+    seq = iter([(2.0, True), (0.5, False), (0.5, False)])
+    monkeypatch.setattr(mra, "multirow_sdpa", fail_tree)
+    monkeypatch.setattr(mra, "_race_pair", lambda fx, fm, q, kvs, kv: next(seq))
+    win, rep = mra.measure_window(8, 2, 64, per_q=True)
+    assert win == {"min_q": 2, "max_q": 2, "min_kv": 1024}
+    assert rep["points"]["tree_q6@1024"] == "unavailable"
+    assert "tree_q8@1024" not in rep["points"]
+    assert "RuntimeError: boom" in rep["tree_unavailable"]
+
+
+def test_measure_window_defaults_to_legacy_strict_win(monkeypatch):
+    monkeypatch.setattr(mra, "PROBE_Q", (2, 4))
+    monkeypatch.setattr(mra, "PROBE_KV", (1024,))
+    # Exact WIN boundary (1.05 / 1.0 == WIN) must NOT win under legacy strict `t_x > WIN * t_m`.
+    seq = iter([1.2, 1.0, mra.WIN, 1.0])
+    monkeypatch.setattr(mra, "_chain_ms", lambda fn, q, kvs: next(seq))
+    win, rep = mra.measure_window(8, 2, 64)
+    assert rep["probe"] == 2
+    assert win == {"min_q": 2, "max_q": 2, "min_kv": 1024}
+
+
+def test_apply_multirow_attn_gen_gate_allows_m5_and_blocks_g18(tmp_path, monkeypatch):
+    import importlib
+    from types import SimpleNamespace
+
+    C = importlib.import_module("mlx_dspark.calibrate")
+    from mlx_dspark import generate as _gen
+
+    fake_target = SimpleNamespace(model=SimpleNamespace(
+        args=SimpleNamespace(num_attention_heads=8, num_key_value_heads=2, head_dim=64)))
+    monkeypatch.setattr(mra, "measure_window",
+                        lambda hq, hk, d, **kw: ({"min_q": 2, "max_q": 8, "min_kv": 1024},
+                                                 {"probe": 3, "max_sg": mra.MAX_SG}))
+    monkeypatch.setattr(C, "_gpu_gen", lambda: 16)
+    assert C.apply_multirow_attn(fake_target, cache_dir=str(tmp_path), verbose=False) is not None
+    monkeypatch.setattr(C, "_gpu_gen", lambda: 17)
+    cfg = C.apply_multirow_attn(fake_target, cache_dir=str(tmp_path), verbose=False)
+    assert cfg is not None and _gen.MULTIROW_CFG is cfg
+    monkeypatch.setattr(C, "_gpu_gen", lambda: 18)
+    monkeypatch.delenv("MLX_DSPARK_FORCE_MULTIROW", raising=False)
+    assert C.apply_multirow_attn(fake_target, cache_dir=str(tmp_path), verbose=False) is None
+    assert _gen.MULTIROW_CFG is None
+    monkeypatch.setenv("MLX_DSPARK_FORCE_MULTIROW", "1")
+    assert C.apply_multirow_attn(fake_target, cache_dir=str(tmp_path), verbose=False) is not None
+    _gen.MULTIROW_CFG = None
+
+
+def test_format_multirow_window():
+    import importlib
+
+    C = importlib.import_module("mlx_dspark.calibrate")
+    assert C._format_multirow_window({"min_q": 2, "max_q": 8, "min_kv": 1024}) == "q 2-8 from kv 1024"
+    assert C._format_multirow_window({
+        "q_min_kv": {"4": 1024, "5": 1024, "9": 1024, "14": 4096, "3": 16384},
+        "tree_q_min_kv": {"4": 1024, "5": 1024, "6": 1024, "7": 1024, "8": 1024, "9": 1024},
+    }) == "q 4-5,9 from kv 1024; q 14 from kv 4096; q 3 from kv 16384 (tree: q 4-9 from kv 1024)"
+    assert C._format_multirow_window({
+        "q_min_kv": {},
+        "tree_q_min_kv": {"6": 4096},
+    }) == "causal off (tree: q 6 from kv 4096)"

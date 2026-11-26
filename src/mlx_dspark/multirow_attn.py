@@ -34,8 +34,9 @@ Numerics: fp32 softmax and accumulation, bf16/fp16 MMA inputs (P rounded to the 
 dtype for the P·V MMA — the unfused path mlx takes past the cliff rounds P too). Max |Δ|
 vs an fp32 reference equals or beats mlx's own kernels at every probed shape: fp-tie
 class, like the split and the small-M kernel. The gate is MEASURED per (chip x mlx x
-attention shape) by :func:`measure_window` and numerics-checked there; M5 (g17+) is gated
-off until verified end to end there (the small-M kernel's M5 stall is the precedent).
+attention shape) by :func:`measure_window` and numerics-checked there; newer GPU
+generations (g18+) stay gated off until verified end to end there (the small-M kernel's
+M5 stall is the precedent).
 """
 
 from __future__ import annotations
@@ -259,16 +260,55 @@ def multirow_sdpa(q: mx.array, k: mx.array, v: mx.array, *, scale: float,
     return out
 
 
+def _norm_q_min_kv(raw) -> tuple[tuple[int, int], ...] | None:
+    if raw is None:
+        return None
+    items = raw.items() if isinstance(raw, dict) else raw
+    return tuple(sorted((int(q), int(kv)) for q, kv in items))
+
+
 @dataclass(frozen=True)
 class Window:
-    """Measured gate for one attention shape ``(hq, hk, d)``: the kernel serves its calls
-    with ``min_q <= q_len <= max_q`` and ``kv_len >= min_kv``."""
+    """Measured gate for one attention shape ``(hq, hk, d)``: the kernel serves calls
+    whose ``q_len`` and ``kv_len`` pass the measured gate.
+
+    Supports both legacy contiguous windows (``min_q <= q_len <= max_q`` and
+    ``kv_len >= min_kv``) and per-``q`` depth thresholds (``q_min_kv`` — handles
+    non-contiguous winning widths such as Apple M5 NAX gaps at ``q=6..8, 16``), plus an
+    optional ``tree_q_min_kv`` when array-masked tree-verify widths differ from causal
+    calls (on M5, ``q=6..8`` fall off NAX under array masks, where the tree kernel wins)."""
     hq: int
     hk: int
     d: int
     min_q: int = 2
     max_q: int = 16
     min_kv: int = 1024
+    q_min_kv: tuple[tuple[int, int], ...] | None = None
+    tree_q_min_kv: tuple[tuple[int, int], ...] | None = None
+
+    def __post_init__(self):
+        qmk = _norm_q_min_kv(self.q_min_kv)
+        tmk = _norm_q_min_kv(self.tree_q_min_kv)
+        object.__setattr__(self, "q_min_kv", qmk)
+        object.__setattr__(self, "tree_q_min_kv", tmk)
+        if qmk is not None:
+            if qmk:
+                object.__setattr__(self, "min_q", min(q for q, _ in qmk))
+                object.__setattr__(self, "max_q", max(q for q, _ in qmk))
+                object.__setattr__(self, "min_kv", min(kv for _, kv in qmk))
+            else:
+                object.__setattr__(self, "min_q", 0)
+                object.__setattr__(self, "max_q", 0)
+                object.__setattr__(self, "min_kv", 0)
+
+    def min_kv_for(self, q_len: int, *, tree: bool = False) -> int | None:
+        table = self.tree_q_min_kv if (tree and self.tree_q_min_kv is not None) else self.q_min_kv
+        if table is not None:
+            for q, kv in table:
+                if q == q_len:
+                    return kv
+            return None
+        return self.min_kv if self.min_q <= q_len <= self.max_q else None
 
 
 @dataclass(frozen=True)
@@ -285,7 +325,7 @@ class MultirowConfig:
         return None
 
 
-def eligible(q, k, v, mask, sinks, cfg: MultirowConfig) -> bool:
+def eligible(q, k, v, mask, sinks, cfg: MultirowConfig, *, tree: bool = False) -> bool:
     """Structural + gate check. Only unmasked or string-"causal" attention without sinks,
     4-D bf16/fp16 tensors of a MEASURED shape, matching K/V/Q head dims (a multiple of 8,
     <= 256), whole GQA groups, and q_len / KV length inside that shape's measured window.
@@ -299,7 +339,8 @@ def eligible(q, k, v, mask, sinks, cfg: MultirowConfig) -> bool:
     B, Hq, qL, D = q.shape
     Hk, L = k.shape[1], k.shape[2]
     w = cfg.window(Hq, Hk, D)
-    if w is None or not (w.min_q <= qL <= w.max_q and qL <= L) or max(w.min_kv, 16) > L:
+    req_kv = None if w is None else w.min_kv_for(qL, tree=tree)
+    if req_kv is None or qL > L or max(req_kv, 16) > L:
         return False
     if q.dtype not in _DTYPES or k.dtype != q.dtype or v.dtype != q.dtype:
         return False
@@ -340,7 +381,7 @@ def _patched_call(q, k, v, *, scale, mask=None, sinks=None, **kw):
     if cfg is not None and not kw:
         tree = _TREE
         if (tree is not None and mask is tree[0] and q.ndim == 4 and q.shape[2] <= 32
-                and eligible(q, k, v, None, sinks, cfg)):
+                and eligible(q, k, v, None, sinks, cfg, tree=True)):
             return multirow_sdpa(q, k, v, scale=scale, causal=False, tree_anc=tree[1])
         if eligible(q, k, v, mask, sinks, cfg):
             return multirow_sdpa(q, k, v, scale=scale,
@@ -377,8 +418,10 @@ def active() -> bool:
 # ---- measurement ---------------------------------------------------------------------
 
 PROBE_Q = (2, 4, 6, 8, 12, 16)
+PER_Q_PROBE_Q = tuple(range(2, 17))
 PROBE_KV = (1024, 4096, 16384)
 WIN = 1.05         # the kernel must beat mlx by >5% (the noise band) at a probed point
+PER_Q_WIN = 1.15   # per-q gating margin (>15%, outside Apple Silicon's +-14% noise band)
 
 
 def _chain_ms(fn, q0, kvs, iters: int = 4) -> float:
@@ -401,15 +444,143 @@ def _chain_ms(fn, q0, kvs, iters: int = 4) -> float:
     return (time.perf_counter() - t) * 1e3 / (iters * len(kvs))
 
 
+def _per_q_min_kv(qs, wins_at: dict[int, list[int]]) -> dict[int, int]:
+    """For each ``q`` winning at the deepest probe, its shortest ``PROBE_KV`` from which it
+    wins at every deeper probe too."""
+    deep = set(wins_at[PROBE_KV[-1]])
+    out: dict[int, int] = {}
+    for ql in qs:
+        if ql not in deep:
+            continue
+        min_kv = PROBE_KV[-1]
+        for kv in reversed(PROBE_KV):
+            if ql in wins_at[kv]:
+                min_kv = kv
+            else:
+                break
+        out[ql] = min_kv
+    return out
+
+
+def _abba_race(fx, fm, q0, kvs, iters: int, blocks: int) -> tuple[float, float]:
+    """Run ``blocks`` interleaved ABBA blocks of dependent-chain ``fx`` vs ``fm`` and
+    return ``(median_ratio, min_ratio)``. Interleaving cancels thermal/clock drift and
+    isolated GPU bursts across the two kernels."""
+    import time
+
+    def run(fn):
+        q = q0
+        for _ in range(iters):
+            for k, v in kvs:
+                q = fn(q, k, v)
+        return q
+
+    mx.eval(run(fx), run(fm))
+    mx.synchronize()
+
+    def timed(fn) -> float:
+        t = time.perf_counter()
+        mx.eval(run(fn))
+        mx.synchronize()
+        return time.perf_counter() - t
+
+    ratios = []
+    for _ in range(blocks):
+        tx1 = timed(fx)
+        tm1 = timed(fm)
+        tm2 = timed(fm)
+        tx2 = timed(fx)
+        ratios.append((tx1 + tx2) / (tm1 + tm2))
+    ratios.sort()
+    return ratios[len(ratios) // 2], ratios[0]
+
+
+def _race_pair(fx, fm, q, kvs, kv: int, thr: float = PER_Q_WIN) -> tuple[float, bool]:
+    iters = 4 if kv <= 1024 else 2
+    r1, r1_min = _abba_race(fx, fm, q, kvs, iters, 3)
+    if r1 < thr:
+        return r1, False
+    if r1 <= 1.15 * thr or r1_min < thr:
+        r2, _ = _abba_race(fx, fm, q, kvs, iters, 3)
+        return min(r1, r2), (r1 >= thr and r2 >= thr)
+    return r1, True
+
+
+def _probe_point(
+    hq: int, ql: int, d: int, dtype, kvs: list, kv: int, scale: float,
+    report: dict, *, verbose: bool, per_q: bool, tree: bool = False,
+) -> str:
+    q = mx.random.normal((1, hq, ql, d)).astype(dtype)
+    k0, v0 = kvs[0]
+    if tree:
+        rows = mx.arange(kv - ql, kv).reshape(ql, 1)
+        cols = mx.arange(kv).reshape(1, kv)
+        mask = (cols <= rows).reshape(1, 1, ql, kv)
+        anc = mx.array([(1 << (i + 1)) - 1 for i in range(ql)], dtype=mx.uint32)
+
+        def fx(qq, kk, vv):
+            return _ORIG_SDPA(qq, kk, vv, scale=scale, mask=mask)
+
+        def fm(qq, kk, vv):
+            return multirow_sdpa(qq, kk, vv, scale=scale, causal=False, tree_anc=anc)
+
+        pt, unavail_key, err_tag = f"tree_q{ql}@{kv}", "tree_unavailable", f"tree q{ql} kv{kv}"
+    else:
+        mask = "causal"
+
+        def fx(qq, kk, vv):
+            return _ORIG_SDPA(qq, kk, vv, scale=scale, mask="causal")
+
+        def fm(qq, kk, vv):
+            return multirow_sdpa(qq, kk, vv, scale=scale, causal=True)
+
+        pt, unavail_key, err_tag = f"q{ql}@{kv}", "unavailable", f"q{ql} kv{kv}"
+
+    ref = _ORIG_SDPA(q.astype(mx.float32), k0.astype(mx.float32),
+                     v0.astype(mx.float32), scale=scale, mask=mask)
+    try:
+        o_m = fm(q, k0, v0)
+        e_m = float(mx.abs(o_m.astype(mx.float32) - ref).max())
+    except Exception as e:  # noqa: BLE001
+        # This q's launch geometry needs more threads per threadgroup than this
+        # GPU allows for the compiled kernel (GitHub's virtualized M1: 384 vs the
+        # 1024 an M4 Pro gives it). Wider q only needs more, so the window ends
+        # below here — narrower q stay eligible instead of the whole shape going
+        # off. A kernel that won't build at all still fails the first q -> None.
+        report["points"][pt] = "unavailable"
+        report.setdefault(unavail_key, f"q{ql}: {type(e).__name__}: {e}")
+        return "unavailable"
+    o_x = fx(q, k0, v0)
+    e_x = float(mx.abs(o_x.astype(mx.float32) - ref).max())
+    if math.isnan(e_m) or e_m > 2.0 * e_x + 2e-3:     # NaN or off
+        report["reason"] = f"numerics {err_tag}: {e_m:.4g} vs mlx {e_x:.4g}"
+        if verbose:
+            print(f"  multirow-attn: REFUSED — {report['reason']}", flush=True)
+        return "refused"
+    if per_q:
+        ratio, won = _race_pair(fx, fm, q, kvs, kv)
+    else:
+        t_x = _chain_ms(fx, q, kvs)
+        t_m = _chain_ms(fm, q, kvs)
+        ratio, won = t_x / t_m, t_x > WIN * t_m
+    report["points"][pt] = round(ratio, 2)
+    return "won" if won else "lost"
+
+
 def measure_window(hq: int, hk: int, d: int, *, dtype=mx.bfloat16,
-                   verbose: bool = False) -> tuple[dict | None, dict]:
+                   verbose: bool = False, per_q: bool = False) -> tuple[dict | None, dict]:
     """Race the kernel against mlx on this (chip x mlx x attention shape) and return
     ``(window, report)``: ``window`` is ``{min_q, max_q, min_kv}`` (a :class:`Window` for
-    this shape) or ``None`` (disabled: the kernel failed to build, mis-computed, or never won).
+    this shape, or ``{q_min_kv, [tree_q_min_kv]}`` when ``per_q=True``) or ``None``
+    (disabled: the kernel failed to build, mis-computed, or never won).
 
-    ``max_q`` is the widest probed q such that the kernel beats mlx by >5% at every probed
-    q <= it at the deepest KV; ``min_kv`` the shortest probed KV from which that whole q
-    range wins at every deeper probe too (the win grows with depth). Numerics are
+    On M1-M4 (``per_q=False``, default), ``max_q`` is the widest probed q in
+    :data:`PROBE_Q` such that the kernel beats mlx by >5% at every probed q <= it at the
+    deepest KV; ``min_kv`` the shortest probed KV from which that whole q range wins at
+    every deeper probe too (the win grows with depth). On M5+ (``per_q=True``, passed by
+    :func:`~mlx_dspark.calibrate.multirow_windows`), probes :data:`PER_Q_PROBE_Q` from
+    deepest KV down to shortest with a 15% margin and borderline confirmation, and races
+    array-masked ``tree_mask`` for launchable widths that lost causal. Numerics are
     checked at every probe against an fp32 reference: the kernel's max |Δ| must stay within
     2x mlx's own (+ a small floor), or the whole window is refused."""
     if d % 8 or d > MAX_D or hk == 0 or hq % hk:
@@ -417,72 +588,108 @@ def measure_window(hq: int, hk: int, d: int, *, dtype=mx.bfloat16,
     scale = 1.0 / math.sqrt(d)
     # "probe" 2 = per-width launch handling (a refused wide q ends the window instead of
     # disabling the shape); calibrate re-probes older "kernel unavailable" verdicts once.
+    # "probe" 3 = per-q non-contiguous + tree_mask probing (M5+ / g17+).
     # "max_sg" stamps the launch size the window was probed at: a window is only valid for
     # the geometry plan() produced while probing it (see calibrate._foreign_geometry).
-    report: dict = {"shape": f"{hq}x{hk}x{d}", "points": {}, "probe": 2, "max_sg": MAX_SG}
+    report: dict = {"shape": f"{hq}x{hk}x{d}", "points": {},
+                    "probe": 3 if per_q else 2, "max_sg": MAX_SG}
+    probe_qs = PER_Q_PROBE_Q if per_q else PROBE_Q
     wins_at: dict[int, list[int]] = {}
+    launchable_at: dict[int, list[int]] = {}
     try:
-        for kv in PROBE_KV:
+        active_qs = list(probe_qs)
+        for kv in (reversed(PROBE_KV) if per_q else PROBE_KV):
+            if not active_qs:
+                wins_at[kv] = []
+                launchable_at[kv] = []
+                continue
             kvs = [(mx.random.normal((1, hk, kv, d)).astype(dtype),
                     mx.random.normal((1, hk, kv, d)).astype(dtype)) for _ in range(3)]
             mx.eval(kvs)
-            ok = []
-            for ql in PROBE_Q:
-                q = mx.random.normal((1, hq, ql, d)).astype(dtype)
-                k0, v0 = kvs[0]
-                ref = _ORIG_SDPA(q.astype(mx.float32), k0.astype(mx.float32),
-                                 v0.astype(mx.float32), scale=scale, mask="causal")
-                try:
-                    o_m = multirow_sdpa(q, k0, v0, scale=scale, causal=True)
-                    e_m = float(mx.abs(o_m.astype(mx.float32) - ref).max())
-                except Exception as e:  # noqa: BLE001
-                    # This q's launch geometry needs more threads per threadgroup than this
-                    # GPU allows for the compiled kernel (GitHub's virtualized M1: 384 vs the
-                    # 1024 an M4 Pro gives it). Wider q only needs more, so the window ends
-                    # below here — narrower q stay eligible instead of the whole shape going
-                    # off. A kernel that won't build at all still fails the first q -> None.
-                    report["points"][f"q{ql}@{kv}"] = "unavailable"
-                    report.setdefault("unavailable", f"q{ql}: {type(e).__name__}: {e}")
-                    break
-                o_x = _ORIG_SDPA(q, k0, v0, scale=scale, mask="causal")
-                e_x = float(mx.abs(o_x.astype(mx.float32) - ref).max())
-                if math.isnan(e_m) or e_m > 2.0 * e_x + 2e-3:     # NaN or off
-                    report["reason"] = f"numerics q{ql} kv{kv}: {e_m:.4g} vs mlx {e_x:.4g}"
-                    if verbose:
-                        print(f"  multirow-attn: REFUSED — {report['reason']}", flush=True)
+            ok, launched = [], []
+            for ql in active_qs:
+                status = _probe_point(hq, ql, d, dtype, kvs, kv, scale, report,
+                                      verbose=verbose, per_q=per_q)
+                if status == "refused":
                     return None, report
-                t_x = _chain_ms(lambda q, k, v: _ORIG_SDPA(q, k, v, scale=scale, mask="causal"),
-                                q, kvs)
-                t_m = _chain_ms(lambda q, k, v: multirow_sdpa(q, k, v, scale=scale, causal=True),
-                                q, kvs)
-                report["points"][f"q{ql}@{kv}"] = round(t_x / t_m, 2)
-                if t_x > WIN * t_m:
+                if status == "unavailable":
+                    break
+                launched.append(ql)
+                if status == "won":
                     ok.append(ql)
             wins_at[kv] = ok
+            launchable_at[kv] = launched
+            if per_q:
+                active_qs = ok
             del kvs
+
+        if per_q:
+            q_min_kv = _per_q_min_kv(probe_qs, wins_at)
+            tree_miss = [ql for ql in launchable_at.get(PROBE_KV[-1], [])
+                         if ql not in q_min_kv]
+            tree_q_min_kv = dict(q_min_kv)
+            if tree_miss:
+                tree_wins_at: dict[int, list[int]] = {}
+                active_tree = list(tree_miss)
+                for kv in reversed(PROBE_KV):
+                    if not active_tree:
+                        tree_wins_at[kv] = []
+                        continue
+                    kvs = [(mx.random.normal((1, hk, kv, d)).astype(dtype),
+                            mx.random.normal((1, hk, kv, d)).astype(dtype)) for _ in range(3)]
+                    mx.eval(kvs)
+                    tok_ok = []
+                    for ql in active_tree:
+                        status = _probe_point(hq, ql, d, dtype, kvs, kv, scale, report,
+                                              verbose=verbose, per_q=True, tree=True)
+                        if status == "refused":
+                            return None, report
+                        if status == "unavailable":
+                            break
+                        if status == "won":
+                            tok_ok.append(ql)
+                    tree_wins_at[kv] = tok_ok
+                    active_tree = tok_ok
+                    del kvs
+                tree_q_min_kv.update(_per_q_min_kv(tree_miss, tree_wins_at))
         mx.clear_cache()
     except Exception as e:  # noqa: BLE001 — a kernel that won't build here is simply off
         report["reason"] = f"kernel unavailable: {type(e).__name__}: {e}"
         if verbose:
             print(f"  multirow-attn: OFF — {report['reason']}", flush=True)
         return None, report
+
     window = None
-    deep = wins_at[PROBE_KV[-1]]
-    max_q = 0
-    for ql in PROBE_Q:                   # contiguous q range winning at the deepest probe
-        if ql not in deep:
-            break
-        max_q = ql
-    if max_q:
-        qs = [ql for ql in PROBE_Q if ql <= max_q]
-        min_kv = PROBE_KV[-1]
-        for kv in reversed(PROBE_KV):    # extend toward shorter KV while the range holds
-            if all(ql in wins_at[kv] for ql in qs):
-                min_kv = kv
-            else:
+    if not per_q:
+        deep = wins_at[PROBE_KV[-1]]
+        max_q = 0
+        for ql in PROBE_Q:                   # contiguous q range winning at the deepest probe
+            if ql not in deep:
                 break
-        window = {"min_q": PROBE_Q[0], "max_q": max_q, "min_kv": min_kv}
-    else:
+            max_q = ql
+        if max_q:
+            qs = [ql for ql in PROBE_Q if ql <= max_q]
+            min_kv = PROBE_KV[-1]
+            for kv in reversed(PROBE_KV):    # extend toward shorter KV while the range holds
+                if all(ql in wins_at[kv] for ql in qs):
+                    min_kv = kv
+                else:
+                    break
+            window = {"min_q": PROBE_Q[0], "max_q": max_q, "min_kv": min_kv}
+    elif q_min_kv or tree_q_min_kv:
+        contiguous = (q_min_kv
+                      and list(q_min_kv) == [ql for ql in probe_qs if ql <= max(q_min_kv)]
+                      and len(set(q_min_kv.values())) == 1
+                      and tree_q_min_kv == q_min_kv)
+        if contiguous:
+            window = {"min_q": probe_qs[0], "max_q": max(q_min_kv),
+                      "min_kv": next(iter(q_min_kv.values()))}
+        else:
+            window = {"q_min_kv": {str(q): kv for q, kv in sorted(q_min_kv.items())}}
+            if tree_q_min_kv != q_min_kv:
+                window["tree_q_min_kv"] = {str(q): kv
+                                           for q, kv in sorted(tree_q_min_kv.items())}
+    if window is None:
         report["reason"] = (f"kernel unavailable: {report['unavailable']}"
                             if "unavailable" in report else "no win on this chip/mlx")
     return window, report
