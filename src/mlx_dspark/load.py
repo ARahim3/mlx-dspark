@@ -153,7 +153,7 @@ REGISTRY = [
     {"id": "qwen3.8-27b", "target": "mlx-community/Qwen3.8-27B-4bit",
      "dspark": "RedHatAI/Qwen3.8-27B-speculator.dspark", "dflash": "incoai/Qwen3.8-27B-DFlash2",
      "mode": "dflash", "lookup_drafts": False,
-     "ram": "~18 GB", "speedup": "~2.7×"},
+     "ram": "~18 GB", "speedup": "~3.6×"},
     # Same pair at 8-bit — best ratio. Listed as its own row so pickers offer both; the 4-bit
     # row keeps the absolute-speed crown (~40 vs ~30 tok/s) in ~18 GB. Resolution: the
     # longest-id-first match sends "*-8bit" here and everything else Qwen3.8 to the row above.
@@ -311,7 +311,11 @@ REGISTRY = [
     # --trials 3`): **cap 6 = 1.81x** (63.5 tok/s; 1.23x chat / 2.13x code / 2.08x math, accept
     # 4.19) where the bundled head gives 1.36x (47.6); `--target-bits 8` 72.5 vs 54.8. Its cap is
     # derived at the pair's measured acceptance prior (`accept_p`, a geometric fit of caps 3-7:
-    # 0.80-0.83), not the DSpark-fitted 0.70 that derived cap 3 (59.0). Lossless by the same gate
+    # 0.80-0.83), not the DSpark-fitted 0.70 that derived cap 3 (59.0). 0.81 since 2026-11-26:
+    # with tree verify on (the default) caps 5 / 6 accept 3.77 / 4.28 a round on mlx 0.32.5 (fits
+    # 0.81 / 0.83), and the cost model's caps 5-7 sit within 0.6% of each other, so 0.80 let 2% of
+    # verify-curve noise tip the derived cap to 5, which measured 4% under cap 6 (69.3 vs 72.2 tok/s
+    # decode). At 0.81 both weight sets derive cap 6 again. Lossless by the same gate
     # (cap 6: 22 / 2,048 near-tie mismatches, the stock reference's own 22). `--max-batch` takes
     # it as the lone request's drafter. See NOTES "DFlash2 on Inkling-2-Mini".
     # Tree verify (`--tree auto`: an equal-width best-first tree through the fused forward,
@@ -321,13 +325,14 @@ REGISTRY = [
     # Inkling-2-Mini".
     {"id": "inkling-2-mini", "target": "thinkingmachines/Inkling-2-Mini",
      "dspark": "thinkingmachines/Inkling-2-Mini", "bundled_head": True, "lookup_drafts": False,
-     "dflash": "incoai/Inkling-2-Mini-DFlash2", "mode": "dflash", "accept_p": {"dflash": 0.80},
-     "model_type": "inkling2_loop", "ram": "~22 GB", "speedup": "~1.9× (2.2× code / math)",
+     "dflash": "incoai/Inkling-2-Mini-DFlash2", "mode": "dflash", "accept_p": {"dflash": 0.81},
+     "model_type": "inkling2_loop", "ram": "~22 GB", "speedup": "~2.0× (2.3–2.4× code / math)",
      # The opt-in `--target-bits 8` (see load_target): what a client says next to its switch.
-     # Measured 2026-11-24 on an M4 Pro: plain 35.2 -> 45.8 tok/s, DFlash 2 67.0 -> 74.8.
+     # Measured 2026-11-26 on an M4 Pro, mlx 0.32.5, decode tok/s: plain 36.1 -> 47.7, DFlash 2
+     # (cap 6) 72.2 -> 82.9 (end to end on 2026-11-24, mlx 0.32.4: 35.2 -> 45.8, 67.0 -> 74.8).
      "target_bits_option": {
          "bits": 8,
-         "gain": "+30% plain decoding, +12% with the drafter",
+         "gain": "+32% plain decoding, +15% with the drafter",
          "caveat": "not the released weights: about 1.6% of next-token choices differ, "
                    "all near-ties"}},
 ]

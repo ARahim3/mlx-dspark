@@ -576,12 +576,12 @@ def test_registry_accept_prior_is_the_pairs_own_drafter_only():
     from mlx_dspark.load import registry_accept_prior
 
     ink, d2 = "thinkingmachines/Inkling-2-Mini", "incoai/Inkling-2-Mini-DFlash2"
-    assert registry_accept_prior(ink, "dflash", d2) == 0.80
-    assert registry_accept_prior(ink, "dflash", "/local/copy/Inkling-2-Mini-DFlash2") == 0.80
+    assert registry_accept_prior(ink, "dflash", d2) == 0.81
+    assert registry_accept_prior(ink, "dflash", "/local/copy/Inkling-2-Mini-DFlash2") == 0.81
     assert registry_accept_prior(ink, "dflash", "someone/Other-DFlash2") is None   # not measured
     assert registry_accept_prior(ink, "dspark", ink) is None          # the bundled head: global
     assert registry_accept_prior("mlx-community/Qwen3-8B-8bit", "dspark", None) is None
-    assert static_prior(ink, "dflash", d2) == 0.80
+    assert static_prior(ink, "dflash", d2) == 0.81
     assert static_prior(ink, "dspark", ink) == STATIC_PRIOR_P
     assert static_prior(None, "dflash", None) == STATIC_PRIOR_P
 
@@ -597,3 +597,9 @@ def test_the_pairs_prior_derives_the_measured_best_cap_on_its_curve():
     ctrl = CapController(verify, 5.7, max_cap=7)
     assert ctrl.static_best(STATIC_PRIOR_P) == 3
     assert ctrl.static_best(0.80) == 6
+    # mlx 0.32.5 (2026-11-26): widths 7-8 read ~2% dearer, caps 5-7 sit within 0.6% at 0.80 and
+    # the argmax tips to 5 (measured 4% under cap 6); the re-fit prior, 0.81 with tree verify on,
+    # derives 6 again
+    v325 = {2: 33.3, 3: 38.8, 4: 43.5, 5: 48.7, 7: 57.1, 8: 60.7}
+    c325 = CapController(v325, 5.26, max_cap=7)
+    assert c325.static_best(0.80) == 5 and c325.static_best(0.81) == 6
