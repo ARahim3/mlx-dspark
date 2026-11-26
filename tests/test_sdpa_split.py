@@ -98,3 +98,45 @@ def test_library_default_off():
     # a plain speculative_generate must not silently split (library-off doctrine)
     from mlx_dspark import generate
     assert generate.SDPA_SPLIT_CFG is None
+
+
+def test_masked_calls_split_from_their_own_cliff():
+    # mlx 0.32.5 moved the causal cliff (q 6 -> 9 at Qwen3.8's shape) but not the masked
+    # path's: a tree verify's array mask still leaves the vector kernel past max_chunk rows
+    cfg = SplitConfig(min_q=9, max_q=15, min_kv=64, max_chunk=5, masked_min_q=6)
+    calls = []
+
+    def counting(q, k, v, **kw):
+        calls.append(q.shape[-2])
+        return _ORIG_SDPA(q, k, v, **kw)
+
+    q, k, v, m = _mk(8, 512, "causal")
+    out = split_sdpa(q, k, v, scale=SCALE, mask=m, cfg=cfg, _orig=counting)
+    assert calls == [8] and _maxabs(out, _ORIG_SDPA(q, k, v, scale=SCALE, mask=m)) == 0.0
+    calls.clear()
+    q, k, v, m = _mk(8, 512, "arr")
+    out = split_sdpa(q, k, v, scale=SCALE, mask=m, cfg=cfg, _orig=counting)
+    assert calls == [4, 4] and _maxabs(out, _ORIG_SDPA(q, k, v, scale=SCALE, mask=m)) < 0.02
+    calls.clear()                                  # without it, masked calls follow min_q
+    split_sdpa(q, k, v, scale=SCALE, mask=m, cfg=SplitConfig(min_q=9, max_q=15, min_kv=64,
+                                                             max_chunk=5), _orig=counting)
+    assert calls == [8]
+
+
+def test_a_probed_window_past_the_vector_limit_splits_masked_calls_from_it(monkeypatch):
+    import importlib
+    from types import SimpleNamespace
+
+    from mlx_dspark import generate as G
+
+    C = importlib.import_module("mlx_dspark.calibrate")
+    target = SimpleNamespace(model=SimpleNamespace(args=SimpleNamespace(
+        num_attention_heads=24, num_key_value_heads=4, head_dim=256)))
+    try:
+        for win, masked in (({"min_q": 9, "max_q": 15, "min_kv": 4096, "max_chunk": 5}, 6),
+                            ({"min_q": 6, "max_q": 15, "min_kv": 4096, "max_chunk": 5}, None)):
+            monkeypatch.setattr(C, "measure_split_window", lambda *a, w=win, **kw: dict(w))
+            cfg = C.apply_sdpa_split(target, verbose=False)
+            assert cfg.min_q == win["min_q"] and cfg.masked_min_q == masked
+    finally:
+        G.SDPA_SPLIT_CFG = None

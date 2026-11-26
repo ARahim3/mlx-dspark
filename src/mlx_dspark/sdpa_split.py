@@ -41,12 +41,17 @@ _ORIG_SDPA = mx.fast.scaled_dot_product_attention
 @dataclass(frozen=True)
 class SplitConfig:
     """Measured cliff window. Split fires iff ``min_q <= q_len <= max_q`` and
-    ``kv_len >= min_kv``. ``max_chunk`` bounds each sub-call's q_len (must be < min_q so a
-    chunk never re-triggers the cliff)."""
+    ``kv_len >= min_kv`` — for an ARRAY-masked call (a tree verify, a sliding-window drafter)
+    from ``masked_min_q`` instead, when set: mlx 0.32.5's mid-row kernels moved the causal
+    cliff (Qwen3.8's 24/4/256 on an M4 Pro: q 6 -> 9) but not its masked path's, which still
+    leaves the vector kernel past ``max_chunk`` rows (8-row masked call at 16k: 3.7 ms on both
+    0.32.4 and 0.32.5, 0.90 causal on 0.32.5). ``max_chunk`` bounds each sub-call's q_len
+    (must be < min_q so a chunk never re-triggers the cliff)."""
     min_q: int = 6
     max_q: int = 15
     min_kv: int = 4096
     max_chunk: int = 5
+    masked_min_q: int | None = None
 
 
 def _partition(q_len: int, max_chunk: int) -> list[int]:
@@ -65,11 +70,12 @@ def split_sdpa(q, k, v, *, scale, mask=None, sinks=None, cfg: SplitConfig, _orig
     orig = _orig or _ORIG_SDPA
     q_len = q.shape[-2]
     kv_len = k.shape[-2]
-    if not (cfg.min_q <= q_len <= cfg.max_q and kv_len >= cfg.min_kv):
-        return orig(q, k, v, scale=scale, mask=mask, sinks=sinks, **kw)
-
     is_str_mask = isinstance(mask, str)          # "causal"
     is_arr_mask = isinstance(mask, mx.array)
+    lo = cfg.masked_min_q if (is_arr_mask and cfg.masked_min_q) else cfg.min_q
+    if not (lo <= q_len <= cfg.max_q and kv_len >= cfg.min_kv):
+        return orig(q, k, v, scale=scale, mask=mask, sinks=sinks, **kw)
+
     if is_arr_mask:
         mq = mask.shape[-2]
         if mq not in (1, q_len):                 # unexpected shape -> don't risk it

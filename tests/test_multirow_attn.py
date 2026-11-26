@@ -177,23 +177,27 @@ def test_measure_window_stops_below_an_unlaunchable_q(monkeypatch):
     # switching the whole shape off (v0.20.0 did: one refused q16 cost Qwen3.8 its q 2-8).
     real = mra.multirow_sdpa
 
-    def limited(q, k, v, *, scale, causal):
+    def limited(q, k, v, *, scale, causal, tree_anc=None):
         if q.shape[2] >= 8:
             raise ValueError(_LIMIT)
-        return real(q, k, v, scale=scale, causal=causal)
+        return real(q, k, v, scale=scale, causal=causal, tree_anc=tree_anc)
 
-    times = iter([2.0, 1.0] * 64)          # (mlx, kernel) per timed probe: the kernel wins
     monkeypatch.setattr(mra, "multirow_sdpa", limited)
-    monkeypatch.setattr(mra, "_chain_ms", lambda fn, q, kvs: next(times))
+    monkeypatch.setattr(mra, "_race", lambda *a, **kw: 2.0)     # the kernel wins every race
     monkeypatch.setattr(mra, "PROBE_KV", (1024,))
-    window, report = mra.measure_window(32, 2, 128)
-    assert window == {"min_q": 2, "max_q": 6, "min_kv": 1024}
+    # 8x2x128: every real width launches under the CI ceiling (384 threads), so only the
+    # fake refusal at q8 ends the tables (32x2x128 there would end them at q7 on its own)
+    window, report = mra.measure_window(8, 2, 128)
+    served = {str(q): 1024 for q in range(2, 8)}
+    assert window == {"causal": served, "tree": served}
     assert report["points"]["q8@1024"] == "unavailable"
+    assert report["points"]["tree_q8@1024"] == "unavailable"
+    assert "q9@1024" not in report["points"]                  # nothing wider was launched
     assert "threads per threadgroup" in report["unavailable"]
 
 
 def test_measure_window_refused_at_the_first_q_is_off(monkeypatch):
-    def refused(q, k, v, *, scale, causal):
+    def refused(q, k, v, *, scale, causal, tree_anc=None):
         raise ValueError(_LIMIT)
 
     monkeypatch.setattr(mra, "multirow_sdpa", refused)
@@ -211,7 +215,7 @@ def test_only_stale_unavailable_verdicts_are_reprobed(tmp_path, monkeypatch):
 
     C = importlib.import_module("mlx_dspark.calibrate")
     dev = mx.device_info().get("device_name", "unknown")
-    key = lambda s: f"v{C.SCHEMA}|{dev}|mlx{mx.__version__}|mra1|{s}"  # noqa: E731
+    key = lambda s: f"v{C.SCHEMA}|{dev}|mlx{mx.__version__}|mra2|{s}"  # noqa: E731
     cache = str(tmp_path)
     sg = {"max_sg": mra.MAX_SG}
     C.save_cached(key("32x2x128"), {"window": None, "report": {
@@ -244,7 +248,7 @@ def test_windows_probed_at_another_launch_size_are_reprobed(tmp_path, monkeypatc
 
     C = importlib.import_module("mlx_dspark.calibrate")
     dev = mx.device_info().get("device_name", "unknown")
-    key = lambda s: f"v{C.SCHEMA}|{dev}|mlx{mx.__version__}|mra1|{s}"  # noqa: E731
+    key = lambda s: f"v{C.SCHEMA}|{dev}|mlx{mx.__version__}|mra2|{s}"  # noqa: E731
     cache = str(tmp_path)
     wide = {"min_q": 2, "max_q": 16, "min_kv": 1024}
     C.save_cached(key("16x2x256"), {"window": wide, "report": {"probe": 2, "max_sg": 14}},
@@ -270,3 +274,146 @@ def test_measure_window_stamps_its_launch_size(monkeypatch):
     monkeypatch.setattr(mra, "PROBE_Q", (2,))
     _, report = mra.measure_window(32, 8, 128)
     assert report["max_sg"] == mra.MAX_SG
+
+
+# ---- per-width tables (mlx 0.32.5: the kernel's wins are per width and per call kind) ----
+
+
+def test_window_tables_gate_each_kind_by_width():
+    # mlx 0.32.5 on an M4 Pro at Qwen3.8's shape: causal q 6-8 tie mlx's new mid-row kernel
+    # below 16k while a tree verify of those widths is 3-4x ahead of mlx's masked path
+    w = Window.from_probe(8, 2, 64, {"causal": {"2": 64, "9": 64, "6": 128},
+                                     "tree": {"2": 128, "6": 64}})
+    assert hash(w) and w.min_kv_for(2) == 64 and w.min_kv_for(6) == 128
+    assert w.min_kv_for(7) is None and w.min_kv_for(6, tree=True) == 64
+    assert w.min_kv_for(9, tree=True) is None
+    cfg = MultirowConfig((w,))
+    q, k, v = _mk(1, 8, 2, 6, 64, 64)
+    assert not eligible(q, k, v, "causal", None, cfg)           # causal q6 only from kv 128
+    assert eligible(q, k, v, None, None, cfg, tree=True)         # the tree table admits it
+    q9, k9, v9 = _mk(1, 8, 2, 9, 64, 64)
+    assert eligible(q9, k9, v9, "causal", None, cfg)
+    assert not eligible(q9, k9, v9, None, None, cfg, tree=True)
+    # a kind the probe never ran (a drafter's shape: no tree table) serves no call of it
+    drafter = Window.from_probe(8, 2, 64, {"causal": {"6": 64}})
+    assert drafter.min_kv_for(6) == 64 and drafter.min_kv_for(6, tree=True) is None
+    # an older contiguous verdict stays contiguous, for both kinds
+    old = Window.from_probe(8, 2, 64, {"min_q": 2, "max_q": 8, "min_kv": 64})
+    assert old.min_kv_for(8) == 64 == old.min_kv_for(8, tree=True) and old.min_kv_for(9) is None
+
+
+def test_scope_routes_tree_and_causal_calls_by_their_own_tables(monkeypatch):
+    cfg = MultirowConfig((Window.from_probe(8, 2, 64, {"causal": {}, "tree": {"6": 64}}),))
+    q, k, v = _mk(1, 8, 2, 6, 128, 64)
+    rows = mx.arange(128 - 6, 128).reshape(6, 1)
+    arr = (mx.arange(128).reshape(1, 128) <= rows).reshape(1, 1, 6, 128)
+    anc = mx.array([(1 << (i + 1)) - 1 for i in range(6)], dtype=mx.uint32)
+    stock = mra._ORIG_SDPA(q, k, v, scale=0.125, mask="causal")
+    real, calls = mra.multirow_sdpa, []
+
+    def counted(*a, tree_anc=None, **kw):
+        calls.append("tree" if tree_anc is not None else "causal")
+        return real(*a, tree_anc=tree_anc, **kw)
+
+    monkeypatch.setattr(mra, "multirow_sdpa", counted)
+    with multirow_attention(cfg), mra.tree_mask(arr, anc):
+        causal = mx.fast.scaled_dot_product_attention(q, k, v, scale=0.125, mask="causal")
+        tree = mx.fast.scaled_dot_product_attention(q, k, v, scale=0.125, mask=arr)
+    assert calls == ["tree"]
+    assert float(mx.abs(causal.astype(mx.float32) - stock.astype(mx.float32)).max()) == 0.0
+    assert _err(tree, q, k, v, True) < 0.02           # a chain-shaped tree is causal attention
+
+
+def test_measure_window_builds_per_width_tables_deepest_first(monkeypatch):
+    monkeypatch.setattr(mra, "PROBE_Q", (2, 4, 6, 8, 9))
+    win_at = {("causal", 2): {1024, 4096, 16384}, ("causal", 6): {16384},
+              ("causal", 8): {1024, 4096}, ("causal", 9): {1024, 4096, 16384},
+              ("tree", 2): {4096, 16384}, ("tree", 6): {1024, 4096, 16384},
+              ("tree", 8): {1024, 4096, 16384}, ("tree", 9): {1024, 4096, 16384}}
+    probed = []
+
+    def fake(kind, hq, ql, d, dtype, kvs, kv, scale, report):
+        probed.append((kind, ql, kv))
+        return "won" if kv in win_at.get((kind, ql), ()) else "lost"
+
+    monkeypatch.setattr(mra, "_probe_point", fake)
+    window, report = mra.measure_window(8, 2, 64)
+    assert window == {"causal": {"2": 1024, "6": 16384, "9": 1024},
+                      "tree": {"2": 4096, "6": 1024, "8": 1024, "9": 1024}}
+    assert report["probe"] == 3
+    # deepest first, every width there; a width is dropped at its first loss (causal q8 loses
+    # at 16k and is never raced shallower even though it would "win" there; causal q6 stops
+    # after its 4k loss)
+    assert probed[:5] == [("causal", q, 16384) for q in (2, 4, 6, 8, 9)]
+    assert ("causal", 8, 4096) not in probed and ("causal", 6, 1024) not in probed
+    probed.clear()                                     # a drafter's shape: causal only
+    window, _ = mra.measure_window(8, 2, 64, tree=False)
+    assert set(window) == {"causal"} and {kind for kind, _, _ in probed} == {"causal"}
+
+
+def test_a_borderline_point_must_win_its_second_race(monkeypatch):
+    _, k, v = _mk(1, 8, 2, 4, 64, 64)
+    ratios = iter([1.10, 1.02,          # borderline, then a loss: lost
+                   1.10, 1.08,          # borderline twice: won on the lower ratio
+                   1.30])               # a clear win: one race
+    monkeypatch.setattr(mra, "_race", lambda *a, **kw: next(ratios))
+    report = {"points": {}}
+    args = (8, 4, 64, mx.bfloat16, [(k, v)], 64, 0.125, report)
+    assert mra._probe_point("causal", *args) == "lost"
+    assert mra._probe_point("causal", *args) == "won"
+    assert mra._probe_point("tree", *args) == "won"
+    assert report["points"] == {"q4@64": 1.08, "tree_q4@64": 1.3}
+
+
+def test_a_shape_probed_as_a_drafters_is_reprobed_as_a_target(tmp_path, monkeypatch):
+    import importlib
+
+    C = importlib.import_module("mlx_dspark.calibrate")
+    seen = []
+
+    def fake(hq, hk, d, *, tree=True, **kw):
+        seen.append(tree)
+        win = {"causal": {"4": 1024}}
+        if tree:
+            win["tree"] = {"6": 1024}
+        return win, {"probe": 3, "max_sg": mra.MAX_SG}
+
+    monkeypatch.setattr(mra, "measure_window", fake)
+    shape, cache = [(8, 2, 64)], str(tmp_path)
+    C.multirow_windows(shape, tree_shapes=set(), cache_dir=cache, verbose=False)
+    C.multirow_windows(shape, tree_shapes=set(), cache_dir=cache, verbose=False)   # cached
+    (w,) = C.multirow_windows(shape, tree_shapes={(8, 2, 64)}, cache_dir=cache, verbose=False)
+    assert seen == [False, True] and w.min_kv_for(6, tree=True) == 1024
+
+
+def test_the_kernel_is_gated_on_through_m5_and_off_past_it(tmp_path, monkeypatch):
+    import importlib
+    from types import SimpleNamespace
+
+    from mlx_dspark import generate as G
+
+    C = importlib.import_module("mlx_dspark.calibrate")
+    target = SimpleNamespace(model=SimpleNamespace(args=SimpleNamespace(
+        num_attention_heads=8, num_key_value_heads=2, head_dim=64)))
+    monkeypatch.setattr(mra, "measure_window", lambda hq, hk, d, **kw: (
+        {"causal": {"4": 1024}, "tree": {"4": 1024}}, {"probe": 3, "max_sg": mra.MAX_SG}))
+    monkeypatch.delenv("MLX_DSPARK_FORCE_MULTIROW", raising=False)
+    try:
+        for gen, on in ((16, True), (17, True), (18, False)):
+            monkeypatch.setattr(C, "_gpu_gen", lambda g=gen: g)
+            cfg = C.apply_multirow_attn(target, cache_dir=str(tmp_path), verbose=False)
+            assert (cfg is not None) is on
+        monkeypatch.setenv("MLX_DSPARK_FORCE_MULTIROW", "1")
+        assert C.apply_multirow_attn(target, cache_dir=str(tmp_path), verbose=False) is not None
+    finally:
+        G.MULTIROW_CFG = None
+
+
+def test_window_text():
+    import importlib
+
+    C = importlib.import_module("mlx_dspark.calibrate")
+    assert C._window_text({"min_q": 2, "max_q": 8, "min_kv": 1024}) == "q 2-8 from kv 1024"
+    assert C._window_text({"causal": {"2": 1024, "3": 1024, "9": 1024, "6": 16384},
+                           "tree": {}}) == ("causal q 2-3,9 from kv 1024, q 6 from kv 16384"
+                                            " · tree off")

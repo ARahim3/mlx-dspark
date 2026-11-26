@@ -28,6 +28,7 @@ lossless for ANY per-round cap sequence. Auto-cap can never change what is gener
 
 from __future__ import annotations
 
+import dataclasses
 import itertools
 import json
 import os
@@ -1309,7 +1310,12 @@ def apply_sdpa_split(target, *, target_repo=None, enabled=None, cache_dir=None, 
         _gen.SDPA_SPLIT_CFG = SplitConfig()
         return _gen.SDPA_SPLIT_CFG
     win = measure_split_window(*dims, cache_dir=cache_dir, verbose=verbose)
-    _gen.SDPA_SPLIT_CFG = SplitConfig(**win) if win else None
+    cfg = SplitConfig(**win) if win else None
+    if cfg is not None and cfg.max_chunk + 1 < cfg.min_q:
+        # the probe races causal calls; mlx's masked path keeps the vector-kernel cliff at
+        # max_chunk + 1 rows (see SplitConfig), so array-masked calls split from there
+        cfg = dataclasses.replace(cfg, masked_min_q=cfg.max_chunk + 1)
+    _gen.SDPA_SPLIT_CFG = cfg
     return _gen.SDPA_SPLIT_CFG
 
 
@@ -1317,10 +1323,12 @@ def apply_sdpa_split(target, *, target_repo=None, enabled=None, cache_dir=None, 
 
 # ---- multi-row decode attention (multirow_attn.py) -----------------------------------
 
-# Verified end to end only on M4 (g16), like the small-M kernel — whose M5 (g17) stall the
-# microbench race could not see. Same hardware gate: a newer GPU generation must re-earn
-# the kernel by an end-to-end run; MLX_DSPARK_FORCE_MULTIROW=1 overrides for that A/B.
-_MULTIROW_MAX_GEN = 16
+# Verified end to end on M4 (g16) and, by quang-Ivan, on an M5 Pro (g17s, mlx 0.32.5, PR #47:
+# 2,560 tokens over 737 rounds at 16k with no stall; the per-width probe leaves mlx's faster
+# kernels the widths they win there). A newer GPU generation must earn it by an end-to-end
+# run, the small-M kernel's M5 stall being the precedent the microbench race could not see;
+# MLX_DSPARK_FORCE_MULTIROW=1 overrides for that A/B.
+_MULTIROW_MAX_GEN = 17
 
 
 def _drafter_attn_dims(drafter):
@@ -1364,31 +1372,64 @@ def _foreign_geometry(hit: dict) -> bool:
     return (hit.get("report") or {}).get("max_sg") != MAX_SG
 
 
-def multirow_windows(shapes, *, cache_dir=None, refresh=False, verbose=True) -> list:
-    """Measured :class:`~mlx_dspark.multirow_attn.Window` per attention shape — raced and
-    numerics-checked once per (chip x mlx x shape), ~2 s each, cached."""
+def _window_text(win: dict) -> str:
+    """A probed window for the log: ``causal q 2-5,9-16 from kv 1024 · tree q 6-16 from kv
+    1024, q 2-4 from kv 4096`` (an older contiguous verdict as ``q 2-16 from kv 1024``)."""
+    if "causal" not in win and "tree" not in win:
+        return f"q {win['min_q']}-{win['max_q']} from kv {win['min_kv']}"
+    parts = []
+    for kind in ("causal", "tree"):
+        if kind not in win:
+            continue
+        by_kv: dict[int, list[int]] = {}
+        for q, kv in sorted((int(q), int(kv)) for q, kv in win[kind].items()):
+            by_kv.setdefault(kv, []).append(q)
+        groups = []
+        for kv, qs in sorted(by_kv.items()):
+            spans, lo, hi = [], qs[0], qs[0]
+            for q in qs[1:] + [None]:
+                if q is not None and q == hi + 1:
+                    hi = q
+                    continue
+                spans.append(f"{lo}-{hi}" if hi > lo else f"{lo}")
+                lo = hi = q
+            groups.append(f"q {','.join(spans)} from kv {kv}")
+        parts.append(f"{kind} {', '.join(groups) if groups else 'off'}")
+    return " · ".join(parts)
+
+
+def multirow_windows(shapes, *, tree_shapes=None, cache_dir=None, refresh=False,
+                     verbose=True) -> list:
+    """Measured :class:`~mlx_dspark.multirow_attn.Window` per attention shape — every width
+    raced and numerics-checked once per (chip x mlx x shape), a few seconds each, cached.
+    ``tree_shapes`` also get a tree-verify table (default: every shape); the others are a
+    drafter's, whose calls are never tree-masked."""
     from .multirow_attn import Window, measure_window
 
     dev = mx.device_info().get("device_name", "unknown")
     out = []
     for hq, hk, d in shapes:
-        key = f"v{SCHEMA}|{dev}|mlx{mx.__version__}|mra1|{hq}x{hk}x{d}"
+        tree = tree_shapes is None or (hq, hk, d) in tree_shapes
+        # mra2: per-width causal / tree tables (mra1, one contiguous window, stays for older
+        # builds sharing this cache file)
+        key = f"v{SCHEMA}|{dev}|mlx{mx.__version__}|mra2|{hq}x{hk}x{d}"
         hit = None if refresh else load_cached(key, cache_dir)
-        if hit is not None and (_stale_mra_refusal(hit) or _foreign_geometry(hit)):
-            hit = None
+        win = (hit or {}).get("window") or {}
+        if hit is not None and (_stale_mra_refusal(hit) or _foreign_geometry(hit)
+                                or (tree and "causal" in win and "tree" not in win)):
+            hit = None                        # last probed as a drafter's: no tree table
         if hit is None:
             if verbose:
                 print(f"calibrating multi-row attention kernel for {hq}x{hk}x{d} "
                       "(one-time, cached)…", flush=True)
-            win, report = measure_window(hq, hk, d, verbose=verbose)
+            win, report = measure_window(hq, hk, d, tree=tree, verbose=verbose)
             hit = {"window": win, "report": report}
             save_cached(key, hit, cache_dir)
             if verbose:
-                state = (f"q {win['min_q']}-{win['max_q']} from kv {win['min_kv']}"
-                         if win else f"off ({report.get('reason', 'no win')})")
+                state = _window_text(win) if win else f"off ({report.get('reason', 'no win')})"
                 print(f"  multirow-attn {hq}x{hk}x{d}: {state}", flush=True)
         if hit.get("window"):
-            out.append(Window(hq, hk, d, **hit["window"]))
+            out.append(Window.from_probe(hq, hk, d, hit["window"]))
     return out
 
 
@@ -1413,11 +1454,13 @@ def apply_multirow_attn(target, drafter=None, *, enabled=None, cache_dir=None, v
                   "MLX_DSPARK_FORCE_MULTIROW=1 to A/B it.", flush=True)
         _gen.MULTIROW_CFG = None
         return None
+    target_dims = _attn_dims(target)
     shapes = []
-    for dims in (_attn_dims(target), _drafter_attn_dims(drafter) if drafter else None):
+    for dims in (target_dims, _drafter_attn_dims(drafter) if drafter else None):
         if dims and dims not in shapes:
             shapes.append(dims)
-    windows = multirow_windows(shapes, cache_dir=cache_dir, verbose=verbose)
+    windows = multirow_windows(shapes, tree_shapes={target_dims} if target_dims else set(),
+                               cache_dir=cache_dir, verbose=verbose)
     _gen.MULTIROW_CFG = MultirowConfig(tuple(windows)) if windows else None
     return _gen.MULTIROW_CFG
 
