@@ -17,16 +17,16 @@
       "context": "256k",
       "tools": true,
       "thinking": true,
-      "summary": "The project's best ratio: a 27B reasoning model at 3.7× on 8-bit, and the fastest 27B-class decode (~40 tok/s) on 4-bit, with Inco AI's DFlash 2 drafter.",
+      "summary": "The project's best ratio: a 27B reasoning model at 3.7× on 8-bit, and the fastest 27B-class decode (~55 tok/s) on 4-bit, with Inco AI's DFlash 2 drafter.",
       "variants": [
         {
           "registry": "qwen3.8-27b",
           "quant": "4-bit",
           "measured": {
-            "when": "2026-11-08",
-            "mlx": "0.32.2",
+            "when": "2026-11-26",
+            "mlx": "0.32.5",
             "fresh": true,
-            "how": "paired in one process (arms interleaved per prompt), High Power mode; both arms re-measured 2026-11-08 with tree verify on (v0.20.4)"
+            "how": "decode tok/s (generation alone; the prompt's processing is its own figure), paired in one process (arms interleaved per prompt), High Power mode, v0.21.4 with tree verify on; end to end the same run gives DFlash 2 3.16× / 46.1 tok/s; long context and prefill below from 2026-11-08 (mlx 0.32.2)"
           },
           "picker_note": "27B quality at the fastest 27B-class decode here, in ~18 GB",
           "arms": [
@@ -36,14 +36,14 @@
               "drafter": "incoai/Qwen3.8-27B-DFlash2",
               "default": true,
               "cap": 7,
-              "accept": 5.37,
-              "baseline": 14.7,
-              "tps": 43.1,
-              "speedup": 2.93,
+              "accept": 5.32,
+              "baseline": 15.5,
+              "tps": 55.3,
+              "speedup": 3.58,
               "content": {
-                "chat": 2.49,
-                "code": 3.17,
-                "math": 3.13
+                "chat": 2.72,
+                "code": 3.8,
+                "math": 4.23
               }
             },
             {
@@ -51,14 +51,14 @@
               "label": "DSpark (Red Hat)",
               "drafter": "RedHatAI/Qwen3.8-27B-speculator.dspark",
               "cap": 7,
-              "accept": 5.08,
-              "baseline": 14.7,
-              "tps": 41.1,
-              "speedup": 2.8,
+              "accept": 4.98,
+              "baseline": 15.5,
+              "tps": 52.1,
+              "speedup": 3.37,
               "content": {
-                "chat": 2.48,
-                "code": 2.97,
-                "math": 2.94
+                "chat": 2.74,
+                "code": 3.88,
+                "math": 3.5
               }
             }
           ],
@@ -927,16 +927,17 @@
       "arch": "Looped MoE: the middle 12 of 24 layers run three times, 8 of 128 experts per token",
       "tools": null,
       "thinking": true,
-      "summary": "67.0 tok/s where mlx-vlm's own code runs this model at 25.9 (2.59×): mlx-dspark's own forward makes plain decoding 35% faster, and Inco AI's DFlash 2 head, verified as a tree, adds 1.90× on top (2.22× on code and on math) — against 1.35× for the DSpark head the model ships in its own repo.",
+      "summary": "72.2 tok/s decode where mlx-vlm's own code decodes this model at 27.5 (2.63×): mlx-dspark's own forward makes plain decoding 31% faster, and Inco AI's DFlash 2 head, verified as a tree, adds 2.00× on top (2.30× on code, 2.41× on math) — against 1.41× for the DSpark head the model ships in its own repo.",
       "caveat": "Needs mlx-vlm 0.8.1 or newer, the first release with the looped inkling2 model. mlx-dspark requires it, so a fresh install or `pip install -U mlx-dspark` brings it in; the separate git install that earlier versions asked for is no longer needed.",
       "variants": [
         {
           "registry": "inkling-2-mini",
           "quant": "NVFP4 experts",
           "measured": {
-            "when": "2026-11-24",
-            "mlx": "0.32.4",
-            "fresh": true
+            "when": "2026-11-26",
+            "mlx": "0.32.5",
+            "fresh": true,
+            "how": "decode tok/s (generation alone; the prompt's processing is its own figure), `mlx-dspark benchmark --trials 3`, each head at the cap it derives"
           },
           "arms": [
             {
@@ -945,14 +946,14 @@
               "drafter": "incoai/Inkling-2-Mini-DFlash2",
               "default": true,
               "cap": 6,
-              "accept": 4.30,
-              "baseline": 35.2,
-              "tps": 67.0,
-              "speedup": 1.90,
+              "accept": 4.28,
+              "baseline": 36.1,
+              "tps": 72.2,
+              "speedup": 2.0,
               "content": {
                 "chat": 1.28,
-                "code": 2.22,
-                "math": 2.22
+                "code": 2.3,
+                "math": 2.41
               }
             },
             {
@@ -960,14 +961,14 @@
               "label": "DSpark (bundled)",
               "drafter": "thinkingmachines/Inkling-2-Mini (bundled)",
               "cap": 3,
-              "accept": 2.35,
-              "baseline": 35.2,
-              "tps": 47.6,
-              "speedup": 1.35,
+              "accept": 2.4,
+              "baseline": 36.5,
+              "tps": 51.7,
+              "speedup": 1.41,
               "content": {
-                "chat": 1.08,
-                "code": 1.31,
-                "math": 1.68
+                "chat": 1.09,
+                "code": 1.33,
+                "math": 1.83
               }
             }
           ],
@@ -976,7 +977,7 @@
           }
         }
       ],
-      "notes": "Inkling-2-Mini is a 26B mixture-of-experts model (3.4B active per token) whose middle 12 layers run **three times** per token. It is published as one mixed-precision checkpoint: NVFP4 and MXFP8 experts, bf16 everywhere else. mlx-dspark runs that checkpoint as released; there is no separate quant to pick.\n\n!!! note \"Faster, if you opt in: `--target-bits 8`\"\n    About **+30%** plain decoding and **+12%** with the drafter (74.8 tok/s on an M4 Pro), same memory. It quantizes the attention projections and the output head when the model loads, so it is **not the model as released**: about 1.6% of next-token choices differ, always where the top two candidates were nearly tied. Off by default. In the Mac app it is the checkbox under the model's row. [Details below](#a-faster-variant-target-bits-8).\n\n`--model thinkingmachines/Inkling-2-Mini` drafts with **Inco AI's DFlash 2 head** (`incoai/Inkling-2-Mini-DFlash2`, a 990 MB second download). It predicts a whole block of 8 in one pass and walks a path through its top candidates, and it is accepted far more often than the DSpark head Thinking Machines ships inside the model repo (`mtp.safetensors`): 4.3 tokens a round at cap 6 against 2.4 at cap 3. Each round verifies a best-first tree of the block's candidates rather than a single chain, at the same cost. `--mode dspark` keeps the bundled head (no second download). mlx-dspark binds what the head was trained on — the same taps as the bundled head, the full input embedding, the model's real 200,058-token vocabulary — and drafts its candidates through an 8-bit copy of the output head on the GPU's matrix units.\n\nLike every mixture-of-experts target, each extra row of a verify pass pulls in fresh experts, so caps are priced carefully: the DFlash 2 head's cap (6 on an M4 Pro) is derived from this machine's measured costs at the head's own measured acceptance, not the DSpark heads' (which would pick 3, 9% slower). mlx-dspark runs the experts with its own kernels, which read each expert's weights once for all the rows routed to it: consecutive tokens share experts heavily, so a four-row check costs about a third more than a one-row step instead of nearly twice.\n\n**What you get compared with plain mlx-vlm.** On an M4 Pro, mlx-vlm's own code (0.8.1) decodes this model at 25.9 tok/s. mlx-dspark runs it at 35 tok/s without a drafter, 47.6 with the bundled DSpark head and 67.0 with the DFlash 2 head: 2.59× in all. (mlx-vlm's own speculative decoding with the bundled head reaches 23–37 tok/s on chat, code and math prompts; mlx-dspark with that same head gives 40–58.) The stock code launches about 7,000 small GPU kernels per token; mlx-dspark folds the runs between the big matrix products into single kernels (about 2,100 launches), and its attention reads the cached keys and values in place where the stock code copies them at every layer. Both help every token, drafted or not, and the second more as the conversation grows (those copies are 7% of a decode step at a 2,600-token prompt and 12% at 8,000).\n\nThe baseline in the table is mlx-dspark's own faster plain decode, so the speedup there reads 1.90×. On the stock forward the bundled head reaches 30.3 tok/s.\n\n## Long prompts, rewrites, thinking\n\nOn a long prompt, a verify pass reads the cached keys and values once per key/value head instead of once per row and query head: 5% of a 4-row verify pass at 2,600 tokens, 8% at 16,000, and about that much more speed for the drafter there.\n\nVerify passes of up to 33 rows run mlx-dspark's forward, so checking copied text is cheap: a pass over 32 copied tokens costs 175 ms. A short prompt is such a pass too: up to 63 new tokens — a first message, or a follow-up turn after the prefix cache restored the rest — go through the same forward, and the first words of a 22-token request stream after 0.20 s (0.26 s at 43 tokens; `mlx-dspark serve`, M4 Pro). Longer prompts read at 465 tok/s: there mlx-dspark's bit-exact kernels run around mlx-vlm's own experts, which computes the same bits in fewer GPU launches (mlx-vlm's code alone: 400). Lookup drafts are off by default for this model, because its drafter already predicts copied text well and an edit that reorders or inserts loses 5–9% with them on. For a verbatim rewrite they are worth turning on: fixing typos in a document runs at 141 tok/s with `--lookup-drafts`, against 74 for the drafter alone and 36 plain.\n\nThe chat template has reasoning-effort levels from `none` to `max` and no on/off switch, so turning thinking off (`enable_thinking: false`, Anthropic's `thinking: disabled`, or `reasoning_effort: \"none\"`) selects `none`. The model still writes a short reasoning passage at that level; it comes back separated from the answer.\n\n## A faster variant: `--target-bits 8`\n\nThe checkpoint quantizes only its experts. The attention projections and the output head stay in bf16, and they are two thirds of the bytes the model reads per token. `--target-bits 8` quantizes them to 8-bit when the model loads (under a second, same memory):\n\n| | released weights | `--target-bits 8` |\n|---|---|---|\n| plain decoding | 35.2 tok/s | **45.8 tok/s** |\n| with the DFlash 2 head | 67.0 tok/s | **74.8 tok/s** |\n| with the bundled DSpark head | 47.6 tok/s | 54.3 tok/s |\n\n**This is no longer the model as released.** Compared token by token over 4,600 positions, the 8-bit model picks a different next token in 1.6% of them, always where the two top candidates were nearly tied. For scale, the released model differs from itself in about 1% of positions between a decode step and a verify pass. 4-bit was measured too and drifts clearly, so it is not offered. The option is off by default.\n\nA drafted round gains less from it than a plain step does: with the DFlash 2 head chat still gains (1.04×), code and math 1.85–1.92×; with the bundled head chat loses (0.91×).\n\n```bash\nmlx-dspark serve --model thinkingmachines/Inkling-2-Mini --target-bits 8\n```\n\n## Several requests at once\n\nWith `--max-batch 8` concurrent requests decode together, one token each per pass: 58.8 / 86.7 / 124.6 tok/s in total at 2 / 4 / 8 requests on an M4 Pro, against 48.6 for one request with the bundled head (measured before the DFlash 2 head; one request alone now runs at ~63, so the batch's total pulls ahead from about four). A request that is alone keeps its drafter — either head — at full speed, and a new arrival streams right away instead of waiting for the request ahead of it. See [Batching](/concepts/batching/#inkling-2-mini).\n\n```bash\nmlx-dspark serve --model thinkingmachines/Inkling-2-Mini --max-batch 8\n```\n\n## First run\n\nmlx-vlm 0.8.1 is the first release that loads this model; `pip install -U mlx-dspark` brings it in.\n\n```bash\nmlx-dspark serve --model thinkingmachines/Inkling-2-Mini\n```\n\nThe checkpoint is about 20 GB, and the model card recommends 32 GB of memory or more."
+      "notes": "Inkling-2-Mini is a 26B mixture-of-experts model (3.4B active per token) whose middle 12 layers run **three times** per token. It is published as one mixed-precision checkpoint: NVFP4 and MXFP8 experts, bf16 everywhere else. mlx-dspark runs that checkpoint as released; there is no separate quant to pick.\n\n!!! note \"Faster, if you opt in: `--target-bits 8`\"\n    About **+32%** plain decoding and **+15%** with the drafter (82.9 tok/s decode on an M4 Pro), same memory. It quantizes the attention projections and the output head when the model loads, so it is **not the model as released**: about 1.6% of next-token choices differ, always where the top two candidates were nearly tied. Off by default. In the Mac app it is the checkbox under the model's row. [Details below](#a-faster-variant-target-bits-8).\n\n`--model thinkingmachines/Inkling-2-Mini` drafts with **Inco AI's DFlash 2 head** (`incoai/Inkling-2-Mini-DFlash2`, a 990 MB second download). It predicts a whole block of 8 in one pass and walks a path through its top candidates, and it is accepted far more often than the DSpark head Thinking Machines ships inside the model repo (`mtp.safetensors`): 4.3 tokens a round at cap 6 against 2.4 at cap 3. Each round verifies a best-first tree of the block's candidates rather than a single chain, at the same cost. `--mode dspark` keeps the bundled head (no second download). mlx-dspark binds what the head was trained on — the same taps as the bundled head, the full input embedding, the model's real 200,058-token vocabulary — and drafts its candidates through an 8-bit copy of the output head on the GPU's matrix units.\n\nLike every mixture-of-experts target, each extra row of a verify pass pulls in fresh experts, so caps are priced carefully: the DFlash 2 head's cap (6 on an M4 Pro) is derived from this machine's measured costs at the head's own measured acceptance, not the DSpark heads' (which would pick 3, 9% slower). mlx-dspark runs the experts with its own kernels, which read each expert's weights once for all the rows routed to it: consecutive tokens share experts heavily, so a four-row check costs about a third more than a one-row step instead of nearly twice.\n\n**What you get compared with plain mlx-vlm.** On an M4 Pro, mlx-vlm's own code (0.8.1) decodes this model at 27.5 tok/s. mlx-dspark decodes it at 36 tok/s without a drafter, 51.7 with the bundled DSpark head and 72.2 with the DFlash 2 head: 2.63× in all (decode tok/s, mlx 0.32.5). (mlx-vlm's own speculative decoding with the bundled head reaches 23–37 tok/s on chat, code and math prompts; mlx-dspark with that same head gives 40–58.) The stock code launches about 7,000 small GPU kernels per token; mlx-dspark folds the runs between the big matrix products into single kernels (about 2,100 launches), and its attention reads the cached keys and values in place where the stock code copies them at every layer. Both help every token, drafted or not, and the second more as the conversation grows (those copies are 7% of a decode step at a 2,600-token prompt and 12% at 8,000).\n\nThe baseline in the table is mlx-dspark's own faster plain decode, so the speedup there reads 2.00×. On the stock forward the bundled head reached 30.3 tok/s (end to end, mlx 0.32.4).\n\n## Long prompts, rewrites, thinking\n\nOn a long prompt, a verify pass reads the cached keys and values once per key/value head instead of once per row and query head: 5% of a 4-row verify pass at 2,600 tokens, 8% at 16,000, and about that much more speed for the drafter there.\n\nVerify passes of up to 33 rows run mlx-dspark's forward, so checking copied text is cheap: a pass over 32 copied tokens costs 175 ms. A short prompt is such a pass too: up to 63 new tokens — a first message, or a follow-up turn after the prefix cache restored the rest — go through the same forward, and the first words of a 22-token request stream after 0.20 s (0.26 s at 43 tokens; `mlx-dspark serve`, M4 Pro). Longer prompts read at 465 tok/s: there mlx-dspark's bit-exact kernels run around mlx-vlm's own experts, which computes the same bits in fewer GPU launches (mlx-vlm's code alone: 400). Lookup drafts are off by default for this model, because its drafter already predicts copied text well and an edit that reorders or inserts loses 5–9% with them on. For a verbatim rewrite they are worth turning on: fixing typos in a document runs at 141 tok/s with `--lookup-drafts`, against 74 for the drafter alone and 36 plain.\n\nThe chat template has reasoning-effort levels from `none` to `max` and no on/off switch, so turning thinking off (`enable_thinking: false`, Anthropic's `thinking: disabled`, or `reasoning_effort: \"none\"`) selects `none`. The model still writes a short reasoning passage at that level; it comes back separated from the answer.\n\n## A faster variant: `--target-bits 8`\n\nThe checkpoint quantizes only its experts. The attention projections and the output head stay in bf16, and they are two thirds of the bytes the model reads per token. `--target-bits 8` quantizes them to 8-bit when the model loads (under a second, same memory):\n\n| | released weights | `--target-bits 8` |\n|---|---|---|\n| plain decoding | 36.1 tok/s | **47.7 tok/s** |\n| with the DFlash 2 head | 72.2 tok/s | **82.9 tok/s** |\n| with the bundled DSpark head | 51.7 tok/s | 56.8 tok/s |\n\n**This is no longer the model as released.** Compared token by token over 4,600 positions, the 8-bit model picks a different next token in 1.6% of them, always where the two top candidates were nearly tied. For scale, the released model differs from itself in about 1% of positions between a decode step and a verify pass. 4-bit was measured too and drifts clearly, so it is not offered. The option is off by default.\n\nA drafted round gains less from it than a plain step does: over the 8-bit model's own plain decoding, the DFlash 2 head still gains on chat (1.19×) and 1.96–2.06× on code and math; the bundled head loses on chat (0.93×). (Decode tok/s, mlx 0.32.5.)\n\n```bash\nmlx-dspark serve --model thinkingmachines/Inkling-2-Mini --target-bits 8\n```\n\n## Several requests at once\n\nWith `--max-batch 8` concurrent requests decode together, one token each per pass: 58.8 / 86.7 / 124.6 tok/s in total at 2 / 4 / 8 requests on an M4 Pro, against 48.6 for one request with the bundled head (measured before the DFlash 2 head; one request alone now runs at ~63, so the batch's total pulls ahead from about four). A request that is alone keeps its drafter — either head — at full speed, and a new arrival streams right away instead of waiting for the request ahead of it. See [Batching](/concepts/batching/#inkling-2-mini).\n\n```bash\nmlx-dspark serve --model thinkingmachines/Inkling-2-Mini --max-batch 8\n```\n\n## First run\n\nmlx-vlm 0.8.1 is the first release that loads this model; `pip install -U mlx-dspark` brings it in.\n\n```bash\nmlx-dspark serve --model thinkingmachines/Inkling-2-Mini\n```\n\nThe checkpoint is about 20 GB, and the model card recommends 32 GB of memory or more."
     },
     {
       "slug": "ternary-bonsai-27b",

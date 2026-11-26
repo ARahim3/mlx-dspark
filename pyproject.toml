@@ -16,8 +16,8 @@ classifiers = [
 ]
 dependencies = [
     # >=0.32.5: mlx's own few-row quantized matmul (qmv_mma / qmv_nax, 3-16 rows) and mid-row
-    # attention kernels — every verify pass cheaper (DFlash 2 on Qwen3.8-27B-4bit +16% on an
-    # M4 Pro), an M5 verify cliff gone (issue #19). Existing installs only move through this
+    # attention kernels — every verify pass cheaper (DFlash 2 on Qwen3.8-27B-4bit +16% decode on
+    # an M4 Pro), an M5 verify cliff gone (issue #19). Existing installs only move through this
     # floor; the multi-row attention probe's per-width tables are measured against it.
     "mlx>=0.32.5",
     "mlx-lm>=0.31.3",

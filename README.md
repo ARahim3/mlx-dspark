@@ -51,13 +51,13 @@ chat/code/math), the Muse row per-content best (footnoted); full tables, baselin
 |---|---|---|
 | **Nanbeige4.2-3B** (bf16, looped)[^nanbeige] | **4.31×** math · **2.50×** code · 1.98× chat | ~34–74 tok/s |
 | **Gemma-4 12B** (8-bit) | **4.24×** math · **2.90×** code · **2.62×** chat | ~48–78 tok/s |
+| **Qwen3.8-27B** (4-bit, DFlash 2)[^q38] | **4.23×** math · **3.80×** code · **2.72×** chat | **~42–65 tok/s** decode |
 | **Qwen3.8-27B** (8-bit, DFlash 2)[^q38] | **4.22×** math · **3.80×** code · **2.99×** chat | ~25–35 tok/s |
 | **MiniCPM5-2B** (bf16, dense)[^minicpm5] | **4.21×** math · **3.15×** code · **2.12×** chat | **~107–213 tok/s** |
 | **LFM2.5-1.2B** (bf16, conv-hybrid)[^lfm2] | **3.83×** code · **3.82×** math · **2.40×** chat | **~240–385 tok/s** |
 | **LFM2.5-2.6B** (bf16, conv-hybrid)[^lfm2] | **3.49×** math · **2.65×** code · **2.24×** chat | ~97–152 tok/s |
 | **Muse-Glimmer-30B** (8-bit, dense)[^muse] | **3.27×** math · **2.50×** code · **2.22×** chat | ~18–26 tok/s |
-| **Qwen3.8-27B** (4-bit, DFlash 2)[^q38] | **3.17×** code · **3.13×** math · **2.49×** chat | **~37–47 tok/s** |
-| **Inkling-2-Mini** (NVFP4, looped MoE, DFlash 2)[^inkling] | **3.01×** code · **3.01×** math · 1.75× chat over stock mlx-vlm (**2.59×** overall, 25.9 → 67.0 tok/s) · over our own plain decode: 2.22× · 2.22× · 1.28× | ~46–79 tok/s · opt-in `--target-bits 8`: **+12%** (+30% plain), not the released weights |
+| **Inkling-2-Mini** (NVFP4, looped MoE, DFlash 2)[^inkling] | **3.18×** math · **3.07×** code · 1.65× chat over stock mlx-vlm (**2.63×** overall, 27.5 → 72.2 tok/s) · over our own plain decode: 2.41× · 2.30× · 1.28× | ~46–88 tok/s decode · opt-in `--target-bits 8`: **+15%** (+32% plain), not the released weights |
 | **Qwen3-8B** (8-bit) | **2.83×** math · **2.03×** code · 1.71× chat | ~50–83 tok/s |
 | **Qwen3.6-27B** (8-bit) | **2.67×** math · **2.26×** chat · 1.96× code | ~16–22 tok/s |
 | **Ornith-1.0-9B** (8-bit) | **2.53×** code · **2.48×** math · **2.21×** chat | ~59–68 tok/s |
@@ -505,9 +505,9 @@ and caps are this M4 Pro's — yours are derived fresh on first run):
   `Qwen3-8B-8bit`, or `Qwen3-4B-8bit` (~89–126 tok/s, fits ~8 GB).
 - **~8 GB** — `MiniCPM5-2B-bf16` (**3.16×** mean, 4.21× on math, ~107–213 tok/s in ~6 GB
   resident — the best small-Mac pick, and a tool-calling model).
-- **Inkling-2-Mini** (~22 GB resident, 32 GB Macs and up) — 67 tok/s as released with its
-  DFlash 2 drafter. **`--target-bits 8` is an opt-in on top: about +30% plain decoding and +12%
-  with the drafter (74.8 tok/s).** It quantizes the attention projections and the output head,
+- **Inkling-2-Mini** (~22 GB resident, 32 GB Macs and up) — 72 tok/s decode as released with its
+  DFlash 2 drafter. **`--target-bits 8` is an opt-in on top: about +32% plain decoding and +15%
+  with the drafter (83 tok/s).** It quantizes the attention projections and the output head,
   which the checkpoint keeps in bf16, so it is no longer the model as released: about 1.6% of
   next-token choices differ, always where the top two candidates were nearly tied. Off by
   default; the Mac app has the same switch under the model's row.
@@ -541,14 +541,18 @@ that trip people up:
 ## Results at a glance
 
 **DSpark** vs plain greedy decoding of the same model, each at **its own derived cap** (M4 Pro 48 GB,
-warm, 4-bit drafter, 200 tokens, end-to-end tok/s). **Re-measured 2026-09-27** on mlx 0.32.2 with
+warm, 4-bit drafter, 200 tokens; end-to-end tok/s, the prompt's processing included, except
+where a row says decode). **Re-measured 2026-09-27** on mlx 0.32.2 with
 the current kernels (`mlx-dspark benchmark --trials 3`, zero-flag derived caps) for every row whose
 models were on this machine: Gemma-4 12B, Qwen3-4B/8B, Qwen3.8-27B (both quants), LFM2.5, MiniCPM5
 and Nanbeige. The other rows keep their earlier stamps (mlx 0.32.0–0.32.1, 2026-07-22 to
 2026-08-12) and predate the 2026-09 verify kernel — the 8-bit ones among them would likely move
 the way Qwen3-4B/8B and Gemma-4 did. The Qwen3.8-27B rows are its DSpark head since 2026-09-28,
 Red Hat's (from the paired head-to-head in the next section — same prompts and semantics, High
-Power mode); that target's *default* is DFlash 2. Every number is a median of 3 runs over the
+Power mode); that target's *default* is DFlash 2. The Qwen3.8-27B 4-bit and Inkling-2-Mini rows
+were re-measured on 2026-11-26 on mlx 0.32.5 (v0.21.4) and are decode tok/s, generation alone,
+which is higher for the same run: the other rows move to decode as they are re-measured. Every
+number is a median of 3 runs over the
 harness's three prompts, and the tok/s columns are the mean across them. Reproduce any row with
 that command.
 
@@ -560,19 +564,19 @@ row at 7 — same code, different measured curves
 | target | cap | accept len | baseline | mlx-dspark | speedup | chat / code / math |
 |---|---|---|---|---|---|---|
 | **Qwen3.8-27B** (8-bit, hybrid)[^q38] | 7 | 5.55 | 8.2 tok/s | 31.1 tok/s | **3.79×** | 3.03× / 4.01× / 4.32× |
+| **Qwen3.8-27B** (4-bit, hybrid)[^q38] | 7 | 4.98 | 15.5 tok/s decode | 52.1 tok/s decode | **3.37×** | 2.74× / 3.88× / 3.50× |
 | **LFM2.5-1.2B** (bf16, conv-hybrid)[^lfm2] | 7 | 5.28 | 99.6 tok/s | 333.5 tok/s | **3.35×** | 2.40× / 3.83× / 3.82× |
 | **Gemma-4 12B** | 7 | 4.98 | 18.4 tok/s | 59.8 tok/s | **3.25×** | 2.62× / 2.90× / 4.24× |
 | **MiniCPM5-2B** (bf16, dense)[^minicpm5] | 7 | 4.87 | 50.6 tok/s | 159.7 tok/s | **3.16×** | 2.12× / 3.15× / 4.21× |
 | **Nanbeige4.2-3B** (bf16, looped)[^nanbeige] | 7 | 3.95 | 17.3 tok/s | 50.6 tok/s | **2.92×** | 1.98× / 2.50× / 4.31× |
 | **LFM2.5-2.6B** (bf16, conv-hybrid)[^lfm2] | 7 | 4.00 | 43.6 tok/s | 121.7 tok/s | **2.79×** | 2.24× / 2.65× / 3.49× |
-| **Qwen3.8-27B** (4-bit, hybrid)[^q38] | 7 | 4.83 | 14.7 tok/s | 38.6 tok/s | **2.63×** | 2.25× / 2.81× / 2.83× |
 | **Muse-Glimmer-30B** (8-bit, dense)[^muse] | 4 | 3.31 | 8.2 tok/s | 20.2 tok/s | **2.47×** | 1.97× / 2.45× / 2.99× |
 | **Ornith-1.0-9B** (hybrid)[^community] | 4 | 3.64 | 26.7 tok/s | 64.2 tok/s | **2.40×** | 2.21× / 2.53× / 2.48× |
 | **Qwen3.6-27B** (8-bit, hybrid)[^community][^q27] | 4 | 3.15 | 8.4 tok/s | 19.2 tok/s | **2.29×** | 2.26× / 1.96× / 2.67× |
 | **Qwen3-8B** | 7 | 3.37 | 29.5 tok/s | 64.5 tok/s | **2.19×** | 1.71× / 2.03× / 2.83× |
 | **Qwen3-14B**[^qwen14b] | 4 | 2.87 | 15.3 tok/s | 31.0 tok/s | **2.03×** | 1.62× / 2.11× / 2.36× |
+| **Inkling-2-Mini** (NVFP4, looped MoE, DFlash 2)[^inkling] | 6 | 4.28 | 36.1 tok/s decode (stock mlx-vlm: 27.5) | 72.2 tok/s decode | **2.00×** (2.63× over stock) | 1.28× / 2.30× / 2.41× |
 | **Qwen3-4B** | 7 | 3.23 | 51.7 tok/s | 102.5 tok/s | **1.98×** | 1.78× / 1.72× / 2.46× |
-| **Inkling-2-Mini** (NVFP4, looped MoE, DFlash 2)[^inkling] | 6 | 4.30 | 35.2 tok/s (stock mlx-vlm: 25.9) | 67.0 tok/s | **1.90×** (2.59× over stock) | 1.28× / 2.22× / 2.22× |
 | **Qwen3.6-35B-A3B** (4-bit, MoE, hybrid)[^community][^moe] | conf | 4.72 | 86.9 tok/s | 114.5 tok/s | **1.32×** | 1.05× / 1.24× / 1.67× |
 | **Nemotron-3.5-Lightning-30B-A3B** (4-bit, MoE+Mamba, hybrid)[^nemotron] | 3 | 3.28 | 91.4 tok/s | 100.9 tok/s | **1.10×** | 0.95× / 1.23× / 1.13× |
 | **Ternary-Bonsai-27B** (2-bit, hybrid) | 2 | 2.60 | 25.4 tok/s | 27.2 tok/s | **1.07×** | 1.01× / 1.13× / 1.07× |
@@ -586,7 +590,8 @@ default — `--mode auto`, and the Mac app, resolve it for both quants. Both dra
 ([`RedHatAI/Qwen3.8-27B-speculator.dspark`](https://huggingface.co/RedHatAI/Qwen3.8-27B-speculator.dspark)),
 and it closes the gap the earlier DSpark heads left: DFlash 2 still leads at 4-bit, the two tie
 at 8-bit. Paired in one process (arms interleaved per prompt, the benchmark's prompts and
-semantics: 200 tok, end-to-end tok/s, 3-trial medians), High Power mode, current kernels:
+semantics: 200 tok, 3-trial medians), High Power mode, current kernels; the 8-bit table is
+end-to-end tok/s (the prompt's processing included), the 4-bit table decode tok/s:
 
 **8-bit** (baseline 8.2 tok/s):
 
@@ -595,17 +600,18 @@ semantics: 200 tok, end-to-end tok/s, 3-trial medians), High Power mode, current
 | DSpark (`RedHatAI`) | **3.79×** | 3.03× | **4.01×** | **4.32×** | **5.55** | **31.1** |
 | **DFlash 2** | 3.74× | **3.07×** | 3.93× | 4.23× | 5.42 | 30.8 |
 
-**4-bit** (baseline 14.7 tok/s, ~18 GB):
+**4-bit** (baseline 15.5 tok/s decode, ~18 GB):
 
 | method (cap 7) | mean | chat | code | math | accept | tok/s |
 |---|---|---|---|---|---|---|
-| DSpark (`RedHatAI`, tree verify) | 2.80× | 2.48× | 2.97× | 2.94× | 5.08 | 41.1 |
-| **DFlash 2** (tree verify) | **2.93×** | **2.49×** | **3.17×** | **3.13×** | **5.37** | **43.1** |
+| DSpark (`RedHatAI`, tree verify) | 3.37× | **2.74×** | **3.88×** | 3.50× | 4.98 | 52.1 |
+| **DFlash 2** (tree verify) | **3.58×** | 2.72× | 3.80× | **4.23×** | **5.32** | **55.3** |
 
-Both 4-bit rows were re-measured on 2026-11-08 with v0.20.4's tree verify, drafter overlap and
-deferred commit (same harness, High Power mode): DFlash 2 up from 2.72× / 40.0 tok/s, the Red Hat
-DSpark head up from 2.63× / 38.6 tok/s on 2026-09-28. The 8-bit table is still the 2026-09-28
-measurement and predates those gains.
+Both 4-bit rows were re-measured on 2026-11-26 on mlx 0.32.5 with v0.21.4 (same harness, High
+Power mode) and are decode tok/s: generation alone, the prompt's processing being its own number.
+End to end, the same run gives DFlash 2 3.16× / 46.1 tok/s and the Red Hat head 3.00× / 43.9,
+against 2.93× / 43.1 and 2.80× / 41.1 on mlx 0.32.2 (2026-11-08). The 8-bit table is still the
+2026-09-28 end-to-end measurement and predates both.
 
 DFlash 2 adds a **candidate path selector** and **dynamic convolutions** to the DFlash backbone:
 acceptance rises ~+1.1–1.4 tokens *without widening the verify*, which is the kind of gain that
@@ -892,19 +898,19 @@ are bundled.
     drafts **off** (the pair's registry default); lossless on both quants (fp ties only).
 
 [^inkling]: **Inkling-2-Mini** (Thinking Machines) — **mlx-vlm's own code (0.8.1) decodes this model
-    at 25.9 tok/s on this Mac; mlx-dspark runs it at 35 tok/s plain and 67.0 tok/s with Inco AI's
-    DFlash 2 head, `incoai/Inkling-2-Mini-DFlash2` (2.59×)**, the default since 0.21.3: the head
-    the model ships in its own repo gives 47.6 in the same run (`--mode dspark`), and with
-    `--target-bits 8` the two give 74.8 and 54.3. (mlx-vlm's own speculative decoding with the
+    at 27.5 tok/s on this Mac; mlx-dspark decodes it at 36 tok/s plain and 72.2 tok/s with Inco
+    AI's DFlash 2 head, `incoai/Inkling-2-Mini-DFlash2` (2.63×)**, the default since 0.21.3: the
+    head the model ships in its own repo gives 51.7 (`--mode dspark`), and with `--target-bits 8`
+    the two give 82.9 and 56.8 (decode tok/s, mlx 0.32.5, 2026-11-26). (mlx-vlm's own speculative decoding with the
     bundled head reaches 23–37 tok/s on chat / code / math prompts where mlx-dspark with that
     same head gives 40–58.) The DFlash 2 head is a 990 MB second download;
     it binds what the bundled head reads (the same taps, the full input embedding, the real
     200,058-token vocabulary), drafts its block's candidates through an 8-bit copy of the output
     head on the GPU's matrix units, and its cap is derived at its own measured acceptance — 6 on
     an M4 Pro. Each round verifies a best-first **tree** of the block's candidates instead of
-    one chain, in the same pass at the same cost (`--tree auto`, the default: 64.6 → 67.0 tok/s
-    here, +6% over eight prompts) (measured 2026-11-24, paired, mlx 0.32.4, mlx-vlm 0.8.1;
-    lossless by token forcing against the stock forward). Both sides gain: the stock code launches about 7,000 small GPU kernels per
+    one chain, in the same pass at the same cost (`--tree auto`, the default: +6% over chains on
+    eight prompts, measured 2026-11-24, paired, mlx 0.32.4, mlx-vlm 0.8.1; lossless by token
+    forcing against the stock forward). Both sides gain: the stock code launches about 7,000 small GPU kernels per
     token on this model, mlx-dspark's own forward about 2,100; its expert kernels read each
     expert's weights once for all the rows routed to it; and its attention reads the cached keys
     and values in place where the stock code copies them at every layer (and again to roll a
