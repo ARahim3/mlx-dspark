@@ -130,8 +130,8 @@ not in the wheel, and the app never touches a pip-installed engine.
 pip install mlx-dspark          # or:  uv pip install mlx-dspark
 ```
 
-Apple Silicon + Python ≥ 3.10; installs mlx ≥ 0.32.0 automatically (0.32's quantized-matmul kernels are
-what current speedup numbers are measured on). Model weights download from the Hugging Face cache on
+Apple Silicon + Python ≥ 3.10; installs mlx ≥ 0.32.5 automatically (its few-row kernels make every
+verify pass cheaper; the tables below were measured on 0.32.0–0.32.2). Model weights download from the Hugging Face cache on
 first use (none bundled). No server framework is pulled in — the API server is built on the standard
 library.
 

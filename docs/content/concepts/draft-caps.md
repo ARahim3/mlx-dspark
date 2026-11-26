@@ -39,7 +39,7 @@ accepted(C) = 1 + p + p² + … + p^C      (tokens committed per round)
 verify(w)   = cost of one pass over w rows, in single-token steps
 ```
 
-On a datacenter GPU, verifying 8 rows costs about the same as 1, so the answer is "draft a lot". On Apple Silicon the verify curve has real shape, and that shape is a property of the chip × the model's quantization × the MLX version × the kernels in use. It moved three times in this project's life: MLX 0.32's matmul kernels, then mlx-dspark's own verify kernel in v0.12.0, then its replacement in September 2026, which moved every re-measured 8-bit model from cap 4 to cap 7.
+On a datacenter GPU, verifying 8 rows costs about the same as 1, so the answer is "draft a lot". On Apple Silicon the verify curve has real shape, and that shape is a property of the chip × the model's quantization × the MLX version × the kernels in use. It has moved four times in this project's life: MLX 0.32's matmul kernels, then mlx-dspark's own verify kernel in v0.12.0, then its replacement in September 2026, which moved every re-measured 8-bit model from cap 4 to cap 7, then MLX 0.32.5's own few-row kernels, which made widths 4–8 about 10% cheaper on an M4 Pro and removed a cliff at widths 7–8 on M5.
 
 ## How mlx-dspark picks it
 
@@ -69,12 +69,12 @@ On Qwen3.6-35B-A3B (a steep MoE curve, acceptance swinging from 2.8 on chat to 7
 The command line and server install two custom Metal kernels, each enabled per shape only after a one-time probe on your Mac proves it both faster and numerically sound. Everything else stays on MLX's kernels.
 
 Small-M verify kernel
-: MLX's quantized matmul re-reads the whole weight matrix *per row* at the few-row widths verification uses. This kernel runs the matmul on the GPU's matrix units with the weights as the shared operand, so each 4- or 8-bit weight group is read once for up to 16 rows (widths 5–16 at 4-bit, 6–16 at 8-bit). On Qwen3.8-27B 4-bit, verifying 5–8 rows now costs about 1.4× a single decode step. `--no-small-m` turns it off for comparisons.
+: MLX's quantized matmul re-reads the whole weight matrix *per row* at the few-row widths verification uses. This kernel runs the matmul on the GPU's matrix units with the weights as the shared operand, so each 4- or 8-bit weight group is read once for up to 16 rows (widths 5–16 at 4-bit, 6–16 at 8-bit). On Qwen3.8-27B 4-bit, verifying 5–8 rows now costs about 1.4× a single decode step. Since MLX 0.32.5 MLX's own kernels do this for most layers and are faster, so the probe keeps this one only for the narrow layers MLX's route skips. `--no-small-m` turns it off for comparisons.
 
 Multi-row attention kernel
-: MLX's decode attention gives every query row its own pass over the KV cache, so a width-8 verify at 32k context reads the cache about 8 times. This kernel reads each KV tile once for all rows: 1.5–4× on those attention calls, about 1.2× on a whole 32k-deep 27B verify. `--no-multirow-attn` turns it off.
+: MLX's decode attention gives every query row its own pass over the KV cache, so a width-8 verify at 32k context reads the cache about 8 times. This kernel reads each KV tile once for all rows: 1.5–4× on those attention calls, about 1.2× on a whole 32k-deep 27B verify. The probe decides per draft width, and separately for tree verifies: MLX 0.32.5 matches the kernel on ordinary verify calls at some widths, while its masked path, which every tree verify takes, is still 3–4× slower there. `--no-multirow-attn` turns it off.
 
-**On M5 and newer chips both kernels are off.** The small-M kernel wins the probe's micro-benchmark there but can stall a sustained generation for about 105 seconds, which a micro-benchmark can't detect. The attention kernel stays off until it's verified on M5. `MLX_DSPARK_FORCE_SMALL_M=1` and `MLX_DSPARK_FORCE_MULTIROW=1` override the gates for a comparison run. If you have an M5, paired numbers are very welcome in an issue.
+**On M5 the small-M kernel is off.** It wins the probe's micro-benchmark there but can stall a sustained generation for about 105 seconds, which a micro-benchmark can't detect, and since MLX 0.32.5 MLX's own kernels cover those rows on M5 anyway. The attention kernel and the tree-verify kernel are on there since v0.21.4, verified end to end on an M5 Pro by a contributor. GPUs newer than M5 start with all three off; `MLX_DSPARK_FORCE_SMALL_M=1`, `MLX_DSPARK_FORCE_MULTIROW=1` and `MLX_DSPARK_FORCE_TREE_KERNEL=1` override the gates for a comparison run. If you have one, paired numbers are very welcome in an issue.
 
 **On M1 and M2 the GPU accepts fewer threads per launch** for these kernels than M3/M4 do. The probes notice when a launch is refused and run the kernel at a size the GPU accepts, or leave that shape on MLX's own path. They never stop the model from loading.
 

@@ -30,7 +30,7 @@ Something is mismatched: a **base** model instead of the instruct one the drafte
 
 ### I'm on an M5 and speculation is slower than I expected
 
-Two of the custom kernels are switched off on M5 and newer: the small-M verify kernel stalled sustained generation there, and the attention kernel isn't verified yet. For a comparison run, `MLX_DSPARK_FORCE_SMALL_M=1` and `MLX_DSPARK_FORCE_MULTIROW=1` enable them. Paired numbers from an M5 are very welcome in an issue.
+Update to v0.21.4 or newer. It requires MLX 0.32.5, which removed a verify-cost cliff at 7–8 rows on M5 (one M5 Pro measured 48.6 → 81.0 tok/s on code with Qwen3.8-27B 4-bit and DFlash 2), and it turns on the multi-row attention and tree-verify kernels there. The small-M verify kernel stays off on M5: it stalled sustained generation there, and MLX's own kernels now cover those rows; `MLX_DSPARK_FORCE_SMALL_M=1` enables it for a comparison run. Paired numbers from an M5 are very welcome in an issue.
 
 ## Memory
 

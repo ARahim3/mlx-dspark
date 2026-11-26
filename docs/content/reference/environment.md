@@ -19,10 +19,10 @@ description: The environment variables the engine reads, and where it keeps thin
 : Enable the small-M verify kernel on M5 and newer, where it's gated off. For comparison runs only.
 
 `MLX_DSPARK_FORCE_MULTIROW=1`
-: Enable the multi-row attention kernel on M5 and newer, where it's gated off until verified. For comparison runs only.
+: Enable the multi-row attention kernel on GPUs newer than M5, where it's gated off until verified. For comparison runs only.
 
 `MLX_DSPARK_FORCE_TREE_KERNEL=1`
-: Enable the tree-verify recurrence kernel (DFlash 2 trees on gated-DeltaNet targets) on M5 and newer, where it's gated off until verified. Without it those GPUs run the exact per-path fallback, and `--tree auto` measures that cost and usually keeps the chain. For comparison runs only.
+: Enable the tree-verify recurrence kernel (DFlash 2 trees on gated-DeltaNet targets) on GPUs newer than M5, where it's gated off until verified. Without it those GPUs run the exact per-path fallback, and `--tree auto` measures that cost and usually keeps the chain. For comparison runs only.
 
 `MLX_DSPARK_EAGER_COMMIT=1`
 : Rebuild a hybrid target's recurrence state at every accept instead of folding the accepted rows into the next verify (the default since the deferred commit). Same tokens, a little slower. For comparison runs only.

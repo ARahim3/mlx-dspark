@@ -15,9 +15,11 @@ classifiers = [
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
 dependencies = [
-    # >=0.32.0: multi-row quantized-matmul fast paths (esp. 2-bit — before 0.32 every extra
-    # verify row on a 2-bit target cost ~a full weight re-read, making Bonsai spec a wash)
-    "mlx>=0.32.0",
+    # >=0.32.5: mlx's own few-row quantized matmul (qmv_mma / qmv_nax, 3-16 rows) and mid-row
+    # attention kernels — every verify pass cheaper (DFlash 2 on Qwen3.8-27B-4bit +16% on an
+    # M4 Pro), an M5 verify cliff gone (issue #19). Existing installs only move through this
+    # floor; the multi-row attention probe's per-width tables are measured against it.
+    "mlx>=0.32.5",
     "mlx-lm>=0.31.3",
     # mlx-vlm gives us Gemma-4 + the existing EAGLE3/DFlash spec-decode reference impl.
     # Floor is 0.8.1: the first release shipping the looped inkling2 model (Inkling-2-Mini) —

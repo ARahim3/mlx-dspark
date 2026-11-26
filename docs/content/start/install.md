@@ -21,7 +21,7 @@ Or, with [uv](https://docs.astral.sh/uv/):
 uv pip install mlx-dspark
 ```
 
-That brings in MLX 0.32 or newer, `mlx-lm` and `mlx-vlm`. There's no server framework to install: the API server is built on the Python standard library. No model weights are bundled; they download from Hugging Face the first time you use a model.
+That brings in MLX 0.32.5 or newer, `mlx-lm` and `mlx-vlm`. There's no server framework to install: the API server is built on the Python standard library. No model weights are bundled; they download from Hugging Face the first time you use a model.
 
 Check your setup:
 
