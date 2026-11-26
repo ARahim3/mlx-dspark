@@ -140,10 +140,13 @@ def rows_per_group(width: int, dk: int, dv: int) -> int:
     return 0
 
 
-# Like the project's other custom kernels, verified end to end on M4 (g16) only: newer GPU
-# generations take the exact stock-kernel fallback (Target._tree_linear's path batching) until
-# an M5 run earns it; MLX_DSPARK_FORCE_TREE_KERNEL=1 overrides for that A/B.
-_MAX_GEN = 16
+# Verified end to end on M4 (g16) and M5 Pro (g17s, mlx 0.32.5, mlx-lm 0.32.2 — base M5 and
+# M5 Max untested: bitwise exact vs stock gated_delta_update, +4.7% to +8.0% on equal-width
+# tree verify vs fallback / up to +15.8% vs chain, 2,560 tokens across 625 rounds with 0
+# stalls, p99=93.3 ms). Newer GPU generations (g18+) take the stock-kernel fallback
+# (Target._tree_linear's path batching) until verified; MLX_DSPARK_FORCE_TREE_KERNEL=1
+# overrides for that A/B.
+_MAX_GEN = 17
 
 
 def _gen_ok() -> bool:

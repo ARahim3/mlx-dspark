@@ -204,3 +204,13 @@ def test_fold_selftest_proves_the_kernel_and_fails_closed_on_a_broken_one(monkey
     monkeypatch.setattr(tree_gdn, "tree_gated_delta", broken)
     assert not t.fold_selftest()
     assert not Target(_tiny_hybrid(), tokenizer=None).fold_selftest()   # ops path: no kernel
+
+
+def test_tree_gdn_gen_gate_allows_g17_and_blocks_g18(monkeypatch):
+    monkeypatch.delenv("MLX_DSPARK_FORCE_TREE_KERNEL", raising=False)
+    monkeypatch.setattr(mx, "device_info", lambda: {"architecture": "applegpu_g17s"})
+    assert tree_gdn._gen_ok()
+    monkeypatch.setattr(mx, "device_info", lambda: {"architecture": "applegpu_g18"})
+    assert not tree_gdn._gen_ok()
+    monkeypatch.setenv("MLX_DSPARK_FORCE_TREE_KERNEL", "1")
+    assert tree_gdn._gen_ok()
